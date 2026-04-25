@@ -1,5 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import copy
+
 import torch  # type: ignore
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -58,7 +60,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         autocast_enabled = (
             target_dtype != torch.float32
         ) and not server_args.disable_autocast
-        scheduler = batch.scheduler or self.scheduler
+        scheduler = batch.scheduler or copy.deepcopy(self.scheduler)
 
         latent_seq_length = batch.latents.shape[-1] * batch.latents.shape[-2]
         patch_ratio = (

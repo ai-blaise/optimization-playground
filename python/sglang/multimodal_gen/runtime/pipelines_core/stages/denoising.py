@@ -485,7 +485,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             boundary_ratio = batch.boundary_ratio
 
         if boundary_ratio is not None:
-            boundary_timestep = boundary_ratio * scheduler.num_train_timesteps
+            num_train_timesteps = getattr(scheduler, "num_train_timesteps", None)
+            if num_train_timesteps is None:
+                num_train_timesteps = scheduler.config.num_train_timesteps
+            boundary_timestep = boundary_ratio * num_train_timesteps
         else:
             boundary_timestep = None
 

@@ -525,7 +525,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         batch.timesteps = timesteps
         batch.scheduler = scheduler
         batch.num_inference_steps = num_inference_steps
-        batch.sigmas = sigmas.tolist()  # Convert numpy array to list for validation
+        batch.sigmas = None
         batch.generator = torch.manual_seed(0)
         batch.original_condition_image_size = image_size
         batch.raw_latent_shape = latents.shape

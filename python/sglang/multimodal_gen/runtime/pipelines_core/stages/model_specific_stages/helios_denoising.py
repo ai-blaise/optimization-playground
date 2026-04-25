@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.scheduler_runtime import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs

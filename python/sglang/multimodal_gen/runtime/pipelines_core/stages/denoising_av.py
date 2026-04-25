@@ -6,7 +6,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
     LTX2DenoisingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.scheduler_runtime import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs

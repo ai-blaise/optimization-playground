@@ -128,6 +128,12 @@ class Req:
     paired_timesteps: torch.Tensor | None = None
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
+
+    # request-local scheduler runtime
+    # PipelineStages are designed to be of no side-effect (not changing global states outside of Req).
+    # So instead of sharing stage-global scheduler state across requests,
+    # scheduler objects should keep mutable denoising loop state (for example step indices and multistep buffers),
+    # and stages will clone the pipeline scheduler template into the request
     scheduler: Any | None = None
 
     eta: float = 0.0

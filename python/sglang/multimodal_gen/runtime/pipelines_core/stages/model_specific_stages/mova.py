@@ -15,7 +15,6 @@ import functools
 import inspect
 import os
 from collections.abc import Iterable
-from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -54,6 +53,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     _ensure_tensor_decode_output,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.scheduler_runtime import (
+    clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -128,7 +130,7 @@ class MOVATimestepPreparationStage(PipelineStage):
         self.scheduler = scheduler
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        scheduler = deepcopy(self.scheduler)
+        scheduler = clone_scheduler_runtime(self.scheduler)
         scheduler.set_timesteps(
             batch.num_inference_steps,
             denoising_strength=1.0,

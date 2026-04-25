@@ -8,7 +8,6 @@ DecodingStage downstream.
 """
 
 import math
-from copy import deepcopy
 
 import numpy as np
 import torch
@@ -20,6 +19,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.scheduler_runtime import (
+    get_or_create_request_scheduler,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -452,8 +454,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the Helios chunked denoising loop."""
         pipeline_config = server_args.pipeline_config
-        scheduler = deepcopy(batch.scheduler or self.scheduler)
-        batch.scheduler = scheduler
+        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = (
             batch.latents.device
             if hasattr(batch, "latents") and batch.latents is not None

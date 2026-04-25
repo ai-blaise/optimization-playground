@@ -1,6 +1,5 @@
 import inspect
 import math
-from copy import deepcopy
 from typing import List, Optional, Union
 
 import numpy as np
@@ -13,6 +12,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.scheduler_runtime import (
+    clone_scheduler_runtime,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -489,7 +491,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         ]
 
         # 5. Prepare timesteps
-        scheduler = deepcopy(self.scheduler)
+        scheduler = clone_scheduler_runtime(self.scheduler)
         sigmas = np.linspace(1.0, 0, num_inference_steps + 1)[:-1]
         image_seq_len = latents.shape[1]
         base_seqlen = 256 * 256 / 16 / 16

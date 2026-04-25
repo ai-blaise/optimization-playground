@@ -8,7 +8,6 @@ This module contains implementations of timestep preparation stages for diffusio
 """
 
 import inspect
-from copy import deepcopy
 from typing import Any, Callable, Tuple
 
 import torch
@@ -18,6 +17,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.scheduler_runtime import (
+    clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -69,7 +71,7 @@ class TimestepPreparationStage(PipelineStage):
         Returns:
             The batch with prepared timesteps.
         """
-        scheduler = deepcopy(self.scheduler)
+        scheduler = clone_scheduler_runtime(self.scheduler)
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
         timesteps = batch.timesteps

@@ -1,4 +1,3 @@
-import copy
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -15,6 +14,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
     DenoisingStepState,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.scheduler_runtime import (
+    clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -1083,7 +1085,7 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         ctx.audio_latents = batch.audio_latents
         # Video and audio keep separate scheduler state throughout the denoising loop.
-        ctx.audio_scheduler = copy.deepcopy(ctx.scheduler)
+        ctx.audio_scheduler = clone_scheduler_runtime(ctx.scheduler)
 
         if ctx.use_ltx23_legacy_one_stage:
             batch.ltx23_audio_replicated_for_sp = False

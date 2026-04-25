@@ -8,7 +8,6 @@ Four-stage pipeline: BeforeDenoising -> Denoising -> Export -> Save.
 from __future__ import annotations
 
 import os
-from copy import deepcopy
 from typing import Any
 
 import numpy as np
@@ -24,6 +23,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.scheduler_runtime import (
+    clone_scheduler_runtime,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -197,7 +199,7 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
             cond = cat_recursive(cond, un_cond)
 
         # 4. Latent and timestep preparation
-        scheduler = deepcopy(self.scheduler)
+        scheduler = clone_scheduler_runtime(self.scheduler)
         batch_size = image.shape[0]
         sigmas = np.linspace(0, 1, batch.num_inference_steps)
         timesteps, _ = retrieve_timesteps(

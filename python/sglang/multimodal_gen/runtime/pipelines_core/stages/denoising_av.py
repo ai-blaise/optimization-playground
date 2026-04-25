@@ -1,5 +1,3 @@
-import copy
-
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -7,6 +5,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
     LTX2DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.scheduler_runtime import (
+    clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -335,7 +336,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         original_batch_timesteps = batch.timesteps
         original_batch_num_inference_steps = batch.num_inference_steps
 
-        scheduler = copy.deepcopy(original_batch_scheduler or self.scheduler)
+        scheduler = clone_scheduler_runtime(original_batch_scheduler or self.scheduler)
         distilled_device = scheduler.sigmas.device
         # Inject `0.0011` before the terminal `0.0` to avoid the
         # `sigma_next==0` singularity in res2s' `(sample - denoised) /

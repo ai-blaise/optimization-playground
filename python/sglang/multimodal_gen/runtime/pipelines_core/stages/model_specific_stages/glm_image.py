@@ -1,7 +1,6 @@
 import inspect
 import re
 import time
-from copy import deepcopy
 from math import sqrt
 from typing import List, Optional, Tuple, Union
 
@@ -17,6 +16,9 @@ from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.scheduler_runtime import (
+    clone_scheduler_runtime,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -776,7 +778,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         )
 
         # Prepare timesteps
-        scheduler = deepcopy(self.scheduler)
+        scheduler = clone_scheduler_runtime(self.scheduler)
         image_seq_len = (
             (height // self.vae_scale_factor) * (width // self.vae_scale_factor)
         ) // (self.transformer.config.patch_size**2)

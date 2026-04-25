@@ -54,7 +54,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     _ensure_tensor_decode_output,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.diffusion_scheduler_utils import (
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (

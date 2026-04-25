@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.diffusion_scheduler_utils import (
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs

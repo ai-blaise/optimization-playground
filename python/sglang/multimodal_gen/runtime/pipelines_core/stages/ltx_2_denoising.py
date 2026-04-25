@@ -15,7 +15,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
     DenoisingStepState,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.diffusion_scheduler_utils import (
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (

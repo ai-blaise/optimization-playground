@@ -331,13 +331,12 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                     device=batch.audio_latents.device, dtype=torch.float32
                 )
 
-        original_scheduler = self.scheduler
+        original_batch_scheduler = batch.scheduler
         original_batch_timesteps = batch.timesteps
         original_batch_num_inference_steps = batch.num_inference_steps
 
-        self.scheduler = copy.deepcopy(original_scheduler)
-        distilled_device = self.scheduler.sigmas.device
-        num_steps = len(self.distilled_sigmas) - 1
+        scheduler = copy.deepcopy(original_batch_scheduler or self.scheduler)
+        distilled_device = scheduler.sigmas.device
         # Inject `0.0011` before the terminal `0.0` to avoid the
         # `sigma_next==0` singularity in res2s' `(sample - denoised) /
         # (sigma - sigma_next)`. Official `res2s_denoising_loop` does this
@@ -354,15 +353,18 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             )
         else:
             scheduler_sigmas = self.distilled_sigmas
-        self.scheduler.sigmas = scheduler_sigmas.to(distilled_device)
-        self.scheduler.num_inference_steps = num_steps
-        self.scheduler.timesteps = (self.distilled_sigmas[:num_steps] * 1000).to(
+
+        scheduler.sigmas = scheduler_sigmas
+        num_steps = len(self.distilled_sigmas) - 1
+        scheduler.num_inference_steps = num_steps
+        scheduler.timesteps = (self.distilled_sigmas[:num_steps] * 1000).to(
             distilled_device
         )
-        self.scheduler._step_index = None
-        self.scheduler._begin_index = None
+        scheduler._step_index = None
+        scheduler._begin_index = None
 
-        batch.timesteps = self.scheduler.timesteps
+        batch.scheduler = scheduler
+        batch.timesteps = scheduler.timesteps
         batch.num_inference_steps = num_steps
         original_do_cfg = batch.do_classifier_free_guidance
         batch.do_classifier_free_guidance = False
@@ -370,7 +372,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         try:
             batch = super().forward(batch, server_args)
         finally:
-            self.scheduler = original_scheduler
+            batch.scheduler = original_batch_scheduler
             batch.timesteps = original_batch_timesteps
             batch.num_inference_steps = original_batch_num_inference_steps
             batch.do_classifier_free_guidance = original_do_cfg

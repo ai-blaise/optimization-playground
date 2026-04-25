@@ -46,6 +46,9 @@ from sglang.multimodal_gen.runtime.models.dits.mova_video_dit import (
 # Create aliases for backward compatibility
 video_sinusoidal_embedding_1d = sinusoidal_embedding_1d
 audio_sinusoidal_embedding_1d = sinusoidal_embedding_1d
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    clone_scheduler_runtime,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -53,9 +56,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     _ensure_tensor_decode_output,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
-    clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,

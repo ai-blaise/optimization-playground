@@ -221,6 +221,10 @@ NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
 PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
 
+NSA_INDEXER_MODE_CHOICES = ["vanilla", "indexcache", "hisa", "indexcache-hisa"]
+
+HISA_EXECUTION_MODE_CHOICES = ["oracle", "optimized"]
+
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 NSA_CHOICES = [
@@ -497,6 +501,13 @@ class ServerArgs:
     nsa_decode_backend: Optional[str] = (
         None  # auto-detect based on hardware/kv_cache_dtype
     )
+    nsa_indexer_mode: str = "vanilla"
+    nsa_indexcache_freq: int = 4
+    nsa_indexcache_pattern: Optional[str] = None
+    hisa_block_size: int = 128
+    hisa_block_topk: int = 64
+    hisa_min_seq_len: int = 65536
+    hisa_execution_mode: str = "optimized"
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
@@ -776,6 +787,7 @@ class ServerArgs:
         self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+        self._handle_nsa_indexer_model_overrides()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -1039,6 +1051,32 @@ class ServerArgs:
             self.prefill_delayer_max_delay_passes = x
         if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
             self.prefill_delayer_token_usage_low_watermark = x
+
+    def _handle_nsa_indexer_model_overrides(self):
+        if self.nsa_indexer_mode == "vanilla":
+            return
+
+        if self.hisa_block_size <= 0:
+            raise ValueError("--hisa-block-size must be positive.")
+        if self.hisa_block_topk <= 0:
+            raise ValueError("--hisa-block-topk must be positive.")
+        if self.hisa_min_seq_len <= 0:
+            raise ValueError("--hisa-min-seq-len must be positive.")
+
+        overrides = json.loads(self.json_model_override_args)
+        overrides["nsa_indexer_mode"] = self.nsa_indexer_mode
+        overrides["hisa_block_size"] = self.hisa_block_size
+        overrides["hisa_block_topk"] = self.hisa_block_topk
+        overrides["hisa_min_seq_len"] = self.hisa_min_seq_len
+        overrides["hisa_execution_mode"] = self.hisa_execution_mode
+
+        if self.nsa_indexer_mode in ("indexcache", "indexcache-hisa"):
+            if self.nsa_indexcache_pattern is not None:
+                overrides["index_topk_pattern"] = self.nsa_indexcache_pattern
+            else:
+                overrides["index_topk_freq"] = self.nsa_indexcache_freq
+
+        self.json_model_override_args = json.dumps(overrides)
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -5197,6 +5235,50 @@ class ServerArgs:
             help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
         )
         parser.add_argument(
+            "--nsa-indexer-mode",
+            default=ServerArgs.nsa_indexer_mode,
+            type=str,
+            choices=NSA_INDEXER_MODE_CHOICES,
+            help="NSA indexer selection mode for DSA models.",
+        )
+        parser.add_argument(
+            "--nsa-indexcache-freq",
+            default=ServerArgs.nsa_indexcache_freq,
+            type=int,
+            help="Keep one full NSA indexer layer every N layers when IndexCache is enabled without a pattern.",
+        )
+        parser.add_argument(
+            "--nsa-indexcache-pattern",
+            default=ServerArgs.nsa_indexcache_pattern,
+            type=str,
+            help="Per-layer F/S IndexCache pattern. Overrides --nsa-indexcache-freq.",
+        )
+        parser.add_argument(
+            "--hisa-block-size",
+            default=ServerArgs.hisa_block_size,
+            type=int,
+            help="Logical token block size for HISA coarse selection.",
+        )
+        parser.add_argument(
+            "--hisa-block-topk",
+            default=ServerArgs.hisa_block_topk,
+            type=int,
+            help="Number of HISA coarse blocks to refine.",
+        )
+        parser.add_argument(
+            "--hisa-min-seq-len",
+            default=ServerArgs.hisa_min_seq_len,
+            type=int,
+            help="Minimum sequence length for HISA pruning.",
+        )
+        parser.add_argument(
+            "--hisa-execution-mode",
+            default=ServerArgs.hisa_execution_mode,
+            type=str,
+            choices=HISA_EXECUTION_MODE_CHOICES,
+            help="HISA execution path.",
+        )
+        parser.add_argument(
             "--fp8-gemm-backend",
             type=str,
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
@@ -6746,6 +6828,31 @@ class ServerArgs:
                     f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
                     f"Please use --kv-cache-dtype=bfloat16."
                 )
+
+        if self.nsa_indexer_mode != "vanilla":
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+            from sglang.srt.layers.attention.nsa.indexer_policy import (
+                validate_indexcache_pattern,
+            )
+
+            hf_config = self.get_model_config().hf_config
+            if not is_deepseek_nsa(hf_config):
+                raise ValueError(
+                    "--nsa-indexer-mode is only supported for DeepSeek Sparse Attention models."
+                )
+            if self.enable_hisparse:
+                raise ValueError("--nsa-indexer-mode is not compatible with HiSparse.")
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "--nsa-indexer-mode is not compatible with speculative decoding."
+                )
+            if self.hisa_block_size * self.hisa_block_topk < hf_config.index_topk:
+                raise ValueError(
+                    "--hisa-block-size * --hisa-block-topk must be at least index_topk."
+                )
+            validate_indexcache_pattern(
+                self.nsa_indexcache_pattern, hf_config.num_hidden_layers
+            )
 
         assert (
             self.schedule_conservativeness >= 0

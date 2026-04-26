@@ -54,6 +54,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
+from sglang.srt.layers.attention.nsa.indexer_policy import get_indexcache_skip_flags
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
@@ -1253,27 +1254,22 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 layer_id=layer_id,
                 alt_stream=alt_stream,
+                nsa_indexer_mode=getattr(config, "nsa_indexer_mode", "vanilla"),
+                hisa_block_size=getattr(config, "hisa_block_size", 128),
+                hisa_block_topk=getattr(config, "hisa_block_topk", 64),
+                hisa_min_seq_len=getattr(config, "hisa_min_seq_len", 65536),
+                hisa_execution_mode=getattr(
+                    config, "hisa_execution_mode", "optimized"
+                ),
             )
-            # Refer: https://arxiv.org/abs/2603.12201 for more details.
-            # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
-            # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
-            if is_nextn:
-                self.skip_topk = False
-                self.next_skip_topk = False
-            else:
-                self.index_topk_freq = getattr(config, "index_topk_freq", 1)
-                self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                if self.index_topk_pattern is None:
-                    self.skip_topk = max(layer_id - 1, 0) % self.index_topk_freq != 0
-                    self.next_skip_topk = layer_id % self.index_topk_freq != 0
-                else:
-                    self.skip_topk = self.index_topk_pattern[layer_id] == "S"
-                    if layer_id < len(self.index_topk_pattern) - 1:
-                        self.next_skip_topk = (
-                            self.index_topk_pattern[layer_id + 1] == "S"
-                        )
-                    else:
-                        self.next_skip_topk = False
+            self.skip_topk, self.next_skip_topk = get_indexcache_skip_flags(
+                mode=getattr(config, "nsa_indexer_mode", "vanilla"),
+                layer_id=layer_id,
+                num_layers=config.num_hidden_layers,
+                freq=getattr(config, "index_topk_freq", 1),
+                pattern=getattr(config, "index_topk_pattern", None),
+                is_nextn=is_nextn,
+            )
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,

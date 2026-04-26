@@ -56,6 +56,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
 )
+from sglang.srt.layers.attention.nsa.indexer_policy import uses_hisa
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -178,6 +179,11 @@ class Indexer(MultiPlatformOp):
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        nsa_indexer_mode: str = "vanilla",
+        hisa_block_size: int = 128,
+        hisa_block_topk: int = 64,
+        hisa_min_seq_len: int = 65536,
+        hisa_execution_mode: str = "optimized",
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -188,6 +194,11 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.nsa_indexer_mode = nsa_indexer_mode
+        self.hisa_block_size = hisa_block_size
+        self.hisa_block_topk = hisa_block_topk
+        self.hisa_min_seq_len = hisa_min_seq_len
+        self.hisa_execution_mode = hisa_execution_mode
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
@@ -526,6 +537,83 @@ class Indexer(MultiPlatformOp):
             topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
 
+    def _should_use_hisa_extend(
+        self, forward_batch: ForwardBatch, metadata: BaseIndexerMetadata
+    ) -> bool:
+        if not uses_hisa(self.nsa_indexer_mode):
+            return False
+        if self.hisa_execution_mode != "optimized":
+            return False
+        if not _is_cuda or _is_fp8_fnuz or not envs.SGLANG_NSA_FUSE_TOPK.get():
+            return False
+        if self.nsa_enable_prefill_cp:
+            return False
+        if not forward_batch.forward_mode.is_extend_without_speculative():
+            return False
+        if self.hisa_block_size * self.hisa_block_topk < self.index_topk:
+            return False
+        seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
+            return False
+        return int(seq_lens_cpu.max().item()) > self.hisa_min_seq_len
+
+    def _get_topk_hisa_extend(
+        self,
+        q_fp8: torch.Tensor,
+        index_k_with_scale_buffer: torch.Tensor,
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        weights: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.nsa.hisa_tilelang_kernels import (
+            hisa_indexer_paged,
+        )
+
+        q_offset = ks.shape[0]
+        topk_result = torch.full(
+            (q_fp8.shape[0], self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=q_fp8.device,
+        )
+        if q_offset == 0:
+            return topk_result
+
+        topk_relative = hisa_indexer_paged(
+            q_fp8[:q_offset],
+            index_k_with_scale_buffer,
+            page_table,
+            seq_lens,
+            weights[:q_offset],
+            ks,
+            ke,
+            metadata.get_token_to_batch_idx()[:q_offset],
+            k_block_size=self.hisa_block_size,
+            block_topk=self.hisa_block_topk,
+            topk_tokens=self.index_topk,
+        )
+        topk_offset = metadata.attn_metadata.topk_indices_offset
+        if topk_offset is not None:
+            topk_offset = topk_offset[:q_offset]
+            topk_result[:q_offset] = torch.where(
+                topk_relative >= 0,
+                topk_relative + topk_offset[:, None],
+                topk_relative,
+            )
+        else:
+            batch_idx = metadata.get_token_to_batch_idx()[:q_offset].long()
+            page_table = metadata.get_page_table_1()[batch_idx]
+            mapped = torch.gather(page_table, 1, topk_relative.clamp_min(0).long())
+            topk_result[:q_offset] = torch.where(
+                topk_relative >= 0,
+                mapped,
+                topk_relative,
+            )
+        return topk_result
+
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
     ) -> Tuple[bool, int]:
@@ -593,6 +681,27 @@ class Indexer(MultiPlatformOp):
             return topk_result
 
         ks, ke = metadata.get_indexer_kvcache_range()
+        q_offset = ks.shape[0]
+
+        if (
+            self._should_use_hisa_extend(forward_batch, metadata)
+            and q_offset == self.hisa_block_size * 16
+        ):
+            index_k_with_scale_buffer = (
+                forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                    layer_id=layer_id
+                )
+            )
+            return self._get_topk_hisa_extend(
+                q_fp8,
+                index_k_with_scale_buffer,
+                block_tables,
+                metadata.get_indexer_seq_len(),
+                weights,
+                ks,
+                ke,
+                metadata,
+            )
 
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
@@ -615,8 +724,8 @@ class Indexer(MultiPlatformOp):
         # Check if we need to chunk to avoid OOM
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
-        q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+
         need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
 
         if not need_chunk:

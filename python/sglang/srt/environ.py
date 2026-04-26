@@ -436,6 +436,7 @@ class Envs:
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
+    SGLANG_DISABLE_PYNCCL = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
 
     # Deterministic inference

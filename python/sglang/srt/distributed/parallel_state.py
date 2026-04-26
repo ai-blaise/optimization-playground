@@ -1419,6 +1419,8 @@ def init_model_parallel_group(
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
+    if envs.SGLANG_DISABLE_PYNCCL.get():
+        use_pynccl = False
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,

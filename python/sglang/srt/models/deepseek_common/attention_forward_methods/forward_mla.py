@@ -81,6 +81,10 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
+def _get_nsa_topk_indices(topk_state):
+    return getattr(topk_state, "token_topk", topk_state)
+
+
 class DeepseekMLAForwardMixin:
 
     def init_mla_forward(self: DeepseekV2AttentionMLA):
@@ -101,6 +105,7 @@ class DeepseekMLAForwardMixin:
 
         q_lora = None
         topk_indices = None
+        topk_state = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -197,7 +202,7 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.qk_head_dim
                     )
                 if not self.skip_topk or prev_topk_indices is None:
-                    topk_indices = self.indexer(
+                    topk_state = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
                         positions=positions,
@@ -205,14 +210,15 @@ class DeepseekMLAForwardMixin:
                         layer_id=self.layer_id,
                     )
                 else:
-                    topk_indices = prev_topk_indices
+                    topk_state = prev_topk_indices
+                topk_indices = _get_nsa_topk_indices(topk_state)
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
                     if not self.skip_topk or prev_topk_indices is None:
-                        topk_indices = self.indexer(
+                        topk_state = self.indexer(
                             x=hidden_states,
                             q_lora=q_lora,
                             positions=positions,
@@ -220,7 +226,8 @@ class DeepseekMLAForwardMixin:
                             layer_id=self.layer_id,
                         )
                     else:
-                        topk_indices = prev_topk_indices
+                        topk_state = prev_topk_indices
+                    topk_indices = _get_nsa_topk_indices(topk_state)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -336,6 +343,7 @@ class DeepseekMLAForwardMixin:
             zero_allocator,
             positions,
             topk_indices,
+            topk_state,
             llama_4_scaling,
         )
 
@@ -349,6 +357,7 @@ class DeepseekMLAForwardMixin:
         zero_allocator,
         positions,
         topk_indices,
+        topk_state,
         llama_4_scaling,
     ):
         save_kv_cache = True
@@ -589,7 +598,7 @@ class DeepseekMLAForwardMixin:
         if not self.next_skip_topk:
             return output, None
         else:
-            return output, topk_indices
+            return output, topk_state
 
     def _fuse_rope_for_trtllm_mla(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch

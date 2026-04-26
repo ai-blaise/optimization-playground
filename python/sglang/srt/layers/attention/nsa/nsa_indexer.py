@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -56,7 +57,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
 )
-from sglang.srt.layers.attention.nsa.indexer_policy import uses_hisa
+from sglang.srt.layers.attention.nsa.indexer_policy import (
+    uses_hisa,
+    uses_hisa_pruning,
+)
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -72,6 +76,12 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+
+
+@dataclass
+class NSAIndexCacheHISAState:
+    token_topk: torch.Tensor
+    block_topm: torch.Tensor
 
 
 class BaseIndexerMetadata(ABC):
@@ -550,12 +560,16 @@ class Indexer(MultiPlatformOp):
             return False
         if not forward_batch.forward_mode.is_extend_without_speculative():
             return False
-        if self.hisa_block_size * self.hisa_block_topk < self.index_topk:
-            return False
         seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
             return False
-        return int(seq_lens_cpu.max().item()) > self.hisa_min_seq_len
+        return uses_hisa_pruning(
+            seq_len=int(seq_lens_cpu.max().item()),
+            index_topk=self.index_topk,
+            block_size=self.hisa_block_size,
+            block_topk=self.hisa_block_topk,
+            min_seq_len=self.hisa_min_seq_len,
+        )
 
     def _get_topk_hisa_extend(
         self,
@@ -567,7 +581,7 @@ class Indexer(MultiPlatformOp):
         ks: torch.Tensor,
         ke: torch.Tensor,
         metadata: BaseIndexerMetadata,
-    ) -> torch.Tensor:
+    ) -> NSAIndexCacheHISAState:
         from sglang.srt.layers.attention.nsa.hisa_tilelang_kernels import (
             hisa_indexer_paged,
         )
@@ -580,9 +594,17 @@ class Indexer(MultiPlatformOp):
             device=q_fp8.device,
         )
         if q_offset == 0:
-            return topk_result
+            block_topm = torch.empty(
+                (0, self.hisa_block_topk),
+                dtype=torch.int64,
+                device=q_fp8.device,
+            )
+            return NSAIndexCacheHISAState(
+                token_topk=topk_result,
+                block_topm=block_topm,
+            )
 
-        topk_relative = hisa_indexer_paged(
+        topk_relative, block_topm = hisa_indexer_paged(
             q_fp8[:q_offset],
             index_k_with_scale_buffer,
             page_table,
@@ -594,6 +616,7 @@ class Indexer(MultiPlatformOp):
             k_block_size=self.hisa_block_size,
             block_topk=self.hisa_block_topk,
             topk_tokens=self.index_topk,
+            return_block_topk=True,
         )
         topk_offset = metadata.attn_metadata.topk_indices_offset
         if topk_offset is not None:
@@ -612,7 +635,7 @@ class Indexer(MultiPlatformOp):
                 mapped,
                 topk_relative,
             )
-        return topk_result
+        return NSAIndexCacheHISAState(token_topk=topk_result, block_topm=block_topm)
 
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device

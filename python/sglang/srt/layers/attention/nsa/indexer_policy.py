@@ -14,6 +14,20 @@ def uses_hisa(mode: str) -> bool:
     return mode in ("hisa", "indexcache-hisa")
 
 
+def uses_hisa_pruning(
+    *,
+    seq_len: int,
+    index_topk: int,
+    block_size: int,
+    block_topk: int,
+    min_seq_len: int,
+) -> bool:
+    candidate_capacity = block_size * block_topk
+    if candidate_capacity < index_topk:
+        return False
+    return seq_len > max(min_seq_len, candidate_capacity)
+
+
 def validate_indexcache_pattern(pattern: Optional[str], num_layers: int) -> None:
     if pattern is None:
         return

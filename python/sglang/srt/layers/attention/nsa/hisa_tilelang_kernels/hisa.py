@@ -159,6 +159,11 @@ def _hisa_indexer_impl(
         dim=-1,
         sorted=False,
     ).indices
+    _force_boundary_blocks_(
+        topk_block_indices,
+        cu_seqlen_blocked_ks,
+        cu_seqlen_blocked_ke,
+    )
 
     block_sparse_logits = fp8_native_block_sparse_mqa_attn_return_logits_interface(
         q,
@@ -197,7 +202,8 @@ def hisa_indexer_paged(
     k_block_size: int,
     block_topk: int,
     topk_tokens: int,
-) -> torch.Tensor:
+    return_block_topk: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     block_pages, block_token_counts, block_offsets = _build_hisa_block_metadata(
         page_table,
         seq_lens,
@@ -233,6 +239,7 @@ def hisa_indexer_paged(
                 k_block_size=k_block_size,
                 block_topk=block_topk,
                 topk_tokens=topk_tokens,
+                return_block_topk=return_block_topk,
             )
         _COMPILED_SHAPES.add(shape_key)
         return result
@@ -249,6 +256,7 @@ def hisa_indexer_paged(
         k_block_size=k_block_size,
         block_topk=block_topk,
         topk_tokens=topk_tokens,
+        return_block_topk=return_block_topk,
     )
 
 
@@ -265,7 +273,8 @@ def _hisa_indexer_paged_impl(
     k_block_size: int,
     block_topk: int,
     topk_tokens: int,
-) -> torch.Tensor:
+    return_block_topk: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     blocked_k_fp8, blocked_k_scale = fp8_paged_block_mean_pooling_interface(
         index_k_with_scale_buffer,
         block_pages,
@@ -295,6 +304,11 @@ def _hisa_indexer_paged_impl(
         dim=-1,
         sorted=False,
     ).indices
+    _force_boundary_blocks_(
+        topk_block_indices,
+        cu_block_ks,
+        cu_block_ke,
+    )
 
     block_sparse_logits = (
         fp8_paged_block_sparse_mqa_attn_return_logits_interface(
@@ -318,7 +332,10 @@ def _hisa_indexer_paged_impl(
     )
     topk_indices = (absolute_topk_block_indices - cu_block_ks[:, None]) * k_block_size
     topk_indices = topk_indices + (relevant_topk_indices % k_block_size)
-    return _mask_relative_topk_indices(topk_indices, prefix_lens)
+    topk_indices = _mask_relative_topk_indices(topk_indices, prefix_lens)
+    if return_block_topk:
+        return topk_indices, topk_block_indices
+    return topk_indices
 
 
 def _build_hisa_block_metadata(
@@ -350,6 +367,35 @@ def _build_hisa_block_metadata(
         device=page_table.device,
     )
     return block_pages, token_counts, block_offsets * max_blocks
+
+
+def _force_boundary_blocks_(
+    topk_block_indices: torch.Tensor,
+    cu_block_ks: torch.Tensor,
+    cu_block_ke: torch.Tensor,
+) -> None:
+    if topk_block_indices.shape[1] == 0:
+        return
+
+    first_blocks = cu_block_ks.to(topk_block_indices.dtype)
+    _force_block_(topk_block_indices, first_blocks, 0)
+
+    if topk_block_indices.shape[1] > 1:
+        last_blocks = (cu_block_ke - 1).to(topk_block_indices.dtype)
+        _force_block_(topk_block_indices, last_blocks, 1)
+
+
+def _force_block_(
+    topk_block_indices: torch.Tensor,
+    target_blocks: torch.Tensor,
+    slot: int,
+) -> None:
+    present = (topk_block_indices == target_blocks[:, None]).any(dim=1)
+    topk_block_indices[:, slot] = torch.where(
+        present,
+        topk_block_indices[:, slot],
+        target_blocks,
+    )
 
 
 def _topk_token_indices(logits: torch.Tensor, topk_tokens: int) -> torch.Tensor:

@@ -2,6 +2,7 @@ import pytest
 
 from sglang.srt.layers.attention.nsa.indexer_policy import (
     get_indexcache_skip_flags,
+    uses_hisa_pruning,
     validate_indexcache_pattern,
 )
 from sglang.srt.server_args import prepare_server_args
@@ -46,6 +47,25 @@ def test_indexcache_skip_flags_from_pattern():
         pattern=pattern,
         is_nextn=False,
     ) == (False, False)
+
+
+def test_hisa_pruning_boundary():
+    params = {
+        "index_topk": 2048,
+        "block_size": 512,
+        "block_topk": 16,
+        "min_seq_len": 2048,
+    }
+    assert not uses_hisa_pruning(seq_len=2048, **params)
+    assert not uses_hisa_pruning(seq_len=8192, **params)
+    assert uses_hisa_pruning(seq_len=8193, **params)
+    assert not uses_hisa_pruning(
+        seq_len=16384,
+        index_topk=2048,
+        block_size=128,
+        block_topk=8,
+        min_seq_len=2048,
+    )
 
 
 def test_nsa_indexer_cli_updates_model_override_args():

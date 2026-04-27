@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -40,6 +41,13 @@ if _is_cuda:
     except ImportError as e:
         deep_gemm = e
 
+
+def _deep_gemm_paged_mqa_context_lens(seqlens: torch.Tensor):
+    if hasattr(deep_gemm, "fp8_fp4_paged_mqa_logits") and seqlens.dim() == 1:
+        return seqlens.view(-1, 1)
+    return seqlens
+
+
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
@@ -76,6 +84,7 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+_HISA_BLOCK_METADATA_CACHE_ENTRIES = 32
 
 
 @dataclass
@@ -261,6 +270,10 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        self._hisa_block_metadata_cache = OrderedDict[
+            Tuple,
+            Tuple[torch.Tensor, torch.Tensor],
+        ]()
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -475,6 +488,7 @@ class Indexer(MultiPlatformOp):
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
         if _is_cuda:
+            seqlens_32 = _deep_gemm_paged_mqa_context_lens(seqlens_32)
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, blocksize, self.sm_count
@@ -571,6 +585,59 @@ class Indexer(MultiPlatformOp):
             min_seq_len=self.hisa_min_seq_len,
         )
 
+    def _get_hisa_block_metadata(
+        self,
+        page_table: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        k_block_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from sglang.srt.layers.attention.nsa.hisa_tilelang_kernels import (
+            build_hisa_block_metadata,
+        )
+
+        cache_key = (
+            page_table.data_ptr(),
+            page_table.shape[0],
+            page_table.shape[1],
+            k_block_size,
+        )
+        pages_per_block = k_block_size // 64
+        max_blocks = page_table.shape[1] // pages_per_block
+
+        cached = self._hisa_block_metadata_cache.get(cache_key)
+        if cached is not None:
+            self._hisa_block_metadata_cache.move_to_end(cache_key)
+            block_pages, block_offsets = cached
+        else:
+            block_pages, _, block_offsets = build_hisa_block_metadata(
+                page_table,
+                torch.zeros(
+                    (page_table.shape[0],), dtype=torch.int32, device=page_table.device
+                ),
+                k_block_size,
+            )
+            self._hisa_block_metadata_cache[cache_key] = (block_pages, block_offsets)
+            if len(self._hisa_block_metadata_cache) > _HISA_BLOCK_METADATA_CACHE_ENTRIES:
+                self._hisa_block_metadata_cache.popitem(last=False)
+
+        if seq_lens_cpu is None:
+            seq_lens_cpu = torch.zeros(
+                (page_table.shape[0],),
+                dtype=torch.int32,
+                device=block_offsets.device,
+            )
+
+        block_ids = torch.arange(
+            max_blocks, device=block_offsets.device, dtype=seq_lens_cpu.dtype
+        )
+        token_counts = (
+            seq_lens_cpu.to(block_ids.device)[:, None]
+            - block_ids[None, :] * k_block_size
+        ).clamp_(
+            min=1, max=k_block_size
+        )
+        return block_pages, token_counts.reshape(-1).to(torch.int32).contiguous(), block_offsets
+
     def _get_topk_hisa_extend(
         self,
         q_fp8: torch.Tensor,
@@ -604,6 +671,11 @@ class Indexer(MultiPlatformOp):
                 block_topm=block_topm,
             )
 
+        block_pages, block_token_counts, block_offsets = self._get_hisa_block_metadata(
+            page_table=page_table,
+            seq_lens_cpu=metadata.get_indexer_seq_len_cpu(),
+            k_block_size=self.hisa_block_size,
+        )
         topk_relative, block_topm = hisa_indexer_paged(
             q_fp8[:q_offset],
             index_k_with_scale_buffer,
@@ -613,6 +685,9 @@ class Indexer(MultiPlatformOp):
             ks,
             ke,
             metadata.get_token_to_batch_idx()[:q_offset],
+            block_pages=block_pages,
+            block_token_counts=block_token_counts,
+            block_offsets=block_offsets,
             k_block_size=self.hisa_block_size,
             block_topk=self.hisa_block_topk,
             topk_tokens=self.index_topk,

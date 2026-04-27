@@ -198,17 +198,21 @@ def hisa_indexer_paged(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     token_to_batch_idx: torch.Tensor,
+    block_pages: torch.Tensor | None = None,
+    block_token_counts: torch.Tensor | None = None,
+    block_offsets: torch.Tensor | None = None,
     *,
     k_block_size: int,
     block_topk: int,
     topk_tokens: int,
     return_block_topk: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    block_pages, block_token_counts, block_offsets = _build_hisa_block_metadata(
-        page_table,
-        seq_lens,
-        k_block_size,
-    )
+    if block_pages is None or block_token_counts is None or block_offsets is None:
+        block_pages, block_token_counts, block_offsets = build_hisa_block_metadata(
+            page_table,
+            seq_lens,
+            k_block_size,
+        )
     prefix_lens = cu_seqlen_ke - cu_seqlen_ks
     cu_block_ks = block_offsets[token_to_batch_idx.long()].to(torch.int32)
     cu_block_ke = cu_block_ks + torch.div(
@@ -338,7 +342,7 @@ def _hisa_indexer_paged_impl(
     return topk_indices
 
 
-def _build_hisa_block_metadata(
+def build_hisa_block_metadata(
     page_table: torch.Tensor,
     seq_lens: torch.Tensor,
     k_block_size: int,
@@ -367,6 +371,15 @@ def _build_hisa_block_metadata(
         device=page_table.device,
     )
     return block_pages, token_counts, block_offsets * max_blocks
+
+
+def _build_hisa_block_metadata(
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    k_block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Internal shim for compatibility with existing call sites.
+    return build_hisa_block_metadata(page_table, seq_lens, k_block_size)
 
 
 def _force_boundary_blocks_(

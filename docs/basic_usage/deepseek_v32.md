@@ -76,6 +76,41 @@ To serve GLM-5, just replace the `--model` argument with `zai-org/GLM-5-FP8`.
     - Float8_e4m3fn KV cache: On Hopper, `flashmla_kv` prefill attention, `flashmla_kv` decode attention; On Blackwell, `trtllm` prefill attention and `trtllm` decode attention.
 - **Index Cache**: Introduce in [this paper](https://arxiv.org/abs/2603.12201), IndexCache improves speed by reusing the result of indexer across different layers, only at cost of negligible accuracy loss.  For **GLM-5** model, we recommend appending `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` to command for better tradeoff between speedup and performance.
 
+### Blaise REAP optimization paths
+
+The `ai-blaise/optimization-playground` fork includes additional opt-in paths for `cerebras/DeepSeek-V3.2-REAP-345B-A37B`:
+
+- **Vanilla IndexCache**: `--nsa-indexer-mode indexcache` with `--nsa-indexcache-pattern` selects Full and Shared indexer layers explicitly. The searched 1/4-uniform pattern used by the REAP benchmark scripts is `FSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSF`.
+- **Dense MLA TurboQuant**: `--enable-turboquant-dense-kv-cache` compresses only the dense MLA KV cache. It does not compress the sparse NSA indexer KV buffers, and it should still be used with sparse attention mode.
+
+Example REAP launch with IndexCache and dense TurboQuant:
+
+```bash
+python -m sglang.launch_server \
+  --model-path cerebras/DeepSeek-V3.2-REAP-345B-A37B \
+  --revision 4fd8e8c3e08442c4a6dde6dd3fa3dac481a0205b \
+  --tp 8 \
+  --dp 8 \
+  --enable-dp-attention \
+  --trust-remote-code \
+  --kv-cache-dtype bfloat16 \
+  --nsa-prefill-backend flashmla_kv \
+  --nsa-decode-backend flashmla_kv \
+  --nsa-indexer-mode indexcache \
+  --nsa-indexcache-pattern FSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSF \
+  --enable-turboquant-dense-kv-cache \
+  --turboquant-dense-kv-preset latent_2p5bit_nc \
+  --turboquant-execution-mode fused_decode \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4
+```
+
+TurboQuant currently requires `--kv-cache-dtype bfloat16`; the compressed dense MLA cache is managed by the TurboQuant pool. Using `--kv-cache-dtype fp8_e4m3` together with `--enable-turboquant-dense-kv-cache` is rejected.
+
+`--nsa-indexer-mode indexcache-hisa` is present for continued experimentation, but the current HISA optimization loop is not part of the accepted REAP production path until it passes the benchmark gates against the IndexCache baseline.
+
 ## Multi-token Prediction
 SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
 

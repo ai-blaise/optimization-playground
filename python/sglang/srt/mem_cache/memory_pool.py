@@ -2060,6 +2060,15 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
 
 class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
+    """NSA KV pool with compressed dense MLA storage.
+
+    PD disaggregation transfers raw contiguous pool buffers. Like the NVFP4 MLA
+    pool, TurboQuant keeps the dense KV bytes in ``kv_buffer`` and exposes NSA
+    indexer state separately through ``get_state_buf_infos`` inherited from
+    ``NSATokenToKVPool``. This lets prefill send compressed dense KV bytes plus
+    indexer state to decode without materializing BF16 dense KV during transfer.
+    """
+
     def __init__(
         self,
         *args,

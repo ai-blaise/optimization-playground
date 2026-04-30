@@ -214,6 +214,201 @@ def test_turboquant_fused_decode_keeps_indexer_native():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_turboquant_pdisagg_transfers_compressed_dense_kv_and_indexer_state():
+    from sglang.srt.mem_cache.memory_pool import TurboQuantNSATokenToKVPool
+
+    def make_pool():
+        return TurboQuantNSATokenToKVPool(
+            size=128,
+            page_size=64,
+            kv_lora_rank=512,
+            dtype=torch.bfloat16,
+            qk_rope_head_dim=64,
+            layer_num=1,
+            device="cuda",
+            index_head_dim=128,
+            enable_memory_saver=False,
+            kv_cache_dim=576,
+            turboquant_dense_kv_preset="latent_2p5bit_nc",
+            turboquant_execution_mode="fused_decode",
+        )
+
+    prefill_pool = make_pool()
+    decode_pool = make_pool()
+    loc = torch.arange(16, device="cuda", dtype=torch.int64)
+    latent = torch.randn(16, 1, 512, device="cuda", dtype=torch.bfloat16)
+    rope = torch.randn(16, 1, 64, device="cuda", dtype=torch.bfloat16)
+
+    prefill_pool.set_mla_kv_buffer(SimpleNamespace(layer_id=0), loc, latent, rope)
+    prefill_pool.set_index_k_scale_buffer(
+        0,
+        loc,
+        torch.randn(16, 128, device="cuda", dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        ),
+        torch.randn(16, 1, device="cuda", dtype=torch.float32),
+    )
+
+    kv_data_ptrs, kv_data_lens, kv_item_lens = prefill_pool.get_contiguous_buf_infos()
+    state_data_ptrs, state_data_lens, state_item_lens = (
+        prefill_pool.get_state_buf_infos()
+    )
+    assert kv_data_ptrs == [prefill_pool.kv_buffer[0].data_ptr()]
+    assert kv_data_lens == [prefill_pool.kv_buffer[0].nbytes]
+    assert kv_item_lens == [
+        prefill_pool.kv_buffer[0][0].nbytes * prefill_pool.page_size
+    ]
+    assert state_data_ptrs == [prefill_pool.index_k_with_scale_buffer[0].data_ptr()]
+    assert state_data_lens == [prefill_pool.index_k_with_scale_buffer[0].nbytes]
+    assert state_item_lens == [prefill_pool.index_k_with_scale_buffer[0][0].nbytes]
+
+    decode_pool.kv_buffer[0][loc] = prefill_pool.kv_buffer[0][loc]
+    page_loc = torch.unique(loc // prefill_pool.page_size)
+    decode_pool.index_k_with_scale_buffer[0][page_loc] = (
+        prefill_pool.index_k_with_scale_buffer[0][page_loc]
+    )
+    kv_cache, page_table = decode_pool.get_turboquant_selected_kv_buffer(
+        0,
+        loc.reshape(1, -1).to(torch.int32),
+    )
+
+    assert torch.equal(page_table, loc.reshape(1, -1).to(torch.int32))
+    assert torch.equal(kv_cache[..., 512:], rope)
+    torch.testing.assert_close(
+        decode_pool.get_index_k_with_scale_buffer(0)[page_loc],
+        prefill_pool.get_index_k_with_scale_buffer(0)[page_loc],
+    )
+    assert torch.all(
+        torch.nn.functional.cosine_similarity(
+            kv_cache[..., :512].float().reshape(16, 512),
+            latent.float().reshape(16, 512),
+            dim=-1,
+        )
+        > 0.85
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_nvfp4_dense_mla_candidate_vs_turboquant_dense_mla_smoke():
+    from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+    from sglang.srt.layers.quantization.turboquant_dense_kv import (
+        TurboQuantDenseKVConfig,
+    )
+    from sglang.srt.mem_cache.memory_pool import TurboQuantNSATokenToKVPool
+    from sglang.srt.utils import is_sm90_supported, is_sm100_supported
+
+    if not (is_sm90_supported() or is_sm100_supported()):
+        pytest.skip("NVFP4 KV quantization requires SM90+ GPU")
+
+    num_tokens = 128
+    loc = torch.arange(16, device="cuda", dtype=torch.int64)
+    latent = torch.randn(num_tokens, 1, 512, device="cuda", dtype=torch.bfloat16)
+    rope = torch.randn(num_tokens, 1, 64, device="cuda", dtype=torch.bfloat16)
+    kv = torch.cat((latent, rope), dim=-1).contiguous()
+    global_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    try:
+        nvfp4_kv, nvfp4_scales, _ = NVFP4KVQuantizeUtil.quantize(kv, global_scale)
+        nvfp4_restored = NVFP4KVQuantizeUtil.dequantize(
+            nvfp4_kv[loc],
+            nvfp4_scales[loc],
+            global_scale,
+            dtype=torch.bfloat16,
+        )
+    except (ImportError, AssertionError, RuntimeError) as exc:
+        pytest.skip(f"NVFP4 KV candidate unavailable: {exc}")
+
+    pool = TurboQuantNSATokenToKVPool(
+        size=num_tokens,
+        page_size=64,
+        kv_lora_rank=512,
+        dtype=torch.bfloat16,
+        qk_rope_head_dim=64,
+        layer_num=1,
+        device="cuda",
+        index_head_dim=128,
+        enable_memory_saver=False,
+        kv_cache_dim=576,
+        turboquant_dense_kv_preset="latent_2p5bit_nc",
+        turboquant_execution_mode="fused_decode",
+    )
+    pool.set_mla_kv_buffer(
+        SimpleNamespace(layer_id=0),
+        torch.arange(num_tokens, device="cuda", dtype=torch.int64),
+        latent,
+        rope,
+    )
+    turboquant_restored, _ = pool.get_turboquant_selected_kv_buffer(
+        0,
+        loc.reshape(1, -1).to(torch.int32),
+    )
+
+    assert nvfp4_kv[0].nbytes + nvfp4_scales[0].nbytes == 324
+    assert (
+        TurboQuantDenseKVConfig(
+            latent_dim=512,
+            rope_dim=64,
+            preset="latent_2p5bit_nc",
+        ).slot_bytes
+        == 274
+    )
+    assert turboquant_restored.shape == nvfp4_restored.shape == kv[loc].shape
+    assert torch.equal(turboquant_restored[..., 512:], rope[loc])
+    assert torch.all(
+        torch.nn.functional.cosine_similarity(
+            turboquant_restored[..., :512].float().reshape(16, 512),
+            latent[loc].float().reshape(16, 512),
+            dim=-1,
+        )
+        > 0.85
+    )
+    assert torch.all(
+        torch.nn.functional.cosine_similarity(
+            nvfp4_restored.float().reshape(16, 576),
+            kv[loc].float().reshape(16, 576),
+            dim=-1,
+        )
+        > 0.70
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_turboquant_hicache_host_pool_uses_compressed_dense_width():
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        compressed_mla_host_dim,
+    )
+    from sglang.srt.mem_cache.memory_pool import TurboQuantNSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+
+    pool = TurboQuantNSATokenToKVPool(
+        size=128,
+        page_size=64,
+        kv_lora_rank=512,
+        dtype=torch.bfloat16,
+        qk_rope_head_dim=64,
+        layer_num=1,
+        device="cuda",
+        index_head_dim=128,
+        enable_memory_saver=False,
+        kv_cache_dim=576,
+        turboquant_dense_kv_preset="latent_2p5bit_nc",
+        turboquant_execution_mode="fused_decode",
+    )
+    host_pool = MLATokenToKVPoolHost(
+        pool,
+        host_to_device_ratio=1,
+        host_size=0,
+        page_size=64,
+        layout="layer_first",
+        override_kv_cache_dim=compressed_mla_host_dim(pool),
+    )
+
+    assert compressed_mla_host_dim(pool) == pool.turboquant_slot_bytes
+    assert host_pool.token_stride_size == pool.kv_buffer[0][0].nbytes
+    assert host_pool.kv_buffer[0, 0].nbytes == pool.kv_buffer[0][0].nbytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_turboquant_fused_mla_decode_matches_dequantized_reference():
     from sglang.srt.mem_cache.memory_pool import TurboQuantNSATokenToKVPool
 

@@ -3501,9 +3501,17 @@ class ServerArgs:
                 )
 
         if self.speculative_algorithm == "SMC":
-            if self.disaggregation_mode != "null":
+            if self.disaggregation_mode == "prefill":
                 raise ValueError(
-                    "Currently SMC speculative decoding does not support disaggregation."
+                    "SMC speculative decoding is only supported on the decode "
+                    "side of PD disaggregation; remove --speculative-algorithm "
+                    "SMC from the prefill worker."
+                )
+            if self.disaggregation_mode == "decode":
+                logger.warning(
+                    "SMC speculative decoding is enabled on a PD decode worker. "
+                    "The SMC draft KV cache is decode-local and is not transferred "
+                    "from prefill."
                 )
             if self.smc_n_particles < 1:
                 raise ValueError("--smc-n-particles must be >= 1.")
@@ -7185,10 +7193,6 @@ class ServerArgs:
             if self.enable_hisparse:
                 raise ValueError(
                     "--enable-turboquant-dense-kv-cache is not compatible with HiSparse."
-                )
-            if self.disaggregation_mode != "null":
-                raise ValueError(
-                    "--enable-turboquant-dense-kv-cache is not compatible with PD disaggregation."
                 )
             if self.turboquant_execution_mode == "fused_decode" and (
                 self.nsa_decode_backend

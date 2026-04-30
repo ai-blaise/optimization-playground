@@ -179,7 +179,9 @@ class NVFP4KVQuantizeUtil:
         """
         from sglang.srt.utils import is_sm90_supported, is_sm100_supported
 
-        assert is_sm90_supported(), "NVFP4 KV cache quantize requires SM90+ GPU"
+        assert (
+            is_sm90_supported() or is_sm100_supported()
+        ), "NVFP4 KV cache quantize requires SM90+ GPU"
 
         b, m, n = tensor.shape
         tensor_2d = tensor.reshape(b * m, n)

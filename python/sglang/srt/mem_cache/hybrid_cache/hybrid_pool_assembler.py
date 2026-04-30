@@ -87,6 +87,11 @@ def build_pool_entry(
     )
 
 
+def compressed_mla_host_dim(kv_pool: Any) -> Optional[int]:
+    """Return compressed per-token element width for MLA-like pools, if any."""
+    return getattr(kv_pool, "turboquant_slot_bytes", None)
+
+
 def build_kv_only_stack(
     *,
     params: CacheInitParams,
@@ -441,6 +446,7 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
     try:
         kv = radix_cache.kv_cache
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
+        override_kv_cache_dim = compressed_mla_host_dim(kv)
         host_pool_group, cache_controller = build_shared_anchor_stack(
             params=params,
             server_args=server_args,
@@ -454,6 +460,7 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
             attn_tp_group=attn_tp_group,
             storage_backend=server_args.hicache_storage_backend,
             use_mla=True,
+            override_kv_cache_dim=override_kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
             shared_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
                 kv,

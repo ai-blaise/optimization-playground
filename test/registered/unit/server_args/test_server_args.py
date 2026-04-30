@@ -48,6 +48,30 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestSMCDisaggregationArgs(unittest.TestCase):
+    def test_smc_decode_disaggregation_is_allowed(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            speculative_algorithm="SMC",
+            speculative_draft_model_path="dummy",
+        )
+        self.assertEqual(server_args.disaggregation_mode, "decode")
+        self.assertEqual(server_args.speculative_algorithm, "SMC")
+
+    def test_smc_prefill_disaggregation_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "SMC speculative decoding is only supported on the decode side",
+        ):
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="prefill",
+                speculative_algorithm="SMC",
+                speculative_draft_model_path="dummy",
+            )
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

@@ -139,6 +139,19 @@ python -m sglang.launch_server \
 
 TurboQuant currently requires target `--kv-cache-dtype bfloat16`; the compressed dense MLA cache is managed by the target TurboQuant pool. The REAP combo runner defaults the SMC draft model to `--smc-draft-kv-cache-dtype fp8_e4m3`; set the draft-only override instead of changing the global target KV dtype. Using global `--kv-cache-dtype fp8_e4m3` together with `--enable-turboquant-dense-kv-cache` is rejected.
 
+Dense MLA KV candidate comparisons can be run with
+`benchmark/deepseek_v3/bench_dense_mla_kv_candidates.py`. The benchmark isolates
+the DeepSeek NSA dense MLA KV dimensions (`latent=512`, `rope=64`) and reports
+both memory footprint and CUDA store/recover latency for generic dense NVFP4 and
+dense TurboQuant 2.5-bit. On an A4 B200, the 4096-token/1024-selected-token gate
+measured dense TurboQuant at 274 bytes/token/layer versus NVFP4 at 324
+bytes/token/layer, so TurboQuant is 15.4% smaller. Store latency was effectively
+tied (0.0247 ms TurboQuant versus 0.0244 ms NVFP4), while selected recovery was
+3.7x faster with TurboQuant (0.0123 ms versus 0.0450 ms). NVFP4 had higher latent
+cosine similarity, but it quantized rope as well; TurboQuant preserves rope
+exactly. Based on that dense-only gate, keep dense TurboQuant as the preferred
+NSA dense MLA KV path unless a future NVFP4 NSA integration wins end-to-end.
+
 The current matrix-safe SMC gamma is 6. A gamma-7 8K/1K candidate improved
 throughput in isolation, but it regressed 16K/1K TTFT beyond the 1% contract
 and the NSA target-verify path assumes a single server-level draft-token count.

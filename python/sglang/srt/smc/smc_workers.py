@@ -15,11 +15,13 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     disable_dp_size,
     get_attention_dp_rank,
     get_attention_tp_group,
 )
+from sglang.srt.layers.quantization.fp8_utils import fp8_gemm_runner_backend_context
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -97,11 +99,17 @@ class SMCWorker(BaseSpecWorker):
         # attention-TP groups. The standalone GLM draft must be initialized under
         # that attention-TP group so its layer shards and KV rows match the local
         # draft batch rather than the target's global TP group.
+        # The DeepSeek target keeps the process-level FP8 backend selected by
+        # --fp8-gemm-backend. The GLM FP8 draft is initialized under a separate
+        # backend override because FlashInfer TRT-LLM groupwise GEMM can assert
+        # on GLM's projection shapes during long SMC decode on B200.
+        draft_fp8_backend = envs.SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND.get()
         with (
             self.draft_dp_context(),
             draft_init_tp_context,
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
+            fp8_gemm_runner_backend_context(draft_fp8_backend),
         ):
             self._draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -598,6 +606,7 @@ class SMCWorker(BaseSpecWorker):
                 # Each sub-backend adds its speculative_step_id to get per-step values.
                 draft_fb.spec_info = draft_input
                 draft_fb.seq_lens = draft_input._orig_seq_lens
+                draft_fb.seq_lens_sum = draft_input._orig_seq_lens_sum
                 draft_fb.seq_lens_cpu = draft_input._orig_seq_lens_cpu
                 self.draft_attn_backend.init_forward_metadata(draft_fb)
                 meta_end_ns = self._probe_mark("decode.draft_metadata", "end", sync=True)
@@ -703,7 +712,7 @@ class SMCWorker(BaseSpecWorker):
             model_worker_batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=not can_run_cuda_graph,
         )
         verify_end_ns = self._probe_mark("decode.target_verify", "end", sync=True)
         self._probe(
@@ -938,7 +947,7 @@ class SMCWorker(BaseSpecWorker):
             batch,
             forward_mode=ForwardMode.IDLE
             if batch.forward_mode.is_idle()
-            else ForwardMode.DRAFT_EXTEND,
+            else ForwardMode.EXTEND,
             spec_info=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             input_ids=input_ids,

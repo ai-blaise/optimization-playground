@@ -523,6 +523,7 @@ class ServerArgs:
     turboquant_residual_window_size: int = 128
     turboquant_skip_layers: Optional[str] = None
     turboquant_execution_mode: str = "fused_decode"
+    turboquant_mla_decode_num_splits: int = 16
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
@@ -5477,6 +5478,12 @@ class ServerArgs:
             help="TurboQuant dense MLA KV execution path.",
         )
         parser.add_argument(
+            "--turboquant-mla-decode-num-splits",
+            default=ServerArgs.turboquant_mla_decode_num_splits,
+            type=int,
+            help="Number of sequence splits for TurboQuant fused dense MLA decode.",
+        )
+        parser.add_argument(
             "--fp8-gemm-backend",
             type=str,
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
@@ -7143,6 +7150,10 @@ class ServerArgs:
                 )
             if self.turboquant_residual_window_size <= 0:
                 raise ValueError("--turboquant-residual-window-size must be positive.")
+            if self.turboquant_mla_decode_num_splits <= 0:
+                raise ValueError(
+                    "--turboquant-mla-decode-num-splits must be positive."
+                )
             validate_turboquant_dense_kv_preset(self.turboquant_dense_kv_preset)
             if self.turboquant_skip_layers:
                 for layer_id in self.turboquant_skip_layers.split(","):

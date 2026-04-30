@@ -1046,7 +1046,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 logits_output.next_token_logits = logits_output.next_token_logits[
                     :num_tokens
                 ]
-                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_draft_extend():  # draft extend
                 self.spec_info.num_accepted_drafts = self.spec_info.num_accepted_drafts[
                     :bs

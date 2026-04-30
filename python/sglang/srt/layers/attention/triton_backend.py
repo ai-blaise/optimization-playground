@@ -14,6 +14,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.speculative.spec_utils import (
     generate_draft_decode_kv_indices,
     generate_smc_draft_decode_kv_indices,
@@ -1394,29 +1395,55 @@ class TritonMultiStepDraftBackend:
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
-
-        generate_draft_decode_kv_indices[
-            (self.speculative_num_steps, num_seqs, self.topk)
-        ](
-            forward_batch.req_pool_indices,
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.seq_lens,
-            kv_indices_buffer,
-            self.kv_indptr,
-            forward_batch.positions,
-            self.pool_len,
-            kv_indices_buffer.shape[1],
-            self.kv_indptr.shape[1],
-            next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps),
-            next_power_of_2(bs),
-            self.page_size,
+        spec_info = forward_batch.spec_info
+        is_smc_draft = (
+            spec_info is not None
+            and getattr(spec_info, "spec_input_type", None) == SpecInputType.SMC_DRAFT
         )
+
+        if is_smc_draft:
+            assert self.topk == 1, "SMC draft multi-step metadata expects topk=1"
+            num_backend_steps = self.speculative_num_steps - 1
+            seq_lens_sum = int(getattr(spec_info, "_orig_seq_lens_sum", seq_lens_sum))
+            self.generate_smc_draft_decode_kv_indices[
+                (num_backend_steps, num_seqs)
+            ](
+                forward_batch.req_pool_indices,
+                self.req_to_token,
+                forward_batch.seq_lens,
+                kv_indices_buffer,
+                self.kv_indptr,
+                num_seqs,
+                self.pool_len,
+                kv_indices_buffer.shape[1],
+                self.kv_indptr.shape[1],
+                next_power_of_2(num_seqs),
+                next_power_of_2(num_backend_steps),
+            )
+        else:
+            num_backend_steps = self.speculative_num_steps - 1
+            generate_draft_decode_kv_indices[
+                (self.speculative_num_steps, num_seqs, self.topk)
+            ](
+                forward_batch.req_pool_indices,
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.seq_lens,
+                kv_indices_buffer,
+                self.kv_indptr,
+                forward_batch.positions,
+                self.pool_len,
+                kv_indices_buffer.shape[1],
+                self.kv_indptr.shape[1],
+                next_power_of_2(num_seqs),
+                next_power_of_2(self.speculative_num_steps),
+                next_power_of_2(bs),
+                self.page_size,
+            )
 
         if call_fn is None:
             return
 
-        for i in range(self.speculative_num_steps - 1):
+        for i in range(num_backend_steps):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
                 : seq_lens_sum * self.topk + bs * (i + 1)

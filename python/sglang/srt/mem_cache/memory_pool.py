@@ -2065,11 +2065,15 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
         *args,
         turboquant_dense_kv_preset: str,
         turboquant_execution_mode: str,
+        turboquant_mla_decode_num_splits: int = 16,
         turboquant_skip_layers: Optional[set[int]] = None,
         **kwargs,
     ):
         self.turboquant_dense_kv_preset = turboquant_dense_kv_preset
         self.turboquant_execution_mode = turboquant_execution_mode
+        self.turboquant_mla_decode_num_splits = int(
+            turboquant_mla_decode_num_splits
+        )
         self.turboquant_skip_layers = turboquant_skip_layers or set()
         super().__init__(*args, **kwargs)
 
@@ -2405,7 +2409,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
             dtype=self.dtype,
             device=q_nope.device,
         )
-        num_splits = 16
+        num_splits = self.turboquant_mla_decode_num_splits
         mid_shape = (
             q_nope.shape[0],
             q_nope.shape[1],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -482,6 +483,28 @@ def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
     if FP8_GEMM_RUNNER_BACKEND is None:
         FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend.AUTO
     return FP8_GEMM_RUNNER_BACKEND
+
+
+@contextmanager
+def fp8_gemm_runner_backend_context(
+    backend: Optional[Union[str, Fp8GemmRunnerBackend]],
+):
+    """Temporarily override FP8 GEMM dispatch for subsequently created layers."""
+    global FP8_GEMM_RUNNER_BACKEND
+    if backend is None or backend == "":
+        yield
+        return
+
+    prev_backend = FP8_GEMM_RUNNER_BACKEND
+    FP8_GEMM_RUNNER_BACKEND = (
+        backend
+        if isinstance(backend, Fp8GemmRunnerBackend)
+        else Fp8GemmRunnerBackend(backend)
+    )
+    try:
+        yield
+    finally:
+        FP8_GEMM_RUNNER_BACKEND = prev_backend
 
 
 def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(

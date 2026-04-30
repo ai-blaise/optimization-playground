@@ -459,6 +459,9 @@ class ModelRunnerKVCacheMixin:
                     turboquant_execution_mode=(
                         self.server_args.turboquant_execution_mode
                     ),
+                    turboquant_mla_decode_num_splits=(
+                        self.server_args.turboquant_mla_decode_num_splits
+                    ),
                     turboquant_skip_layers=skip_layers,
                 )
             else:

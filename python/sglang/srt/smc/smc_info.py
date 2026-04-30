@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -405,17 +406,21 @@ class SMCDraftInput(SpecInput):
             else ForwardMode.TARGET_VERIFY
         )
 
-        # Check CUDA graph eligibility before creating ForwardBatch
-        graph_runner = target_worker.model_runner.graph_runner
-        # Create a temporary ForwardBatch to test graph eligibility
+        # Keep the known-valid eager path as the default. The graph path is
+        # gated while validating IndexCache+dense TurboQuant+SMC-SD on B200.
+        graph_runner = (
+            target_worker.model_runner.graph_runner
+            if envs.SGLANG_SMC_TARGET_VERIFY_GRAPH.get()
+            else None
+        )
         verify_forward_batch = ForwardBatch.init_new(
             batch, target_worker.model_runner
         )
-
         can_run_cuda_graph = bool(
             graph_runner
             and graph_runner.can_run(verify_forward_batch)
         )
+        verify_forward_batch.disable_graph_runner = not can_run_cuda_graph
 
         # Both graph and non-graph paths use TARGET_VERIFY with linear verify
         # metadata so the model returns logits for ALL tokens, not just the last.
@@ -423,7 +428,10 @@ class SMCDraftInput(SpecInput):
             verify_spec_info.populate_linear_verify_metadata(verify_forward_batch)
 
         if can_run_cuda_graph:
-            graph_runner.replay_prepare(verify_forward_batch)
+            # Let ModelRunner/CudaGraphRunner perform replay_prepare immediately
+            # before replay. Pre-preparing here and then skipping backend init can
+            # reuse stale graph metadata across DP attention streams.
+            pass
         else:
             if not is_idle:
                 target_worker.model_runner.attn_backend.init_forward_metadata(

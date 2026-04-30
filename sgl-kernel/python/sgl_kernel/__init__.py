@@ -14,6 +14,7 @@ from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     cutlass_mla_decode,
     cutlass_mla_get_workspace_size,
+    g1_gate_forward,
     merge_state_v2,
 )
 from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_data
@@ -139,6 +140,7 @@ _DEBUG_EXPORT_NAMES = [
     "fp8_scaled_mm",
     "fused_add_rmsnorm",
     "fused_qk_norm_rope",
+    "g1_gate_forward",
     "gelu_and_mul",
     "gelu_tanh_and_mul",
     "gemma_fused_add_rmsnorm",

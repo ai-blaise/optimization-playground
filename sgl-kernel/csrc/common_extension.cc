@@ -57,6 +57,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
   m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
+  m.def("g1_gate_forward(Tensor linear_out, Tensor attn_out, Tensor! output, Tensor! gate) -> ()");
+  m.impl("g1_gate_forward", torch::kCUDA, &g1_gate_forward);
 
   /*
    * From csrc/elementwise

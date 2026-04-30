@@ -11,7 +11,7 @@ from sglang.kernel_api_logging import debug_kernel_api
 
 _MAX_BLOCK_H = 128
 _MAX_BLOCK_R = 64
-_SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+_SUPPORTED_DTYPE = torch.bfloat16
 
 
 def _next_power_of_2(value: int, maximum: int) -> int:
@@ -28,8 +28,8 @@ def _validate_gated_norm_inputs(
         raise RuntimeError("gated_norm_forward requires CUDA tensors")
     if normed.dim() < 2:
         raise ValueError(f"normed must have at least 2 dimensions, got {tuple(normed.shape)}")
-    if normed.dtype not in _SUPPORTED_DTYPES:
-        raise TypeError(f"normed must have dtype bf16, fp16, or fp32; got {normed.dtype}")
+    if normed.dtype != _SUPPORTED_DTYPE:
+        raise TypeError(f"normed must have dtype bf16; got {normed.dtype}")
     if w_down.dtype != normed.dtype or w_up.dtype != normed.dtype:
         raise TypeError(
             "w_down and w_up must have the same dtype as normed: "
@@ -122,7 +122,7 @@ def gated_norm_forward(
     w_up: torch.Tensor,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Apply forward-only GatedNorm to an already normalized tensor.
+    """Apply forward-only BF16 GatedNorm to an already normalized tensor.
 
     Formula:
         output = normed * sigmoid(silu(normed @ w_down.T) @ w_up.T)

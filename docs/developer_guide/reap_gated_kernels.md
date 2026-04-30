@@ -26,7 +26,7 @@ python -m pytest -q sgl-kernel/tests/test_g1_attention.py
 ## GatedNorm Forward
 
 The `sglang.jit_kernel.gated_norm.gated_norm_forward` kernel applies the
-forward-only GatedNorm formula:
+forward-only BF16 GatedNorm formula:
 
 ```text
 z = normed @ w_down.T
@@ -37,6 +37,9 @@ output = normed * gate
 This is intentionally inference-only. The Megatron-LM source commit also
 contains backward/autograd and transformer training integration, but those paths
 are not ported here.
+
+The deployment contract for both G1 attention gating and GatedNorm is BF16.
+Other input dtypes are rejected by the inference wrapper.
 
 Validation:
 

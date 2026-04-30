@@ -12,7 +12,6 @@ register_cuda_ci(est_time=20, suite="stage-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=60, suite="nightly-kernel-1-gpu", nightly=True)
 
 
-DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 SHAPES = [(1, 128), (7, 512), (2, 3, 1024), (4, 7168)]
 RANKS = [1, 8, 32, 64]
 
@@ -23,40 +22,44 @@ def _reference(normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor) -
     return (normed.float() * gate).to(normed.dtype)
 
 
-def _tolerances(dtype: torch.dtype) -> tuple[float, float]:
-    if dtype == torch.float32:
-        return 2e-4, 2e-4
-    return 2e-2, 2e-2
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape,rank", list(itertools.product(SHAPES, RANKS)))
-def test_gated_norm_forward(dtype: torch.dtype, shape: tuple[int, ...], rank: int) -> None:
+def test_gated_norm_forward(shape: tuple[int, ...], rank: int) -> None:
     torch.manual_seed(2026)
-    normed = torch.randn(shape, device="cuda", dtype=dtype)
+    normed = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     hidden_size = shape[-1]
-    w_down = torch.randn(rank, hidden_size, device="cuda", dtype=dtype) / hidden_size**0.5
-    w_up = torch.randn(hidden_size, rank, device="cuda", dtype=dtype) / rank**0.5
+    w_down = (
+        torch.randn(rank, hidden_size, device="cuda", dtype=torch.bfloat16)
+        / hidden_size**0.5
+    )
+    w_up = (
+        torch.randn(hidden_size, rank, device="cuda", dtype=torch.bfloat16)
+        / rank**0.5
+    )
 
     actual = gated_norm_forward(normed, w_down, w_up)
     expected = _reference(normed, w_down, w_up)
-    atol, rtol = _tolerances(dtype)
-    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_gated_norm_forward_out(dtype: torch.dtype) -> None:
+def test_gated_norm_forward_out() -> None:
     torch.manual_seed(2027)
-    normed = torch.randn(9, 256, device="cuda", dtype=dtype)
-    w_down = torch.randn(16, 256, device="cuda", dtype=dtype) / 16
-    w_up = torch.randn(256, 16, device="cuda", dtype=dtype) / 4
+    normed = torch.randn(9, 256, device="cuda", dtype=torch.bfloat16)
+    w_down = torch.randn(16, 256, device="cuda", dtype=torch.bfloat16) / 16
+    w_up = torch.randn(256, 16, device="cuda", dtype=torch.bfloat16) / 4
     out = torch.empty_like(normed)
 
     result = gated_norm_forward(normed, w_down, w_up, out=out)
     assert result is out
     expected = _reference(normed, w_down, w_up)
-    atol, rtol = _tolerances(dtype)
-    torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_gated_norm_rejects_non_bf16() -> None:
+    normed = torch.empty(1, 128, device="cuda", dtype=torch.float16)
+    w_down = torch.empty(8, 128, device="cuda", dtype=torch.float16)
+    w_up = torch.empty(128, 8, device="cuda", dtype=torch.float16)
+    with pytest.raises(TypeError, match="bf16"):
+        gated_norm_forward(normed, w_down, w_up)
 
 
 def test_gated_norm_rank_guard() -> None:

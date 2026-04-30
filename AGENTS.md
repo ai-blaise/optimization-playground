@@ -5,10 +5,12 @@
   durable entry after every result, diagnosis, launch, correction, or decision
   before continuing.
 - For the active REAP optimization lane, work only on the combined
-  IndexCache + dense TurboQuant + SMC-SD implementation. Do not optimize HISA
-  unless a later user instruction explicitly reopens it.
-- Always benchmark the full IndexCache + dense TurboQuant + SMC-SD combo. The
-  baseline is the current upstream combo implementation, not vanilla MTP.
+  IndexCache + target dense TurboQuant + SMC-SD implementation. Do not optimize
+  HISA unless a later user instruction explicitly reopens it.
+- Always benchmark the full IndexCache + target dense TurboQuant + SMC-SD combo.
+  Use the FP8 SMC draft checkpoint and, when supported, FP8 SMC draft KV via
+  `--smc-draft-kv-cache-dtype fp8_e4m3`. The baseline is the current upstream
+  combo implementation, not vanilla MTP.
 - Run this lane on `a4-us-001-rl9`.
 - Optimize end-to-end throughput as the primary metric, with less than 1% TTFT
   regression on every matrix cell: 8192/1024, 16384/1024, 16384/4096,

@@ -545,6 +545,7 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    smc_draft_kv_cache_dtype: Optional[str] = None
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
     smc_n_particles: int = 4
@@ -3545,6 +3546,16 @@ class ServerArgs:
                 logger.warning(
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
+            if self.smc_draft_kv_cache_dtype == "bf16":
+                self.smc_draft_kv_cache_dtype = "bfloat16"
+            if self.smc_draft_kv_cache_dtype is not None and (
+                self.smc_draft_kv_cache_dtype
+                not in ("auto", "bfloat16", "fp8_e4m3", "fp8_e5m2")
+            ):
+                raise ValueError(
+                    "--smc-draft-kv-cache-dtype must be one of auto, bfloat16, "
+                    "fp8_e4m3, or fp8_e5m2."
+                )
 
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = 1
@@ -5641,6 +5652,17 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--smc-draft-kv-cache-dtype",
+            type=str,
+            choices=("auto", "bfloat16", "bf16", "fp8_e4m3", "fp8_e5m2"),
+            default=ServerArgs.smc_draft_kv_cache_dtype,
+            help=(
+                "SMC-only draft-model KV cache dtype override. This keeps the "
+                "target model's --kv-cache-dtype unchanged, which is required "
+                "when the target uses dense TurboQuant KV."
+            ),
         )
         parser.add_argument(
             "--smc-n-particles",

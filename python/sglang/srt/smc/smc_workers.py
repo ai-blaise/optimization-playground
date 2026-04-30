@@ -8,6 +8,7 @@ No rejection - all drafted tokens are accepted.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import logging
 import time
@@ -104,6 +105,15 @@ class SMCWorker(BaseSpecWorker):
         # backend override because FlashInfer TRT-LLM groupwise GEMM can assert
         # on GLM's projection shapes during long SMC decode on B200.
         draft_fp8_backend = envs.SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND.get()
+        draft_server_args = server_args
+        if server_args.smc_draft_kv_cache_dtype is not None:
+            draft_server_args = copy.copy(server_args)
+            draft_server_args.kv_cache_dtype = server_args.smc_draft_kv_cache_dtype
+            logger.info(
+                "Using SMC draft KV cache dtype override: target=%s draft=%s",
+                server_args.kv_cache_dtype,
+                draft_server_args.kv_cache_dtype,
+            )
         with (
             self.draft_dp_context(),
             draft_init_tp_context,
@@ -112,7 +122,7 @@ class SMCWorker(BaseSpecWorker):
             fp8_gemm_runner_backend_context(draft_fp8_backend),
         ):
             self._draft_worker = TpModelWorker(
-                server_args=server_args,
+                server_args=draft_server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 pp_rank=0,
@@ -202,7 +212,6 @@ class SMCWorker(BaseSpecWorker):
                 for k_buf, v_buf in zip(pool.k_buffer, pool.v_buffer):
                     k_buf[dst_locs] = k_buf[src_locs]
                     v_buf[dst_locs] = v_buf[src_locs]
-
             if hasattr(pool, "kv_buffer"):
                 for kv_buf in pool.kv_buffer:
                     kv_buf[dst_locs] = kv_buf[src_locs]

@@ -509,6 +509,8 @@ class SchedulerOutputProcessorMixin:
         if batch.spec_algorithm.is_none() or uses_batched_decode_result:
             if uses_batched_decode_result:
                 next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+            elif isinstance(next_token_ids, list):
+                pass  # MLX path: already a list[int], skip torch round-trip
             else:
                 next_token_ids = next_token_ids.tolist()
             if batch.spec_algorithm.is_smc():
@@ -562,7 +564,9 @@ class SchedulerOutputProcessorMixin:
         for i, req in enumerate(batch.reqs):
             req: Req
 
-            if self.enable_overlap and (req.finished() or req.is_retracted):
+            if (self.enable_overlap or self.enable_overlap_mlx) and (
+                req.finished() or req.is_retracted
+            ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 if batch.spec_algorithm.is_smc():

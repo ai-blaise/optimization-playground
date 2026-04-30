@@ -83,7 +83,7 @@ The `ai-blaise/optimization-playground` fork includes additional opt-in paths fo
 - **Vanilla IndexCache**: `--nsa-indexer-mode indexcache` with `--nsa-indexcache-pattern` selects Full and Shared indexer layers explicitly. The searched 1/4-uniform pattern used by the REAP benchmark scripts is `FSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSF`.
 - **Dense MLA TurboQuant**: `--enable-turboquant-dense-kv-cache` compresses only the dense MLA KV cache. It does not compress the sparse NSA indexer KV buffers, and it should still be used with sparse attention mode.
 - **SMC-SD**: `--speculative-algorithm SMC` enables the Sequential Monte Carlo speculative decoding path. The REAP path is intended to run SMC-SD on top of IndexCache and dense TurboQuant, with an FP8 draft model that has been token-aligned to DeepSeek V3.2.
-- **SMC draft KV dtype override**: `--smc-draft-kv-cache-dtype fp8_e4m3` keeps the target model's KV dtype unchanged while using FP8 KV for the SMC draft model. This is useful for the REAP combo because target dense TurboQuant currently requires target `--kv-cache-dtype bfloat16`.
+- **SMC draft KV dtype override**: `--smc-draft-kv-cache-dtype fp8_e4m3` keeps the target model's KV dtype unchanged while using FP8 KV for the SMC draft model. This is useful for the REAP combo because target dense TurboQuant currently requires target `--kv-cache-dtype bfloat16`. `--speculative-draft-attention-backend trtllm_mha` is supported for draft-backend comparisons, but the current 8K/1K gate favors the Triton draft backend for end-to-end throughput.
 
 Example REAP launch with IndexCache and dense TurboQuant:
 

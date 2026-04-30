@@ -133,11 +133,15 @@ python -m sglang.launch_server \
   --speculative-draft-attention-backend triton \
   --smc-draft-kv-cache-dtype fp8_e4m3 \
   --smc-n-particles 4 \
-  --smc-gamma 4 \
+  --smc-gamma 6 \
   --smc-resample-threshold 0.5
 ```
 
-TurboQuant currently requires target `--kv-cache-dtype bfloat16`; the compressed dense MLA cache is managed by the target TurboQuant pool. If SMC draft FP8 KV is desired, set `--smc-draft-kv-cache-dtype fp8_e4m3` instead of changing the global target KV dtype. Using global `--kv-cache-dtype fp8_e4m3` together with `--enable-turboquant-dense-kv-cache` is rejected.
+TurboQuant currently requires target `--kv-cache-dtype bfloat16`; the compressed dense MLA cache is managed by the target TurboQuant pool. The REAP combo runner defaults the SMC draft model to `--smc-draft-kv-cache-dtype fp8_e4m3`; set the draft-only override instead of changing the global target KV dtype. Using global `--kv-cache-dtype fp8_e4m3` together with `--enable-turboquant-dense-kv-cache` is rejected.
+
+The current matrix-safe SMC gamma is 6. A gamma-7 8K/1K candidate improved
+throughput in isolation, but it regressed 16K/1K TTFT beyond the 1% contract
+and the NSA target-verify path assumes a single server-level draft-token count.
 
 The SMC-SD path was brought in from the reference SMC-SD SGLang integration and adapted for the current `ForwardBatch`/worker APIs, FP8 draft loading, DeepSeek V3.2 REAP TP=8/DP=8 with DP attention, and an IndexCache+dense TurboQuant target. The current 16K/4K gate improves end-to-end throughput over vanilla MTP by about 7.0%, but still regresses mean TTFT by about 6.7%, so treat SMC-SD as the primary experimental optimization path until the TTFT gate is closed.
 

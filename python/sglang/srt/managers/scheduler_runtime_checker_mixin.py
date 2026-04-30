@@ -167,6 +167,12 @@ class SchedulerRuntimeCheckerMixin:
     def _session_held_req_count(self: Scheduler) -> int:
         return self.tree_cache.session_held_req_count()
 
+    def _smc_held_tokens(self: Scheduler) -> int:
+        smc_manager = getattr(self, "smc_manager", None)
+        if smc_manager is None:
+            return 0
+        return smc_manager.smc_held_token_count()
+
     def get_pool_stats(self: Scheduler) -> PoolStats:
         if self.is_hybrid_swa:
             pool_stats = self._get_swa_token_info()
@@ -282,13 +288,16 @@ class SchedulerRuntimeCheckerMixin:
         session_held: int,
         total: int,
         uncached: int = 0,
+        smc_held: int = 0,
     ) -> Tuple[bool, str]:
-        """Check: available + evictable + protected + session_held + uncached == total."""
-        total_accounted = available + evictable + protected + session_held + uncached
+        """Check: available + evictable + protected + session_held + uncached + smc_held == total."""
+        total_accounted = (
+            available + evictable + protected + session_held + uncached + smc_held
+        )
         leak = total_accounted != total
         msg = (
             f"[{pool_name}] {total=}, {available=}, {evictable=}, "
-            f"{protected=}, {session_held=}, {uncached=}"
+            f"{protected=}, {session_held=}, {uncached=}, {smc_held=}"
         )
         return leak, msg
 
@@ -315,6 +324,7 @@ class SchedulerRuntimeCheckerMixin:
             session_held,
             total,
             uncached,
+            self._smc_held_tokens(),
         )
 
     def _check_swa_pool(
@@ -442,11 +452,24 @@ class SchedulerRuntimeCheckerMixin:
             req_total_size = self.req_to_token_pool.size
 
         session_req_count = self._session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
+        smc_req_count = 0
+        smc_manager = getattr(self, "smc_manager", None)
+        if smc_manager is not None:
+            for group in smc_manager.groups.values():
+                for req in group.particle_reqs.values():
+                    if req.req_pool_idx is not None:
+                        smc_req_count += 1
+        if (
+            len(self.req_to_token_pool.free_slots)
+            + session_req_count
+            + smc_req_count
+            != req_total_size
+        ):
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"session_held={session_req_count}, "
+                f"smc_held={smc_req_count}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
             raise_error_or_warn(
@@ -458,6 +481,53 @@ class SchedulerRuntimeCheckerMixin:
 
     def _report_leak(self: Scheduler, pool_name: str, token_msg: str):
         msg = f"{pool_name} memory leak detected! {token_msg}"
+        smc_manager = getattr(self, "smc_manager", None)
+        smc_resampler = getattr(self, "smc_resampler", None)
+        if smc_manager is not None and smc_manager.groups:
+            group_msgs = []
+            for group_id, group in smc_manager.groups.items():
+                particle_msgs = []
+                for particle_idx, req in sorted(group.particle_reqs.items()):
+                    particle_msgs.append(
+                        f"idx={particle_idx} pool={req.req_pool_idx} "
+                        f"finished={req.finished()} committed={req.kv_committed_len} "
+                        f"allocated={req.kv_allocated_len}"
+                    )
+                group_msgs.append(
+                    f"group={group_id} active={group.active_particle_indices()} "
+                    f"finished={sorted(group.finished_particles.keys())} "
+                    + "; ".join(particle_msgs)
+                )
+            msg += "SMC_GROUPS:\n" + "\n".join(group_msgs) + "\n"
+        if smc_resampler is not None:
+            msg += (
+                f"SMC_RESAMPLER: groups_needing_resample="
+                f"{list(smc_resampler._groups_needing_resample)}, "
+                f"pending_new_groups="
+                f"{list(smc_resampler._pending_new_groups)}\n"
+            )
+        tracked_req_msgs = []
+        tracked_sources = [
+            ("running", getattr(getattr(self, "running_batch", None), "reqs", [])),
+            ("waiting", getattr(self, "waiting_queue", [])),
+            ("last", getattr(getattr(self, "last_batch", None), "reqs", [])),
+            ("cur", getattr(getattr(self, "cur_batch", None), "reqs", [])),
+        ]
+        for source, reqs in tracked_sources:
+            for req in reqs:
+                req_pool_idx = getattr(req, "req_pool_idx", None)
+                if req_pool_idx is None:
+                    continue
+                tracked_req_msgs.append(
+                    f"{source}: rid={getattr(req, 'rid', None)} "
+                    f"pool={req_pool_idx} finished={req.finished()} "
+                    f"committed={req.kv_committed_len} "
+                    f"allocated={req.kv_allocated_len} "
+                    f"group={getattr(req, 'smc_group_id', None)} "
+                    f"particle={getattr(req, 'smc_particle_idx', None)}"
+                )
+        if tracked_req_msgs:
+            msg += "TRACKED_REQS:\n" + "\n".join(tracked_req_msgs[:64]) + "\n"
         raise_error_or_warn(
             self,
             envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),

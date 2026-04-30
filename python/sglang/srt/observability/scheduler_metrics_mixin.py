@@ -518,9 +518,11 @@ class SchedulerMetricsMixin:
         iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.spec_num_forward_ct <= 0:
             spec_accept_length = 0
             spec_accept_rate = 0
+            self.spec_num_accepted_tokens = 0
+            self.spec_num_forward_ct = 0
         else:
             spec_accept_length = (
                 self.spec_num_accepted_tokens / self.spec_num_forward_ct
@@ -528,7 +530,9 @@ class SchedulerMetricsMixin:
             num_accepted_drafts = (
                 self.spec_num_accepted_tokens - self.spec_num_forward_ct
             )
-            if self.server_args.speculative_num_draft_tokens:
+            if self.spec_algorithm.is_smc():
+                draft_per_round = self.server_args.smc_gamma
+            elif self.server_args.speculative_num_draft_tokens:
                 draft_per_round = self.server_args.speculative_num_draft_tokens - 1
             else:
                 draft_per_round = self.server_args.speculative_num_steps or 0

@@ -620,7 +620,16 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if model_runner.spec_algorithm.is_speculative():
+        if (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_standalone()
+            or model_runner.spec_algorithm.is_dflash()
+            or model_runner.spec_algorithm.is_ngram()
+            or (
+                model_runner.spec_algorithm.is_smc()
+                and not self.model_runner.is_draft_worker
+            )
+        ):
             if self.model_runner.is_draft_worker:
                 # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
                 if not self.model_runner.spec_algorithm.is_dflash():
@@ -703,7 +712,12 @@ class CudaGraphRunner:
             ),
             is_hybrid_swa=model_runner.is_hybrid_swa,
         )
-        self.buffers.share_buffers()
+        buffer_pool_key = "default"
+        if self.model_runner.spec_algorithm.is_smc():
+            buffer_pool_key = (
+                "smc_draft" if self.model_runner.is_draft_worker else "smc_target"
+            )
+        self.buffers.share_buffers(pool_key=buffer_pool_key)
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -749,6 +763,7 @@ class CudaGraphRunner:
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_smc()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -1223,6 +1238,7 @@ class CudaGraphRunner:
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_smc()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -1351,12 +1367,25 @@ class CudaGraphRunner:
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or (
+                self.model_runner.spec_algorithm.is_smc()
+                and not self.model_runner.is_draft_worker
+            )
         ):
-            from sglang.srt.speculative.eagle_info import EagleVerifyInput
-
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
+            elif self.model_runner.spec_algorithm.is_smc():
+                from sglang.srt.smc.smc_info import SMCVerifyInput
+
+                spec_info = SMCVerifyInput(
+                    draft_token_num=self.num_tokens_per_bs,
+                    positions=None,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    num_tokens_per_req=self.num_tokens_per_bs,
+                )
             else:
+                from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
                 spec_info = EagleVerifyInput(
                     draft_token=None,
                     custom_mask=self.buffers.custom_mask,

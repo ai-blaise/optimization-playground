@@ -59,6 +59,45 @@ Glm4Config = None
 logger = logging.getLogger(__name__)
 
 
+class Glm4RMSNorm(RMSNorm):
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if x.numel() == 0 or self.variance_size_override is not None:
+            return super().forward_cuda(x, residual, post_residual_addition)
+
+        needs_reshape = x.dim() != 2 and residual is None
+        if needs_reshape:
+            original_shape = x.shape
+            x = x.contiguous().reshape(-1, original_shape[-1])
+        elif not x.is_contiguous():
+            x = x.contiguous()
+
+        if residual is not None:
+            if not residual.is_contiguous():
+                residual = residual.contiguous()
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            # The FlashInfer CuTe RMSNorm path can fail during SMC draft CUDA
+            # graph capture for GLM4 FP8 speculators. Use the stable sgl-kernel
+            # implementation while preserving the same activation dtype.
+            torch.ops.sgl_kernel.fused_add_rmsnorm.default(
+                x, residual, self.weight.data, self.variance_epsilon, False
+            )
+            return x, residual
+
+        out = torch.empty_like(x)
+        torch.ops.sgl_kernel.rmsnorm.default(
+            out, x, self.weight.data, self.variance_epsilon, False
+        )
+        if needs_reshape:
+            out = out.reshape(original_shape)
+        return out
+
+
 class Glm4MLP(nn.Module):
     def __init__(
         self,
@@ -253,14 +292,18 @@ class Glm4DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = Glm4RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_self_attn_layernorm = RMSNorm(
+        self.post_attention_layernorm = Glm4RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_self_attn_layernorm = Glm4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_mlp_layernorm = Glm4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -332,7 +375,7 @@ class Glm4Model(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = Glm4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 

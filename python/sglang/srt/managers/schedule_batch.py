@@ -110,6 +110,35 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 logger = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass(frozen=True)
+class SMCGroupSpan:
+    group_id: str
+    start: int
+    end: int
+
+    @property
+    def size(self) -> int:
+        return self.end - self.start
+
+
+def build_smc_group_spans(reqs: List["Req"]) -> Optional[list[SMCGroupSpan]]:
+    spans: list[SMCGroupSpan] = []
+    seen_group_ids: set[str] = set()
+    start = 0
+    while start < len(reqs):
+        group_id = getattr(reqs[start], "smc_group_id", None)
+        end = start + 1
+        while end < len(reqs) and getattr(reqs[end], "smc_group_id", None) == group_id:
+            end += 1
+        if group_id is not None:
+            if group_id in seen_group_ids:
+                return None
+            spans.append(SMCGroupSpan(group_id=group_id, start=start, end=end))
+            seen_group_ids.add(group_id)
+        start = end
+    return spans
+
+
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
@@ -850,6 +879,9 @@ class Req(ReqDllmMixin):
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
         self.spec_acceptance_histogram: List[int] = []
 
+        self.smc_group_id: Optional[str] = None
+        self.smc_particle_idx: Optional[int] = None
+
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
@@ -1224,6 +1256,11 @@ class Req(ReqDllmMixin):
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
+        #
+        # SMC NOTE: This reset is NOT SMC-aware. It clears kv_committed_len and
+        # kv_allocated_len without updating the SMC group's log_weights,
+        # step_counts, or resampling state. After this call the particle's
+        # cached state is gone but the SMCManager still references it as active.
         self.retraction_count += 1
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
@@ -1352,6 +1389,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Request, memory pool, and cache
     reqs: List[Req]
+    smc_group_spans: Optional[List[SMCGroupSpan]] = None
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
@@ -1507,6 +1545,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return cls(
             reqs=reqs,
+            smc_group_spans=build_smc_group_spans(reqs),
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
@@ -2087,6 +2126,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
         server_args = get_global_server_args()
+        if self.spec_algorithm.is_smc():
+            per_particle = server_args.speculative_num_draft_tokens
+            if page_size > 1:
+                per_particle = ceil_align(per_particle, page_size)
+            return per_particle * len(requests)
+
         len_per_topk = server_args.speculative_num_steps or 1
         spec_topk = server_args.speculative_eagle_topk or 1
         spec_tokens = server_args.speculative_num_draft_tokens
@@ -2132,7 +2177,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def retract_decode(
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
-        """Retract the decoding requests when there is not enough memory."""
+        """Retract the decoding requests when there is not enough memory.
+
+        SMC NOTE: Scheduler-level retraction is NOT fully functional for SMC
+        particles. When SMC particles are retracted:
+        1. reset_for_retract() clears KV state (kv_allocated_len,
+           kv_committed_len) but does NOT notify the SMCManager/SMCResampler,
+           leaving group state (log_weights, step_counts, pending_diffs,
+           resampling bookkeeping) inconsistent.
+        2. The group-level retraction at lines 1963-1978 collects sibling
+           particles but does NOT clean up or pause the SMC group atomically —
+           remaining siblings may continue forward while retracted ones are
+           reset.
+        3. Re-admission via the waiting queue re-prefills particles
+           independently, but the SMC group has no mechanism to reconcile
+           divergent step counts or restore log_weights after retraction.
+        A proper fix requires group-aware atomic retract/re-admit; see
+        smc_design_docs/smc_resampler_group_design.md.
+        """
         sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
@@ -2150,6 +2212,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        retract_indices = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2162,11 +2225,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
-            # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            retract_indices.append(idx)
+
+        # SMC NOTE: This block ensures all particles of a group are retracted
+        # together (no partial group in running batch). However, it does NOT
+        # pause the SMC group state or reset log_weights/step_counts, so re-
+        # admission will encounter stale group bookkeeping.
+        retracted_group_ids = {
+            req.smc_group_id for req in retracted_reqs if req.smc_group_id is not None
+        }
+        if retracted_group_ids:
+            extra_indices = [
+                idx
+                for idx in sorted_indices
+                if self.reqs[idx].smc_group_id in retracted_group_ids
+            ]
+            if extra_indices:
+                extra_index_set = set(extra_indices)
+                sorted_indices = [
+                    idx for idx in sorted_indices if idx not in extra_index_set
+                ]
+                retract_indices.extend(extra_indices)
+                retracted_reqs.extend(self.reqs[idx] for idx in extra_indices)
 
         reqs_to_abort: List[Req] = []
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+        if sorted_indices and len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
             # Even the last remaining request cannot fit in memory.
@@ -2179,10 +2262,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
+            retract_indices.append(last_idx)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
+
+        remaining_req_count = len(sorted_indices)
+        for idx in sorted(set(retract_indices), reverse=True):
+            self.release_req(idx, remaining_req_count, server_args)
 
         self.filter_batch(keep_indices=sorted_indices)
 
@@ -2211,7 +2298,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
         # TODO (csy): for preempted requests, we may want to insert into the tree
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if req.smc_particle_idx is not None:
+            from sglang.srt.smc.smc_utils import _release_internal_req
+
+            _release_internal_req(
+                req,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            )
+        else:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
@@ -2255,9 +2351,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
-        if self.is_spec_v2:
-            # TODO(spec-v2): all spec v2 should go through this path
-            draft_input: EagleDraftInput = self.spec_info
+        if self.is_spec_v2 or self.spec_algorithm.is_smc():
+            # Spec v2 (EAGLE) and SMC both manage their own KV allocation
+            # and seq_lens advancement inside prepare_for_decode.
+            draft_input = self.spec_info
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
@@ -2358,7 +2455,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
-            if draft_input.verify_done is not None:
+            if draft_input is not None and draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
     def filter_batch(
@@ -2369,7 +2466,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         v1_spec_info_filtered: Optional[bool] = False,
     ):
         # FIXME(lsyin): used here to get the correct seq_lens
-        # The batch has been launched but we need it verified to get correct next batch info
+        # The batch has been launched but we need launch-produced draft metadata
+        # to be ready before filtering or merging.
         self.maybe_wait_verify_done()
 
         if keep_indices is None:
@@ -2387,6 +2485,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.smc_group_spans = []
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2404,6 +2503,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        self.smc_group_spans = build_smc_group_spans(self.reqs)
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
@@ -2484,6 +2584,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+        self.smc_group_spans = build_smc_group_spans(self.reqs)
         if self.multimodal_inputs is not None:
             self.multimodal_inputs.extend(other.multimodal_inputs)
 
@@ -2585,6 +2686,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # merge_batch) on the original don't corrupt this snapshot.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            smc_group_spans=(
+                list(self.smc_group_spans) if self.smc_group_spans is not None else None
+            ),
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
@@ -2607,6 +2711,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
         )
+
+    def get_smc_group_span(self, group_id: str) -> Optional[SMCGroupSpan]:
+        if self.smc_group_spans is None:
+            return None
+        for span in self.smc_group_spans:
+            if span.group_id == group_id:
+                return span
+        return None
+
+    def count_smc_particle_reqs(self) -> int:
+        if self.smc_group_spans is None:
+            return sum(1 for req in self.reqs if req.smc_group_id is not None)
+        return sum(span.size for span in self.smc_group_spans)
 
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():

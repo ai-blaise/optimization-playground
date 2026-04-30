@@ -1253,7 +1253,11 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 layer_id=layer_id,
                 alt_stream=alt_stream,
-                nsa_indexer_mode=getattr(config, "nsa_indexer_mode", "vanilla"),
+                nsa_indexer_mode=(
+                    "vanilla"
+                    if is_nextn
+                    else getattr(config, "nsa_indexer_mode", "vanilla")
+                ),
                 hisa_block_size=getattr(config, "hisa_block_size", 128),
                 hisa_block_topk=getattr(config, "hisa_block_topk", 64),
                 hisa_min_seq_len=getattr(config, "hisa_min_seq_len", 65536),

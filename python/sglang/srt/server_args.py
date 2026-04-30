@@ -546,6 +546,12 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
+    smc_n_particles: int = 4
+    smc_gamma: int = 4
+    smc_draft_temperature: float = 0.7
+    smc_target_temperature: float = 1.0
+    smc_resample_threshold: float = 0.5
+    smc_resample_method: Literal["systematic", "multinomial"] = "systematic"
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -806,7 +812,12 @@ class ServerArgs:
         self._handle_nsa_indexer_model_overrides()
 
         if self.model_path.lower() in ["none", "dummy"]:
-            # Skip for dummy models
+            # Keep the dummy-model fast path, but still run lightweight defaulting and
+            # speculative validation that unit tests rely on.
+            self._handle_missing_default_values()
+            self._handle_page_size()
+            if self.speculative_algorithm in ("SMC", "NGRAM"):
+                self._handle_speculative_decoding()
             return
 
         # Handle deprecated arguments.
@@ -1503,7 +1514,7 @@ class ServerArgs:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
-                if self.speculative_algorithm == "STANDALONE":
+                if self.speculative_algorithm in ("STANDALONE", "SMC"):
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
@@ -3468,6 +3479,82 @@ class ServerArgs:
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
                 )
 
+        if self.speculative_algorithm == "SMC":
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "Currently SMC speculative decoding does not support disaggregation."
+                )
+            if self.smc_n_particles < 1:
+                raise ValueError("--smc-n-particles must be >= 1.")
+            if self.smc_gamma < 1:
+                raise ValueError("--smc-gamma must be >= 1.")
+            if self.smc_draft_temperature < 0:
+                raise ValueError("--smc-draft-temperature must be >= 0.")
+            if self.smc_target_temperature < 0:
+                raise ValueError("--smc-target-temperature must be >= 0.")
+            if not 0 < self.smc_resample_threshold <= 1:
+                raise ValueError("--smc-resample-threshold must be in (0, 1].")
+
+            prefill_attention_backend, decode_attention_backend = (
+                self.get_attention_backends()
+            )
+            draft_attention_backend = self.speculative_draft_attention_backend
+            if draft_attention_backend is None:
+                draft_attention_backend = (
+                    decode_attention_backend
+                    if self.speculative_attention_mode == "decode"
+                    else prefill_attention_backend
+                )
+            smc_supported_backends = {"triton", "fa3"}
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            target_supported_backends = set(smc_supported_backends)
+            if self.model_path.lower() in ["none", "dummy"]:
+                pass
+            elif is_deepseek_nsa(self.get_model_config().hf_config):
+                target_supported_backends.add("nsa")
+            unsupported_attention_backends = {}
+            for name, backend in {
+                "attention_backend": self.attention_backend,
+                "prefill_attention_backend": prefill_attention_backend,
+                "decode_attention_backend": decode_attention_backend,
+            }.items():
+                if backend is not None and backend not in target_supported_backends:
+                    unsupported_attention_backends[name] = backend
+            if (
+                draft_attention_backend is not None
+                and draft_attention_backend not in smc_supported_backends
+            ):
+                unsupported_attention_backends[
+                    "speculative_draft_attention_backend"
+                ] = draft_attention_backend
+            if unsupported_attention_backends:
+                unsupported_text = ", ".join(
+                    f"{name}={backend}"
+                    for name, backend in unsupported_attention_backends.items()
+                )
+                raise ValueError(
+                    "Currently SMC speculative decoding only supports target "
+                    f"attention backends {target_supported_backends} and draft "
+                    f"attention backends {smc_supported_backends}. "
+                    f"Got {unsupported_text}."
+                )
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.enable_mixed_chunk = False
+            self.speculative_eagle_topk = 1
+            self.speculative_num_steps = self.smc_gamma
+            self.speculative_num_draft_tokens = self.smc_gamma + 1
+            self.disable_overlap_schedule = True
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "SMC speculative decoding requires --speculative-draft-model-path."
+                )
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -5429,7 +5516,15 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=[
+                "DFLASH",
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+                "SMC",
+                "NGRAM",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -5540,7 +5635,43 @@ class ServerArgs:
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
         )
-
+        parser.add_argument(
+            "--smc-n-particles",
+            type=int,
+            default=ServerArgs.smc_n_particles,
+            help="Number of SMC particles per request.",
+        )
+        parser.add_argument(
+            "--smc-gamma",
+            type=int,
+            default=ServerArgs.smc_gamma,
+            help="Maximum drafted tokens per SMC step.",
+        )
+        parser.add_argument(
+            "--smc-draft-temperature",
+            type=float,
+            default=ServerArgs.smc_draft_temperature,
+            help="Sampling temperature used by the SMC draft model.",
+        )
+        parser.add_argument(
+            "--smc-target-temperature",
+            type=float,
+            default=ServerArgs.smc_target_temperature,
+            help="Temperature for target model scoring during SMC verification.",
+        )
+        parser.add_argument(
+            "--smc-resample-threshold",
+            type=float,
+            default=ServerArgs.smc_resample_threshold,
+            help="Trigger resampling when ESS drops below n_particles * threshold.",
+        )
+        parser.add_argument(
+            "--smc-resample-method",
+            type=str,
+            choices=["systematic", "multinomial"],
+            default=ServerArgs.smc_resample_method,
+            help="Resampling method for SMC speculative decoding.",
+        )
         # Speculative decoding (ngram)
         parser.add_argument(
             "--speculative-ngram-min-bfs-breadth",
@@ -7565,7 +7696,7 @@ def auto_choose_speculative_params(self: ServerArgs):
     """
     hf_config = self.get_model_config().hf_config
     arch = hf_config.architectures[0]
-    if self.speculative_algorithm == "STANDALONE":
+    if self.speculative_algorithm in ("STANDALONE", "SMC"):
         # The default value for standalone speculative decoding
         return (3, 1, 4)
     if arch in ["LlamaForCausalLM"]:

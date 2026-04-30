@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
 
@@ -152,6 +152,9 @@ class NSAMetadata:
     indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
+    hisa_block_metadata: Dict[
+        int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
 
 
 class TopkTransformMethod(IntEnum):
@@ -218,6 +221,23 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self.attn_metadata.token_to_batch_idx
+
+    def get_hisa_block_metadata(
+        self, k_block_size: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        metadata = self.attn_metadata.hisa_block_metadata.get(k_block_size)
+        if metadata is None:
+            from sglang.srt.layers.attention.nsa.hisa_tilelang_kernels import (
+                build_hisa_block_metadata,
+            )
+
+            metadata = build_hisa_block_metadata(
+                self.get_page_table_64(),
+                self.get_indexer_seq_len(),
+                k_block_size,
+            )
+            self.attn_metadata.hisa_block_metadata[k_block_size] = metadata
+        return metadata
 
     def topk_transform(
         self,
@@ -623,6 +643,10 @@ class NativeSparseAttnBackend(
         indexer_k_start_end, token_to_batch_idx = self._cal_indexer_k_start_end(
             forward_batch, bs_idx_cpu
         )
+        if forward_batch.forward_mode.is_decode_or_idle():
+            token_to_batch_idx = torch.arange(
+                batch_size, dtype=torch.int32, device=device
+            )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
         nsa_cache_seqlens_int32 = compute_nsa_seqlens(
             original_seq_lens=seqlens_expanded,
@@ -965,6 +989,13 @@ class NativeSparseAttnBackend(
             nsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
+            indexer_seq_lens_cpu=None,
+            indexer_seq_lens=cache_seqlens_int32,
+            token_to_batch_idx=(
+                torch.arange(num_tokens, dtype=torch.int32, device=self.device)
+                if forward_mode.is_decode_or_idle()
+                else None
+            ),
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata

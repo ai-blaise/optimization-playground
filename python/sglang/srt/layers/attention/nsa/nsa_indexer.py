@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import os
+import threading
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -20,6 +24,7 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
+    get_int_env_var,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -31,6 +36,18 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_hisa_paged_min_query_len = get_int_env_var(
+    "SGLANG_NSA_HISA_PAGED_MIN_QUERY_LEN", 256
+)
+_hisa_paged_min_seq_len = get_int_env_var(
+    "SGLANG_NSA_HISA_PAGED_MIN_SEQ_LEN", 0
+)
+_hisa_paged_decode_min_seq_len = get_int_env_var(
+    "SGLANG_NSA_HISA_PAGED_DECODE_MIN_SEQ_LEN", 0
+)
+_hisa_profile_path = os.environ.get("SGLANG_NSA_HISA_PROFILE_PATH")
+_hisa_profile_sync = get_bool_env_var("SGLANG_NSA_HISA_PROFILE_SYNC")
+_hisa_profile_lock = threading.Lock()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 if _is_cuda:
@@ -44,6 +61,48 @@ def _deep_gemm_paged_mqa_context_lens(deep_gemm_module, seqlens: torch.Tensor):
     if hasattr(deep_gemm_module, "fp8_fp4_paged_mqa_logits") and seqlens.dim() == 1:
         return seqlens.view(-1, 1)
     return seqlens
+
+
+def _hisa_profile_enabled() -> bool:
+    return bool(_hisa_profile_path) and not get_is_capture_mode()
+
+
+def _hisa_profile_start(device: Optional[torch.device] = None) -> Optional[float]:
+    if not _hisa_profile_enabled():
+        return None
+    if _hisa_profile_sync and _is_cuda and device is not None:
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
+
+
+def _hisa_profile_end(
+    path: str, start: Optional[float], device: Optional[torch.device] = None, **record
+) -> None:
+    if start is None or not _hisa_profile_path:
+        return
+    if _hisa_profile_sync and _is_cuda and device is not None:
+        torch.cuda.synchronize(device)
+    try:
+        attn_rank = get_attn_context_model_parallel_rank()
+        attn_world = get_attn_context_model_parallel_world_size()
+    except Exception:
+        attn_rank = None
+        attn_world = None
+    payload = {
+        "time": time.time(),
+        "pid": os.getpid(),
+        "path": path,
+        "duration_ms": (time.perf_counter() - start) * 1000.0,
+        "attn_rank": attn_rank,
+        "attn_world": attn_world,
+        **record,
+    }
+    directory = os.path.dirname(_hisa_profile_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with _hisa_profile_lock:
+        with open(_hisa_profile_path, "a") as f:
+            f.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 if _use_aiter:
@@ -132,6 +191,11 @@ class BaseIndexerMetadata(ABC):
         """
         Return: batch idx for each token.
         """
+
+    def get_hisa_block_metadata(
+        self, k_block_size: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        return None
 
     @abstractmethod
     def topk_transform(
@@ -468,6 +532,38 @@ class Indexer(MultiPlatformOp):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
+
+        # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
+        # and it is necessary to extract the actual q length.
+        q_offset = sum(metadata.get_nsa_extend_len_cpu())
+        hisa_paged_ok = self._should_use_hisa_paged(
+            forward_batch, metadata, seqlens_32
+        )
+        if hisa_paged_ok:
+            profile_start = _hisa_profile_start(q_fp8.device)
+            result = self._get_topk_hisa_paged(
+                q_fp8,
+                kv_cache_fp8,
+                block_tables,
+                seqlens_32,
+                weights,
+                metadata,
+            )
+            _hisa_profile_end(
+                "hisa_paged",
+                profile_start,
+                q_fp8.device,
+                layer_id=int(layer_id),
+                forward_mode=str(forward_batch.forward_mode),
+                q_offset=int(q_offset),
+                q_tokens=int(q_fp8.shape[0]),
+                max_seq_len=int(max_seq_len),
+                batch_size=int(block_tables.shape[0]),
+                page_size=int(page_size),
+            )
+            return result
+
+        profile_start = _hisa_profile_start(q_fp8.device)
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
@@ -496,9 +592,6 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
-        # and it is necessary to extract the actual q length.
-        q_offset = sum(metadata.get_nsa_extend_len_cpu())
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
@@ -544,7 +637,132 @@ class Indexer(MultiPlatformOp):
                 device=topk_result.device,
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
+        _hisa_profile_end(
+            "indexcache_paged",
+            profile_start,
+            q_fp8.device,
+            layer_id=int(layer_id),
+            forward_mode=str(forward_batch.forward_mode),
+            q_offset=int(q_offset),
+            q_tokens=int(q_fp8.shape[0]),
+            max_seq_len=int(max_seq_len),
+            batch_size=int(block_tables.shape[0]),
+            page_size=int(page_size),
+            hisa_eligible=bool(hisa_paged_ok),
+        )
         return topk_result
+
+    def _hisa_boundary_len(self) -> int:
+        return self.hisa_block_size * self.hisa_block_topk
+
+    def _should_use_hisa_paged(
+        self,
+        forward_batch: ForwardBatch,
+        metadata: BaseIndexerMetadata,
+        seqlens_32: torch.Tensor,
+    ) -> bool:
+        if not uses_hisa(self.nsa_indexer_mode):
+            return False
+        if self.hisa_execution_mode != "optimized":
+            return False
+        if not _is_cuda or _is_fp8_fnuz or not envs.SGLANG_NSA_FUSE_TOPK.get():
+            return False
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return False
+        if self.hisa_block_size * self.hisa_block_topk < self.index_topk:
+            return False
+        if metadata.get_token_to_batch_idx() is None:
+            return False
+        if sum(metadata.get_nsa_extend_len_cpu()) < _hisa_paged_min_query_len:
+            return False
+        min_seq_len = max(
+            self.hisa_min_seq_len,
+            self._hisa_boundary_len(),
+            _hisa_paged_min_seq_len,
+            _hisa_paged_decode_min_seq_len,
+        )
+        seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        if seq_lens_cpu is not None and len(seq_lens_cpu) != 0:
+            return int(seq_lens_cpu.max().item()) > min_seq_len
+        return int(seqlens_32.max().item()) > min_seq_len
+
+    def _get_topk_hisa_paged(
+        self,
+        q_fp8: torch.Tensor,
+        index_k_with_scale_buffer: torch.Tensor,
+        page_table: torch.Tensor,
+        seqlens_32: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.nsa.hisa_tilelang_kernels import (
+            hisa_indexer_paged,
+        )
+
+        q_offset = sum(metadata.get_nsa_extend_len_cpu())
+        topk_result = torch.full(
+            (q_fp8.shape[0], self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=q_fp8.device,
+        )
+        if q_offset == 0:
+            return topk_result
+
+        token_to_batch_idx = self._get_hisa_token_to_batch_idx(
+            metadata, q_offset, page_table
+        )
+        cu_seqlen_ks = torch.zeros(
+            (q_offset,), dtype=torch.int32, device=q_fp8.device
+        )
+        cu_seqlen_ke = seqlens_32.reshape(-1)[:q_offset].to(torch.int32)
+        block_metadata = metadata.get_hisa_block_metadata(self.hisa_block_size)
+        hisa_weights = weights[:q_offset]
+        if hisa_weights.dim() == 3:
+            hisa_weights = hisa_weights.squeeze(2)
+        topk_relative = hisa_indexer_paged(
+            q_fp8[:q_offset],
+            index_k_with_scale_buffer,
+            page_table,
+            metadata.get_indexer_seq_len(),
+            hisa_weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            token_to_batch_idx,
+            k_block_size=self.hisa_block_size,
+            block_topk=self.hisa_block_topk,
+            topk_tokens=self.index_topk,
+            block_metadata=block_metadata,
+        )
+        block_tables = metadata.get_page_table_1()
+        safe_topk_relative = torch.where(topk_relative < 0, 0, topk_relative)
+        topk_result[:q_offset] = torch.where(
+            topk_relative < 0,
+            -1,
+            torch.gather(block_tables[:q_offset], dim=1, index=safe_topk_relative.long()),
+        )
+        return topk_result
+
+    def _get_hisa_token_to_batch_idx(
+        self,
+        metadata: BaseIndexerMetadata,
+        q_offset: int,
+        page_table: torch.Tensor,
+    ) -> torch.Tensor:
+        token_to_batch_idx = metadata.get_token_to_batch_idx()
+        page_table_rows = page_table.shape[0]
+        if page_table_rows == 1:
+            return torch.zeros(q_offset, dtype=torch.int32, device=page_table.device)
+        if q_offset == page_table_rows:
+            return torch.arange(q_offset, dtype=torch.int32, device=page_table.device)
+        if q_offset % page_table_rows == 0:
+            return torch.repeat_interleave(
+                torch.arange(page_table_rows, dtype=torch.int32, device=page_table.device),
+                q_offset // page_table_rows,
+            )
+        if token_to_batch_idx is not None:
+            return token_to_batch_idx[:q_offset]
+        return torch.arange(q_offset, dtype=torch.int32, device=page_table.device)
 
     def _should_use_hisa_extend(
         self, forward_batch: ForwardBatch, metadata: BaseIndexerMetadata
@@ -564,7 +782,12 @@ class Indexer(MultiPlatformOp):
         seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
             return False
-        return int(seq_lens_cpu.max().item()) > self.hisa_min_seq_len
+        min_seq_len = max(
+            self.hisa_min_seq_len,
+            self._hisa_boundary_len(),
+            _hisa_paged_min_seq_len,
+        )
+        return int(seq_lens_cpu.max().item()) > min_seq_len
 
     def _get_topk_hisa_extend(
         self,
@@ -591,35 +814,47 @@ class Indexer(MultiPlatformOp):
         if q_offset == 0:
             return topk_result
 
+        block_metadata = metadata.get_hisa_block_metadata(self.hisa_block_size)
+        hisa_weights = weights[:q_offset]
+        if hisa_weights.dim() == 3:
+            hisa_weights = hisa_weights.squeeze(2)
+        token_to_batch_idx = self._get_hisa_token_to_batch_idx(
+            metadata, q_offset, page_table
+        )
+        topk_offset = metadata.attn_metadata.topk_indices_offset
+        if topk_offset is not None:
+            topk_offset = topk_offset[:q_offset]
         topk_relative = hisa_indexer_paged(
             q_fp8[:q_offset],
             index_k_with_scale_buffer,
             page_table,
             seq_lens,
-            weights[:q_offset],
+            hisa_weights,
             ks,
             ke,
-            metadata.get_token_to_batch_idx()[:q_offset],
+            token_to_batch_idx,
             k_block_size=self.hisa_block_size,
             block_topk=self.hisa_block_topk,
             topk_tokens=self.index_topk,
+            block_metadata=block_metadata,
+            topk_offsets=topk_offset,
         )
-        topk_offset = metadata.attn_metadata.topk_indices_offset
         if topk_offset is not None:
-            topk_offset = topk_offset[:q_offset]
-            topk_result[:q_offset] = torch.where(
-                topk_relative >= 0,
-                topk_relative + topk_offset[:, None],
-                topk_relative,
-            )
+            topk_result[:q_offset] = topk_relative
         else:
-            batch_idx = metadata.get_token_to_batch_idx()[:q_offset].long()
-            page_table = metadata.get_page_table_1()[batch_idx]
-            mapped = torch.gather(page_table, 1, topk_relative.clamp_min(0).long())
+            block_tables = metadata.get_page_table_1()
+            token_block_tables = block_tables.index_select(
+                0, token_to_batch_idx.to(dtype=torch.long)
+            )
+            safe_topk_relative = torch.where(topk_relative < 0, 0, topk_relative)
             topk_result[:q_offset] = torch.where(
-                topk_relative >= 0,
-                mapped,
-                topk_relative,
+                topk_relative < 0,
+                -1,
+                torch.gather(
+                    token_block_tables,
+                    dim=1,
+                    index=safe_topk_relative.long(),
+                ),
             )
         return topk_result
 
@@ -691,17 +926,17 @@ class Indexer(MultiPlatformOp):
 
         ks, ke = metadata.get_indexer_kvcache_range()
         q_offset = ks.shape[0]
+        hisa_extend_ok = self._should_use_hisa_extend(forward_batch, metadata)
+        hisa_boundary_q = self.hisa_block_size * 16
 
-        if (
-            self._should_use_hisa_extend(forward_batch, metadata)
-            and q_offset == self.hisa_block_size * 16
-        ):
+        if hisa_extend_ok and q_offset >= hisa_boundary_q:
             index_k_with_scale_buffer = (
                 forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
                     layer_id=layer_id
                 )
             )
-            return self._get_topk_hisa_extend(
+            profile_start = _hisa_profile_start(device)
+            result = self._get_topk_hisa_extend(
                 q_fp8,
                 index_k_with_scale_buffer,
                 block_tables,
@@ -711,7 +946,21 @@ class Indexer(MultiPlatformOp):
                 ke,
                 metadata,
             )
+            _hisa_profile_end(
+                "hisa_extend",
+                profile_start,
+                device,
+                layer_id=int(layer_id),
+                forward_mode=str(forward_batch.forward_mode),
+                q_offset=int(q_offset),
+                q_tokens=int(token_nums),
+                batch_size=int(batch_size),
+                page_size=int(page_size),
+                hisa_boundary_q=int(hisa_boundary_q),
+            )
+            return result
 
+        profile_start = _hisa_profile_start(device)
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
@@ -761,6 +1010,23 @@ class Indexer(MultiPlatformOp):
 
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
+            _hisa_profile_end(
+                "indexcache_ragged",
+                profile_start,
+                device,
+                layer_id=int(layer_id),
+                forward_mode=str(forward_batch.forward_mode),
+                q_offset=int(q_offset),
+                q_tokens=int(token_nums),
+                k_offset=int(k_offset),
+                batch_size=int(batch_size),
+                page_size=int(page_size),
+                max_seq_len=int(max_seq_len),
+                seq_len_sum=int(seq_len_sum),
+                hisa_eligible=bool(hisa_extend_ok),
+                hisa_boundary_q=int(hisa_boundary_q),
+                chunked=False,
+            )
             return topk_result
 
         # Chunk path
@@ -836,6 +1102,24 @@ class Indexer(MultiPlatformOp):
             topk_result[start:end] = raw_topk_chunk
             start = end
 
+        _hisa_profile_end(
+            "indexcache_ragged",
+            profile_start,
+            device,
+            layer_id=int(layer_id),
+            forward_mode=str(forward_batch.forward_mode),
+            q_offset=int(q_offset),
+            q_tokens=int(token_nums),
+            k_offset=int(k_offset),
+            batch_size=int(batch_size),
+            page_size=int(page_size),
+            max_seq_len=int(max_seq_len),
+            seq_len_sum=int(seq_len_sum),
+            hisa_eligible=bool(hisa_extend_ok),
+            hisa_boundary_q=int(hisa_boundary_q),
+            chunked=True,
+            max_rows=int(max_rows),
+        )
         return topk_result
 
     def _forward_cuda_k_only(

@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
+    SMC = auto()
     NGRAM = auto()
     NONE = auto()
 
@@ -50,11 +51,14 @@ class SpeculativeAlgorithm(Enum):
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
+    def is_smc(self) -> bool:
+        return self == SpeculativeAlgorithm.SMC
+
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_smc()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -109,6 +113,10 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
             return StandaloneWorker
+        elif self.is_smc():
+            from sglang.srt.smc.smc_workers import SMCWorker
+
+            return SMCWorker
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(
@@ -129,6 +137,9 @@ class SpecInputType(IntEnum):
     EAGLE_VERIFY = auto()
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
+    SMC_DRAFT = auto()
+    SMC_SCORE = auto()
+    SMC_VERIFY = auto()
     NGRAM_VERIFY = auto()
 
 
@@ -142,12 +153,14 @@ class SpecInput(ABC):
         return self.spec_input_type in {
             SpecInputType.EAGLE_DRAFT,
             SpecInputType.DFLASH_DRAFT,
+            SpecInputType.SMC_DRAFT,
         }
 
     def is_verify_input(self) -> bool:
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.DFLASH_VERIFY,
+            SpecInputType.SMC_SCORE,
             SpecInputType.NGRAM_VERIFY,
         }
 
@@ -164,3 +177,6 @@ class SpecInput(ABC):
             x * c2 for x in forward_batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob
+
+    def use_linear_target_verify(self) -> bool:
+        return False

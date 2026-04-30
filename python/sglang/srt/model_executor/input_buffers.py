@@ -8,18 +8,21 @@ import torch
 
 from sglang.srt.utils import is_npu
 
-_forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
+_forward_input_buffer_pools: Dict[str, Dict[str, torch.Tensor]] = {"default": {}}
 
 
 @dataclass
 class ForwardInputBuffers:
 
-    def _share_one_buffer(self, name: str, new_buffer: torch.Tensor) -> torch.Tensor:
+    def _share_one_buffer(
+        self, name: str, new_buffer: torch.Tensor, pool_key: str
+    ) -> torch.Tensor:
 
         buffer_size = new_buffer.size()
         buffer_stride = new_buffer.stride()
 
-        old_buffer = _forward_input_buffer_pool.get(name, None)
+        pool = _forward_input_buffer_pools.setdefault(pool_key, {})
+        old_buffer = pool.get(name, None)
         if old_buffer is not None:
             assert (
                 new_buffer.dtype == old_buffer.dtype
@@ -30,10 +33,10 @@ class ForwardInputBuffers:
             if old_buffer.numel() > new_buffer.numel():
                 new_buffer = old_buffer
 
-        _forward_input_buffer_pool[name] = new_buffer
+        pool[name] = new_buffer
         return new_buffer.as_strided(buffer_size, buffer_stride)
 
-    def share_buffers(self):
+    def share_buffers(self, pool_key: str = "default"):
         # disable share input buffer on npu due to accuracy issue
         if is_npu():
             return
@@ -54,12 +57,12 @@ class ForwardInputBuffers:
                         sub_buffer, torch.Tensor
                     ), f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
                     new_buffer = self._share_one_buffer(
-                        f"{name}.{sub_name}", sub_buffer
+                        f"{name}.{sub_name}", sub_buffer, pool_key
                     )
                     buffer[sub_name] = new_buffer
             else:
                 assert isinstance(
                     buffer, torch.Tensor
                 ), f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
-                new_buffer = self._share_one_buffer(name, buffer)
+                new_buffer = self._share_one_buffer(name, buffer, pool_key)
                 setattr(self, name, new_buffer)

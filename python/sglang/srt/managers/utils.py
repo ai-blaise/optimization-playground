@@ -43,6 +43,7 @@ class GenerationBatchResult:
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
+    logprob_diff: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
@@ -58,7 +59,7 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
-        if return_logprob:
+        if return_logprob and self.logits_output is not None:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = (
                     self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
@@ -82,7 +83,10 @@ class GenerationBatchResult:
                     v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if self.logits_output.hidden_states is not None:
+        if (
+            self.logits_output is not None
+            and self.logits_output.hidden_states is not None
+        ):
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )
@@ -90,6 +94,8 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+        if self.logprob_diff is not None:
+            self.logprob_diff = self.logprob_diff.to("cpu", non_blocking=True)
 
         if self.routed_experts_output is not None:
             self.routed_experts_output.copy_to_cpu()

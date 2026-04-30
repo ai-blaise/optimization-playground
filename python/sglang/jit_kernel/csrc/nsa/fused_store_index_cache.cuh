@@ -21,6 +21,7 @@ struct FusedStoreCacheParam {
   void* __restrict__ cache;
   const void* __restrict__ indices;
   uint32_t num_tokens;
+  uint32_t num_pages;
 };
 
 [[maybe_unused]]
@@ -42,7 +43,7 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   constexpr int64_t kPageBytes = 132 << kPageBits;
 
   // each warp handles 128 elements, each block handles multiple rows
-  const auto& [input, cache, indices, num_tokens] = param;
+  const auto& [input, cache, indices, num_tokens, num_pages] = param;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto global_wid = global_tid / 32;
   const auto lane_id = threadIdx.x % 32;
@@ -52,7 +53,7 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
 
   // prefetch the index
-  const auto index = static_cast<const IndicesT*>(indices)[global_wid];
+  const auto index = static_cast<int64_t>(static_cast<const IndicesT*>(indices)[global_wid]);
   // always load the value from input (don't store if invalid)
   using KeyT2 = packed_t<KeyT>;
   using InStorage = AlignedVector<KeyT2, 2>;
@@ -65,16 +66,18 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   // use normal fp32 scale
   const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
   const auto inv_scale = 1.0f / scale;
-  const int32_t page = index >> kPageBits;
-  const int32_t offset = index & ((1 << kPageBits) - 1);
-  const auto page_ptr = pointer::offset(cache, page * kPageBytes);
-  const auto value_ptr = pointer::offset(page_ptr, offset * 128);
-  const auto scale_ptr = pointer::offset(page_ptr, 128 << kPageBits, offset * 4);
   OutStorage result;
   result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
   result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
-  static_cast<OutStorage*>(value_ptr)[lane_id] = result;
-  static_cast<float*>(scale_ptr)[0] = scale;
+  const int64_t page = index >> kPageBits;
+  if (index >= 0 && page < num_pages) {
+    const int32_t offset = index & ((1 << kPageBits) - 1);
+    const auto page_ptr = pointer::offset(cache, page * kPageBytes);
+    const auto value_ptr = pointer::offset(page_ptr, offset * 128);
+    const auto scale_ptr = pointer::offset(page_ptr, 128 << kPageBits, offset * 4);
+    static_cast<OutStorage*>(value_ptr)[lane_id] = result;
+    static_cast<float*>(scale_ptr)[0] = scale;
+  }
 
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
@@ -114,6 +117,7 @@ struct FusedStoreCacheIndexerKernel {
         .cache = cache.data_ptr(),
         .indices = indices.data_ptr(),
         .num_tokens = num_tokens,
+        .num_pages = static_cast<uint32_t>(cache.shape()[0]),
     };
     const auto kBlockSize = 128;
     const auto num_blocks = div_ceil(num_tokens * 32, kBlockSize);

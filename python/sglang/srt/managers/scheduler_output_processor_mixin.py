@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -17,11 +18,18 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
+    FINISH_ABORT,
     Req,
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
+from sglang.srt.smc.smc_debug_utils import append_smc_probe_record, smc_probe_enabled
+from sglang.srt.smc.smc_info import SMCDraftInput
+from sglang.srt.smc.smc_utils import (
+    _release_internal_req,
+    _release_smc_parent_req,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -131,6 +139,10 @@ class SchedulerOutputProcessorMixin:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        is_smc = batch.spec_algorithm.is_smc()
+        smc_req_indices_to_remove = set()
+        smc_parent_group_jobs: List[Tuple[int, Req]] = []
+        smc_prefill_stream_candidates: List[Req] = []
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -198,6 +210,13 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                    elif is_smc and req.smc_particle_idx is None:
+                        smc_parent_group_jobs.append((i, req))
+                        if req.stream and not batch.return_logprob:
+                            smc_prefill_stream_candidates.append(req)
+                    elif is_smc and req.smc_particle_idx is not None:
+                        if not batch.decoding_reqs or req not in batch.decoding_reqs:
+                            self.tree_cache.cache_unfinished_req(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
@@ -339,7 +358,70 @@ class SchedulerOutputProcessorMixin:
                     req.is_chunked -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        if smc_prefill_stream_candidates:
+            before_offsets = {
+                req.rid: req.send_token_offset for req in smc_prefill_stream_candidates
+            }
+            if smc_probe_enabled:
+                for req in smc_prefill_stream_candidates:
+                    append_smc_probe_record(
+                        {
+                            "type": "prefill_parent_stream",
+                            "event": "before_materialize",
+                            "rid": req.rid,
+                            "output_len": len(req.output_ids),
+                            "send_token_offset": req.send_token_offset,
+                            "batch_size": len(smc_prefill_stream_candidates),
+                        }
+                    )
+            stream_start_ns = time.perf_counter_ns()
+            self.stream_output(smc_prefill_stream_candidates, False)
+            stream_duration_ms = (time.perf_counter_ns() - stream_start_ns) / 1_000_000
+            if smc_probe_enabled:
+                append_smc_probe_record(
+                    {
+                        "type": "prefill_parent_stream",
+                        "event": "stream_output_done",
+                        "batch_size": len(smc_prefill_stream_candidates),
+                        "duration_ms": stream_duration_ms,
+                    }
+                )
+            for req in smc_prefill_stream_candidates:
+                streamed = req.send_token_offset > before_offsets[req.rid]
+                if smc_probe_enabled:
+                    append_smc_probe_record(
+                        {
+                            "type": "prefill_parent_stream",
+                            "event": "after_stream_before_materialize",
+                            "rid": req.rid,
+                            "output_len": len(req.output_ids),
+                            "send_token_offset": req.send_token_offset,
+                            "streamed": streamed,
+                            "batch_size": len(smc_prefill_stream_candidates),
+                        }
+                    )
+
+        for i, req in smc_parent_group_jobs:
+            assert self.smc_resampler is not None
+            self.smc_resampler.enqueue_parent_group(req)
+            if smc_probe_enabled:
+                append_smc_probe_record(
+                    {
+                        "type": "prefill_parent_group",
+                        "event": "queued_for_next_turn",
+                        "rid": req.rid,
+                    }
+                )
+            smc_req_indices_to_remove.add(i)
+
+        if is_smc:
+            self.stream_output(
+                [req for req in batch.reqs if req.finished()],
+                False,
+                skip_stream_req,
+            )
+        else:
+            self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
@@ -347,13 +429,23 @@ class SchedulerOutputProcessorMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+        if smc_req_indices_to_remove:
+            keep_indices = [
+                i for i in range(len(batch.reqs)) if i not in smc_req_indices_to_remove
+            ]
+            batch.filter_batch(keep_indices=keep_indices)
 
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
-        assert result.next_token_ids.is_cpu
-        assert result.accept_lens.is_cpu
+        """Resolve batched accept-lens token ids for speculative decoding.
+
+        Overlap scheduling copies these tensors to CPU ahead of time. The
+        synchronous SMC path does not, so this helper must also tolerate GPU
+        tensors there.
+        """
+        assert result.next_token_ids is not None
+        assert result.accept_lens is not None
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
@@ -364,8 +456,12 @@ class SchedulerOutputProcessorMixin:
         stride = self.draft_worker.speculative_num_draft_tokens
 
         for i, req in enumerate(batch.reqs):
-            # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
+            if batch.spec_algorithm.is_smc():
+                commit_len = accept_lens[i]
+            else:
+                # -1 because prepare_for_decode pre-claimed the bonus slot.
+                commit_len = accept_lens[i] - 1
+            req.kv_committed_len += commit_len
             predict_tokens.append(
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
@@ -405,12 +501,26 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
+        smc_logprob_diffs = None
+        smc_filtered_reqs: Optional[List[Req]] = None
+        smc_filtered_rows: Optional[List[int]] = None
+        uses_batched_decode_result = batch.is_spec_v2 or batch.spec_algorithm.is_smc()
 
-        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
-            if batch.is_spec_v2:
+        if batch.spec_algorithm.is_none() or uses_batched_decode_result:
+            if uses_batched_decode_result:
                 next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
             else:
                 next_token_ids = next_token_ids.tolist()
+            if batch.spec_algorithm.is_smc():
+                assert result.logprob_diff is not None
+                if torch.is_tensor(result.logprob_diff):
+                    smc_logprob_diffs = result.logprob_diff
+                else:
+                    smc_logprob_diffs = torch.as_tensor(
+                        result.logprob_diff,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
 
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
@@ -431,7 +541,7 @@ class SchedulerOutputProcessorMixin:
         # are already handled in the verify phase (eagle_info.py / ngram_info.py).
 
         self.num_generated_tokens += len(batch.reqs)
-        if not batch.spec_algorithm.is_none():
+        if not batch.spec_algorithm.is_none() and not batch.spec_algorithm.is_smc():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_drafts)
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
@@ -439,10 +549,15 @@ class SchedulerOutputProcessorMixin:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        smc_finalized_reqs: List[Req] = []
 
         # Spec V1 handles output_ids, check_finished, grammar, and reasoning tokens
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
-        is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
+        is_spec_v1 = (
+            not batch.spec_algorithm.is_none()
+            and not batch.is_spec_v2
+            and not batch.spec_algorithm.is_smc()
+        )
 
         for i, req in enumerate(batch.reqs):
             req: Req
@@ -450,6 +565,18 @@ class SchedulerOutputProcessorMixin:
             if self.enable_overlap and (req.finished() or req.is_retracted):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                if batch.spec_algorithm.is_smc():
+                    if smc_filtered_reqs is None:
+                        smc_filtered_reqs = list(batch.reqs[:i])
+                        smc_filtered_rows = list(range(i))
+                    if req.finished() and self.smc_manager is not None:
+                        self.smc_manager.on_particle_finished(req)
+                    if req.is_retracted:
+                        _release_internal_req(
+                            req,
+                            req_to_token_pool=self.req_to_token_pool,
+                            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        )
                 continue
 
             if is_spec_v1:
@@ -469,7 +596,8 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
-            else:
+            elif uses_batched_decode_result:
+                # Spec v2 and SMC both return a batched accept-lens decode result.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
@@ -480,12 +608,41 @@ class SchedulerOutputProcessorMixin:
             req.time_stats.set_last_decode_finish_time()
             req.check_finished(new_accepted_len)
 
+            if batch.spec_algorithm.is_smc() and self.smc_manager is not None:
+                req.kv_allocated_len = max(
+                    req.kv_allocated_len, req.kv_committed_len
+                )
+                if req.finished():
+                    self.smc_manager.on_particle_finished(req)
+                if smc_logprob_diffs is None:
+                    raise RuntimeError(
+                        "SMC decode result is missing batched smc_logprob_diffs."
+                    )
+                if smc_filtered_reqs is not None:
+                    smc_filtered_reqs.append(req)
+                    assert smc_filtered_rows is not None
+                    smc_filtered_rows.append(i)
+
+                if (
+                    self.server_args.disaggregation_decode_enable_offload_kvcache
+                    and not req.finished()
+                ):
+                    self.decode_offload_manager.offload_kv_cache(req)
+
+                if req.finished():
+                    if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                        if not self.decode_offload_manager.offload_kv_cache(req):
+                            self.decode_offload_manager.finalize_release_on_finish(req)
+                    req.time_stats.set_completion_time()
+
+                continue
+
             self._handle_finished_req(req, i, logits_output)
 
             if req.return_logprob:
                 # Spec v1 handles logprobs inside its own worker.
                 # Normalize: non-spec has 1 token, spec v2 has multiple.
-                if batch.is_spec_v2:
+                if uses_batched_decode_result:
                     accepted_logprobs = next_token_logprobs[i]
                     accepted_ids = next_token_id
                     max_accept = len(accepted_logprobs)
@@ -525,8 +682,8 @@ class SchedulerOutputProcessorMixin:
                     if batch.spec_algorithm.is_none():
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
-                    elif batch.is_spec_v2:
-                        # Speculative decode: next_token_id is a list of accepted tokens
+                    elif uses_batched_decode_result:
+                        # Speculative decode: next_token_id is a list of accepted tokens.
                         for token_id in next_token_id:
                             req.grammar.accept_token(token_id)
                 except ValueError as e:
@@ -538,7 +695,62 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
+        if batch.spec_algorithm.is_smc() and self.smc_resampler is not None:
+            assert smc_logprob_diffs is not None
+            smc_step_reqs = batch.reqs if smc_filtered_reqs is None else smc_filtered_reqs
+            if smc_step_reqs:
+                if smc_filtered_rows is None:
+                    step_logprob_diffs = smc_logprob_diffs
+                else:
+                    row_indices = torch.tensor(
+                        smc_filtered_rows,
+                        dtype=torch.int64,
+                        device=smc_logprob_diffs.device,
+                    )
+                    step_logprob_diffs = smc_logprob_diffs.index_select(0, row_indices)
+                smc_finalized_reqs.extend(
+                    self.smc_resampler.on_batch_done(
+                        smc_step_reqs,
+                        step_logprob_diffs,
+                        group_spans=(
+                            batch.smc_group_spans
+                            if smc_filtered_rows is None
+                            else None
+                        ),
+                        scheduler=self,
+                    )
+                )
+
+        if batch.spec_algorithm.is_smc() and not self.enable_overlap and batch.reqs:
+            # seq_lens = kv_committed_len (actual KV coverage)
+            refreshed_seq_lens_cpu = torch.tensor(
+                [int(req.kv_committed_len) for req in batch.reqs],
+                dtype=torch.int64,
+            )
+            refreshed_verified_ids = torch.tensor(
+                [
+                    req.output_ids[-1]
+                    if req.output_ids
+                    else req.origin_input_ids[-1]
+                    for req in batch.reqs
+                ],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            batch.seq_lens_cpu = refreshed_seq_lens_cpu
+            batch.seq_lens = refreshed_seq_lens_cpu.to(device=self.device)
+            batch.seq_lens_sum = int(refreshed_seq_lens_cpu.sum().item())
+            batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+            batch.output_ids = refreshed_verified_ids
+            if isinstance(batch.spec_info, SMCDraftInput):
+                batch.spec_info.verified_id = refreshed_verified_ids
+                batch.spec_info.new_seq_lens = batch.seq_lens
+
         self.stream_output(batch.reqs, batch.return_logprob)
+        if smc_finalized_reqs:
+            for req in smc_finalized_reqs:
+                req.time_stats.set_completion_time()
+            self.stream_output(smc_finalized_reqs, False)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -998,6 +1210,8 @@ class SchedulerOutputProcessorMixin:
 
         for req in reqs:
             if req is skip_req:
+                continue
+            if req.smc_particle_idx is not None:
                 continue
 
             if req.finished():

@@ -539,7 +539,27 @@ def assign_extend_cache_locs_func(
     draft_token_num: int,
     device,
 ) -> torch.Tensor:
-    if _is_cuda or _is_hip:
+    if _is_cuda:
+        from sglang.jit_kernel.assign_extend_cache_locs import (
+            assign_extend_cache_locs_cuda,
+        )
+
+        out_cache_loc = torch.empty(
+            (batch_size * draft_token_num,),
+            dtype=torch.int64,
+            device=device,
+        )
+        assign_extend_cache_locs_cuda(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+        )
+
+        return out_cache_loc
+
+    elif _is_hip:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int64,

@@ -1,0 +1,505 @@
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+import torch
+
+from sglang.srt.managers.schedule_batch import (
+    BaseFinishReason,
+    FINISH_ABORT,
+    Req,
+    ScheduleBatch,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.smc.smc_debug_utils import append_smc_diag_record, smc_diag_enabled
+from sglang.srt.smc.smc_info import SMCDraftInput
+from sglang.srt.smc.smc_utils import (
+    _release_internal_req,
+    clone_req_for_smc_particle,
+    compute_smc_shared_prefix_len,
+    validate_smc_parent_req,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+@dataclass
+class SMCFinishedParticleSnapshot:
+    output_ids: List[int]
+    finished_reason: Optional[BaseFinishReason]
+    finished_len: Optional[int]
+
+
+@dataclass
+class SMCGroupState:
+    group_id: str
+    parent_req: Req
+    particle_reqs: Dict[int, Req]
+    log_weights: torch.Tensor
+    step_counts: List[int] = field(default_factory=list)
+    resampled_at_step: int = 0
+    finished_particles: Dict[int, SMCFinishedParticleSnapshot] = field(
+        default_factory=dict
+    )
+    # Deferred log_weight updates: list of (particle_indices, logprob_diffs)
+    # Applied lazily in _launch_pending_resamples / _finalize to keep
+    # on_batch_done 100% CPU (zero GPU kernel launches).
+    pending_diffs: List[tuple] = field(default_factory=list)
+    visible_particle_idx: Optional[int] = None
+
+    def flush_pending_diffs(self) -> None:
+        """Apply all deferred log_weight updates to the GPU tensor.
+
+        Called from _launch_pending_resamples (synchronous) or _finalize_group.
+        This is the only place GPU log_weight kernels fire.
+        """
+        if not self.pending_diffs:
+            return
+        lw = self.log_weights
+        dev = lw.device
+        for pidxs, diffs in self.pending_diffs:
+            if isinstance(pidxs, int):
+                # Single particle: pidxs is a plain int, diffs is 1-elem tensor
+                lw[pidxs] += diffs[0].to(dtype=lw.dtype, device=dev)
+            else:
+                # Multiple particles: pidxs is a Python list
+                pidx_t = torch.tensor(pidxs, dtype=torch.int64, device=dev)
+                lw[pidx_t] += diffs.to(dtype=lw.dtype, device=dev)
+        self.pending_diffs.clear()
+
+    def active_particle_indices(self) -> List[int]:
+        return [
+            idx
+            for idx, req in self.particle_reqs.items()
+            if idx not in self.finished_particles and not req.finished()
+        ]
+
+    def all_active_aligned(self) -> bool:
+        """Check that all active particles have taken the same number of steps
+        and have advanced past the last resampling point."""
+        active = self.active_particle_indices()
+        if not active:
+            return True
+        first_count = self.step_counts[active[0]]
+        if first_count <= self.resampled_at_step:
+            return False
+        for idx in active[1:]:
+            if self.step_counts[idx] != first_count:
+                return False
+        return True
+
+class SMCManager:
+    def __init__(self, server_args):
+        self.server_args = server_args
+        self.groups: Dict[str, SMCGroupState] = {}
+        self.req_to_token_pool = None
+        self.token_to_kv_pool_allocator = None
+        self.device: torch.device | str = "cpu"
+
+    def has_active_groups(self) -> bool:
+        return bool(self.groups)
+
+    def smc_held_token_count(self) -> int:
+        """Count unique token slots held by SMC particle requests.
+
+        Particles within a group share prefix token slots (via refcount),
+        so we collect the union of all referenced slot indices to avoid
+        double-counting shared slots.
+        """
+        if not self.groups or self.req_to_token_pool is None:
+            return 0
+        held: set = set()
+        for group in self.groups.values():
+            for req in group.particle_reqs.values():
+                if req.req_pool_idx is None:
+                    continue
+                allocated = int(req.kv_allocated_len)
+                if allocated > 0:
+                    indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :allocated
+                    ]
+                    held.update(indices.cpu().tolist())
+        return len(held)
+
+    def clear(self) -> None:
+        self.groups.clear()
+
+    def get_group(self, group_id: Optional[str]) -> Optional[SMCGroupState]:
+        if group_id is None:
+            return None
+        return self.groups.get(group_id)
+
+    def get_group_for_req(self, req: Req) -> Optional[SMCGroupState]:
+        return self.get_group(req.smc_group_id)
+
+    def get_active_particle_reqs(self, group_id: Optional[str]) -> List[Req]:
+        group = self.get_group(group_id)
+        if group is None:
+            return []
+        return [
+            group.particle_reqs[idx]
+            for idx in sorted(group.active_particle_indices())
+        ]
+
+    def get_active_particle_reqs_in_collection(
+        self,
+        group_id: Optional[str],
+        reqs: List[Req],
+    ) -> List[Req]:
+        if group_id is None:
+            return []
+        req_ids = {id(req) for req in reqs}
+        return [
+            req
+            for req in self.get_active_particle_reqs(group_id)
+            if id(req) in req_ids
+        ]
+
+    def all_active_members_present(
+        self,
+        group_id: Optional[str],
+        reqs: List[Req],
+    ) -> bool:
+        active = self.get_active_particle_reqs(group_id)
+        if not active:
+            return False
+        req_ids = {id(req) for req in reqs}
+        return all(id(req) in req_ids for req in active)
+
+    def get_particle_lag(self, req: Req) -> int:
+        group = self.get_group_for_req(req)
+        if group is None:
+            return 0
+        counts = group.step_counts
+        active = group.active_particle_indices()
+        if not active:
+            return 0
+        max_step = max(counts[idx] for idx in active)
+        return max_step - counts[req.smc_particle_idx]
+
+    def get_group_lag(self, group_id: Optional[str]) -> int:
+        group = self.get_group(group_id)
+        if group is None:
+            return 0
+        active = group.active_particle_indices()
+        if not active:
+            return 0
+        counts = group.step_counts
+        max_step = max(counts[idx] for idx in active)
+        min_active_step = min(counts[idx] for idx in active)
+        return max_step - min_active_step
+
+    def create_group(self, parent_req: Req, scheduler) -> Optional[str]:
+        if parent_req.rid in self.groups:
+            return None
+        self.req_to_token_pool = scheduler.req_to_token_pool
+        self.token_to_kv_pool_allocator = scheduler.token_to_kv_pool_allocator
+        self.device = scheduler.device
+
+        error = validate_smc_parent_req(parent_req)
+        if error is not None:
+            return error
+
+        particle_reqs: List[Req] = []
+        for particle_idx in range(self.server_args.smc_n_particles):
+            particle_req = clone_req_for_smc_particle(
+                parent_req,
+                particle_idx=particle_idx,
+                temperature=self.server_args.smc_draft_temperature,
+                return_logprob=False,
+            )
+            particle_req.smc_group_id = parent_req.rid
+            particle_reqs.append(particle_req)
+
+        if scheduler.req_to_token_pool.alloc(particle_reqs) is None:
+            return "SMC particle allocation failed because req_to_token_pool is full."
+
+        shared_seq_len = compute_smc_shared_prefix_len(parent_req)
+        page_size = int(scheduler.token_to_kv_pool_allocator.page_size)
+        shared_full_pages_len = shared_seq_len
+        shared_tail_len = 0
+        if page_size > 1:
+            shared_full_pages_len = (shared_seq_len // page_size) * page_size
+            shared_tail_len = shared_seq_len - shared_full_pages_len
+
+        tail_allocs: List[torch.Tensor] = []
+
+        def cleanup_partial_group_allocs():
+            for locs in tail_allocs:
+                scheduler.token_to_kv_pool_allocator.dec_ref_and_free(locs)
+            for req in particle_reqs:
+                if req.req_pool_idx is not None:
+                    scheduler.req_to_token_pool.free(req)
+
+        for particle_req in particle_reqs:
+            scheduler.req_to_token_pool.copy_block_table(
+                parent_req.req_pool_idx,
+                particle_req.req_pool_idx,
+                shared_full_pages_len,
+                scheduler.token_to_kv_pool_allocator,
+            )
+            if shared_tail_len > 0:
+                if not hasattr(scheduler.model_worker, "copy_smc_kv_cache"):
+                    cleanup_partial_group_allocs()
+                    return "SMC partial-page prefix cloning requires copy_smc_kv_cache."
+                tail_page_locs = scheduler.token_to_kv_pool_allocator.alloc(page_size)
+                if tail_page_locs is None:
+                    cleanup_partial_group_allocs()
+                    return "SMC particle partial-page allocation failed because KV pool is full."
+                tail_allocs.append(tail_page_locs)
+                dst_tail_locs = tail_page_locs[:shared_tail_len]
+                src_tail_locs = scheduler.req_to_token_pool.req_to_token[
+                    parent_req.req_pool_idx,
+                    shared_full_pages_len:shared_seq_len,
+                ].to(dtype=torch.int64, copy=True)
+                scheduler.model_worker.copy_smc_kv_cache(dst_tail_locs, src_tail_locs)
+                scheduler.req_to_token_pool.write(
+                    (
+                        particle_req.req_pool_idx,
+                        slice(shared_full_pages_len, shared_seq_len),
+                    ),
+                    dst_tail_locs.to(dtype=torch.int32),
+                )
+            particle_req.kv_committed_len = shared_seq_len
+            particle_req.kv_allocated_len = shared_seq_len
+            particle_req.prefix_indices = scheduler.req_to_token_pool.req_to_token[
+                particle_req.req_pool_idx, :shared_seq_len
+            ].to(dtype=torch.int64, copy=True)
+            particle_req.cache_protected_len = shared_seq_len
+
+        if smc_diag_enabled and shared_tail_len > 0:
+            append_smc_diag_record(
+                {
+                    "type": "partial_page_prefix_clone",
+                    "group_id": parent_req.rid,
+                    "shared_seq_len": shared_seq_len,
+                    "shared_full_pages_len": shared_full_pages_len,
+                    "shared_tail_len": shared_tail_len,
+                    "page_size": page_size,
+                    "num_particles": len(particle_reqs),
+                }
+            )
+
+        group = SMCGroupState(
+            group_id=parent_req.rid,
+            parent_req=parent_req,
+            particle_reqs={req.smc_particle_idx: req for req in particle_reqs},
+            log_weights=torch.zeros(
+                self.server_args.smc_n_particles,
+                dtype=torch.float64,
+                device=self.device,
+            ),
+            step_counts=[0] * self.server_args.smc_n_particles,
+            visible_particle_idx=0 if parent_req.stream else None,
+        )
+        self.groups[parent_req.rid] = group
+        return None
+
+    def _build_particle_batch(
+        self,
+        particle_reqs: List[Req],
+        scheduler,
+        use_future_map: bool = True,
+    ) -> ScheduleBatch:
+        batch = ScheduleBatch.init_new(
+            reqs=particle_reqs,
+            req_to_token_pool=scheduler.req_to_token_pool,
+            token_to_kv_pool_allocator=scheduler.token_to_kv_pool_allocator,
+            tree_cache=scheduler.tree_cache,
+            model_config=scheduler.model_config,
+            enable_overlap=scheduler.enable_overlap,
+            spec_algorithm=SpeculativeAlgorithm.SMC,
+        )
+        batch.forward_mode = ForwardMode.DECODE
+        batch.multimodal_inputs = [None] * len(particle_reqs)
+        batch.req_pool_indices = torch.tensor(
+            [req.req_pool_idx for req in particle_reqs],
+            dtype=torch.int64,
+            device=scheduler.device,
+        )
+        committed_seq_lens = torch.tensor(
+            [compute_smc_shared_prefix_len(req) for req in particle_reqs],
+            dtype=torch.int64,
+            device=scheduler.device,
+        )
+        batch.seq_lens = committed_seq_lens
+        batch.seq_lens_cpu = committed_seq_lens.cpu()
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+        batch.orig_seq_lens = committed_seq_lens.to(dtype=torch.int32)
+        last_token_ids = torch.tensor(
+            [
+                req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
+                for req in particle_reqs
+            ],
+            dtype=torch.int32,
+            device=scheduler.device,
+        )
+        batch.output_ids = last_token_ids
+        batch.top_logprobs_nums = [0] * len(particle_reqs)
+        batch.token_ids_logprobs = [None] * len(particle_reqs)
+        from sglang.srt.server_args import get_global_server_args
+        server_args = get_global_server_args()
+        batch.spec_info = SMCDraftInput(
+            verified_id=last_token_ids,
+            new_seq_lens=committed_seq_lens,
+            num_tokens_per_req=server_args.speculative_num_draft_tokens,
+        )
+        if use_future_map and scheduler.enable_overlap and scheduler.future_map is not None:
+            future_indices = scheduler.future_map.alloc_future_indices(len(particle_reqs))
+            scheduler.future_map.store_to_map_for_new_smc_batch(
+                future_indices,
+                batch.spec_info,
+            )
+            batch.spec_info.future_indices = future_indices
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch,
+            scheduler.model_config.vocab_size,
+        )
+        return batch
+
+    def on_particle_finished(self, req: Req) -> None:
+        group = self.groups.get(req.smc_group_id)
+        if group is None:
+            return
+        particle_idx = req.smc_particle_idx
+        if particle_idx in group.finished_particles:
+            return
+        group.finished_particles[particle_idx] = SMCFinishedParticleSnapshot(
+            output_ids=list(req.output_ids),
+            finished_reason=copy.copy(req.finished_reason),
+            finished_len=req.finished_len,
+        )
+
+    def sync_visible_parent(self, group: SMCGroupState) -> Optional[Req]:
+        visible_idx = group.visible_particle_idx
+        if visible_idx is None:
+            return None
+
+        parent_req = group.parent_req
+        if visible_idx in group.finished_particles:
+            snapshot = group.finished_particles[visible_idx]
+            output_ids = snapshot.output_ids
+            finished_reason = snapshot.finished_reason
+            finished_len = snapshot.finished_len
+        else:
+            visible_req = group.particle_reqs.get(visible_idx)
+            if visible_req is None:
+                return None
+            output_ids = visible_req.output_ids
+            finished_reason = visible_req.finished_reason
+            finished_len = visible_req.finished_len
+
+        if len(output_ids) < parent_req.send_token_offset:
+            return parent_req
+
+        parent_req.output_ids = list(output_ids)
+        if finished_reason is not None:
+            parent_req.finished_reason = copy.copy(finished_reason)
+            parent_req.finished_len = (
+                finished_len if finished_len is not None else len(parent_req.output_ids)
+            )
+        return parent_req
+
+    def _finalize_group(self, group_id: str) -> Optional[Req]:
+        group = self.groups.pop(group_id, None)
+        if group is None:
+            return None
+
+        # Flush deferred log_weight diffs so best-particle selection is correct
+        group.flush_pending_diffs()
+
+        def _visible_output_len(
+            output_ids: List[int],
+            finished_len: Optional[int],
+        ) -> int:
+            if finished_len is None:
+                return len(output_ids)
+            return min(finished_len, len(output_ids))
+
+        particle_outputs = {}
+        for particle_idx, req in group.particle_reqs.items():
+            if particle_idx in group.finished_particles:
+                snapshot = group.finished_particles[particle_idx]
+                output_ids = snapshot.output_ids
+                finish_reason = snapshot.finished_reason
+                finished_len = snapshot.finished_len
+            else:
+                output_ids = list(req.output_ids)
+                finish_reason = copy.copy(req.finished_reason)
+                finished_len = req.finished_len
+
+            particle_outputs[particle_idx] = (output_ids, finish_reason, finished_len)
+
+        best_idx = None
+        best_key = None
+        best_output_ids: List[int] = []
+        best_finish_reason: Optional[BaseFinishReason] = None
+        best_finished_len: Optional[int] = None
+
+        if group.visible_particle_idx is not None:
+            best_idx = group.visible_particle_idx
+            best_output_ids, best_finish_reason, best_finished_len = particle_outputs[
+                best_idx
+            ]
+        else:
+            for particle_idx, (
+                output_ids,
+                finish_reason,
+                finished_len,
+            ) in particle_outputs.items():
+                key = (
+                    float(group.log_weights[particle_idx].item()),
+                    _visible_output_len(output_ids, finished_len),
+                )
+                if best_key is None or key > best_key:
+                    best_idx = particle_idx
+                    best_key = key
+                    best_output_ids = output_ids
+                    best_finish_reason = finish_reason
+                    best_finished_len = finished_len
+
+        if smc_diag_enabled:
+            append_smc_diag_record(
+                {
+                    "type": "finalize_group",
+                    "group_id": group_id,
+                    "log_weights": [float(x) for x in group.log_weights.tolist()],
+                    "best_idx": best_idx,
+                    "visible_particle_idx": group.visible_particle_idx,
+                    "particle_output_ids": {
+                        str(particle_idx): list(output_ids)
+                        for particle_idx, (
+                            output_ids,
+                            _finish_reason,
+                            _finished_len,
+                        ) in particle_outputs.items()
+                    },
+                    "best_output_ids": list(best_output_ids),
+                }
+            )
+
+        # Release KV cache and req_pool entries for all particle requests.
+        # Particles that were already released during decode (finished early)
+        # will be skipped by _release_internal_req (req_pool_idx is None).
+        for particle_idx, req in group.particle_reqs.items():
+            _release_internal_req(
+                req,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            )
+
+        parent_req = group.parent_req
+        parent_req.output_ids = list(best_output_ids)
+        parent_req.finished_reason = (
+            best_finish_reason
+            if best_finish_reason is not None
+            else FINISH_ABORT("SMC group finalized without a finished particle.")
+        )
+        parent_req.finished_len = (
+            best_finished_len
+            if best_finished_len is not None
+            else len(parent_req.output_ids)
+        )
+        return parent_req

@@ -494,7 +494,7 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 ) -> torch.Tensor:
     assert input_scale is None
 
-    input_2d = input.view(-1, input.shape[-1])
+    input_2d = input.view(-1, input.shape[-1]).contiguous()
     backend = _get_flashinfer_groupwise_backend()
     # TRTLLM backend requires K dimension >= 256.
     if backend == "trtllm" and input_2d.shape[1] < 256:
@@ -590,7 +590,7 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
             input, weight, block_size, weight_scale, input_scale, bias
         )
 
-    input_2d = input.view(-1, input.shape[-1])
+    input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     # - input: (M, K) BF16 or FP8
@@ -620,8 +620,11 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
 ) -> torch.Tensor:
     assert input_scale is None
 
-    # TODO: add more robust shape check here
-    shape_supported = weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
+    shape_supported = (
+        block_size == [128, 128]
+        and weight.shape[0] % 128 == 0
+        and weight.shape[1] % 128 == 0
+    )
 
     if not shape_supported:
         # fallback to triton
@@ -629,7 +632,7 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
             input, weight, block_size, weight_scale, input_scale, bias
         )
 
-    input_2d = input.view(-1, input.shape[-1])
+    input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = per_token_group_quant_fp8(
@@ -672,7 +675,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             input, weight, block_size, weight_scale, input_scale, bias
         )
 
-    input_2d = input.view(-1, input.shape[-1])
+    input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = sglang_per_token_group_quant_fp8(

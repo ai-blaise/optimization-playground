@@ -82,6 +82,7 @@ The `ai-blaise/optimization-playground` fork includes additional opt-in paths fo
 
 - **Vanilla IndexCache**: `--nsa-indexer-mode indexcache` with `--nsa-indexcache-pattern` selects Full and Shared indexer layers explicitly. The searched 1/4-uniform pattern used by the REAP benchmark scripts is `FSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSF`.
 - **Dense MLA TurboQuant**: `--enable-turboquant-dense-kv-cache` compresses only the dense MLA KV cache. It does not compress the sparse NSA indexer KV buffers, and it should still be used with sparse attention mode.
+- **SMC-SD**: `--speculative-algorithm SMC` enables the Sequential Monte Carlo speculative decoding path. The REAP path is intended to run SMC-SD on top of IndexCache and dense TurboQuant, with an FP8 draft model that has been token-aligned to DeepSeek V3.2.
 
 Example REAP launch with IndexCache and dense TurboQuant:
 
@@ -107,9 +108,38 @@ python -m sglang.launch_server \
   --speculative-num-draft-tokens 4
 ```
 
+Example REAP launch with IndexCache, dense TurboQuant, and SMC-SD:
+
+```bash
+python -m sglang.launch_server \
+  --model-path cerebras/DeepSeek-V3.2-REAP-345B-A37B \
+  --revision 4fd8e8c3e08442c4a6dde6dd3fa3dac481a0205b \
+  --tp 8 \
+  --dp 8 \
+  --enable-dp-attention \
+  --trust-remote-code \
+  --kv-cache-dtype bfloat16 \
+  --nsa-prefill-backend flashmla_kv \
+  --nsa-decode-backend flashmla_kv \
+  --nsa-indexer-mode indexcache \
+  --nsa-indexcache-pattern FSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSF \
+  --enable-turboquant-dense-kv-cache \
+  --turboquant-dense-kv-preset latent_2p5bit_nc \
+  --turboquant-execution-mode fused_decode \
+  --speculative-algorithm SMC \
+  --speculative-draft-model-path BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP \
+  --speculative-draft-model-quantization fp8 \
+  --speculative-draft-attention-backend triton \
+  --smc-n-particles 4 \
+  --smc-gamma 4 \
+  --smc-resample-threshold 0.5
+```
+
 TurboQuant currently requires `--kv-cache-dtype bfloat16`; the compressed dense MLA cache is managed by the TurboQuant pool. Using `--kv-cache-dtype fp8_e4m3` together with `--enable-turboquant-dense-kv-cache` is rejected.
 
-`--nsa-indexer-mode indexcache-hisa` is present for continued experimentation, but the current HISA optimization loop is not part of the accepted REAP production path until it passes the benchmark gates against the IndexCache baseline.
+The SMC-SD path was brought in from the reference SMC-SD SGLang integration and adapted for the current `ForwardBatch`/worker APIs, FP8 draft loading, DeepSeek V3.2 REAP TP=8/DP=8 with DP attention, and an IndexCache+dense TurboQuant target. The current 16K/4K gate improves end-to-end throughput over vanilla MTP by about 7.0%, but still regresses mean TTFT by about 6.7%, so treat SMC-SD as the primary experimental optimization path until the TTFT gate is closed.
+
+`--nsa-indexer-mode indexcache-hisa` is also present for continued experimentation. HISA remains paper-aligned with block top-k 64 and index top-k 2048; the optimization-playground variant broadens long-prefill dispatch coverage above the HISA boundary while leaving dense TurboQuant and IndexCache semantics unchanged. The best current 32K/4K gate improves end-to-end throughput by about 0.7% but regresses mean TTFT by about 0.1%, so it is not part of the accepted REAP production path until it passes the benchmark gates against the IndexCache+dense TurboQuant baseline.
 
 ## Multi-token Prediction
 SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.

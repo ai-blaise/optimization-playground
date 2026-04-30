@@ -73,23 +73,25 @@ def _fp8_paged_block_mean_pooling_kernel(
         page_slot = offs_t // PAGE_SIZE
         token_in_page = offs_t % PAGE_SIZE
         page = tl.load(block_pages + block_id * (K_BLOCK_SIZE // PAGE_SIZE) + page_slot)
+        valid_token = (offs_t < token_count) & (page >= 0)
+        safe_page = tl.maximum(page, 0)
 
         k = tl.load(
             buf_fp8
-            + page[:, None] * PAGE_BYTES
+            + safe_page[:, None] * PAGE_BYTES
             + token_in_page[:, None] * INDEX_DIM
             + offs_d[None, :],
-            mask=offs_t[:, None] < token_count,
+            mask=valid_token[:, None],
             other=0.0,
         ).to(tl.float32)
         scale = tl.load(
-            buf_f32 + page * PAGE_FLOATS + SCALE_OFFSET + token_in_page,
-            mask=offs_t < token_count,
+            buf_f32 + safe_page * PAGE_FLOATS + SCALE_OFFSET + token_in_page,
+            mask=valid_token,
             other=0.0,
         )
         acc += tl.sum(k * scale[:, None], axis=0)
 
-    mean = acc / token_count.to(tl.float32)
+    mean = acc / tl.maximum(token_count, 1).to(tl.float32)
     abs_max = tl.max(tl.abs(mean), axis=0)
     out_scale = tl.maximum(abs_max * (1.0 / 448.0), 1.0e-10)
     tl.store(blocked_k + block_id * INDEX_DIM + offs_d, mean / out_scale)
@@ -135,6 +137,7 @@ def fp8_paged_block_sparse_mqa_attn_return_logits_interface(
         PAGE_SIZE=page_size,
         INDEX_DIM=index_dim,
         KV_BLOCK_SIZE=kv_block_size,
+        NUM_BLOCKS=block_pages.shape[0],
         TOPK=topk,
         BLOCK_T=kv_block_size,
         HEADS=heads,
@@ -159,6 +162,7 @@ def _fp8_paged_block_sparse_mqa_kernel(
     PAGE_SIZE: tl.constexpr,
     INDEX_DIM: tl.constexpr,
     KV_BLOCK_SIZE: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HEADS: tl.constexpr,
@@ -173,29 +177,43 @@ def _fp8_paged_block_sparse_mqa_kernel(
     topk_block_id = tl.load(topk_block_index + query_id * TOPK + topk_id)
     first_block = tl.load(cu_seqlen_blocked_ks + query_id)
     prefix_len = tl.load(prefix_lens + query_id)
+    block_count = tl.cdiv(prefix_len, KV_BLOCK_SIZE)
+    last_block = first_block + block_count
+    valid_block = (
+        (topk_block_id >= first_block)
+        & (topk_block_id < last_block)
+        & (topk_block_id >= 0)
+        & (topk_block_id < NUM_BLOCKS)
+    )
+    safe_block_id = tl.minimum(tl.maximum(topk_block_id, 0), NUM_BLOCKS - 1)
     local_block_id = topk_block_id - first_block
     page_slot = offs_t // PAGE_SIZE
     token_in_page = offs_t % PAGE_SIZE
-    page = tl.load(block_pages + topk_block_id * (KV_BLOCK_SIZE // PAGE_SIZE) + page_slot)
+    page = tl.load(block_pages + safe_block_id * (KV_BLOCK_SIZE // PAGE_SIZE) + page_slot)
+    token_offset = local_block_id * KV_BLOCK_SIZE + offs_t
+    valid = valid_block & (token_offset >= 0) & (token_offset < prefix_len) & (page >= 0)
+    safe_page = tl.maximum(page, 0)
 
     k = tl.load(
         buf_fp8
-        + page[:, None] * PAGE_BYTES
+        + safe_page[:, None] * PAGE_BYTES
         + token_in_page[:, None] * INDEX_DIM
         + offs_d[None, :],
+        mask=valid[:, None],
+        other=0.0,
     )
     q_tile = tl.load(
         q + query_id * HEADS * INDEX_DIM + offs_h[:, None] * INDEX_DIM + offs_d[None, :]
     )
     dot = tl.dot(k, tl.trans(q_tile))
-    scale = tl.load(buf_f32 + page * PAGE_FLOATS + SCALE_OFFSET + token_in_page)
+    scale = tl.load(
+        buf_f32 + safe_page * PAGE_FLOATS + SCALE_OFFSET + token_in_page,
+        mask=valid,
+        other=0.0,
+    )
     w = tl.load(weights + query_id * HEADS + offs_h)
     score = tl.sum(tl.maximum(dot * scale[:, None], 0.0) * w[None, :], axis=1)
 
-    token_offset = local_block_id * KV_BLOCK_SIZE + offs_t
-    valid = (topk_block_id >= first_block) & (token_offset >= 0) & (
-        token_offset < prefix_len
-    )
     score = tl.where(valid, score, -float("inf"))
     out = query_id * TOPK * KV_BLOCK_SIZE + topk_id * KV_BLOCK_SIZE
     tl.store(logits + out + offs_t, score)

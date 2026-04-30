@@ -28,10 +28,11 @@ def clean_and_maintain_logits_(
         for n_i in T.Pipelined(T.ceildiv(seq_len_kv, block_K)):
             for k_i in T.serial(block_K // threads):
                 idx = n_i * block_K + k_i * threads + tx
-                if idx == cu_k_s or idx == cu_k_e - 1:
-                    Logits[bx, idx] = T.infinity(dtype)
-                if idx < cu_k_s or idx >= cu_k_e:
-                    Logits[bx, idx] = -T.infinity(dtype)
+                if idx < seq_len_kv:
+                    if idx == cu_k_s or idx == cu_k_e - 1:
+                        Logits[bx, idx] = T.infinity(dtype)
+                    if idx < cu_k_s or idx >= cu_k_e:
+                        Logits[bx, idx] = -T.infinity(dtype)
 
 
 def clean_and_maintain_logits_interface(

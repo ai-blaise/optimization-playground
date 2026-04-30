@@ -108,14 +108,67 @@ def pool_mqa_attn_return_logits_fp8_interface(
     cu_seqlen_blocked_ke: torch.Tensor,
     block_N: int = 256,
 ):
-    """Raw kernel invocation; zero-inits logits so positions the kernel
-    doesn't touch are 0 (matches the ref)."""
     seq_len, heads, index_dim = q_fp8.shape
     seq_len_blocked_kv = blocked_kv_fp8.shape[0]
+    if block_N == 256 and seq_len_blocked_kv <= 128:
+        block_N = 128
+    block_q = 128 // heads
+    padded_seq_len = ((seq_len + block_q - 1) // block_q) * block_q
+    padded_blocked_kv = ((seq_len_blocked_kv + block_N - 1) // block_N) * block_N
 
-    logits = torch.zeros([seq_len, seq_len_blocked_kv], device=q_fp8.device, dtype=torch.float32)
+    if padded_seq_len != seq_len:
+        q_padded = torch.zeros(
+            (padded_seq_len, heads, index_dim),
+            device=q_fp8.device,
+            dtype=q_fp8.dtype,
+        )
+        weights_padded = torch.zeros(
+            (padded_seq_len, heads),
+            device=weights_f32.device,
+            dtype=weights_f32.dtype,
+        )
+        cu_ks_padded = torch.zeros(
+            (padded_seq_len,),
+            device=cu_seqlen_blocked_ks.device,
+            dtype=cu_seqlen_blocked_ks.dtype,
+        )
+        cu_ke_padded = torch.zeros(
+            (padded_seq_len,),
+            device=cu_seqlen_blocked_ke.device,
+            dtype=cu_seqlen_blocked_ke.dtype,
+        )
+        q_padded[:seq_len] = q_fp8
+        weights_padded[:seq_len] = weights_f32
+        cu_ks_padded[:seq_len] = cu_seqlen_blocked_ks
+        cu_ke_padded[:seq_len] = cu_seqlen_blocked_ke
+        q_fp8 = q_padded
+        weights_f32 = weights_padded
+        cu_seqlen_blocked_ks = cu_ks_padded
+        cu_seqlen_blocked_ke = cu_ke_padded
+
+    if padded_blocked_kv != seq_len_blocked_kv:
+        blocked_kv_padded = torch.zeros(
+            (padded_blocked_kv, index_dim),
+            device=blocked_kv_fp8.device,
+            dtype=blocked_kv_fp8.dtype,
+        )
+        blocked_kv_scale_padded = torch.zeros(
+            (padded_blocked_kv,),
+            device=blocked_kv_scale.device,
+            dtype=blocked_kv_scale.dtype,
+        )
+        blocked_kv_padded[:seq_len_blocked_kv] = blocked_kv_fp8
+        blocked_kv_scale_padded[:seq_len_blocked_kv] = blocked_kv_scale
+        blocked_kv_fp8 = blocked_kv_padded
+        blocked_kv_scale = blocked_kv_scale_padded
+
+    logits = torch.empty(
+        [padded_seq_len, padded_blocked_kv],
+        device=q_fp8.device,
+        dtype=torch.float32,
+    )
     pool_mqa_attn_return_logits_fp8(
-        q_fp8.view(seq_len * heads, index_dim),
+        q_fp8.view(padded_seq_len * heads, index_dim),
         blocked_kv_fp8,
         blocked_kv_scale,
         logits,
@@ -126,4 +179,4 @@ def pool_mqa_attn_return_logits_fp8_interface(
         index_dim=index_dim,
         block_N=block_N,
     )
-    return logits
+    return logits[:seq_len]

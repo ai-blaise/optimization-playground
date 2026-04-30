@@ -550,6 +550,7 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    smc_draft_kv_cache_dtype: Optional[str] = None
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
     smc_n_particles: int = 4
@@ -3525,10 +3526,15 @@ class ServerArgs:
                     if self.speculative_attention_mode == "decode"
                     else prefill_attention_backend
                 )
-            smc_supported_backends = {"triton", "fa3"}
+            smc_supported_target_backends = {"triton", "fa3"}
+            smc_supported_draft_backends = {
+                "triton",
+                "fa3",
+                "trtllm_mha",
+            }
             from sglang.srt.configs.model_config import is_deepseek_nsa
 
-            target_supported_backends = set(smc_supported_backends)
+            target_supported_backends = set(smc_supported_target_backends)
             if self.model_path.lower() in ["none", "dummy"]:
                 pass
             elif is_deepseek_nsa(self.get_model_config().hf_config):
@@ -3543,7 +3549,7 @@ class ServerArgs:
                     unsupported_attention_backends[name] = backend
             if (
                 draft_attention_backend is not None
-                and draft_attention_backend not in smc_supported_backends
+                and draft_attention_backend not in smc_supported_draft_backends
             ):
                 unsupported_attention_backends[
                     "speculative_draft_attention_backend"
@@ -3556,13 +3562,23 @@ class ServerArgs:
                 raise ValueError(
                     "Currently SMC speculative decoding only supports target "
                     f"attention backends {target_supported_backends} and draft "
-                    f"attention backends {smc_supported_backends}. "
+                    f"attention backends {smc_supported_draft_backends}. "
                     f"Got {unsupported_text}."
                 )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+            if self.smc_draft_kv_cache_dtype == "bf16":
+                self.smc_draft_kv_cache_dtype = "bfloat16"
+            if self.smc_draft_kv_cache_dtype is not None and (
+                self.smc_draft_kv_cache_dtype
+                not in ("auto", "bfloat16", "fp8_e4m3", "fp8_e5m2")
+            ):
+                raise ValueError(
+                    "--smc-draft-kv-cache-dtype must be one of auto, bfloat16, "
+                    "fp8_e4m3, or fp8_e5m2."
                 )
 
             self.enable_mixed_chunk = False
@@ -5669,6 +5685,17 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--smc-draft-kv-cache-dtype",
+            type=str,
+            choices=("auto", "bfloat16", "bf16", "fp8_e4m3", "fp8_e5m2"),
+            default=ServerArgs.smc_draft_kv_cache_dtype,
+            help=(
+                "SMC-only draft-model KV cache dtype override. This keeps the "
+                "target model's --kv-cache-dtype unchanged, which is required "
+                "when the target uses dense TurboQuant KV."
+            ),
         )
         parser.add_argument(
             "--smc-n-particles",

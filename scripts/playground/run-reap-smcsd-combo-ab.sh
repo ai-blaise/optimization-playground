@@ -48,8 +48,11 @@ TURBOQUANT_RESIDUAL_WINDOW_SIZE=${TURBOQUANT_RESIDUAL_WINDOW_SIZE:-128}
 TURBOQUANT_EXECUTION_MODE=${TURBOQUANT_EXECUTION_MODE:-fused_decode}
 TURBOQUANT_MLA_DECODE_NUM_SPLITS=${TURBOQUANT_MLA_DECODE_NUM_SPLITS:-16}
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION=${SPECULATIVE_DRAFT_MODEL_QUANTIZATION:-fp8}
+SMC_DRAFT_KV_CACHE_DTYPE=${SMC_DRAFT_KV_CACHE_DTYPE:-fp8_e4m3}
 FP8_GEMM_BACKEND=${FP8_GEMM_BACKEND:-auto}
-SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND=${SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND:-triton}
+SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND=${SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND:-cutlass}
+BASELINE_SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND=${BASELINE_SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND:-}
+CANDIDATE_SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND=${CANDIDATE_SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND:-}
 SPECULATIVE_MOE_RUNNER_BACKEND=${SPECULATIVE_MOE_RUNNER_BACKEND:-}
 SMC_N_PARTICLES=${SMC_N_PARTICLES:-4}
 SMC_GAMMA=${SMC_GAMMA:-6}
@@ -410,12 +413,29 @@ run_one() {
   local smc_probe_record_path="${SGLANG_SMC_PROBE_RECORD_PATH}"
   local smc_diag_path="${SGLANG_SMC_DIAG_PATH}"
   local turboquant_args=("${TURBOQUANT_ARGS[@]}")
+  local smc_args=("${SMC_ARGS[@]}")
+  local smc_draft_fp8_gemm_backend="${SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND}"
   local turboquant_mla_decode_num_splits_effective="repo-default"
+  local smc_draft_kv_cache_dtype_effective="repo-default"
   mkdir -p "${run_dir}"
+
+  if [[ "${name}" == "baseline_combo" && -n "${BASELINE_SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND}" ]]; then
+    smc_draft_fp8_gemm_backend="${BASELINE_SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND}"
+  elif [[ "${name}" == "candidate_combo" && -n "${CANDIDATE_SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND}" ]]; then
+    smc_draft_fp8_gemm_backend="${CANDIDATE_SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND}"
+  fi
 
   if repo_supports_server_arg "${repo}" "turboquant_mla_decode_num_splits"; then
     turboquant_args+=(--turboquant-mla-decode-num-splits "${TURBOQUANT_MLA_DECODE_NUM_SPLITS}")
     turboquant_mla_decode_num_splits_effective="${TURBOQUANT_MLA_DECODE_NUM_SPLITS}"
+  fi
+  if [[ -n "${SMC_DRAFT_KV_CACHE_DTYPE}" ]]; then
+    if repo_supports_server_arg "${repo}" "smc_draft_kv_cache_dtype"; then
+      smc_args+=(--smc-draft-kv-cache-dtype "${SMC_DRAFT_KV_CACHE_DTYPE}")
+      smc_draft_kv_cache_dtype_effective="${SMC_DRAFT_KV_CACHE_DTYPE}"
+    else
+      smc_draft_kv_cache_dtype_effective="unsupported"
+    fi
   fi
 
   if [[ "${name}" == "candidate_combo" && "${SMC_PROBE}" == "1" && -z "${smc_probe_record_path}" ]]; then
@@ -452,8 +472,9 @@ run_one() {
     echo "turboquant_execution_mode=${TURBOQUANT_EXECUTION_MODE}"
     echo "turboquant_mla_decode_num_splits_requested=${TURBOQUANT_MLA_DECODE_NUM_SPLITS}"
     echo "turboquant_mla_decode_num_splits_effective=${turboquant_mla_decode_num_splits_effective}"
+    echo "smc_draft_kv_cache_dtype=${smc_draft_kv_cache_dtype_effective}"
     echo "fp8_gemm_backend=${FP8_GEMM_BACKEND}"
-    echo "sglang_smc_draft_fp8_gemm_backend=${SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND}"
+    echo "sglang_smc_draft_fp8_gemm_backend=${smc_draft_fp8_gemm_backend}"
     echo "smc_gamma=${SMC_GAMMA}"
     echo "smc_probe=${SMC_PROBE}"
     echo "sglang_smc_probe_record_path=${smc_probe_record_path}"
@@ -508,7 +529,7 @@ run_one() {
     SGLANG_SMC_DIAG_PATH="${smc_diag_path}" \
     SGLANG_SMC_PREFILL_STREAM_YIELD_MS="${SGLANG_SMC_PREFILL_STREAM_YIELD_MS}" \
     SGLANG_SMC_TARGET_VERIFY_GRAPH="${SGLANG_SMC_TARGET_VERIFY_GRAPH}" \
-    SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND="${SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND}" \
+    SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND="${smc_draft_fp8_gemm_backend}" \
     NCCL_IB_DISABLE="${NCCL_IB_DISABLE}" \
     NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE}" \
     NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL}" \
@@ -540,7 +561,7 @@ run_one() {
       "${CUSTOM_ALL_REDUCE_ARGS[@]}" \
       "${INDEXER_ARGS[@]}" \
       "${turboquant_args[@]}" \
-      "${SMC_ARGS[@]}" \
+      "${smc_args[@]}" \
       > "${log_file}" 2>&1 &
   echo $! > "${pid_file}"
 

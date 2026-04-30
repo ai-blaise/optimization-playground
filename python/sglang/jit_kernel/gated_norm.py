@@ -17,6 +17,7 @@ _SUPPORTED_DTYPE = torch.bfloat16
 _NEVER_USE_TORCH_MM = 1 << 60
 _TORCH_MM_MIN_TOKENS_ENV = "SGLANG_GATED_NORM_TORCH_MM_MIN_TOKENS"
 _TORCH_MM_RANK_MIN_TOKENS_ENV = {
+    1: "SGLANG_GATED_NORM_TORCH_MM_R1_MIN_TOKENS",
     8: "SGLANG_GATED_NORM_TORCH_MM_R8_MIN_TOKENS",
     32: "SGLANG_GATED_NORM_TORCH_MM_R32_MIN_TOKENS",
     64: "SGLANG_GATED_NORM_TORCH_MM_R64_MIN_TOKENS",
@@ -49,6 +50,8 @@ def _default_torch_mm_min_tokens(rank: int) -> int:
         return 512
     if rank >= 8:
         return 2048
+    if rank >= 1:
+        return 4096
     return _NEVER_USE_TORCH_MM
 
 
@@ -58,7 +61,7 @@ def _torch_mm_min_tokens(rank: int) -> int:
         return _parse_min_tokens(global_override, _default_torch_mm_min_tokens(rank))
 
     default = _default_torch_mm_min_tokens(rank)
-    for rank_floor in (64, 32, 8):
+    for rank_floor in (64, 32, 8, 1):
         if rank >= rank_floor:
             return _parse_min_tokens(
                 os.getenv(_TORCH_MM_RANK_MIN_TOKENS_ENV[rank_floor]),

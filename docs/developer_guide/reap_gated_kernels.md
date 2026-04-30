@@ -49,10 +49,10 @@ GatedNorm uses two BF16 execution paths:
   are faster than scalar per-token reductions.
 
 The default dispatch thresholds were measured on B200 for hidden size 7168:
-rank >= 64 uses GEMMs from 256 tokens, rank >= 32 from 512 tokens, and
-rank >= 8 from 2048 tokens. Set
+rank >= 64 uses GEMMs from 256 tokens, rank >= 32 from 512 tokens,
+rank >= 8 from 2048 tokens, and rank 1 from 4096 tokens. Set
 `SGLANG_GATED_NORM_TORCH_MM_MIN_TOKENS=-1` to force the Triton path, or use
-`SGLANG_GATED_NORM_TORCH_MM_R{8,32,64}_MIN_TOKENS` to tune rank-specific
+`SGLANG_GATED_NORM_TORCH_MM_R{1,8,32,64}_MIN_TOKENS` to tune rank-specific
 thresholds during autoinfer runs.
 
 Validation:

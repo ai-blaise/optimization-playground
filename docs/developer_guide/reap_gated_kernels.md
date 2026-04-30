@@ -41,10 +41,25 @@ are not ported here.
 The deployment contract for both G1 attention gating and GatedNorm is BF16.
 Other input dtypes are rejected by the inference wrapper.
 
+GatedNorm uses two BF16 execution paths:
+
+- a fused Triton per-token path for decode and small batches, where avoiding
+  extra launches and intermediate tensors is fastest;
+- a torch/cuBLAS BF16 GEMM path for larger prefill batches, where tensor cores
+  are faster than scalar per-token reductions.
+
+The default dispatch thresholds were measured on B200 for hidden size 7168:
+rank >= 64 uses GEMMs from 256 tokens, rank >= 32 from 512 tokens, and
+rank >= 8 from 2048 tokens. Set
+`SGLANG_GATED_NORM_TORCH_MM_MIN_TOKENS=-1` to force the Triton path, or use
+`SGLANG_GATED_NORM_TORCH_MM_R{8,32,64}_MIN_TOKENS` to tune rank-specific
+thresholds during autoinfer runs.
+
 Validation:
 
 ```bash
 python -m pytest -q python/sglang/jit_kernel/tests/test_gated_norm.py
+PYTHONPATH=python python scripts/playground/bench_gated_norm.py
 ```
 
 Both kernels should be validated on Blackwell before using the full Dynamo

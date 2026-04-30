@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -12,10 +14,61 @@ from sglang.kernel_api_logging import debug_kernel_api
 _MAX_BLOCK_H = 128
 _MAX_BLOCK_R = 64
 _SUPPORTED_DTYPE = torch.bfloat16
+_NEVER_USE_TORCH_MM = 1 << 60
+_TORCH_MM_MIN_TOKENS_ENV = "SGLANG_GATED_NORM_TORCH_MM_MIN_TOKENS"
+_TORCH_MM_RANK_MIN_TOKENS_ENV = {
+    8: "SGLANG_GATED_NORM_TORCH_MM_R8_MIN_TOKENS",
+    32: "SGLANG_GATED_NORM_TORCH_MM_R32_MIN_TOKENS",
+    64: "SGLANG_GATED_NORM_TORCH_MM_R64_MIN_TOKENS",
+}
 
 
 def _next_power_of_2(value: int, maximum: int) -> int:
     return min(triton.next_power_of_2(value), maximum)
+
+
+def _parse_min_tokens(raw: str | None, default: int) -> int:
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "GatedNorm torch-MM token thresholds must be integers; "
+            f"got {raw!r}"
+        ) from exc
+    if value < 0:
+        return _NEVER_USE_TORCH_MM
+    return value
+
+
+def _default_torch_mm_min_tokens(rank: int) -> int:
+    if rank >= 64:
+        return 256
+    if rank >= 32:
+        return 512
+    if rank >= 8:
+        return 2048
+    return _NEVER_USE_TORCH_MM
+
+
+def _torch_mm_min_tokens(rank: int) -> int:
+    global_override = os.getenv(_TORCH_MM_MIN_TOKENS_ENV)
+    if global_override is not None:
+        return _parse_min_tokens(global_override, _default_torch_mm_min_tokens(rank))
+
+    default = _default_torch_mm_min_tokens(rank)
+    for rank_floor in (64, 32, 8):
+        if rank >= rank_floor:
+            return _parse_min_tokens(
+                os.getenv(_TORCH_MM_RANK_MIN_TOKENS_ENV[rank_floor]),
+                default,
+            )
+    return default
+
+
+def _should_use_torch_mm(num_tokens: int, rank: int) -> bool:
+    return num_tokens >= _torch_mm_min_tokens(rank)
 
 
 def _validate_gated_norm_inputs(
@@ -115,6 +168,21 @@ def _gated_norm_forward_kernel(
         tl.store(output_ptr + token_idx * hidden_size + h, y * gate, mask=h_mask)
 
 
+def _gated_norm_torch_mm_forward(
+    flat_normed: torch.Tensor,
+    w_down: torch.Tensor,
+    w_up: torch.Tensor,
+    output: torch.Tensor,
+    hidden_size: int,
+) -> torch.Tensor:
+    z = torch.mm(flat_normed, w_down.t())
+    F.silu(z, inplace=True)
+    logits = torch.mm(z, w_up.t())
+    torch.sigmoid(logits, out=logits)
+    torch.mul(flat_normed, logits, out=output.reshape(-1, hidden_size))
+    return output
+
+
 @debug_kernel_api
 def gated_norm_forward(
     normed: torch.Tensor,
@@ -145,12 +213,19 @@ def gated_norm_forward(
     if num_tokens == 0:
         return output
 
+    w_down = w_down.contiguous()
+    w_up = w_up.contiguous()
+    if _should_use_torch_mm(num_tokens, rank):
+        return _gated_norm_torch_mm_forward(
+            flat_normed, w_down, w_up, output, hidden_size
+        )
+
     block_h = _next_power_of_2(hidden_size, _MAX_BLOCK_H)
     block_r = _next_power_of_2(rank, _MAX_BLOCK_R)
     _gated_norm_forward_kernel[(num_tokens,)](
         flat_normed,
-        w_down.contiguous(),
-        w_up.contiguous(),
+        w_down,
+        w_up,
         flat_output,
         hidden_size,
         rank,

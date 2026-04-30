@@ -54,6 +54,18 @@ def test_gated_norm_forward_out() -> None:
     torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
 
 
+def test_gated_norm_torch_mm_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SGLANG_GATED_NORM_TORCH_MM_MIN_TOKENS", "1")
+    torch.manual_seed(2028)
+    normed = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+    w_down = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16) / 8
+    w_up = torch.randn(128, 8, device="cuda", dtype=torch.bfloat16) / 8
+
+    actual = gated_norm_forward(normed, w_down, w_up)
+    expected = _reference(normed, w_down, w_up)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
 def test_gated_norm_rejects_non_bf16() -> None:
     normed = torch.empty(1, 128, device="cuda", dtype=torch.float16)
     w_down = torch.empty(8, 128, device="cuda", dtype=torch.float16)

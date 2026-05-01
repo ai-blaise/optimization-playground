@@ -402,6 +402,10 @@ def _wrap(host: str) -> str:
     return f"[{host}]" if _is_ipv6(host) else host
 
 
+def maybe_wrap_ipv6_address(host: str) -> str:
+    return _wrap(host)
+
+
 def _parse_port(s: str) -> int:
     try:
         port = int(s)

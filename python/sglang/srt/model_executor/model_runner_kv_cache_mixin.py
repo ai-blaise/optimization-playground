@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseNSATokenToKVPool,
+    HiSparseTurboQuantNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
@@ -438,7 +439,21 @@ class ModelRunnerKVCacheMixin:
                 nsa_pool_kwargs["host_to_device_ratio"] = (
                     hisparse_cfg.host_to_device_ratio
                 )
-                self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
+                if self.server_args.enable_turboquant_dense_kv_cache:
+                    self.token_to_kv_pool = HiSparseTurboQuantNSATokenToKVPool(
+                        **nsa_pool_kwargs,
+                        turboquant_dense_kv_preset=(
+                            self.server_args.turboquant_dense_kv_preset
+                        ),
+                        turboquant_execution_mode=(
+                            self.server_args.turboquant_execution_mode
+                        ),
+                        turboquant_mla_decode_num_splits=(
+                            self.server_args.turboquant_mla_decode_num_splits
+                        ),
+                    )
+                else:
+                    self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
             elif self.server_args.enable_turboquant_dense_kv_cache:
                 skip_layers = (
                     {

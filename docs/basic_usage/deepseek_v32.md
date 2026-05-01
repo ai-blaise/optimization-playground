@@ -78,12 +78,17 @@ To serve GLM-5, just replace the `--model` argument with `zai-org/GLM-5-FP8`.
 
 ### Blaise REAP optimization paths
 
-The `ai-blaise/optimization-playground` fork includes additional opt-in paths for `cerebras/DeepSeek-V3.2-REAP-345B-A37B`:
+The `ai-blaise/optimization-playground` fork includes additional opt-in paths for the REAP DeepSeek V3.2 lane, including the current `BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-GatedNorm-G1` deployment target:
 
 - **Vanilla IndexCache**: `--nsa-indexer-mode indexcache` with `--nsa-indexcache-pattern` selects Full and Shared indexer layers explicitly. The searched 1/4-uniform pattern used by the REAP benchmark scripts is `FSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSF`.
 - **Dense MLA TurboQuant**: `--enable-turboquant-dense-kv-cache` compresses only the dense MLA KV cache. It does not compress the sparse NSA indexer KV buffers, and it should still be used with sparse attention mode.
+- **HiSparse with dense TurboQuant**: HiSparse can share the NSA KV-pool path with dense TurboQuant through `HiSparseTurboQuantNSATokenToKVPool`. This keeps HiSparse's decode hot-set mapping and CPU host pool while storing dense MLA KV rows in the TurboQuant compressed row format. Use this with `--enable-hisparse`, `--disable-radix-cache`, `--nsa-indexer-mode indexcache`, and `--enable-turboquant-dense-kv-cache`.
 - **SMC-SD**: `--speculative-algorithm SMC` enables the Sequential Monte Carlo speculative decoding path. The REAP path is intended to run SMC-SD on top of IndexCache and dense TurboQuant, with an FP8 draft model that has been token-aligned to DeepSeek V3.2.
 - **SMC draft KV dtype override**: `--smc-draft-kv-cache-dtype fp8_e4m3` keeps the target model's KV dtype unchanged while using FP8 KV for the SMC draft model. This is useful for the REAP combo because target dense TurboQuant currently requires target `--kv-cache-dtype bfloat16`. `--speculative-draft-attention-backend trtllm_mha` is supported for draft-backend comparisons, but the current matrix-safe combo runner keeps the Triton draft attention backend and defaults the SMC draft FP8 GEMM runner to CUTLASS on B200s via `SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND=cutlass`. For isolated A/B checks, the combo runner also accepts `BASELINE_SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND` and `CANDIDATE_SGLANG_SMC_DRAFT_FP8_GEMM_BACKEND`.
+
+The Dynamo production profile for `BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-GatedNorm-G1` is a 4-GPU prefill plus 4-GPU decode deployment. It enables DSA sparse attention, IndexCache, dense TurboQuant 2.5-bit KV, decode-side HiSparse, Dynamo KV-aware routing, and decode-only SMC-SD. Do not enable SGLang HiCache in that profile unless the HiSparse no-radix contract is deliberately reworked and revalidated.
+
+The current target checkpoint stores packed NVFP4 weights and weight scales in `compressed-tensors` format. Its activation quantization metadata is expected to be supplied by the W4A4 runtime/checkpoint conversion path; if the artifact has `input_activations: null` and no serialized input activation scales, the compressed-tensors W4A4 NVFP4 loader cannot safely synthesize those scales. Quantize or attach the activation metadata offline before treating the W4A4 production manifest as fully launchable.
 
 Example REAP launch with IndexCache and dense TurboQuant:
 

@@ -54,13 +54,17 @@ class HiSparseCoordinator:
         self.mem_pool_device: HiSparseNSATokenToKVPool = (
             self.token_to_kv_pool_allocator.get_kvcache()
         )
+        host_kv_cache_dim = (
+            getattr(self.mem_pool_device, "turboquant_slot_bytes", None)
+            or self.mem_pool_device.kv_cache_dim
+        )
         self.mem_pool_host = MLATokenToKVPoolHost(
             device_pool=self.mem_pool_device,
             host_to_device_ratio=host_to_device_ratio,
             host_size=0,
             page_size=1,  # for simplicity, we set page size to 1 to enable backup one token at a time
             layout="layer_first",
-            override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+            override_kv_cache_dim=host_kv_cache_dim,
         )
 
         max_num_reqs = req_to_token_pool.req_to_token.shape[0]

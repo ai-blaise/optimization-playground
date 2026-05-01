@@ -7169,8 +7169,11 @@ class ServerArgs:
                 raise ValueError(
                     "--nsa-indexer-mode is only supported for DeepSeek Sparse Attention models."
                 )
-            if self.enable_hisparse:
-                raise ValueError("--nsa-indexer-mode is not compatible with HiSparse.")
+            if self.enable_hisparse and self.nsa_indexer_mode == "indexcache-hisa":
+                raise ValueError(
+                    "--nsa-indexer-mode=indexcache-hisa is not compatible with HiSparse. "
+                    "Use --nsa-indexer-mode=indexcache for the HiSparse combined path."
+                )
             if self.hisa_block_size * self.hisa_block_topk < hf_config.index_topk:
                 raise ValueError(
                     "--hisa-block-size * --hisa-block-topk must be at least index_topk."
@@ -7191,9 +7194,17 @@ class ServerArgs:
                     "--enable-turboquant-dense-kv-cache is only supported for DeepSeek Sparse Attention models."
                 )
             if self.enable_hisparse:
-                raise ValueError(
-                    "--enable-turboquant-dense-kv-cache is not compatible with HiSparse."
-                )
+                if self.turboquant_execution_mode != "fused_decode":
+                    raise ValueError(
+                        "--enable-hisparse with --enable-turboquant-dense-kv-cache "
+                        "requires --turboquant-execution-mode=fused_decode."
+                    )
+                if self.turboquant_skip_layers:
+                    raise ValueError(
+                        "--turboquant-skip-layers is not supported with HiSparse "
+                        "because the HiSparse device and host transfer path requires "
+                        "a uniform MLA row width across layers."
+                    )
             if self.turboquant_execution_mode == "fused_decode" and (
                 self.nsa_decode_backend
                 not in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang")

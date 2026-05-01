@@ -81,11 +81,17 @@ To serve GLM-5, just replace the `--model` argument with `zai-org/GLM-5-FP8`.
 
 ### Blaise REAP optimization paths
 
-The `ai-blaise/optimization-playground` fork includes additional opt-in paths for `cerebras/DeepSeek-V3.2-REAP-345B-A37B`:
+The `ai-blaise/optimization-playground` fork includes additional opt-in paths for the REAP DeepSeek V3.2 lane, including the current `BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-GatedNorm-G1` deployment target:
 
 - **Vanilla IndexCache**: `--nsa-indexer-mode indexcache` with `--nsa-indexcache-pattern` selects Full and Shared indexer layers explicitly. The searched 1/4-uniform pattern used by the REAP benchmark scripts is `FSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSF`.
 - **Dense MLA TurboQuant**: `--enable-turboquant-dense-kv-cache` compresses only the dense MLA KV cache. It does not compress the sparse NSA indexer KV buffers, and it should still be used with sparse attention mode.
+- **HiSparse with dense TurboQuant**: HiSparse can share the NSA KV-pool path with dense TurboQuant through `HiSparseTurboQuantNSATokenToKVPool`. This keeps HiSparse's decode hot-set mapping and CPU host pool while storing dense MLA KV rows in the TurboQuant compressed row format. Use this with `--enable-hisparse`, `--disable-radix-cache`, `--nsa-indexer-mode indexcache`, and `--enable-turboquant-dense-kv-cache`.
 - **SMC-SD**: `--speculative-algorithm SMC` enables the Sequential Monte Carlo speculative decoding path. The REAP path is intended to run SMC-SD on top of IndexCache and dense TurboQuant, with an FP8 draft model that has been token-aligned to DeepSeek V3.2.
+- **SMC draft KV dtype override**: `--smc-draft-kv-cache-dtype fp8_e4m3` keeps the target model's KV dtype unchanged while using FP8 KV for the SMC draft model. This is useful for the REAP combo because target dense TurboQuant currently requires target `--kv-cache-dtype bfloat16`.
+
+The Dynamo production profile for `BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-GatedNorm-G1` is a 4-GPU prefill plus 4-GPU decode deployment. It enables DSA sparse attention, IndexCache, dense TurboQuant 2.5-bit KV, decode-side HiSparse, Dynamo KV-aware routing, and decode-only SMC-SD. Do not enable SGLang HiCache in that profile unless the HiSparse no-radix contract is deliberately reworked and revalidated.
+
+The current target checkpoint stores packed NVFP4 weights and weight scales in `compressed-tensors` format. Its activation quantization metadata is expected to be supplied by the W4A4 runtime/checkpoint conversion path; if the artifact has `input_activations: null` and no serialized input activation scales, the compressed-tensors W4A4 NVFP4 loader cannot safely synthesize those scales. Quantize or attach the activation metadata offline before treating the W4A4 production manifest as fully launchable.
 
 Example REAP launch with IndexCache and dense TurboQuant:
 
@@ -133,12 +139,13 @@ python -m sglang.launch_server \
   --speculative-draft-model-path BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP \
   --speculative-draft-model-quantization fp8 \
   --speculative-draft-attention-backend triton \
+  --smc-draft-kv-cache-dtype fp8_e4m3 \
   --smc-n-particles 4 \
-  --smc-gamma 4 \
+  --smc-gamma 6 \
   --smc-resample-threshold 0.5
 ```
 
-TurboQuant currently requires `--kv-cache-dtype bfloat16`; the compressed dense MLA cache is managed by the TurboQuant pool. Using `--kv-cache-dtype fp8_e4m3` together with `--enable-turboquant-dense-kv-cache` is rejected.
+TurboQuant currently requires target `--kv-cache-dtype bfloat16`; the compressed dense MLA cache is managed by the target TurboQuant pool. The REAP combo runner defaults the SMC draft model to `--smc-draft-kv-cache-dtype fp8_e4m3`; set the draft-only override instead of changing the global target KV dtype. Using global `--kv-cache-dtype fp8_e4m3` together with `--enable-turboquant-dense-kv-cache` is rejected.
 
 The SMC-SD path was brought in from the reference SMC-SD SGLang integration and adapted for the current `ForwardBatch`/worker APIs, FP8 draft loading, DeepSeek V3.2 REAP TP=8/DP=8 with DP attention, and an IndexCache+dense TurboQuant target. The current 16K/4K gate improves end-to-end throughput over vanilla MTP by about 7.0%, but still regresses mean TTFT by about 6.7%, so treat SMC-SD as the primary experimental optimization path until the TTFT gate is closed.
 

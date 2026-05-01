@@ -86,6 +86,7 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_state_item_lens: list[int] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: list[int] = dataclasses.field(default_factory=list)
+    enable_hisparse: bool = False
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -119,6 +120,9 @@ class KVArgsRegisterInfo:
             dst_kv_item_len=int(msg[11].decode("ascii")),
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
+            enable_hisparse=(
+                msg[14].decode("ascii") == "1" if len(msg) > 14 else False
+            ),
         )
 
 
@@ -470,6 +474,42 @@ class NixlKVManager(CommonKVManager):
             item_lens=self.kv_args.kv_item_lens,
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
+            dst_gpu_id=dst_gpu_id,
+            notif=notif,
+        )
+
+    def send_kvcache_hisparse(
+        self,
+        peer_name: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        page_index_slice: slice,
+        dst_gpu_id: int,
+        notif: str,
+    ):
+        page_size = self.kv_args.page_size
+        per_token_item_lens = [il // page_size for il in self.kv_args.kv_item_lens]
+
+        base = np.repeat(prefill_kv_indices * page_size, page_size)
+        offsets = np.tile(np.arange(page_size, dtype=np.int32), len(prefill_kv_indices))
+        expanded_src = base + offsets
+
+        token_start = page_index_slice.start * page_size
+        token_end = min(page_index_slice.stop * page_size, len(dst_kv_indices))
+        expanded_dst = dst_kv_indices[token_start:token_end]
+        expanded_src = expanded_src[: len(expanded_dst)]
+
+        logger.debug(
+            f"Send KVCache for hisparse: {expanded_src.shape} -> {expanded_dst.shape}"
+        )
+        return self._send_kvcache_generic(
+            peer_name=peer_name,
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            dst_data_ptrs=dst_kv_ptrs,
+            item_lens=per_token_item_lens,
+            prefill_data_indices=expanded_src,
+            dst_data_indices=expanded_dst,
             dst_gpu_id=dst_gpu_id,
             notif=notif,
         )
@@ -886,33 +926,41 @@ class NixlKVManager(CommonKVManager):
             notif = (
                 f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
             )
-            decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
+            target_rank_info = self.decode_kv_args_table[req.agent_name]
+            decode_tp_size = target_rank_info.decode_tp_size
 
             if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
-                kv_xfer_handle = self.send_kvcache(
-                    req.agent_name,
-                    kv_indices,
-                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
-                    chunked_dst_kv_indice,
-                    self.decode_kv_args_table[req.agent_name].gpu_id,
-                    notif,
-                )
+                if target_rank_info.enable_hisparse:
+                    kv_xfer_handle = self.send_kvcache_hisparse(
+                        req.agent_name,
+                        kv_indices,
+                        target_rank_info.dst_kv_ptrs,
+                        req.dst_kv_indices,
+                        index_slice,
+                        target_rank_info.gpu_id,
+                        notif,
+                    )
+                else:
+                    kv_xfer_handle = self.send_kvcache(
+                        req.agent_name,
+                        kv_indices,
+                        target_rank_info.dst_kv_ptrs,
+                        chunked_dst_kv_indice,
+                        target_rank_info.gpu_id,
+                        notif,
+                    )
             else:
                 kv_xfer_handle = self.send_kvcache_slice(
                     req.agent_name,
                     kv_indices,
-                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                    target_rank_info.dst_kv_ptrs,
                     chunked_dst_kv_indice,
-                    self.decode_kv_args_table[req.agent_name].gpu_id,
+                    target_rank_info.gpu_id,
                     notif,
                     prefill_tp_size=self.attn_tp_size,
                     decode_tp_size=decode_tp_size,
-                    decode_tp_rank=self.decode_kv_args_table[
-                        req.agent_name
-                    ].decode_tp_rank,
-                    dst_kv_item_len=self.decode_kv_args_table[
-                        req.agent_name
-                    ].dst_kv_item_len,
+                    decode_tp_rank=target_rank_info.decode_tp_rank,
+                    dst_kv_item_len=target_rank_info.dst_kv_item_len,
                 )
 
             handles.append(kv_xfer_handle)
@@ -1218,6 +1266,7 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor = b"".join(
                 struct.pack("I", dim) for dim in state_dim_per_tensor
             )
+            enable_hisparse = b"1" if self.kv_mgr.server_args.enable_hisparse else b"0"
 
             with lock:
                 sock.send_multipart(
@@ -1237,6 +1286,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
+                        enable_hisparse,
                     ]
                 )
 

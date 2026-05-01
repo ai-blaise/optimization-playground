@@ -409,6 +409,71 @@ def test_turboquant_hicache_host_pool_uses_compressed_dense_width():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hisparse_turboquant_pool_uses_compressed_rows_and_indexcache_state():
+    from sglang.srt.mem_cache.hisparse_memory_pool import (
+        HiSparseTurboQuantNSATokenToKVPool,
+    )
+    from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+
+    pool = HiSparseTurboQuantNSATokenToKVPool(
+        size=128,
+        page_size=64,
+        kv_lora_rank=512,
+        dtype=torch.bfloat16,
+        qk_rope_head_dim=64,
+        layer_num=1,
+        device="cuda",
+        index_head_dim=128,
+        enable_memory_saver=False,
+        kv_cache_dim=576,
+        turboquant_dense_kv_preset="latent_2p5bit_nc",
+        turboquant_execution_mode="fused_decode",
+        host_to_device_ratio=2,
+    )
+    mapping = torch.zeros(128 * 2 + 64 + 1, device="cuda", dtype=torch.int64)
+    mapping[-1] = -1
+    logical_loc = torch.arange(16, 32, device="cuda", dtype=torch.int64)
+    device_loc = torch.arange(4, 20, device="cuda", dtype=torch.int64)
+    mapping[logical_loc] = device_loc
+    pool.register_mapping(mapping)
+
+    latent = torch.randn(16, 1, 512, device="cuda", dtype=torch.bfloat16)
+    rope = torch.randn(16, 1, 64, device="cuda", dtype=torch.bfloat16)
+    pool.set_mla_kv_buffer(SimpleNamespace(layer_id=0), logical_loc, latent, rope)
+
+    translated = pool.translate_loc_to_hisparse_device(
+        logical_loc.reshape(1, -1).to(torch.int32)
+    )
+    kv_cache, page_table = pool.get_turboquant_selected_kv_buffer(0, translated)
+    state_ptrs, state_lens, state_item_lens = pool.get_state_buf_infos()
+    host_pool = MLATokenToKVPoolHost(
+        pool,
+        host_to_device_ratio=1,
+        host_size=0,
+        page_size=1,
+        layout="layer_first",
+        override_kv_cache_dim=pool.turboquant_slot_bytes,
+    )
+
+    assert pool.bytes_per_token == pool.turboquant_slot_bytes == 274
+    assert pool.kv_buffer[0][0].nbytes == 274
+    assert page_table.shape == translated.shape
+    assert host_pool.token_stride_size == pool.turboquant_slot_bytes
+    assert state_ptrs == [pool.index_k_with_scale_buffer[0].data_ptr()]
+    assert state_lens == [pool.index_k_with_scale_buffer[0].nbytes]
+    assert state_item_lens == [pool.index_k_with_scale_buffer[0][0].nbytes]
+    assert torch.equal(kv_cache[..., 512:], rope)
+    assert torch.all(
+        torch.nn.functional.cosine_similarity(
+            kv_cache[..., :512].float().reshape(16, 512),
+            latent.float().reshape(16, 512),
+            dim=-1,
+        )
+        > 0.85
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_turboquant_fused_mla_decode_matches_dequantized_reference():
     from sglang.srt.mem_cache.memory_pool import TurboQuantNSATokenToKVPool
 

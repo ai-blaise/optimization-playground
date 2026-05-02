@@ -1043,9 +1043,17 @@ class ModelConfig:
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
-            "modelopt_fp4": ["modelopt"],
+            # modelopt_fp4 also accepts checkpoints whose HF config declares
+            # compressed-tensors. Some NVFP4 checkpoints (e.g. the
+            # deepseek-v32-reap line) ship with quant_method=compressed-tensors
+            # in config.json but only carry partial activation-quant info per
+            # layer. Pairing those checkpoints with modelopt_fp4 lets SGLang
+            # quantize activations online for the missing layers without
+            # touching the checkpoint. Plain "compressed-tensors" still works
+            # in isolation when the checkpoint is fully self-describing.
+            "modelopt_fp4": ["modelopt", "compressed-tensors", "compressed_tensors"],
             "modelopt_mixed": ["modelopt"],
-            "petit_nvfp4": ["modelopt"],
+            "petit_nvfp4": ["modelopt", "compressed-tensors", "compressed_tensors"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }

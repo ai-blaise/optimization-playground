@@ -35,11 +35,12 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
-if is_cuda():
+if is_cuda() or is_musa():
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
@@ -540,6 +541,11 @@ def assign_extend_cache_locs_func(
     device,
 ) -> torch.Tensor:
     if _is_cuda:
+        # CUDA fast path: JIT-compiled fused kernel writing into the
+        # slot range in a single launch. Stays separate from the
+        # generic branch upstream uses for hip/musa so the cuda-only
+        # `assign_extend_cache_locs_cuda` symbol from `jit_kernel` is
+        # not pulled in on non-cuda platforms.
         from sglang.jit_kernel.assign_extend_cache_locs import (
             assign_extend_cache_locs_cuda,
         )
@@ -559,7 +565,7 @@ def assign_extend_cache_locs_func(
 
         return out_cache_loc
 
-    elif _is_hip:
+    elif _is_hip or _is_musa:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int64,

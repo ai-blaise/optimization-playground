@@ -344,6 +344,13 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _is_dynamic_token_w4a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
+        # Layers without activation quant (e.g. NVFP4 weight-only paths in
+        # the deepseek-v32-reap checkpoint loaded by this fork) have
+        # input_quant=None. Without this guard, the .num_bits read raises
+        # AttributeError and the engine fails scheduler init. Mirrors the
+        # guard already present on _is_fp8_w8a8 / _is_fp4a4_nvfp4.
+        if weight_quant is None or input_quant is None:
+            return False
         is_weight_4_bits = weight_quant.num_bits == 4
         is_activation_8_bits = input_quant.num_bits == 8
         weight_strategy = (
@@ -366,6 +373,8 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _is_static_tensor_w8a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
+        if weight_quant is None or input_quant is None:
+            return False
         is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
         weight_strategy = (
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
@@ -384,6 +393,8 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _is_dynamic_token_w8a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
+        if weight_quant is None or input_quant is None:
+            return False
         is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
         weight_strategy = (
             weight_quant.strategy == QuantizationStrategy.TENSOR.value

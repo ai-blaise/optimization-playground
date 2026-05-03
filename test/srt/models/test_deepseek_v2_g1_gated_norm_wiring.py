@@ -32,6 +32,8 @@ def _ref_g1(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
 def _ref_gated_norm(
     x: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor
 ) -> torch.Tensor:
+    w_down = w_down.detach()
+    w_up = w_up.detach()
     flat = x.reshape(-1, x.shape[-1])
     z = torch.matmul(flat.float(), w_down.float().t())
     activation = nn.functional.silu(z).to(w_up.dtype)

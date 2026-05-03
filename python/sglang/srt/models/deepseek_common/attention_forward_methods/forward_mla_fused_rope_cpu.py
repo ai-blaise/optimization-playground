@@ -29,15 +29,22 @@ class DeepseekMLACpuForwardMixin:
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
             )
 
+        # Guard the .weight access: compressed-tensors quantized layers
+        # expose `weight_packed` instead of `.weight`; the AMX CPU
+        # backend probe falls through to the standard dispatch when
+        # neither int8 nor fp8 attributes are detectable.
+        _fused_w = getattr(self.fused_qkv_a_proj_with_mqa, "weight", None)
         self.qkv_proj_with_rope_is_int8 = (
             self.has_fused_proj
             and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.int8
+            and _fused_w is not None
+            and _fused_w.dtype == torch.int8
         )
         self.qkv_proj_with_rope_is_fp8 = (
             self.has_fused_proj
             and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
+            and _fused_w is not None
+            and _fused_w.dtype == torch.float8_e4m3fn
         )
 
         self.weight_block_size = None

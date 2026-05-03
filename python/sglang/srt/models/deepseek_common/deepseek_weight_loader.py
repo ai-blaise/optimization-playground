@@ -212,10 +212,32 @@ class DeepseekV2WeightLoaderMixin:
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                     if ("mlp.experts." in name) and name not in params_dict:
                         continue
-                    name = name.replace(weight_name, param_name)
+                    # IMPORTANT: do NOT mutate `name` in-place. The next
+                    # stacked_params_mapping iteration's `weight_name in name`
+                    # substring check would see the rewritten name and either
+                    # over-rewrite (e.g. gate_up_proj -> gate_gate_up_proj on
+                    # the second iteration) or fall through silently. The
+                    # corresponding bug bit when a checkpoint carried
+                    # `self_attn.gate_proj.weight` (the G1 attention gate, see
+                    # deepseek_v2.py wiring): the first iteration renamed it
+                    # to `self_attn.gate_up_proj.weight` (which has no MLA
+                    # destination and the next iteration treated as already
+                    # renamed). Compute into a local instead.
+                    new_name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if new_name.endswith(".bias") and new_name not in params_dict:
                         continue
+                    # The G1 attention gate (`self_attn.gate_proj.weight`)
+                    # is registered as the un-renamed name (the model
+                    # exposes `gate_proj` as the Linear's attribute);
+                    # the stacked rename to `gate_up_proj` produces a
+                    # name with no destination. Skip the rewritten name
+                    # in that case so the catch-all path below picks up
+                    # the original name and routes to the gate_proj
+                    # parameter.
+                    if new_name not in params_dict:
+                        continue
+                    name = new_name
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     maybe_executor_submit(

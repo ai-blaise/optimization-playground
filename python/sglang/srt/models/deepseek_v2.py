@@ -155,6 +155,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -1135,6 +1136,116 @@ class DeepseekV2MoE(nn.Module):
         state.hidden_states_mlp_output = final_hidden_states
 
 
+# G1 attention gate + GatedNorm support -----------------------------------
+#
+# These two paths come from ai-blaise/Megatron-LM commits c7fd7c156 and
+# e04dcb14b respectively. Papers: arXiv 2601.22966 (G1 gating) and
+# 2505.06708 (GatedNorm). The kernels ship in this fork as
+# `sgl_kernel.g1_gate_forward` and
+# `sglang.jit_kernel.gated_norm.gated_norm_forward`. Only the model-side
+# wiring (the missing piece) is added here.
+try:
+    from sgl_kernel import g1_gate_forward as _g1_gate_forward
+except Exception:  # pragma: no cover - kernel always present in production image
+    _g1_gate_forward = None
+try:
+    from sglang.jit_kernel.gated_norm import gated_norm_forward as _gated_norm_forward
+except Exception:  # pragma: no cover
+    _gated_norm_forward = None
+
+
+def _apply_g1_gate(attn_output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """Apply the G1 attention gate (sigmoid * pointwise) on BF16 CUDA tensors.
+
+    Mirrors Megatron's ``Attention._apply_output_gate`` -> ``g1_gate_impl``
+    fast-path: the fused CUDA kernel from ``sgl_kernel`` is used when
+    available and inputs are BF16 + CUDA; otherwise falls back to the
+    same scalar formula in fp32.
+    """
+    gate = gate.contiguous().view(*attn_output.shape)
+    if (
+        _g1_gate_forward is not None
+        and attn_output.is_cuda
+        and gate.is_cuda
+        and attn_output.dtype == torch.bfloat16
+        and gate.dtype == torch.bfloat16
+    ):
+        out = torch.empty_like(attn_output)
+        gate_out = torch.empty_like(attn_output)
+        _g1_gate_forward(gate, attn_output, out, gate_out)
+        return out
+    # Fallback path keeps numerics identical to Megatron's
+    # ``_apply_output_gate_torch`` (cast through fp32 sigmoid).
+    x = attn_output * torch.sigmoid(gate.float())
+    return x.to(attn_output.dtype)
+
+
+class _G1GatedOProj(nn.Module):
+    """Wraps RowParallelLinear ``o_proj`` to apply a G1 gate before projection.
+
+    The gate tensor is staged on the owning ``DeepseekV2AttentionMLA``
+    instance as ``_g1_pending_gate`` at the start of every attention
+    forward (see ``forward_prepare`` patch below). When ``forward`` is
+    invoked from any of the ~5 attention forward variants
+    (forward_normal, forward_normal_dual_stream, forward_deepep,
+    forward_absorb, forward_absorb_fused_mla_rope_{cpu,rocm}, ...), the
+    gate is consumed once, multiplied element-wise into the attention
+    output via the fused ``g1_gate_forward`` kernel, then cleared so a
+    re-entrant call cannot accidentally re-use it.
+
+    Attribute forwarding to the inner linear (``reduce_results``,
+    ``weight`` for the legacy backend probes, ``quant_method``, etc.) is
+    explicit so the standard MLA forward paths see the same surface as
+    if they were calling the original RowParallelLinear directly.
+    """
+
+    def __init__(self, inner: nn.Module, owner: nn.Module):
+        super().__init__()
+        self._inner = inner
+        # Plain attribute, NOT a Parameter — owner is the
+        # DeepseekV2AttentionMLA itself; we look up the per-call gate
+        # tensor on it without holding a reference.
+        self._owner = owner
+
+    @property
+    def reduce_results(self):
+        return self._inner.reduce_results
+
+    @property
+    def weight(self):
+        # Some backend-detection paths (DeepseekV2DecoderLayer
+        # _detect_gfx95_quant_format / forward_mha / forward_mla
+        # _use_aiter_gfx95 branches) read .weight.dtype on the o_proj.
+        # Forward through to the inner linear so the probe still works.
+        return self._inner.weight
+
+    @property
+    def quant_method(self):
+        return getattr(self._inner, "quant_method", None)
+
+    def __getattr__(self, name):
+        # PyTorch's nn.Module __getattr__ raises if the attribute is not
+        # in _parameters / _buffers / _modules. Fall through to the
+        # inner linear so attribute reads like .output_size_per_partition
+        # work transparently.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            inner = self.__dict__.get("_modules", {}).get("_inner")
+            if inner is None:
+                raise
+            return getattr(inner, name)
+
+    def forward(self, x):
+        gate = getattr(self._owner, "_g1_pending_gate", None)
+        if gate is not None:
+            # Single-shot consume; clearing on the owner prevents a
+            # re-entrant attention call from re-applying a stale gate.
+            self._owner._g1_pending_gate = None
+            x = _apply_g1_gate(x, gate)
+        return self._inner(x)
+
+
 class DeepseekV2AttentionMLA(
     nn.Module,
     DeepseekMHAForwardMixin,
@@ -1294,6 +1405,49 @@ class DeepseekV2AttentionMLA(
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
         )
+
+        # G1 attention gate (paper-faithful Megatron-LM placement, see
+        # ai-blaise/Megatron-LM commit e04dcb14b: "Updated Gated Attention
+        # location"). When enabled, the attention output is element-wise
+        # multiplied by sigmoid(gate_proj(hidden_states)) BEFORE o_proj.
+        # This is the MLA-side placement that covers normal MLA, DSA
+        # (DSAttention inherits MLAAttention), and FlashMLA -- matching
+        # MultiLatentAttention.forward in the training source. Detection:
+        # the model config carries `attention_output_gate=True`, OR the
+        # checkpoint exposes `self_attn.gate_proj.weight` (auto-detected
+        # via the SGLANG_DEEPSEEK_V2_ENABLE_GATED_ATTN env var, default
+        # off so unrelated DeepSeek deployments are untouched).
+        self.has_g1_attention_gate = bool(
+            getattr(config, "attention_output_gate", False)
+            or get_bool_env_var("SGLANG_DEEPSEEK_V2_ENABLE_GATED_ATTN")
+        )
+        if self.has_g1_attention_gate:
+            # Match Megatron's gate_proj exactly: hidden_size ->
+            # query_projection_size = num_heads * v_head_dim, BF16,
+            # bias=False, gather_output=False so each TP rank owns its
+            # head slice and the gate shape matches the local attention
+            # output without a cross-rank gather.
+            self.gate_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads * self.v_head_dim,
+                bias=False,
+                gather_output=False,
+                params_dtype=torch.bfloat16,
+                prefix=add_prefix("gate_proj", prefix),
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+            )
+            # Replace o_proj with a wrapper that applies the G1 gate
+            # immediately before the projection. This keeps every
+            # attention forward variant (normal / mha / mla / fused-rope-cpu
+            # / fused-rope-rocm / deepep / etc.) honoring the gate without
+            # threading a `gate` argument through ~5 separate forward
+            # paths. See `_G1GatedOProj` below for the wrapping shape.
+            self.o_proj = _G1GatedOProj(self.o_proj, self)
+        else:
+            self.gate_proj = None
+        self._g1_pending_gate = None
+
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:
@@ -1358,12 +1512,18 @@ class DeepseekV2AttentionMLA(
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
+        # Guard the .weight access: compressed-tensors quantized layers
+        # expose `weight_packed` instead of `.weight`; reading
+        # `.weight.dtype` unguarded raises AttributeError. Quantized
+        # layers fall through to the non-fused gemm path.
+        _fused_w = getattr(self.fused_qkv_a_proj_with_mqa, "weight", None)
         self.use_min_latency_fused_a_gemm = (
             self.has_fused_proj
             and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
+            and _fused_w is not None
+            and _fused_w.dtype == torch.bfloat16
+            and _fused_w.shape[0] == 2112
+            and _fused_w.shape[1] == 7168
             and _is_cuda
             and 90 <= _device_sm < 120
         )
@@ -1446,6 +1606,23 @@ class DeepseekV2AttentionMLA(
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
+
+        # G1 attention gate stage. Compute the gate ONCE here from the
+        # original hidden_states (i.e. the layer's gated-normed input);
+        # _G1GatedOProj on self.o_proj will consume it inside whichever
+        # forward variant is dispatched below. Skipped on the
+        # short-circuit empty-input early-returns and on the
+        # tuple-shaped quantized-input path (where _g1_pending_gate stays
+        # None and o_proj behaves as a plain RowParallelLinear).
+        if (
+            self.has_g1_attention_gate
+            and not isinstance(hidden_states, tuple)
+            and hidden_states.shape[0] != 0
+        ):
+            gate_out, _ = self.gate_proj(hidden_states)
+            self._g1_pending_gate = gate_out
+        else:
+            self._g1_pending_gate = None
 
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):
@@ -1697,6 +1874,48 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # GatedNorm low-rank projections (Megatron commit 142fc0091
+        # "Gated Norm Kernels & Friends" + paper arXiv 2505.06708). When
+        # enabled, GatedNorm runs IMMEDIATELY AFTER the existing RMSNorm
+        # and IMMEDIATELY BEFORE the consumer (attention or MLP):
+        #     normed = RMSNorm(x)
+        #     z = normed @ w_down.T                               # [..., R]
+        #     gate = sigmoid(silu(z) @ w_up.T)                    # [..., H]
+        #     normed = normed * gate                              # [..., H]
+        # Two pairs per layer: pre-attention ("input") and pre-MLP
+        # ("post_attention" in DeepSeek naming). Detection mirrors the
+        # G1 attention gate -- a config flag or env var. Kept off by
+        # default to avoid touching unrelated DeepSeek deployments.
+        self.has_gated_norm = bool(
+            getattr(config, "gated_norm", False)
+            or get_bool_env_var("SGLANG_DEEPSEEK_V2_ENABLE_GATED_NORM")
+        )
+        if self.has_gated_norm:
+            rank = int(getattr(config, "gated_norm_rank", 16))
+            hsz = config.hidden_size
+            # The Megatron-side names are "input_gated_norm_down/up" and
+            # "pre_mlp_gated_norm_down/up"; the deepseek-v32-reap
+            # checkpoint uses "input_gated_norm_*" and
+            # "post_attention_gated_norm_*". We follow the checkpoint
+            # naming so the loader maps each weight directly.
+            self.input_gated_norm_down = nn.Linear(
+                hsz, rank, bias=False, dtype=torch.bfloat16
+            )
+            self.input_gated_norm_up = nn.Linear(
+                rank, hsz, bias=False, dtype=torch.bfloat16
+            )
+            self.post_attention_gated_norm_down = nn.Linear(
+                hsz, rank, bias=False, dtype=torch.bfloat16
+            )
+            self.post_attention_gated_norm_up = nn.Linear(
+                rank, hsz, bias=False, dtype=torch.bfloat16
+            )
+        else:
+            self.input_gated_norm_down = None
+            self.input_gated_norm_up = None
+            self.post_attention_gated_norm_down = None
+            self.post_attention_gated_norm_up = None
+
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
         if self.nsa_enable_prefill_cp:
@@ -1721,6 +1940,52 @@ class DeepseekV2DecoderLayer(nn.Module):
                 ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
+
+    def _maybe_apply_gated_norm(
+        self,
+        hidden_states,
+        gate_down,
+        gate_up,
+    ):
+        """Apply GatedNorm post-RMSNorm if both projections are present.
+
+        No-op when the layer was constructed with ``has_gated_norm=False``
+        (so the gate_down/gate_up modules are ``None``) or when
+        hidden_states is a tuple (quantized weight + scale, not a plain
+        token tensor — this happens on some LayerCommunicator paths).
+        Defers to ``_gated_norm_forward`` for the BF16 / CUDA fused
+        kernel and falls back to a torch matmul on other backends.
+        """
+        if (
+            gate_down is None
+            or gate_up is None
+            or isinstance(hidden_states, tuple)
+            or _gated_norm_forward is None
+        ):
+            return hidden_states
+        if not (
+            hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+        ):
+            # Reference path -- mirror the formula from
+            # ai-blaise/Megatron-LM/megatron/core/fusions/gated_norm.py
+            # _gated_norm_torch_mm_forward exactly.
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            z = torch.matmul(flat.float(), gate_down.weight.float().t())
+            activation = nn.functional.silu(z).to(gate_up.weight.dtype)
+            logits = torch.matmul(activation, gate_up.weight.t())
+            torch.sigmoid(logits, out=logits)
+            out = (flat * logits).to(hidden_states.dtype)
+            return out.reshape(hidden_states.shape)
+        # Fast path: fused Triton / cuBLAS BF16 kernel from this fork.
+        out = torch.empty_like(hidden_states)
+        _gated_norm_forward(
+            hidden_states,
+            gate_down.weight,
+            gate_up.weight,
+            out,
+        )
+        return out
 
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
@@ -1761,6 +2026,17 @@ class DeepseekV2DecoderLayer(nn.Module):
             getattr(self, "_gfx95_quant_format", ""),
         )
 
+        # GatedNorm runs in-place on the post-RMSNorm tensor coming out
+        # of prepare_attn (paper-faithful pre-attention pre-norm gating
+        # from arXiv 2505.06708). The kernel handles BF16 / CUDA only;
+        # the helper short-circuits on tuple-shaped inputs (quantized
+        # weight + scale) since those aren't the hidden_states tensor.
+        hidden_states = self._maybe_apply_gated_norm(
+            hidden_states,
+            self.input_gated_norm_down,
+            self.input_gated_norm_up,
+        )
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -1777,6 +2053,14 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
+        )
+
+        # Pre-MLP GatedNorm (mirrors the pre-attention path above on the
+        # post_attention residual stream).
+        hidden_states = self._maybe_apply_gated_norm(
+            hidden_states,
+            self.post_attention_gated_norm_down,
+            self.post_attention_gated_norm_up,
         )
 
         should_allreduce_fusion = (

@@ -73,6 +73,54 @@ _NVFP4_FP4_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _NVFP4_BLOCK_SIZE = 16
 
 
+_FLOAT8_E4M3_MAX = 448.0
+_FLOAT4_E2M1_MAX = 6.0
+
+
+def _load_fused_nvfp4_into(
+    params_dict: Dict[str, torch.nn.Parameter],
+    target_stem: str,
+    fused_bf16: torch.Tensor,
+    executor,
+    futures,
+    use_async_loading: bool,
+) -> None:
+    """Re-quantize a BF16 fused weight into NVFP4 (compressed-tensors W4A4Fp4)
+    format and dispatch the three sub-tensors to their destination params."""
+    from flashinfer import fp4_quantize as _fp4_quantize
+
+    max_abs = fused_bf16.abs().amax().clamp_min(1e-6).to(torch.float32)
+    g_scale = (_FLOAT8_E4M3_MAX * _FLOAT4_E2M1_MAX / max_abs).to(torch.float32)
+    on_device = fused_bf16.cuda() if not fused_bf16.is_cuda else fused_bf16
+    g_scale_dev = g_scale.cuda() if not g_scale.is_cuda else g_scale
+
+    packed, scale_linear = _fp4_quantize(
+        on_device, g_scale_dev, is_sf_swizzled_layout=False
+    )
+    if scale_linear.dtype == torch.uint8:
+        scale_linear = scale_linear.view(torch.float8_e4m3fn)
+    scale_linear = scale_linear.contiguous()
+
+    triples = (
+        ("weight_packed", packed),
+        ("weight_scale", scale_linear),
+        ("weight_global_scale", g_scale_dev.flatten()),
+    )
+    for suffix, tensor in triples:
+        full = f"{target_stem}.{suffix}"
+        if full not in params_dict:
+            continue
+        param = params_dict[full]
+        loader = getattr(param, "weight_loader", default_weight_loader)
+        maybe_executor_submit(
+            executor=executor,
+            futures=futures,
+            use_async=use_async_loading,
+            func=loader,
+            func_args=(param, tensor),
+        )
+
+
 def _nvfp4_dequant_tensor_to_bf16(
     packed: torch.Tensor,
     scale_linear: torch.Tensor,
@@ -352,6 +400,79 @@ class DeepseekV2WeightLoaderMixin:
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
+                            # NVFP4 case: defer fusion until all 6 sub-tensors
+                            # (q.{packed,scale,gscale} + kv.{packed,scale,gscale})
+                            # are present, then dequantize+concat+requantize.
+                            is_nvfp4_chunk = (
+                                name.endswith(".weight_packed")
+                                or name.endswith(".weight_scale")
+                                or name.endswith(".weight_global_scale")
+                            )
+                            if is_nvfp4_chunk:
+                                cached_a_proj[name] = _clone_if_runai_streamed_tensor(
+                                    loaded_weight
+                                )
+                                stem_q = (
+                                    name.rsplit(".", 1)[0]
+                                    if "q_a_proj" in name
+                                    else name.replace(
+                                        "kv_a_proj_with_mqa", "q_a_proj"
+                                    ).rsplit(".", 1)[0]
+                                )
+                                stem_kv = stem_q.replace(
+                                    "q_a_proj", "kv_a_proj_with_mqa"
+                                )
+                                needed = [
+                                    f"{stem_q}.weight_packed",
+                                    f"{stem_q}.weight_scale",
+                                    f"{stem_q}.weight_global_scale",
+                                    f"{stem_kv}.weight_packed",
+                                    f"{stem_kv}.weight_scale",
+                                    f"{stem_kv}.weight_global_scale",
+                                ]
+                                if all(k in cached_a_proj for k in needed):
+                                    fused_bf16 = torch.cat(
+                                        [
+                                            _nvfp4_dequant_tensor_to_bf16(
+                                                cached_a_proj[
+                                                    f"{stem_q}.weight_packed"
+                                                ],
+                                                cached_a_proj[
+                                                    f"{stem_q}.weight_scale"
+                                                ],
+                                                cached_a_proj[
+                                                    f"{stem_q}.weight_global_scale"
+                                                ],
+                                            ),
+                                            _nvfp4_dequant_tensor_to_bf16(
+                                                cached_a_proj[
+                                                    f"{stem_kv}.weight_packed"
+                                                ],
+                                                cached_a_proj[
+                                                    f"{stem_kv}.weight_scale"
+                                                ],
+                                                cached_a_proj[
+                                                    f"{stem_kv}.weight_global_scale"
+                                                ],
+                                            ),
+                                        ],
+                                        dim=0,
+                                    )
+                                    target_stem = stem_q.replace(
+                                        "q_a_proj", "fused_qkv_a_proj_with_mqa"
+                                    )
+                                    _load_fused_nvfp4_into(
+                                        params_dict,
+                                        target_stem,
+                                        fused_bf16,
+                                        executor,
+                                        futures,
+                                        use_async_loading,
+                                    )
+                                    for k in needed:
+                                        cached_a_proj.pop(k, None)
+                                continue
+
                             cached_a_proj[name] = _clone_if_runai_streamed_tensor(
                                 loaded_weight
                             )
@@ -366,7 +487,6 @@ class DeepseekV2WeightLoaderMixin:
                                 else name.replace("q_a_proj", "kv_a_proj_with_mqa")
                             )
 
-                            # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
                             if (
                                 q_a_proj_name in cached_a_proj
                                 and kv_a_proj_name in cached_a_proj
@@ -378,24 +498,6 @@ class DeepseekV2WeightLoaderMixin:
                                     []
                                 ) and kv_a_proj_weight.shape == torch.Size([]):
                                     fused_weight = q_a_proj_weight
-                                # Per-tensor scales (NVFP4 weight_global_scale,
-                                # int8 input_scale, etc.) are scalars whose
-                                # destination on the fused ReplicatedLinear
-                                # is a single PerTensorScaleParameter of
-                                # shape (1,). Concatenating two (1,) scales
-                                # would produce (2,) and crash the loader's
-                                # size assert; the right fusion is the max
-                                # (the fused tensor's per-tensor amax is the
-                                # max of the two source amaxes since
-                                # NVFP4 scale = absmax / 6).
-                                elif (
-                                    q_a_proj_weight.numel() == 1
-                                    and kv_a_proj_weight.numel() == 1
-                                ):
-                                    fused_weight = torch.maximum(
-                                        q_a_proj_weight.flatten(),
-                                        kv_a_proj_weight.flatten(),
-                                    )
                                 else:
                                     cat_dim = 0
                                     if self.quant_config is not None and (
@@ -404,7 +506,6 @@ class DeepseekV2WeightLoaderMixin:
                                         or self.quant_config.get_name() == "moe_wna16"
                                     ):
                                         cat_dim = 1
-
                                     fused_weight = torch.cat(
                                         [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
                                     )
@@ -420,7 +521,6 @@ class DeepseekV2WeightLoaderMixin:
                                     )
                                 )
                                 param = params_dict[param_name]
-
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )

@@ -66,6 +66,46 @@ logger = logging.getLogger(__name__)
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
+_NVFP4_FP4_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_NVFP4_BLOCK_SIZE = 16
+
+
+def _nvfp4_dequantize_to_bf16(layer: nn.Module) -> torch.Tensor:
+    """Reverse the compressed-tensors W4A4 NVFP4 packing on a Linear layer
+    back to a dense BF16 tensor of shape [out, in]. Used by the MLA absorb
+    path to materialize w_kc / w_vc from a quantized kv_b_proj."""
+    packed = layer.weight_packed.data
+    scales_swizzled = layer.weight_scale.data
+    global_scale = layer.weight_global_scale.data.to(torch.float32)
+    device = packed.device
+
+    rows, packed_cols = packed.shape
+    cols = packed_cols * 2
+
+    lut = torch.tensor(_NVFP4_FP4_LUT, dtype=torch.float32, device=device)
+    nibble_lo = packed & 0x0F
+    nibble_hi = (packed & 0xF0) >> 4
+    val_lo = torch.where(
+        (nibble_lo & 0x8) != 0, -lut[(nibble_lo & 0x7).long()], lut[(nibble_lo & 0x7).long()]
+    )
+    val_hi = torch.where(
+        (nibble_hi & 0x8) != 0, -lut[(nibble_hi & 0x7).long()], lut[(nibble_hi & 0x7).long()]
+    )
+    unpacked = torch.stack((val_lo, val_hi), dim=-1).reshape(rows, cols)
+
+    sc = scales_swizzled.view(torch.float8_e4m3fn)
+    row_tiles = (rows + 128 - 1) // 128
+    tile_cols = _NVFP4_BLOCK_SIZE * 4
+    col_tiles = (cols + tile_cols - 1) // tile_cols
+    tmp = sc.reshape(1, row_tiles, col_tiles, 32, 4, 4).permute(0, 1, 4, 3, 2, 5)
+    scales_linear = tmp.reshape(
+        row_tiles * 128, col_tiles * tile_cols // _NVFP4_BLOCK_SIZE
+    )[:rows, : cols // _NVFP4_BLOCK_SIZE].to(torch.float32)
+
+    blocks = unpacked.reshape(rows, cols // _NVFP4_BLOCK_SIZE, _NVFP4_BLOCK_SIZE)
+    deq = blocks * (scales_linear / global_scale).unsqueeze(-1)
+    return deq.reshape(rows, cols).to(torch.bfloat16)
+
 
 @dataclass(frozen=True)
 class NextNEnabledConfig:
@@ -486,6 +526,10 @@ class DeepseekV2WeightLoaderMixin:
                     raise ValueError(
                         "AWQ dequantize function is not supported for the current device"
                     )
+            elif hasattr(self_attn.kv_b_proj, "weight_packed"):
+                # NVFP4 (compressed-tensors W4A4Fp4): dequantize to BF16
+                # so the downstream MLA-absorb path can split into w_kc/w_vc.
+                w = _nvfp4_dequantize_to_bf16(self_attn.kv_b_proj)
             else:
                 w = self_attn.kv_b_proj.weight
 

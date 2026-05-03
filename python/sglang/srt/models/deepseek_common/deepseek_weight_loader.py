@@ -73,6 +73,42 @@ _NVFP4_FP4_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _NVFP4_BLOCK_SIZE = 16
 
 
+def _nvfp4_dequant_tensor_to_bf16(
+    packed: torch.Tensor,
+    scale_linear: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize a NVFP4 (compressed-tensors W4A4Fp4) tensor straight
+    from the on-disk checkpoint format (weight_scale stored linear, not
+    yet swizzled by process_weights_after_loading) to dense BF16."""
+    rows, packed_cols = packed.shape
+    cols = packed_cols * 2
+    device = packed.device
+
+    lut = torch.tensor(_NVFP4_FP4_LUT, dtype=torch.float32, device=device)
+    nibble_lo = packed & 0x0F
+    nibble_hi = (packed & 0xF0) >> 4
+    val_lo = torch.where(
+        (nibble_lo & 0x8) != 0,
+        -lut[(nibble_lo & 0x7).long()],
+        lut[(nibble_lo & 0x7).long()],
+    )
+    val_hi = torch.where(
+        (nibble_hi & 0x8) != 0,
+        -lut[(nibble_hi & 0x7).long()],
+        lut[(nibble_hi & 0x7).long()],
+    )
+    unpacked = torch.stack((val_lo, val_hi), dim=-1).reshape(rows, cols)
+
+    sc = scale_linear
+    if sc.dtype == torch.uint8:
+        sc = sc.view(torch.float8_e4m3fn)
+    sc = sc.to(torch.float32)
+    blocks = unpacked.reshape(rows, cols // _NVFP4_BLOCK_SIZE, _NVFP4_BLOCK_SIZE)
+    gs = global_scale.flatten()[0].to(torch.float32)
+    return (blocks * (sc / gs).unsqueeze(-1)).reshape(rows, cols).to(torch.bfloat16)
+
+
 def _nvfp4_dequantize_to_bf16(layer: nn.Module) -> torch.Tensor:
     """Reverse the compressed-tensors W4A4 NVFP4 packing on a Linear layer
     back to a dense BF16 tensor of shape [out, in]. Used by the MLA absorb
@@ -431,6 +467,56 @@ class DeepseekV2WeightLoaderMixin:
                                         )
                                         break
                             if name not in params_dict:
+                                # NSA indexer.weights_proj is constructed as a
+                                # plain BF16 ReplicatedLinear (no quant_config)
+                                # but NVFP4 checkpoints store it as
+                                # weight_packed/weight_scale/weight_global_scale.
+                                # Stash the three pieces, then dequantize into
+                                # the BF16 `.weight` once all three arrive.
+                                if (
+                                    ".indexer.weights_proj." in name
+                                    and (
+                                        name.endswith(".weight_packed")
+                                        or name.endswith(".weight_scale")
+                                        or name.endswith(".weight_global_scale")
+                                    )
+                                ):
+                                    stem = name.rsplit(".", 1)[0]
+                                    bucket = cached_a_proj.setdefault(
+                                        f"__indexer_wproj__{stem}", {}
+                                    )
+                                    bucket[name.rsplit(".", 1)[1]] = loaded_weight
+                                    if {
+                                        "weight_packed",
+                                        "weight_scale",
+                                        "weight_global_scale",
+                                    } <= bucket.keys():
+                                        target_name = stem + ".weight"
+                                        if target_name in params_dict:
+                                            target_param = params_dict[target_name]
+                                            dequant = (
+                                                _nvfp4_dequant_tensor_to_bf16(
+                                                    bucket["weight_packed"],
+                                                    bucket["weight_scale"],
+                                                    bucket["weight_global_scale"],
+                                                )
+                                            )
+                                            target_loader = getattr(
+                                                target_param,
+                                                "weight_loader",
+                                                default_weight_loader,
+                                            )
+                                            maybe_executor_submit(
+                                                executor=executor,
+                                                futures=futures,
+                                                use_async=use_async_loading,
+                                                func=target_loader,
+                                                func_args=(target_param, dequant),
+                                            )
+                                        cached_a_proj.pop(
+                                            f"__indexer_wproj__{stem}", None
+                                        )
+                                    continue
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
                                 # model.decoder.self_attn.attn_mqa.k_scale

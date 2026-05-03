@@ -84,14 +84,30 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
 
         layer.register_parameter("weight_scale", weight_scale)
 
+        # Default to 1.0 so that checkpoints without per-tensor activation
+        # scales (e.g. weight-only NVFP4 with dynamic input quantization
+        # patched in via config_groups[*].input_activations.dynamic=True)
+        # produce a valid alpha. With input_global_scale=1.0 and runtime
+        # fp4_quantize(x, 1.0), the per-block x_blockscale captures the
+        # dynamic range and `alpha = 1 / (1 * weight_global_scale)`
+        # correctly cancels weight rescaling at the FP4 GEMM site.
         input_global_scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            data=torch.ones(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("input_global_scale", input_global_scale)
 
     def process_weights_after_loading(self, layer) -> None:
         global_input_scale = layer.input_global_scale.max().to(torch.float32)
+        # Guard against checkpoints that left input_global_scale at a
+        # degenerate value (NaN/inf/<=0). Defaulting to 1.0 implements
+        # the dynamic-input semantics the model expects when it has no
+        # static activation scale of its own.
+        if (
+            not torch.isfinite(global_input_scale)
+            or global_input_scale.item() <= 0.0
+        ):
+            global_input_scale = torch.ones_like(global_input_scale)
         layer.input_global_scale = Parameter(global_input_scale, requires_grad=False)
 
         layer.weight_global_scale = Parameter(

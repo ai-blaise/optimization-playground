@@ -1180,70 +1180,40 @@ def _apply_g1_gate(attn_output: torch.Tensor, gate: torch.Tensor) -> torch.Tenso
     return x.to(attn_output.dtype)
 
 
-class _G1GatedOProj(nn.Module):
-    """Wraps RowParallelLinear ``o_proj`` to apply a G1 gate before projection.
+def _g1_gate_pre_hook(module, args, kwargs):
+    """forward_pre_hook installed on ``o_proj`` to apply the G1 gate.
 
-    The gate tensor is staged on the owning ``DeepseekV2AttentionMLA``
-    instance as ``_g1_pending_gate`` at the start of every attention
-    forward (see ``forward_prepare`` patch below). When ``forward`` is
-    invoked from any of the ~5 attention forward variants
-    (forward_normal, forward_normal_dual_stream, forward_deepep,
-    forward_absorb, forward_absorb_fused_mla_rope_{cpu,rocm}, ...), the
-    gate is consumed once, multiplied element-wise into the attention
-    output via the fused ``g1_gate_forward`` kernel, then cleared so a
-    re-entrant call cannot accidentally re-use it.
+    Why a hook and not a Module wrapper: a wrapping nn.Module would
+    move ``o_proj``'s parameters under a ``_inner.`` prefix in
+    ``named_parameters()``, breaking the checkpoint loader's lookup
+    of ``o_proj.weight_packed`` / ``o_proj.weight_scale`` /
+    ``o_proj.weight_global_scale`` (those keys would silently fall to
+    the warn-and-skip catchall and o_proj would never be loaded).
 
-    Attribute forwarding to the inner linear (``reduce_results``,
-    ``weight`` for the legacy backend probes, ``quant_method``, etc.) is
-    explicit so the standard MLA forward paths see the same surface as
-    if they were calling the original RowParallelLinear directly.
+    Hook contract: PyTorch's ``register_forward_pre_hook(..., with_kwargs=True)``
+    invokes the hook as ``hook(module, args, kwargs)``; returning
+    ``(new_args, new_kwargs)`` substitutes the call's arguments,
+    returning ``None`` keeps them as-is. The owner
+    ``DeepseekV2AttentionMLA`` stages the per-call gate tensor on
+    itself as ``_g1_pending_gate`` inside ``forward_prepare``; this
+    pre-hook consumes it once (clearing on the owner so a re-entrant
+    attention call cannot re-apply a stale gate) and substitutes the
+    gated activation as the first positional argument to ``o_proj``.
     """
-
-    def __init__(self, inner: nn.Module, owner: nn.Module):
-        super().__init__()
-        self._inner = inner
-        # Plain attribute, NOT a Parameter — owner is the
-        # DeepseekV2AttentionMLA itself; we look up the per-call gate
-        # tensor on it without holding a reference.
-        self._owner = owner
-
-    @property
-    def reduce_results(self):
-        return self._inner.reduce_results
-
-    @property
-    def weight(self):
-        # Some backend-detection paths (DeepseekV2DecoderLayer
-        # _detect_gfx95_quant_format / forward_mha / forward_mla
-        # _use_aiter_gfx95 branches) read .weight.dtype on the o_proj.
-        # Forward through to the inner linear so the probe still works.
-        return self._inner.weight
-
-    @property
-    def quant_method(self):
-        return getattr(self._inner, "quant_method", None)
-
-    def __getattr__(self, name):
-        # PyTorch's nn.Module __getattr__ raises if the attribute is not
-        # in _parameters / _buffers / _modules. Fall through to the
-        # inner linear so attribute reads like .output_size_per_partition
-        # work transparently.
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            inner = self.__dict__.get("_modules", {}).get("_inner")
-            if inner is None:
-                raise
-            return getattr(inner, name)
-
-    def forward(self, x):
-        gate = getattr(self._owner, "_g1_pending_gate", None)
-        if gate is not None:
-            # Single-shot consume; clearing on the owner prevents a
-            # re-entrant attention call from re-applying a stale gate.
-            self._owner._g1_pending_gate = None
-            x = _apply_g1_gate(x, gate)
-        return self._inner(x)
+    owner_ref = getattr(module, "_g1_owner_ref", None)
+    if owner_ref is None:
+        return None
+    owner = owner_ref()
+    if owner is None:
+        return None
+    gate = getattr(owner, "_g1_pending_gate", None)
+    if gate is None:
+        return None
+    owner._g1_pending_gate = None
+    if not args:
+        return None
+    new_args = (_apply_g1_gate(args[0], gate),) + tuple(args[1:])
+    return new_args, kwargs
 
 
 class DeepseekV2AttentionMLA(
@@ -1437,13 +1407,20 @@ class DeepseekV2AttentionMLA(
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
             )
-            # Replace o_proj with a wrapper that applies the G1 gate
-            # immediately before the projection. This keeps every
-            # attention forward variant (normal / mha / mla / fused-rope-cpu
-            # / fused-rope-rocm / deepep / etc.) honoring the gate without
-            # threading a `gate` argument through ~5 separate forward
-            # paths. See `_G1GatedOProj` below for the wrapping shape.
-            self.o_proj = _G1GatedOProj(self.o_proj, self)
+            # Install a forward_pre_hook on o_proj that applies the G1
+            # gate immediately before the projection. This keeps every
+            # attention forward variant (normal / mha / mla /
+            # fused-rope-cpu / fused-rope-rocm / deepep / ...) honoring
+            # the gate without threading a `gate` argument through ~5
+            # separate forward paths AND without changing the parameter
+            # hierarchy (a wrapping Module would move o_proj's params
+            # under `_inner.`, breaking the checkpoint loader). See
+            # `_g1_gate_pre_hook` above for the hook implementation.
+            import weakref as _weakref
+            self.o_proj._g1_owner_ref = _weakref.ref(self)
+            self.o_proj.register_forward_pre_hook(
+                _g1_gate_pre_hook, with_kwargs=True
+            )
         else:
             self.gate_proj = None
         self._g1_pending_gate = None

@@ -313,6 +313,24 @@ class DeepseekV2WeightLoaderMixin:
                                     []
                                 ) and kv_a_proj_weight.shape == torch.Size([]):
                                     fused_weight = q_a_proj_weight
+                                # Per-tensor scales (NVFP4 weight_global_scale,
+                                # int8 input_scale, etc.) are scalars whose
+                                # destination on the fused ReplicatedLinear
+                                # is a single PerTensorScaleParameter of
+                                # shape (1,). Concatenating two (1,) scales
+                                # would produce (2,) and crash the loader's
+                                # size assert; the right fusion is the max
+                                # (the fused tensor's per-tensor amax is the
+                                # max of the two source amaxes since
+                                # NVFP4 scale = absmax / 6).
+                                elif (
+                                    q_a_proj_weight.numel() == 1
+                                    and kv_a_proj_weight.numel() == 1
+                                ):
+                                    fused_weight = torch.maximum(
+                                        q_a_proj_weight.flatten(),
+                                        kv_a_proj_weight.flatten(),
+                                    )
                                 else:
                                     cat_dim = 0
                                     if self.quant_config is not None and (

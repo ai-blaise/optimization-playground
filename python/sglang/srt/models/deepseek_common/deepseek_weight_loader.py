@@ -112,38 +112,16 @@ def _nvfp4_dequant_tensor_to_bf16(
 def _nvfp4_dequantize_to_bf16(layer: nn.Module) -> torch.Tensor:
     """Reverse the compressed-tensors W4A4 NVFP4 packing on a Linear layer
     back to a dense BF16 tensor of shape [out, in]. Used by the MLA absorb
-    path to materialize w_kc / w_vc from a quantized kv_b_proj."""
-    packed = layer.weight_packed.data
-    scales_swizzled = layer.weight_scale.data
-    global_scale = layer.weight_global_scale.data.to(torch.float32)
-    device = packed.device
+    path to materialize w_kc / w_vc from a quantized kv_b_proj.
 
-    rows, packed_cols = packed.shape
-    cols = packed_cols * 2
-
-    lut = torch.tensor(_NVFP4_FP4_LUT, dtype=torch.float32, device=device)
-    nibble_lo = packed & 0x0F
-    nibble_hi = (packed & 0xF0) >> 4
-    val_lo = torch.where(
-        (nibble_lo & 0x8) != 0, -lut[(nibble_lo & 0x7).long()], lut[(nibble_lo & 0x7).long()]
+    post_load_weights runs BEFORE process_weights_after_loading swizzles
+    the per-block scale, so weight_scale is still in linear layout here
+    and we delegate to the tensor-mode helper."""
+    return _nvfp4_dequant_tensor_to_bf16(
+        layer.weight_packed.data,
+        layer.weight_scale.data,
+        layer.weight_global_scale.data,
     )
-    val_hi = torch.where(
-        (nibble_hi & 0x8) != 0, -lut[(nibble_hi & 0x7).long()], lut[(nibble_hi & 0x7).long()]
-    )
-    unpacked = torch.stack((val_lo, val_hi), dim=-1).reshape(rows, cols)
-
-    sc = scales_swizzled.view(torch.float8_e4m3fn)
-    row_tiles = (rows + 128 - 1) // 128
-    tile_cols = _NVFP4_BLOCK_SIZE * 4
-    col_tiles = (cols + tile_cols - 1) // tile_cols
-    tmp = sc.reshape(1, row_tiles, col_tiles, 32, 4, 4).permute(0, 1, 4, 3, 2, 5)
-    scales_linear = tmp.reshape(
-        row_tiles * 128, col_tiles * tile_cols // _NVFP4_BLOCK_SIZE
-    )[:rows, : cols // _NVFP4_BLOCK_SIZE].to(torch.float32)
-
-    blocks = unpacked.reshape(rows, cols // _NVFP4_BLOCK_SIZE, _NVFP4_BLOCK_SIZE)
-    deq = blocks * (scales_linear / global_scale).unsqueeze(-1)
-    return deq.reshape(rows, cols).to(torch.bfloat16)
 
 
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:

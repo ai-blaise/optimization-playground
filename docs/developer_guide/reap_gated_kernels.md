@@ -64,3 +64,46 @@ PYTHONPATH=python python scripts/playground/bench_gated_norm.py
 
 Both kernels should be validated on Blackwell before using the full Dynamo
 deployment profile.
+
+## Model-side wiring
+
+The model-side glue lives in `sglang.srt.models.deepseek_v2`:
+
+- `_apply_g1_gate(attn_output, gate)` dispatches BF16 CUDA inputs to the
+  `sgl_kernel.g1_gate_forward` op and falls back to a sigmoid-times in fp32
+  otherwise; numerics match `Megatron-LM`'s `Attention._apply_output_gate`.
+- `_g1_gate_pre_hook(module, args, kwargs)` is registered as a
+  `forward_pre_hook(with_kwargs=True)` on `o_proj`. A `Module` wrapper would
+  re-key the loaded parameters under an `_inner.` prefix, so the hook approach
+  is what keeps `o_proj.weight_packed` / `weight_scale` /
+  `weight_global_scale` discoverable by the checkpoint loader. The hook
+  consumes the per-call gate stashed on the owner as `_g1_pending_gate`,
+  clears it (so a re-entrant call cannot re-apply a stale gate), and
+  substitutes `attn_output * sigmoid(gate)` as `args[0]`.
+- `DeepseekV2DecoderLayer._maybe_apply_gated_norm(x, w_down, w_up)` runs
+  after each `prepare_attn` / `prepare_mlp` and dispatches to the BF16 fused
+  kernel when `x.is_cuda and x.dtype == torch.bfloat16`; otherwise an
+  fp32 reference matmul exactly mirrors
+  `ai-blaise/Megatron-LM/megatron/core/fusions/gated_norm.py
+  ._gated_norm_torch_mm_forward`.
+
+Construction is gated by `attention_output_gate=True` /
+`gated_norm=True` in `config.json`, or by setting
+`SGLANG_DEEPSEEK_V2_ENABLE_GATED_ATTN=1` /
+`SGLANG_DEEPSEEK_V2_ENABLE_GATED_NORM=1`. When the flags are off the
+modules become `None` and the helpers short-circuit.
+
+### Wiring tests
+
+```bash
+python -m pytest -q test/srt/models/test_deepseek_v2_g1_gated_norm_wiring.py
+```
+
+13 cases covering the BF16 fast paths, the fp32 fallback, the
+`forward_pre_hook` substitution + clearing semantics, the
+`Megatron-LM` reference for `_maybe_apply_gated_norm` at production
+shapes (hidden 7168, rank 16), no-op semantics for `None` projections,
+and the tuple-input passthrough used by the quantized
+`LayerCommunicator` path. Tested on B200 inside the
+`reap-nvfp4-fix13` runtime image (single GPU is enough — the helpers
+process one decoder layer at a time).

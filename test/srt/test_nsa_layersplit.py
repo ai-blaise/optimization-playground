@@ -40,6 +40,7 @@ def valid_layersplit_args(**overrides):
         "enable_nsa_prefill_context_parallel": True,
         "attn_cp_size": 2,
         "disaggregation_mode": "prefill",
+        "disaggregation_transfer_backend": "mooncake",
         "all_cp_ranks_transfer": True,
         "is_deepseek_nsa_model": True,
         "enable_turboquant_dense_kv_cache": True,
@@ -164,6 +165,10 @@ def test_layersplit_rejects_bad_policy():
                 "all_cp_ranks_transfer": False,
             },
             "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1",
+        ),
+        (
+            {"disaggregation_transfer_backend": "mori"},
+            "mooncake or nixl transfer backend",
         ),
         ({"is_deepseek_nsa_model": False}, "DeepSeek Sparse Attention"),
         (

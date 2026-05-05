@@ -1000,8 +1000,17 @@ class MooncakeKVManager(CommonKVManager):
             ):
                 raise RuntimeError(
                     f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {state_type.upper()} hybrid models yet."
-                )
+            )
             dst_state_indices = req.dst_state_indices
+            if (
+                self.use_layersplit_pd_transfer()
+                and len(prefill_state_indices) != len(dst_state_indices)
+            ):
+                raise RuntimeError(
+                    "LayerSplit NSA state index length mismatch: "
+                    f"prefill={len(prefill_state_indices)}, "
+                    f"dst={len(dst_state_indices)}"
+                )
             if len(prefill_state_indices) > len(dst_state_indices):
                 logger.warning(
                     f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(dst_state_indices)}"

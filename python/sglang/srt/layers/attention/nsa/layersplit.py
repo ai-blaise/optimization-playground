@@ -12,6 +12,7 @@ def validate_layersplit_server_args(
     enable_nsa_prefill_context_parallel: bool,
     attn_cp_size: int,
     disaggregation_mode: str,
+    disaggregation_transfer_backend: str,
     all_cp_ranks_transfer: bool,
     is_deepseek_nsa_model: bool,
     enable_turboquant_dense_kv_cache: bool,
@@ -39,6 +40,14 @@ def validate_layersplit_server_args(
             "--nsa-prefill-cp-kv-storage-mode=layersplit with "
             "disaggregated prefill requires "
             "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1."
+        )
+    if disaggregation_mode == "prefill" and disaggregation_transfer_backend not in (
+        "mooncake",
+        "nixl",
+    ):
+        raise ValueError(
+            "--nsa-prefill-cp-kv-storage-mode=layersplit with "
+            "disaggregated prefill requires the mooncake or nixl transfer backend."
         )
     if not is_deepseek_nsa_model:
         raise ValueError(

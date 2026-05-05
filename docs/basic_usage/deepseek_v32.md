@@ -467,7 +467,8 @@ ranks across which to split layer ownership. The 4-GPU prefill/4-GPU decode
 REAP production profile with `--tp 4 --dp 4` keeps LayerSplit disabled for this
 reason until a CP-capable prefill topology is used. Startup validation rejects
 decode workers, non-DSA models, topology CP size 1, disaggregated prefill without
-all-CP-rank transfer, and dense TurboQuant skip-layer layouts.
+all-CP-rank transfer, disaggregated prefill backends other than Mooncake or NIXL,
+and dense TurboQuant skip-layer layouts.
 
 For the REAP production path, LayerSplit is intended to feed decode-side
 HiSparse with dense TurboQuant and decode-only SMC-SD. HiSparse remains the

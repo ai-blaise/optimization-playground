@@ -7245,6 +7245,9 @@ class ServerArgs:
                 ),
                 attn_cp_size=self.attn_cp_size,
                 disaggregation_mode=self.disaggregation_mode,
+                disaggregation_transfer_backend=(
+                    self.disaggregation_transfer_backend
+                ),
                 all_cp_ranks_transfer=(
                     envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
                 ),

@@ -143,14 +143,17 @@ def benchmark_cell(torch, dist, device, args, input_len, output_len):
 
     avg_ms = float(latency.item())
     return {
+        "benchmark_kind": "layersplit_pool",
         "input_tokens": input_len,
         "output_tokens": output_len,
+        "output_tokens_timed": False,
         "storage": args.storage,
         "layout": args.layout,
         "cp_size": dist.get_world_size(),
         "layer_count": args.layer_count,
         "avg_latency_ms": avg_ms,
-        "tokens_per_second": input_len / max(avg_ms / 1000.0, 1e-9),
+        "pool_effective_input_tokens_per_second": input_len
+        / max(avg_ms / 1000.0, 1e-9),
         "within_latency_budget": avg_ms <= args.latency_budget_ms,
         "kv_bytes_sum": int(bytes_per_rank.item()),
     }
@@ -200,13 +203,14 @@ def main():
                 print(json.dumps(result, sort_keys=True), flush=True)
         if dist.get_rank() == 0:
             max_latency_ms = max(result["avg_latency_ms"] for result in results)
-            min_tokens_per_second = min(
-                result["tokens_per_second"] for result in results
+            min_pool_effective_input_tokens_per_second = min(
+                result["pool_effective_input_tokens_per_second"]
+                for result in results
             )
             total_input_tokens = sum(result["input_tokens"] for result in results)
             total_latency_ms = sum(result["avg_latency_ms"] for result in results)
-            aggregate_tokens_per_second = total_input_tokens / max(
-                total_latency_ms / 1000.0, 1e-9
+            aggregate_pool_effective_input_tokens_per_second = (
+                total_input_tokens / max(total_latency_ms / 1000.0, 1e-9)
             )
             max_kv_bytes_sum = max(result["kv_bytes_sum"] for result in results)
             all_within_budget = int(
@@ -215,8 +219,10 @@ def main():
             print(
                 "layersplit_summary "
                 f"max_latency_ms={max_latency_ms:.6f} "
-                f"min_tokens_per_second={min_tokens_per_second:.6f} "
-                f"aggregate_tokens_per_second={aggregate_tokens_per_second:.6f} "
+                "min_pool_effective_input_tokens_per_second="
+                f"{min_pool_effective_input_tokens_per_second:.6f} "
+                "aggregate_pool_effective_input_tokens_per_second="
+                f"{aggregate_pool_effective_input_tokens_per_second:.6f} "
                 f"max_kv_bytes_sum={max_kv_bytes_sum} "
                 f"all_within_latency_budget={all_within_budget}",
                 flush=True,

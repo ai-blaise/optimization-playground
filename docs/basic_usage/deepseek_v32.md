@@ -511,12 +511,15 @@ for cp_size in 2 4 8; do
 done
 ```
 
-The LayerSplit-only prefill benchmark uses the same owner-local dense KV,
+The LayerSplit pool benchmark uses the same owner-local dense KV,
 IndexCache/indexer state, CP broadcast, and dense TurboQuant compressed storage
-paths without changing Dynamo or infrastructure scripts. It is intended for the
-current bring-up loop, where CP configurations only need functional validation
-and the selected target topology is optimized for maximum throughput within a
-2-second prefill latency budget:
+paths without changing Dynamo or infrastructure scripts. It is a LayerSplit
+storage-path microbenchmark: it times synthetic per-layer KV/indexer buffer
+access and CP broadcast work, not model forward, decode, scheduling, tokenizer,
+or end-to-end serving throughput. The reported
+`pool_effective_input_tokens_per_second` metrics are only for relative
+LayerSplit A/B comparisons inside this harness. The selected target topology is
+optimized for maximum pool throughput within a 2-second per-cell latency budget:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \

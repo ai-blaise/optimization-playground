@@ -25,10 +25,6 @@ for module_name in [
 ]:
     sys.modules.setdefault(module_name, types.ModuleType(module_name))
 
-load_module(
-    "sglang.srt.layers.attention.nsa.indexer_policy",
-    ROOT / "python/sglang/srt/layers/attention/nsa/indexer_policy.py",
-)
 layersplit = load_module(
     "sglang.srt.layers.attention.nsa.layersplit",
     ROOT / "python/sglang/srt/layers/attention/nsa/layersplit.py",
@@ -36,11 +32,7 @@ layersplit = load_module(
 
 LayerSplitPolicy = layersplit.LayerSplitPolicy
 build_layersplit_mla_transfer_params = layersplit.build_layersplit_mla_transfer_params
-build_layersplit_transfer_descriptors = (
-    layersplit.build_layersplit_transfer_descriptors
-)
 filter_layers_for_cp_owner = layersplit.filter_layers_for_cp_owner
-get_indexcache_source_layer_id = layersplit.get_indexcache_source_layer_id
 
 
 def test_layersplit_interleaved_owner_mapping():
@@ -68,54 +60,6 @@ def test_layersplit_contiguous_owner_mapping():
 
     assert policy.owned_layer_ids() == (5, 6, 7)
     assert policy.owner_rank(9) == 3
-
-
-def test_layersplit_indexcache_source_from_pattern():
-    pattern = "FSSFFS"
-
-    assert get_indexcache_source_layer_id(
-        0, num_layers=6, freq=4, pattern=pattern
-    ) == 0
-    assert get_indexcache_source_layer_id(
-        2, num_layers=6, freq=4, pattern=pattern
-    ) == 0
-    assert get_indexcache_source_layer_id(
-        5, num_layers=6, freq=4, pattern=pattern
-    ) == 4
-
-
-def test_layersplit_indexcache_source_from_frequency():
-    assert get_indexcache_source_layer_id(
-        0, num_layers=8, freq=4, pattern=None
-    ) == 0
-    assert get_indexcache_source_layer_id(
-        2, num_layers=8, freq=4, pattern=None
-    ) == 1
-    assert get_indexcache_source_layer_id(
-        6, num_layers=8, freq=4, pattern=None
-    ) == 5
-
-
-def test_layersplit_transfer_descriptors_keep_indexcache_source():
-    policy = LayerSplitPolicy(cp_rank=0, cp_size=2, start_layer=0, end_layer=6)
-    descriptors = build_layersplit_transfer_descriptors(
-        policy,
-        num_layers=6,
-        indexcache_freq=4,
-        indexcache_pattern="FSSFFS",
-    )
-
-    assert [
-        (d.layer_id, d.owner_rank, d.indexcache_source_layer_id)
-        for d in descriptors
-    ] == [
-        (0, 0, 0),
-        (1, 1, 0),
-        (2, 0, 0),
-        (3, 1, 3),
-        (4, 0, 4),
-        (5, 1, 4),
-    ]
 
 
 def test_layersplit_disaggregation_layer_owner_filter():

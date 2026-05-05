@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence, Tuple
-
-from sglang.srt.layers.attention.nsa.indexer_policy import validate_indexcache_pattern
+from typing import Iterable, Sequence, Tuple
 
 NSA_PREFILL_CP_KV_STORAGE_CHOICES = ("replicated", "layersplit")
 NSA_PREFILL_CP_LAYERSPLIT_LAYOUT_CHOICES = ("interleaved", "contiguous")
@@ -60,109 +58,11 @@ class LayerSplitPolicy:
             )
 
 
-@dataclass(frozen=True)
-class LayerSplitTransferDescriptor:
-    layer_id: int
-    owner_rank: int
-    indexcache_source_layer_id: int
-
-
-@dataclass(frozen=True)
-class LayerSplitMetadata:
-    policy: LayerSplitPolicy
-    transfer_descriptors: Tuple[LayerSplitTransferDescriptor, ...]
-
-    def owns_layer(self, layer_id: int) -> bool:
-        return self.policy.owns_layer(layer_id)
-
-    @property
-    def owned_layer_ids(self) -> Tuple[int, ...]:
-        return self.policy.owned_layer_ids()
-
-
-def get_indexcache_source_layer_id(
-    layer_id: int,
-    *,
-    num_layers: int,
-    freq: int,
-    pattern: Optional[str],
-) -> int:
-    if not 0 <= layer_id < num_layers:
-        raise ValueError(f"layer_id must be in [0, {num_layers}), got {layer_id}.")
-    if pattern is not None:
-        validate_indexcache_pattern(pattern, num_layers)
-        if pattern[layer_id] == "F":
-            return layer_id
-        for source_layer_id in range(layer_id - 1, -1, -1):
-            if pattern[source_layer_id] == "F":
-                return source_layer_id
-        raise ValueError("NSA IndexCache pattern must keep layer 0 as 'F'.")
-    if freq < 1:
-        raise ValueError("NSA IndexCache frequency must be at least 1.")
-    if max(layer_id - 1, 0) % freq == 0:
-        return layer_id
-    for source_layer_id in range(layer_id - 1, -1, -1):
-        if max(source_layer_id - 1, 0) % freq == 0:
-            return source_layer_id
-    return 0
-
-
-def build_layersplit_transfer_descriptors(
-    policy: LayerSplitPolicy,
-    *,
-    num_layers: int,
-    indexcache_freq: int,
-    indexcache_pattern: Optional[str],
-) -> Tuple[LayerSplitTransferDescriptor, ...]:
-    return tuple(
-        LayerSplitTransferDescriptor(
-            layer_id=layer_id,
-            owner_rank=policy.owner_rank(layer_id),
-            indexcache_source_layer_id=get_indexcache_source_layer_id(
-                layer_id,
-                num_layers=num_layers,
-                freq=indexcache_freq,
-                pattern=indexcache_pattern,
-            ),
-        )
-        for layer_id in range(policy.start_layer, policy.end_layer)
-    )
-
-
 def filter_layers_for_cp_owner(
     layer_ids: Iterable[int],
     policy: LayerSplitPolicy,
 ) -> Tuple[int, ...]:
     return tuple(layer_id for layer_id in layer_ids if policy.owns_layer(layer_id))
-
-
-def prepare_layersplit_metadata(
-    *,
-    cp_rank: int,
-    cp_size: int,
-    start_layer: int,
-    end_layer: int,
-    layout: str,
-    num_layers: int,
-    indexcache_freq: int,
-    indexcache_pattern: Optional[str],
-) -> LayerSplitMetadata:
-    policy = LayerSplitPolicy(
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-        start_layer=start_layer,
-        end_layer=end_layer,
-        layout=layout,
-    )
-    return LayerSplitMetadata(
-        policy=policy,
-        transfer_descriptors=build_layersplit_transfer_descriptors(
-            policy,
-            num_layers=num_layers,
-            indexcache_freq=indexcache_freq,
-            indexcache_pattern=indexcache_pattern,
-        ),
-    )
 
 
 def build_layersplit_mla_transfer_params(

@@ -39,13 +39,6 @@ def is_nsa_prefill_cp_round_robin_split():
     )
 
 
-def is_nsa_prefill_layersplit_enabled():
-    return (
-        is_nsa_enable_prefill_cp()
-        and get_global_server_args().nsa_prefill_cp_kv_storage_mode == "layersplit"
-    )
-
-
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
@@ -155,7 +148,6 @@ def can_nsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     else:
         return False
 
-
 @triton.jit
 def nsa_cp_round_robin_split_q_seqs_kernel(
     in_seqs_ptr,
@@ -233,11 +225,3 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
         return True
     else:
         return False
-
-
-def nsa_use_prefill_layersplit(forward_batch):
-    return (
-        nsa_use_prefill_cp(forward_batch)
-        and is_nsa_prefill_layersplit_enabled()
-        and getattr(forward_batch, "nsa_layersplit_metadata", None) is not None
-    )

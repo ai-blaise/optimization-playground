@@ -456,10 +456,9 @@ parallelism. It is controlled separately from the token split mode:
 The default `--nsa-prefill-cp-kv-storage-mode replicated` keeps the existing
 behavior, where each CP rank writes a full per-layer KV copy after the CP
 all-gather. `layersplit` assigns persistent dense KV and NSA indexer cache
-ownership by layer across CP ranks. The initial owner metadata also preserves
-IndexCache F/S source-layer mapping so disaggregated prefill/decode can transfer
-both dense KV and indexer state by global layer owner instead of by token/page
-CP slice.
+ownership by layer across CP ranks. Disaggregated prefill/decode transfers both
+dense KV and indexer state by global layer owner instead of by token/page CP
+slice.
 
 LayerSplit inherits the existing NSA prefill context-parallel topology
 constraints. The effective attention CP size must be greater than 1 after SGLang

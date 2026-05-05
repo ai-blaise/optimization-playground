@@ -1573,6 +1573,8 @@ class MLATokenToKVPool(KVCache):
             if self.nsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
+        self.layersplit_policy = self._build_layersplit_policy() if use_nsa else None
+        self.layersplit_kv_buffer = None
 
         self._create_buffers()
 
@@ -1593,14 +1595,28 @@ class MLATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.kv_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                m = self.size + self.page_size
+                self.kv_buffer = []
+                for local_layer_idx in range(self.layer_num):
+                    layer_id = self.start_layer + local_layer_idx
+                    rows = (
+                        m
+                        if self.layersplit_owns_layer(layer_id)
+                        else self.page_size
+                    )
+                    self.kv_buffer.append(
+                        torch.zeros(
+                            (rows, 1, self.kv_cache_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                    )
+                if self.layersplit_policy is not None:
+                    self.layersplit_kv_buffer = torch.zeros(
+                        (m, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
-                ]
 
     def _clear_buffers(self):
         del self.kv_buffer
@@ -1622,24 +1638,68 @@ class MLATokenToKVPool(KVCache):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def _build_layersplit_policy(self):
+        from sglang.srt.layers.attention.nsa.layersplit import LayerSplitPolicy
+        from sglang.srt.layers.dp_attention import (
+            get_attention_cp_rank,
+            get_attention_cp_size,
+        )
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        if (
+            getattr(server_args, "nsa_prefill_cp_kv_storage_mode", "replicated")
+            != "layersplit"
+        ):
+            return None
+        cp_size = get_attention_cp_size()
+        if cp_size <= 1:
+            return None
+        return LayerSplitPolicy(
+            cp_rank=get_attention_cp_rank(),
+            cp_size=cp_size,
+            start_layer=self.start_layer,
+            end_layer=self.start_layer + self.layer_num,
+            layout=server_args.nsa_prefill_cp_layersplit_layout,
+        )
+
+    def layersplit_owns_layer(self, layer_id: int) -> bool:
+        if self.layersplit_policy is None:
+            return True
+        return self.layersplit_policy.owns_layer(layer_id)
+
+    def _get_layersplit_kv_buffer(self, layer_id: int) -> torch.Tensor:
+        layer_idx = layer_id - self.start_layer
+        if self.layersplit_policy is None:
+            return self.kv_buffer[layer_idx]
+        owner_rank = self.layersplit_policy.owner_rank(layer_id)
+        if self.layersplit_owns_layer(layer_id):
+            kv_buffer = self.kv_buffer[layer_idx]
+        else:
+            kv_buffer = self.layersplit_kv_buffer
+
+        from sglang.srt.layers.dp_attention import get_attention_cp_group
+
+        return get_attention_cp_group().broadcast(kv_buffer, src=owner_rank)
+
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        kv_buffer = self._get_layersplit_kv_buffer(layer_id)
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+            return kv_buffer.view(self.dtype)
 
-        return self.kv_buffer[layer_id - self.start_layer]
+        return kv_buffer
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        kv_buffer = self._get_layersplit_kv_buffer(layer_id)
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer][
-                ..., : self.kv_lora_rank
-            ].view(self.dtype)
-        return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
+            return kv_buffer[..., : self.kv_lora_rank].view(self.dtype)
+        return kv_buffer[..., : self.kv_lora_rank]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -1652,6 +1712,8 @@ class MLATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
+        if not self.layersplit_owns_layer(layer_id):
+            return
         assert not self.nsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
@@ -1671,6 +1733,8 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
+        if not self.layersplit_owns_layer(layer_id):
+            return
 
         if _is_hip and self.use_nsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
@@ -1946,37 +2010,64 @@ class NSATokenToKVPool(MLATokenToKVPool):
             assert self.page_size == 1
         else:
             assert self.page_size == 64
+        index_rows = (index_buf_size + page_size + 1) // self.page_size
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
             else nullcontext()
         ):
-            self.index_k_with_scale_buffer = [
-                torch.zeros(
-                    # Layout:
-                    #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
-                    #     data: for page i,
-                    #         * buf[i, :page_size * head_dim] for fp8 data
-                    #         * buf[i, page_size * head_dim:].view(float32) for scale
+            self.index_k_with_scale_buffer = []
+            for local_layer_idx in range(layer_num):
+                layer_id = self.start_layer + local_layer_idx
+                rows = index_rows if self.layersplit_owns_layer(layer_id) else 1
+                self.index_k_with_scale_buffer.append(
+                    torch.zeros(
+                        (
+                            rows,
+                            self.page_size
+                            * (
+                                index_head_dim
+                                + index_head_dim // self.quant_block_size * 4
+                            ),
+                        ),
+                        dtype=self.index_k_with_scale_buffer_dtype,
+                        device=device,
+                    )
+                )
+            self.layersplit_index_k_with_scale_buffer = None
+            if self.layersplit_policy is not None:
+                self.layersplit_index_k_with_scale_buffer = torch.zeros(
                     (
-                        (index_buf_size + page_size + 1) // self.page_size,
+                        index_rows,
                         self.page_size
                         * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
+                            index_head_dim
+                            + index_head_dim // self.quant_block_size * 4
                         ),
                     ),
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=device,
                 )
-                for _ in range(layer_num)
-            ]
         self._finalize_allocation_log(size)
+
+    def _get_layersplit_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        layer_idx = layer_id - self.start_layer
+        if self.layersplit_policy is None:
+            return self.index_k_with_scale_buffer[layer_idx]
+        owner_rank = self.layersplit_policy.owner_rank(layer_id)
+        if self.layersplit_owns_layer(layer_id):
+            index_k_buffer = self.index_k_with_scale_buffer[layer_idx]
+        else:
+            index_k_buffer = self.layersplit_index_k_with_scale_buffer
+
+        from sglang.srt.layers.dp_attention import get_attention_cp_group
+
+        return get_attention_cp_group().broadcast(index_k_buffer, src=owner_rank)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return self._get_layersplit_index_k_with_scale_buffer(layer_id)
 
     def get_index_k_continuous(
         self,
@@ -1986,7 +2077,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
     ):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_layersplit_index_k_with_scale_buffer(layer_id)
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -1999,7 +2090,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
     ):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_layersplit_index_k_with_scale_buffer(layer_id)
         return index_buf_accessor.GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -2025,7 +2116,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_layersplit_index_k_with_scale_buffer(layer_id)
         return index_buf_accessor.GetKAndS.execute(
             self,
             buf,
@@ -2042,6 +2133,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
+        if not self.layersplit_owns_layer(layer_id):
+            return
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
@@ -2121,10 +2214,15 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
                 self.kv_buffer = []
                 for local_layer_idx in range(self.layer_num):
                     layer_id = self.start_layer + local_layer_idx
+                    rows = (
+                        m
+                        if self.layersplit_owns_layer(layer_id)
+                        else self.page_size
+                    )
                     if layer_id in self.turboquant_skip_layers:
                         self.kv_buffer.append(
                             torch.zeros(
-                                (m, 1, self.kv_cache_dim),
+                                (rows, 1, self.kv_cache_dim),
                                 dtype=self.dtype,
                                 device=self.device,
                             )
@@ -2132,11 +2230,17 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
                     else:
                         self.kv_buffer.append(
                             torch.zeros(
-                                (m, 1, self.turboquant_slot_bytes),
+                                (rows, 1, self.turboquant_slot_bytes),
                                 dtype=torch.uint8,
                                 device=self.device,
                             )
                         )
+                if self.layersplit_policy is not None:
+                    self.layersplit_kv_buffer = torch.zeros(
+                        (m, 1, self.turboquant_slot_bytes),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
                 self._deq_buffer = (
                     torch.zeros(
                         (m, 1, self.kv_cache_dim),
@@ -2181,7 +2285,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
 
         layer_idx = layer_id - self.start_layer
         if not self._uses_turboquant_layer(layer_id):
-            return self.kv_buffer[layer_idx]
+            return self._get_layersplit_kv_buffer(layer_id)
 
         if self._deq_buffer is None:
             raise RuntimeError(
@@ -2191,7 +2295,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
             n = self._tq_active[layer_idx]
             if n > 0:
                 self._deq_buffer[:n] = self.turboquant_codec.decompress(
-                    self.kv_buffer[layer_idx][:n],
+                    self._get_layersplit_kv_buffer(layer_id)[:n],
                     self.dtype,
                 )
             self._tq_dirty[layer_idx] = False
@@ -2209,8 +2313,9 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
         fp8_layout: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         layer_idx = layer_id - self.start_layer
+        layer_buffer = self._get_layersplit_kv_buffer(layer_id)
         if not self._uses_turboquant_layer(layer_id):
-            return self.kv_buffer[layer_idx], page_table
+            return layer_buffer, page_table
 
         if (
             fp8_layout
@@ -2269,7 +2374,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
                 ]
                 kv_cache = self._tq_selected_fp8_buffer[:full_rows]
                 dequantize_page_table_selected_2p5_fp8(
-                    self.kv_buffer[layer_idx],
+                    layer_buffer,
                     full_page_table,
                     kv_cache.view(torch.uint8),
                     full_compact_page_table,
@@ -2304,7 +2409,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
                 else dequantize_page_table_selected_2p5_fp8
             )
             fp8_dequant_fn(
-                self.kv_buffer[layer_idx],
+                layer_buffer,
                 page_table,
                 kv_cache.view(torch.uint8),
                 self._tq_compact_page_table,
@@ -2338,7 +2443,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
                 self._tq_compact_page_table = torch.empty_like(page_table)
             kv_cache = self._tq_selected_buffer[: page_table.numel()]
             dequantize_page_table_selected_2p5(
-                self.kv_buffer[layer_idx],
+                layer_buffer,
                 page_table,
                 kv_cache,
                 self._tq_compact_page_table,
@@ -2367,7 +2472,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
                 )
             kv_cache = self._tq_selected_buffer[: flat_loc.numel()]
             dequantize_selected_4bit(
-                self.kv_buffer[layer_idx],
+                layer_buffer,
                 flat_loc,
                 kv_cache,
                 self.turboquant_codec.centroids,
@@ -2390,7 +2495,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
                 )
             kv_cache = self._tq_selected_buffer[: flat_loc.numel()]
             dequantize_selected_2p5(
-                self.kv_buffer[layer_idx],
+                layer_buffer,
                 flat_loc,
                 kv_cache,
                 self.turboquant_codec.centroids_high,
@@ -2400,7 +2505,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
             )
         else:
             kv_cache = self.turboquant_codec.decompress(
-                self.kv_buffer[layer_idx][flat_loc],
+                layer_buffer[flat_loc],
                 self.dtype,
             )
         compact_page_table = torch.arange(
@@ -2420,6 +2525,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
         sm_scale: float,
     ) -> torch.Tensor:
         layer_idx = layer_id - self.start_layer
+        layer_buffer = self._get_layersplit_kv_buffer(layer_id)
         out = torch.empty(
             (q_nope.shape[0], q_nope.shape[1], self.kv_lora_rank),
             dtype=self.dtype,
@@ -2460,7 +2566,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
         turboquant_dense_mla_decode_2p5_split_rotated(
             self._tq_mla_q_rotated,
             q_rope,
-            self.kv_buffer[layer_idx],
+            layer_buffer,
             page_table,
             self._tq_mla_decode_mid,
             out,
@@ -2501,6 +2607,8 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
     ):
         layer_id = layer.layer_id
         layer_idx = layer_id - self.start_layer
+        if not self.layersplit_owns_layer(layer_id):
+            return
 
         if not self._uses_turboquant_layer(layer_id):
             if cache_k_nope.dtype != self.dtype:
@@ -2562,9 +2670,10 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
         if not self._uses_turboquant_layer(layer_id):
             return super().get_mla_kv_buffer(layer, loc, dst_dtype)
 
-        layer_idx = layer_id - self.start_layer
         dst_dtype = dst_dtype or self.dtype
-        kv = self.turboquant_codec.decompress(self.kv_buffer[layer_idx][loc], dst_dtype)
+        kv = self.turboquant_codec.decompress(
+            self._get_layersplit_kv_buffer(layer_id)[loc], dst_dtype
+        )
         return kv[..., : self.kv_lora_rank], kv[..., self.kv_lora_rank :]
 
 

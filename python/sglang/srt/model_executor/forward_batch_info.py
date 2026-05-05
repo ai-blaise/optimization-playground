@@ -66,6 +66,7 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.layers.attention.nsa.layersplit import LayerSplitMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
@@ -424,6 +425,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dimensions: Optional[list[int]] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
+    nsa_layersplit_metadata: Optional["LayerSplitMetadata"] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

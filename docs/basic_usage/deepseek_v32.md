@@ -440,6 +440,35 @@ Example usage:
 # Launch with FusedMoe + CP8
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-nsa-prefill-context-parallel  --attn-cp-size 8 --nsa-prefill-cp-mode round-robin-split --max-running-requests 32
 ```
+
+### LayerSplit KV storage mode
+
+LayerSplit is an experimental storage policy for DSA prefill context
+parallelism. It is controlled separately from the token split mode:
+
+```bash
+--enable-nsa-prefill-context-parallel \
+--nsa-prefill-cp-mode round-robin-split \
+--nsa-prefill-cp-kv-storage-mode layersplit \
+--nsa-prefill-cp-layersplit-layout interleaved
+```
+
+The default `--nsa-prefill-cp-kv-storage-mode replicated` keeps the existing
+behavior, where each CP rank writes a full per-layer KV copy after the CP
+all-gather. `layersplit` assigns persistent dense KV and NSA indexer cache
+ownership by layer across CP ranks. The initial owner metadata also preserves
+IndexCache F/S source-layer mapping so disaggregated prefill/decode can transfer
+both dense KV and indexer state by global layer owner instead of by token/page
+CP slice.
+
+For the REAP production path, LayerSplit is intended to feed decode-side
+HiSparse with dense TurboQuant and decode-only SMC-SD. HiSparse remains the
+preferred runtime path when it conflicts with HiCache. In disaggregated
+prefill/decode mode, LayerSplit requires
+`SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1`: each prefill CP rank owns full
+prefix pages for a subset of global layers, so the P/D transfer must collect
+all layer owners rather than filtering page indices to a single CP rank.
+
 ### Pipeline Parallel + Context Parallel (PP + CP)
 
 This mode combines Pipeline Parallelism (PP) and Context Parallelism (CP) to scale across multiple nodes, which can achieve better throughput and Time To First Token (TTFT). Note that this method has only been tested on H20 96G.

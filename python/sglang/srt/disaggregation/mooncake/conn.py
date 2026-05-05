@@ -603,17 +603,11 @@ class MooncakeKVManager(CommonKVManager):
 
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend:
-            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+            layers_params = self.get_mla_layers_params_with_pp(
+                src_data_ptrs,
+                dst_data_ptrs,
+                item_lens,
             )
-            layers_params = [
-                (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
-                )
-                for layer_id in range(layers_current_pp_stage)
-            ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
@@ -1681,7 +1675,10 @@ class MooncakeKVSender(CommonKVSender):
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
         # Special handling for cp
-        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+        if (
+            self.kv_mgr.enable_all_cp_ranks_for_transfer
+            and not self.kv_mgr.use_layersplit_pd_transfer()
+        ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
                 kv_indices,

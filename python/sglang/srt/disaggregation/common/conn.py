@@ -428,6 +428,59 @@ class CommonKVManager(BaseKVManager):
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
+    def use_layersplit_pd_transfer(self) -> bool:
+        return (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.is_mla_backend
+            and getattr(
+                self.server_args,
+                "nsa_prefill_cp_kv_storage_mode",
+                "replicated",
+            )
+            == "layersplit"
+        )
+
+    def get_mla_layers_params_with_pp(
+        self,
+        src_data_ptrs: List[int],
+        dst_data_ptrs: List[int],
+        item_lens: List[int],
+    ) -> List[Tuple[int, int, int]]:
+        if not self.use_layersplit_pd_transfer():
+            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+            )
+            return [
+                (
+                    src_kv_ptrs[layer_id],
+                    dst_kv_ptrs[layer_id],
+                    item_lens[layer_id],
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
+
+        from sglang.srt.layers.attention.nsa.layersplit import (
+            LayerSplitPolicy,
+            build_layersplit_mla_transfer_params,
+        )
+
+        start_layer = self.kv_args.prefill_start_layer
+        layer_count = len(src_data_ptrs)
+        policy = LayerSplitPolicy(
+            cp_rank=self.attn_cp_rank,
+            cp_size=self.attn_cp_size,
+            start_layer=start_layer,
+            end_layer=start_layer + layer_count,
+            layout=self.server_args.nsa_prefill_cp_layersplit_layout,
+        )
+
+        return build_layersplit_mla_transfer_params(
+            src_data_ptrs,
+            dst_data_ptrs,
+            item_lens,
+            policy,
+        )
+
 
 class CommonKVSender(BaseKVSender):
     def __init__(

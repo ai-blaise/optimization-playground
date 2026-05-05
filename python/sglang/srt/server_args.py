@@ -230,6 +230,10 @@ ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "moo
 
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
+NSA_PREFILL_CP_KV_STORAGE_CHOICES = ["replicated", "layersplit"]
+
+NSA_PREFILL_CP_LAYERSPLIT_LAYOUT_CHOICES = ["interleaved", "contiguous"]
+
 PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
 
 NSA_INDEXER_MODE_CHOICES = ["vanilla", "indexcache", "hisa", "indexcache-hisa"]
@@ -734,6 +738,8 @@ class ServerArgs:
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     nsa_prefill_cp_mode: str = "round-robin-split"
+    nsa_prefill_cp_kv_storage_mode: str = "replicated"
+    nsa_prefill_cp_layersplit_layout: str = "interleaved"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
@@ -6628,6 +6634,24 @@ class ServerArgs:
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
         )
         parser.add_argument(
+            "--nsa-prefill-cp-kv-storage-mode",
+            type=str,
+            default=ServerArgs.nsa_prefill_cp_kv_storage_mode,
+            choices=NSA_PREFILL_CP_KV_STORAGE_CHOICES,
+            help="KV storage policy for DeepSeek NSA prefill context parallelism. "
+            "'replicated' keeps the incumbent full KV copy on every CP rank; "
+            "'layersplit' assigns persistent dense KV and indexer cache ownership "
+            "by layer across CP ranks.",
+        )
+        parser.add_argument(
+            "--nsa-prefill-cp-layersplit-layout",
+            type=str,
+            default=ServerArgs.nsa_prefill_cp_layersplit_layout,
+            choices=NSA_PREFILL_CP_LAYERSPLIT_LAYOUT_CHOICES,
+            help="Layer-to-CP-rank owner layout used when "
+            "--nsa-prefill-cp-kv-storage-mode=layersplit.",
+        )
+        parser.add_argument(
             "--enable-prefill-context-parallel",
             action="store_true",
             help="Enable context parallelism used in the prefill phase",
@@ -7205,6 +7229,40 @@ class ServerArgs:
                 raise ValueError(
                     f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
                     f"Please use --kv-cache-dtype=bfloat16."
+                )
+
+        if self.nsa_prefill_cp_kv_storage_mode == "layersplit":
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            hf_config = self.get_model_config().hf_config
+            if not self.enable_nsa_prefill_context_parallel:
+                raise ValueError(
+                    "--nsa-prefill-cp-kv-storage-mode=layersplit requires "
+                    "--enable-nsa-prefill-context-parallel."
+                )
+            if self.disaggregation_mode == "decode":
+                raise ValueError(
+                    "LayerSplit is a prefill CP KV storage policy and should not "
+                    "be enabled on decode workers."
+                )
+            if self.disaggregation_mode == "prefill":
+                from sglang.srt.environ import envs
+
+                if not envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get():
+                    raise ValueError(
+                        "--nsa-prefill-cp-kv-storage-mode=layersplit with "
+                        "disaggregated prefill requires "
+                        "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1."
+                    )
+            if not is_deepseek_nsa(hf_config):
+                raise ValueError(
+                    "--nsa-prefill-cp-kv-storage-mode=layersplit is only "
+                    "supported for DeepSeek Sparse Attention models."
+                )
+            if self.enable_turboquant_dense_kv_cache and self.turboquant_skip_layers:
+                raise ValueError(
+                    "LayerSplit with dense TurboQuant requires a uniform dense KV "
+                    "row width and does not support --turboquant-skip-layers."
                 )
 
         if self.nsa_indexer_mode != "vanilla":

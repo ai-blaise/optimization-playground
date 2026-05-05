@@ -20,7 +20,12 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.attention.nsa.layersplit import LayerSplitPolicy
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.quantization.turboquant_dense_kv import TurboQuantDenseKVConfig
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
@@ -163,6 +168,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, mr: ModelRunner, num_layers: int, kv_size: int
     ) -> int:
         model_config = mr.model_config
+        storage_layers = self._nsa_storage_layer_count(mr, num_layers)
         index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
         indexer_size_per_token = (
             index_head_dim + index_head_dim // NSATokenToKVPool.quant_block_size * 4
@@ -170,10 +176,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         indexer_element_size = torch._utils._element_size(
             NSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
-        indexer_cell_size = indexer_size_per_token * num_layers * indexer_element_size
+        indexer_cell_size = (
+            indexer_size_per_token * storage_layers * indexer_element_size
+        )
 
         if not mr.server_args.enable_turboquant_dense_kv_cache:
-            dense_cell_size = mr.calculate_mla_kv_cache_dim() * num_layers * kv_size
+            dense_cell_size = mr.calculate_mla_kv_cache_dim() * storage_layers * kv_size
             if is_float4_e2m1fn_x2(mr.kv_cache_dtype):
                 scale_block_size = 16
                 dense_cell_size = (dense_cell_size // 2) + (
@@ -181,7 +189,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                         // scale_block_size
                     )
-                    * num_layers
+                    * storage_layers
                     * kv_size
                 )
             return dense_cell_size + indexer_cell_size
@@ -202,7 +210,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         ).slot_bytes
         dense_cache_bytes = mr.calculate_mla_kv_cache_dim() * kv_size
         dense_cell_size = 0
-        for layer_id in range(mr.start_layer, mr.end_layer):
+        storage_layer_ids = self._nsa_storage_layer_ids(mr, num_layers)
+        for layer_id in storage_layer_ids:
             dense_cell_size += (
                 dense_cache_bytes
                 if layer_id in skipped_layers
@@ -212,6 +221,32 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             dense_cell_size += dense_cache_bytes
 
         return dense_cell_size + indexer_cell_size
+
+    def _nsa_storage_layer_ids(
+        self, mr: ModelRunner, _num_layers: int
+    ) -> tuple[int, ...]:
+        if mr.server_args.nsa_prefill_cp_kv_storage_mode != "layersplit":
+            return tuple(range(mr.start_layer, mr.end_layer))
+        cp_size = get_attention_cp_size()
+        if cp_size <= 1:
+            return tuple(range(mr.start_layer, mr.end_layer))
+        policy = LayerSplitPolicy(
+            cp_rank=get_attention_cp_rank(),
+            cp_size=cp_size,
+            start_layer=mr.start_layer,
+            end_layer=mr.end_layer,
+            layout=mr.server_args.nsa_prefill_cp_layersplit_layout,
+        )
+        owned_layers = policy.owned_layer_ids()
+        scratch_layers = tuple(
+            layer_id
+            for layer_id in range(mr.start_layer, mr.end_layer)
+            if layer_id not in owned_layers
+        )[:1]
+        return owned_layers + scratch_layers
+
+    def _nsa_storage_layer_count(self, mr: ModelRunner, num_layers: int) -> int:
+        return len(self._nsa_storage_layer_ids(mr, num_layers))
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int

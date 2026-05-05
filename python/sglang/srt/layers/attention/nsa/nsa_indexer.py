@@ -1411,6 +1411,9 @@ class Indexer(MultiPlatformOp):
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
         """
 
+        if not forward_batch.token_to_kv_pool.layersplit_owns_layer(layer_id):
+            return
+
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
         if (
             _is_cuda

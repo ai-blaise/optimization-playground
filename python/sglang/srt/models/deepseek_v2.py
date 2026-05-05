@@ -55,9 +55,11 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.nsa.indexer_policy import get_indexcache_skip_flags
+from sglang.srt.layers.attention.nsa.layersplit import prepare_layersplit_metadata
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_layersplit_enabled,
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import (
@@ -2564,6 +2566,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        forward_batch.nsa_layersplit_metadata = None
         if self.nsa_enable_prefill_cp:
             if can_nsa_cp_split(
                 len(input_ids), self.cp_size, self.use_nsa, forward_batch
@@ -2574,6 +2577,18 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
+                if is_nsa_prefill_layersplit_enabled():
+                    server_args = get_global_server_args()
+                    forward_batch.nsa_layersplit_metadata = prepare_layersplit_metadata(
+                        cp_rank=self.cp_rank,
+                        cp_size=self.cp_size,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        layout=server_args.nsa_prefill_cp_layersplit_layout,
+                        num_layers=self.config.num_hidden_layers,
+                        indexcache_freq=server_args.nsa_indexcache_freq,
+                        indexcache_pattern=server_args.nsa_indexcache_pattern,
+                    )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(

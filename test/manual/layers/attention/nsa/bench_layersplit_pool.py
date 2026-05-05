@@ -184,10 +184,27 @@ def main():
         if args.layer_count < dist.get_world_size():
             raise ValueError("--layer-count must be at least WORLD_SIZE")
         patch_sglang_runtime(dist)
+        results = []
         for input_len, output_len in parse_matrix(args.matrix):
             result = benchmark_cell(torch, dist, device, args, input_len, output_len)
             if dist.get_rank() == 0:
+                results.append(result)
                 print(json.dumps(result, sort_keys=True), flush=True)
+        if dist.get_rank() == 0:
+            max_latency_ms = max(result["avg_latency_ms"] for result in results)
+            min_tokens_per_second = min(
+                result["tokens_per_second"] for result in results
+            )
+            all_within_budget = int(
+                all(result["within_latency_budget"] for result in results)
+            )
+            print(
+                "layersplit_summary "
+                f"max_latency_ms={max_latency_ms:.6f} "
+                f"min_tokens_per_second={min_tokens_per_second:.6f} "
+                f"all_within_latency_budget={all_within_budget}",
+                flush=True,
+            )
     finally:
         dist.destroy_process_group()
 

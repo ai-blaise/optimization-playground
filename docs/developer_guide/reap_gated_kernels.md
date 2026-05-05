@@ -1,7 +1,7 @@
 # REAP Gated Kernels
 
 This repository carries two REAP-specific gated kernels for the
-`BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-GatedNorm-G1` deployment lane.
+`BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1` deployment lane.
 
 ## G1 Attention Gate
 

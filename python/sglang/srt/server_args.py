@@ -7240,6 +7240,13 @@ class ServerArgs:
                     "--nsa-prefill-cp-kv-storage-mode=layersplit requires "
                     "--enable-nsa-prefill-context-parallel."
                 )
+            if self.attn_cp_size <= 1:
+                raise ValueError(
+                    "--nsa-prefill-cp-kv-storage-mode=layersplit requires an "
+                    "effective attention CP size greater than 1. Check --tp, "
+                    "--dp, and --attn-cp-size; a topology with CP size 1 would "
+                    "not split KV ownership across ranks."
+                )
             if self.disaggregation_mode == "decode":
                 raise ValueError(
                     "LayerSplit is a prefill CP KV storage policy and should not "

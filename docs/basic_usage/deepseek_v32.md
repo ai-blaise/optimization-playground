@@ -461,6 +461,13 @@ IndexCache F/S source-layer mapping so disaggregated prefill/decode can transfer
 both dense KV and indexer state by global layer owner instead of by token/page
 CP slice.
 
+LayerSplit inherits the existing NSA prefill context-parallel topology
+constraints. The effective attention CP size must be greater than 1 after SGLang
+derives CP from `--tp`, `--dp`, and `--attn-cp-size`; otherwise there are no CP
+ranks across which to split layer ownership. The 4-GPU prefill/4-GPU decode
+REAP production profile with `--tp 4 --dp 4` keeps LayerSplit disabled for this
+reason until a CP-capable prefill topology is used.
+
 For the REAP production path, LayerSplit is intended to feed decode-side
 HiSparse with dense TurboQuant and decode-only SMC-SD. HiSparse remains the
 preferred runtime path when it conflicts with HiCache. In disaggregated

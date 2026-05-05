@@ -1674,10 +1674,11 @@ class MLATokenToKVPool(KVCache):
 
     def _get_layersplit_kv_buffer(self, layer_id: int) -> torch.Tensor:
         layer_idx = layer_id - self.start_layer
-        if self.layersplit_policy is None:
+        policy = self.layersplit_policy
+        if policy is None:
             return self.kv_buffer[layer_idx]
-        owner_rank = self.layersplit_policy.owner_rank(layer_id)
-        if self.layersplit_owns_layer(layer_id):
+        owner_rank = policy.owner_rank(layer_id)
+        if owner_rank == policy.cp_rank:
             kv_buffer = self.kv_buffer[layer_idx]
         else:
             kv_buffer = self.layersplit_kv_buffer
@@ -2056,10 +2057,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
     def _get_layersplit_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         layer_idx = layer_id - self.start_layer
-        if self.layersplit_policy is None:
+        policy = self.layersplit_policy
+        if policy is None:
             return self.index_k_with_scale_buffer[layer_idx]
-        owner_rank = self.layersplit_policy.owner_rank(layer_id)
-        if self.layersplit_owns_layer(layer_id):
+        owner_rank = policy.owner_rank(layer_id)
+        if owner_rank == policy.cp_rank:
             index_k_buffer = self.index_k_with_scale_buffer[layer_idx]
         else:
             index_k_buffer = self.layersplit_index_k_with_scale_buffer

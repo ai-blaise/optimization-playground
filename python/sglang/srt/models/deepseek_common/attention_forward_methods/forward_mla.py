@@ -181,6 +181,13 @@ class DeepseekMLAForwardMixin:
             if self.use_nsa:
                 if q_lora is None:
                     q_lora = q
+                if (
+                    nsa_use_prefill_cp(forward_batch)
+                    and sum(forward_batch.extend_prefix_lens_cpu) > 0
+                ):
+                    forward_batch.token_to_kv_pool.prefetch_layersplit_kv_buffer(
+                        self.layer_id, use_staging=True
+                    )
 
             # overlap q_b_proj and indexer during decode
             if (

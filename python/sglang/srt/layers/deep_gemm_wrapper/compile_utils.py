@@ -196,12 +196,10 @@ def _compile_deep_gemm_one_type_all(
             kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
         )
 
-        old_compile_mode = deep_gemm.get_compile_mode()
-        deep_gemm.set_compile_mode(1)
-        # TODO can use multi thread
-        for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
-            executor.execute(m=m)
-        deep_gemm.set_compile_mode(old_compile_mode)
+        with _deep_gemm_compile_mode():
+            # TODO can use multi thread
+            for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
+                executor.execute(m=m)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()
@@ -247,6 +245,22 @@ class _BaseWarmupExecutor:
 
     def execute(self, m):
         raise NotImplementedError
+
+
+@contextmanager
+def _deep_gemm_compile_mode():
+    get_compile_mode = getattr(deep_gemm, "get_compile_mode", None)
+    set_compile_mode = getattr(deep_gemm, "set_compile_mode", None)
+    if get_compile_mode is None or set_compile_mode is None:
+        yield
+        return
+
+    old_compile_mode = get_compile_mode()
+    set_compile_mode(1)
+    try:
+        yield
+    finally:
+        set_compile_mode(old_compile_mode)
 
 
 def _empty_token_fp8(size):

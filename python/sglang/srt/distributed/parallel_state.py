@@ -1012,6 +1012,16 @@ class GroupCoordinator:
         )
         return input_
 
+    def broadcast_async(self, input_: torch.Tensor, src: int = 0):
+        """Asynchronously broadcast the input tensor."""
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        if self.world_size == 1:
+            return None
+        return torch.distributed.broadcast(
+            input_, src=self.ranks[src], group=self.device_group, async_op=True
+        )
+
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
         """Broadcast the input object.
         NOTE: `src` is the local rank of the source rank.

@@ -67,7 +67,7 @@ class LayerSplitPolicy:
     cp_size: int
     start_layer: int
     end_layer: int
-    layout: str = "contiguous"
+    layout: str = "interleaved"
 
     def __post_init__(self) -> None:
         if self.cp_size <= 0:

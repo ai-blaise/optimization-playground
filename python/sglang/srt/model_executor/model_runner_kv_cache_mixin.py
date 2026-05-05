@@ -418,54 +418,28 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
-            PoolCls = (
-                HiSparseNSATokenToKVPool if self.enable_hisparse else NSATokenToKVPool
-            )
-            pool_kwargs = {}
+            nsa_pool_kwargs = {
+                "size": self.max_total_num_tokens,
+                "page_size": self.page_size,
+                "dtype": self.kv_cache_dtype,
+                "kv_lora_rank": self.model_config.kv_lora_rank,
+                "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+                "layer_num": self.num_effective_layers,
+                "device": self.device,
+                "kv_cache_dim": self.calculate_mla_kv_cache_dim(),
+                "enable_memory_saver": self.server_args.enable_memory_saver,
+                "start_layer": self.start_layer,
+                "end_layer": self.end_layer,
+                "index_head_dim": get_nsa_index_head_dim(self.model_config.hf_config),
+            }
             if self.enable_hisparse:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-                pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
-                    self.server_args
-                ).host_to_device_ratio
-            self.token_to_kv_pool = PoolCls(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                kv_lora_rank=self.model_config.kv_lora_rank,
-                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                kv_cache_dim=self.calculate_mla_kv_cache_dim(),
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
-                **pool_kwargs,
-            )
-            if self.enable_hisparse:
-                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-                hisparse_cfg = parse_hisparse_config(self.server_args)
                 nsa_pool_kwargs["host_to_device_ratio"] = (
-                    hisparse_cfg.host_to_device_ratio
+                    parse_hisparse_config(self.server_args).host_to_device_ratio
                 )
-                if self.server_args.enable_turboquant_dense_kv_cache:
-                    self.token_to_kv_pool = HiSparseTurboQuantNSATokenToKVPool(
-                        **nsa_pool_kwargs,
-                        turboquant_dense_kv_preset=(
-                            self.server_args.turboquant_dense_kv_preset
-                        ),
-                        turboquant_execution_mode=(
-                            self.server_args.turboquant_execution_mode
-                        ),
-                        turboquant_mla_decode_num_splits=(
-                            self.server_args.turboquant_mla_decode_num_splits
-                        ),
-                    )
-                else:
-                    self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
-            elif self.server_args.enable_turboquant_dense_kv_cache:
+
+            if self.server_args.enable_turboquant_dense_kv_cache:
                 skip_layers = (
                     {
                         int(layer_id)
@@ -477,7 +451,12 @@ class ModelRunnerKVCacheMixin:
                     if self.server_args.turboquant_skip_layers
                     else set()
                 )
-                self.token_to_kv_pool = TurboQuantNSATokenToKVPool(
+                pool_cls = (
+                    HiSparseTurboQuantNSATokenToKVPool
+                    if self.enable_hisparse
+                    else TurboQuantNSATokenToKVPool
+                )
+                self.token_to_kv_pool = pool_cls(
                     **nsa_pool_kwargs,
                     turboquant_dense_kv_preset=(
                         self.server_args.turboquant_dense_kv_preset
@@ -490,6 +469,8 @@ class ModelRunnerKVCacheMixin:
                     ),
                     turboquant_skip_layers=skip_layers,
                 )
+            elif self.enable_hisparse:
+                self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
             else:
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:

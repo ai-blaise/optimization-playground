@@ -77,10 +77,10 @@ def test_layersplit_contiguous_owner_mapping():
     assert policy.owner_rank(9) == 3
 
 
-def test_layersplit_default_owner_mapping_is_contiguous():
+def test_layersplit_default_owner_mapping_is_interleaved():
     policy = LayerSplitPolicy(cp_rank=0, cp_size=2, start_layer=0, end_layer=4)
 
-    assert policy.owned_layer_ids() == (0, 1)
+    assert policy.owned_layer_ids() == (0, 2)
 
 
 @pytest.mark.parametrize("cp_size", [2, 4, 8])

@@ -1207,12 +1207,10 @@ class Indexer(MultiPlatformOp):
                 end_seq_position += pre_chunk_offset
                 if offset == 0 and batch_idx != 0:
                     offset += forward_batch.extend_seq_lens_cpu[batch_idx - 1]
-                k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
-                    layer_id,
-                    end_seq_position,
-                    block_tables[batch_idx],
-                )
-                k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+                (
+                    k_fp8,
+                    k_scale,
+                ) = forward_batch.token_to_kv_pool.get_index_k_and_scale_continuous(
                     layer_id,
                     end_seq_position,
                     block_tables[batch_idx],
@@ -1268,12 +1266,10 @@ class Indexer(MultiPlatformOp):
                 - forward_batch.extend_seq_lens_cpu[0]
                 + kv_len
             )
-            k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
-                layer_id,
-                kv_len,
-                block_tables[0],
-            )
-            k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+            (
+                k_fp8,
+                k_scale,
+            ) = forward_batch.token_to_kv_pool.get_index_k_and_scale_continuous(
                 layer_id,
                 kv_len,
                 block_tables[0],
@@ -1361,12 +1357,10 @@ class Indexer(MultiPlatformOp):
             weights_partial = weights[q_len_start:q_len_end]
             weights_partial = weights_partial.squeeze(-1).unsqueeze(0).contiguous()
 
-            k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
-                layer_id,
-                seq_len,
-                block_tables[i],
-            )
-            k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+            (
+                k_fp8,
+                k_scale,
+            ) = forward_batch.token_to_kv_pool.get_index_k_and_scale_continuous(
                 layer_id,
                 seq_len,
                 block_tables[i],
@@ -1411,7 +1405,9 @@ class Indexer(MultiPlatformOp):
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
         """
 
-        if not forward_batch.token_to_kv_pool.layersplit_owns_layer(layer_id):
+        pool = forward_batch.token_to_kv_pool
+        if not pool.layersplit_owns_layer(layer_id):
+            pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return
 
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
@@ -1425,22 +1421,19 @@ class Indexer(MultiPlatformOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
+            buf = pool.get_local_index_k_with_scale_buffer(layer_id=layer_id)
             fused_store_index_k_cache(
                 key,
                 buf,
                 forward_batch.out_cache_loc,
-                forward_batch.token_to_kv_pool.page_size,
+                pool.page_size,
             )
+            pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return
 
         # Fast path: AITER fused quant + cache store (HIP, page_size=1)
         if _use_aiter:
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
+            buf = pool.get_local_index_k_with_scale_buffer(layer_id=layer_id)
             # Reshape from (num_pages, 132) uint8 to (num_pages, 1, 132) fp8
             # to match kernel's (num_blocks, block_size, head_dim + scale_bytes) layout
             kv_cache = buf.unsqueeze(1).view(fp8_dtype)
@@ -1450,6 +1443,7 @@ class Indexer(MultiPlatformOp):
             indexer_k_quant_and_cache(
                 key, kv_cache, out_loc, self.block_size, self.scale_fmt
             )
+            pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return
 
         # Fallback: original path

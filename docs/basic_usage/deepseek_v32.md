@@ -450,7 +450,7 @@ parallelism. It is controlled separately from the token split mode:
 --enable-nsa-prefill-context-parallel \
 --nsa-prefill-cp-mode round-robin-split \
 --nsa-prefill-cp-kv-storage-mode layersplit \
---nsa-prefill-cp-layersplit-layout contiguous
+--nsa-prefill-cp-layersplit-layout interleaved
 ```
 
 The default `--nsa-prefill-cp-kv-storage-mode replicated` keeps the existing
@@ -460,10 +460,10 @@ ownership by layer across CP ranks. Disaggregated prefill/decode transfers both
 dense KV and indexer state by global layer owner instead of by token/page CP
 slice.
 
-The default LayerSplit owner layout is `contiguous`: adjacent layers are grouped
-on the same CP rank to reduce owner-rank changes during the normal layer-order
-prefill traversal. `interleaved` remains available for explicit comparison and
-diagnostics.
+The default LayerSplit owner layout is `interleaved`, which distributes adjacent
+layers across CP ranks and matches the cross-GPU interleaved storage described
+for the production CP design. `contiguous` remains available for explicit
+comparison and diagnostics.
 
 LayerSplit inherits the existing NSA prefill context-parallel topology
 constraints. The effective attention CP size must be greater than 1 after SGLang
@@ -487,6 +487,14 @@ owned NSA indexer state, and one full-layer scratch buffer used when a non-owner
 rank reads a layer through the CP group. P/D transfer descriptors are validated
 against either same-PP local decode layers or a global decode layer list; other
 layouts are rejected instead of being remapped implicitly.
+
+During prefill, LayerSplit overlaps owner-rank dense KV broadcast with the NSA
+indexer path. The owner copies the cached-prefix layer KV into the LayerSplit
+scratch buffer before launching the early broadcast, then writes current-step
+rows into the persistent owner buffer later. Non-owner ranks wait for the early
+broadcast and patch the current-step rows into their scratch buffer. This keeps
+the source tensor immutable while the asynchronous broadcast is in flight and
+avoids a second full-layer broadcast before attention.
 
 The owner-local dense KV, NSA indexer cache, and dense TurboQuant storage path
 can be smoke-tested on one CUDA node with:
@@ -528,12 +536,21 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
   test/manual/layers/attention/nsa/bench_layersplit_pool.py \
   --matrix 8192x1k,16kx1k,32kx1k,64kx1k,128kx1k \
   --storage turboquant \
-  --layout contiguous \
+  --layout interleaved \
   --layer-count 61 \
   --warmup 2 \
   --iters 10 \
   --latency-budget-ms 2000
 ```
+
+On `instance-20260415-161450` with dummy `deepseek-ai/DeepSeek-V3.2-Exp`,
+TP=8/CP=8, IndexCache, dense TurboQuant 2.5-bit KV, Triton FP8/MoE, and CUDA
+graphs disabled, the selected generated-shared-prefix point for this candidate
+is c16 at 19,725.53 input tokens/s and 1,569.50 ms mean TTFT. The comparable
+replicated-KV point under the same mean-2s TTFT budget is c8 at 19,034.93 input
+tokens/s. P99 TTFT is still above 2 seconds for the LayerSplit c16 point, so use
+that metric explicitly if the serving objective switches from mean TTFT to tail
+TTFT.
 
 ### Pipeline Parallel + Context Parallel (PP + CP)
 

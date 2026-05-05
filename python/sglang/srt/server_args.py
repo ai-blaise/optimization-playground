@@ -739,7 +739,7 @@ class ServerArgs:
     enable_nsa_prefill_context_parallel: bool = False
     nsa_prefill_cp_mode: str = "round-robin-split"
     nsa_prefill_cp_kv_storage_mode: str = "replicated"
-    nsa_prefill_cp_layersplit_layout: str = "contiguous"
+    nsa_prefill_cp_layersplit_layout: str = "interleaved"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False

@@ -6,7 +6,7 @@ class Args:
 
     def __init__(self):
         self.nsa_prefill_cp_layersplit_layout = os.environ.get(
-            "LAYERSPLIT_LAYOUT", "contiguous"
+            "LAYERSPLIT_LAYOUT", "interleaved"
         )
 
 
@@ -21,6 +21,9 @@ class Group:
     def broadcast(self, tensor, src=0):
         self._dist.broadcast(tensor, src=src)
         return tensor
+
+    def broadcast_async(self, tensor, src=0):
+        return self._dist.broadcast(tensor, src=src, async_op=True)
 
 
 def patch_sglang_runtime(dist):
@@ -46,6 +49,10 @@ def smoke_layer_count(world_size):
 def run_dense_pool(torch, dist, device, layer_count):
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
+    class Layer:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+
     pool = NSATokenToKVPool(
         size=128,
         page_size=64,
@@ -67,21 +74,59 @@ def run_dense_pool(torch, dist, device, layer_count):
         if pool.layersplit_owns_layer(layer_id):
             owned_layers += 1
             pool.kv_buffer[layer_id].fill_(10 + layer_id)
-            pool.index_k_with_scale_buffer[layer_id].fill_(40 + layer_id)
-    if owned_layers == 0:
-        raise AssertionError(f"rank {rank} owns no layers in smoke test")
-    dist.barrier()
-    for layer_id in range(layer_count):
+            local_index_buf = pool.get_local_index_k_with_scale_buffer(layer_id)
+            if local_index_buf.data_ptr() != pool.index_k_with_scale_buffer[
+                layer_id
+            ].data_ptr():
+                raise AssertionError("local indexer cache accessor copied storage")
+            local_index_buf.fill_(40 + layer_id)
+        pool.prefetch_layersplit_kv_buffer(layer_id, use_staging=True)
+        pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
+        update_loc = torch.tensor([0, 65], dtype=torch.int64, device=device)
+        cache_k_nope = torch.full(
+            (2, 1, pool.kv_lora_rank),
+            100 + layer_id,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        cache_k_rope = torch.full(
+            (2, 1, pool.qk_rope_head_dim),
+            100 + layer_id,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        pool.set_mla_kv_buffer(
+            Layer(layer_id), update_loc, cache_k_nope, cache_k_rope
+        )
         key, value = pool.get_kv_buffer(layer_id)
         assert value.data_ptr() == key.data_ptr()
         assert value.shape[-1] == pool.kv_lora_rank
         assert_tensor_value(
-            f"dense kv rank={rank} layer={layer_id}", key, 10 + layer_id
+            f"dense current kv rank={rank} layer={layer_id}",
+            key[update_loc[0]],
+            100 + layer_id,
+        )
+        assert_tensor_value(
+            f"dense prefix kv rank={rank} layer={layer_id}", key[1], 10 + layer_id
         )
         index_buf = pool.get_index_k_with_scale_buffer(layer_id)
         assert_tensor_value(
             f"index rank={rank} layer={layer_id}", index_buf, 40 + layer_id
         )
+        page_indices = torch.arange(2, device=device)
+        index_k, index_scale = pool.get_index_k_and_scale_continuous(
+            layer_id, 128, page_indices
+        )
+        assert_tensor_value(
+            f"paired index k rank={rank} layer={layer_id}", index_k, 40 + layer_id
+        )
+        assert_tensor_value(
+            f"paired index scale rank={rank} layer={layer_id}",
+            index_scale,
+            40 + layer_id,
+        )
+    if owned_layers == 0:
+        raise AssertionError(f"rank {rank} owns no layers in smoke test")
     return pool.get_kv_size_bytes()
 
 
@@ -112,16 +157,15 @@ def run_turboquant_storage(torch, dist, device, layer_count):
         if pool.layersplit_owns_layer(layer_id):
             owned_layers += 1
             pool.kv_buffer[layer_id].fill_(70 + layer_id)
-    if owned_layers == 0:
-        raise AssertionError(f"rank {rank} owns no TurboQuant layers in smoke test")
-    dist.barrier()
-    for layer_id in range(layer_count):
+        pool.prefetch_layersplit_kv_buffer(layer_id)
         kv = pool._get_layersplit_kv_buffer(layer_id)
         if kv.dtype != torch.uint8:
             raise AssertionError(f"turboquant storage dtype mismatch: {kv.dtype}")
         assert_tensor_value(
             f"turboquant kv rank={rank} layer={layer_id}", kv, 70 + layer_id
         )
+    if owned_layers == 0:
+        raise AssertionError(f"rank {rank} owns no TurboQuant layers in smoke test")
     return pool.get_kv_size_bytes()
 
 
@@ -137,7 +181,7 @@ def main():
     dist.init_process_group(backend="nccl")
     try:
         patch_sglang_runtime(dist)
-        layout = os.environ.get("LAYERSPLIT_LAYOUT", "contiguous")
+        layout = os.environ.get("LAYERSPLIT_LAYOUT", "interleaved")
         layer_count = smoke_layer_count(dist.get_world_size())
         dense_bytes = run_dense_pool(torch, dist, device, layer_count)
         tq_bytes = run_turboquant_storage(torch, dist, device, layer_count)

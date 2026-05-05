@@ -3,9 +3,11 @@ import json
 import os
 
 
-class Args:
+class RuntimeArgs:
     nsa_prefill_cp_kv_storage_mode = "layersplit"
-    nsa_prefill_cp_layersplit_layout = "interleaved"
+
+    def __init__(self, layout):
+        self.nsa_prefill_cp_layersplit_layout = layout
 
 
 class Group:
@@ -21,14 +23,14 @@ class Group:
         return tensor
 
 
-def patch_sglang_runtime(dist):
+def patch_sglang_runtime(dist, layout):
     import sglang.srt.layers.dp_attention as dp_attention
     import sglang.srt.server_args as server_args
 
     dp_attention.get_attention_cp_rank = lambda: dist.get_rank()
     dp_attention.get_attention_cp_size = lambda: dist.get_world_size()
     dp_attention.get_attention_cp_group = lambda: Group(dist)
-    server_args.get_global_server_args = lambda: Args()
+    server_args.get_global_server_args = lambda: RuntimeArgs(layout)
 
 
 def parse_matrix(value):
@@ -144,6 +146,7 @@ def benchmark_cell(torch, dist, device, args, input_len, output_len):
         "input_tokens": input_len,
         "output_tokens": output_len,
         "storage": args.storage,
+        "layout": args.layout,
         "cp_size": dist.get_world_size(),
         "layer_count": args.layer_count,
         "avg_latency_ms": avg_ms,
@@ -167,6 +170,11 @@ def main():
         choices=("turboquant", "dense"),
         default="turboquant",
     )
+    parser.add_argument(
+        "--layout",
+        choices=("interleaved", "contiguous"),
+        default="contiguous",
+    )
     parser.add_argument("--layer-count", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
@@ -183,7 +191,7 @@ def main():
     try:
         if args.layer_count < dist.get_world_size():
             raise ValueError("--layer-count must be at least WORLD_SIZE")
-        patch_sglang_runtime(dist)
+        patch_sglang_runtime(dist, args.layout)
         results = []
         for input_len, output_len in parse_matrix(args.matrix):
             result = benchmark_cell(torch, dist, device, args, input_len, output_len)
@@ -195,6 +203,12 @@ def main():
             min_tokens_per_second = min(
                 result["tokens_per_second"] for result in results
             )
+            total_input_tokens = sum(result["input_tokens"] for result in results)
+            total_latency_ms = sum(result["avg_latency_ms"] for result in results)
+            aggregate_tokens_per_second = total_input_tokens / max(
+                total_latency_ms / 1000.0, 1e-9
+            )
+            max_kv_bytes_sum = max(result["kv_bytes_sum"] for result in results)
             all_within_budget = int(
                 all(result["within_latency_budget"] for result in results)
             )
@@ -202,6 +216,8 @@ def main():
                 "layersplit_summary "
                 f"max_latency_ms={max_latency_ms:.6f} "
                 f"min_tokens_per_second={min_tokens_per_second:.6f} "
+                f"aggregate_tokens_per_second={aggregate_tokens_per_second:.6f} "
+                f"max_kv_bytes_sum={max_kv_bytes_sum} "
                 f"all_within_latency_budget={all_within_budget}",
                 flush=True,
             )

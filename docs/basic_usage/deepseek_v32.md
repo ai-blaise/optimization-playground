@@ -450,7 +450,7 @@ parallelism. It is controlled separately from the token split mode:
 --enable-nsa-prefill-context-parallel \
 --nsa-prefill-cp-mode round-robin-split \
 --nsa-prefill-cp-kv-storage-mode layersplit \
---nsa-prefill-cp-layersplit-layout interleaved
+--nsa-prefill-cp-layersplit-layout contiguous
 ```
 
 The default `--nsa-prefill-cp-kv-storage-mode replicated` keeps the existing
@@ -459,6 +459,11 @@ all-gather. `layersplit` assigns persistent dense KV and NSA indexer cache
 ownership by layer across CP ranks. Disaggregated prefill/decode transfers both
 dense KV and indexer state by global layer owner instead of by token/page CP
 slice.
+
+The default LayerSplit owner layout is `contiguous`: adjacent layers are grouped
+on the same CP rank to reduce owner-rank changes during the normal layer-order
+prefill traversal. `interleaved` remains available for explicit comparison and
+diagnostics.
 
 LayerSplit inherits the existing NSA prefill context-parallel topology
 constraints. The effective attention CP size must be greater than 1 after SGLang
@@ -520,7 +525,10 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
   test/manual/layers/attention/nsa/bench_layersplit_pool.py \
   --matrix 8192x1k,16kx1k,32kx1k,64kx1k,128kx1k \
   --storage turboquant \
+  --layout contiguous \
   --layer-count 61 \
+  --warmup 2 \
+  --iters 10 \
   --latency-budget-ms 2000
 ```
 

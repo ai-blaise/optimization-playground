@@ -77,6 +77,12 @@ def test_layersplit_contiguous_owner_mapping():
     assert policy.owner_rank(9) == 3
 
 
+def test_layersplit_default_owner_mapping_is_contiguous():
+    policy = LayerSplitPolicy(cp_rank=0, cp_size=2, start_layer=0, end_layer=4)
+
+    assert policy.owned_layer_ids() == (0, 1)
+
+
 @pytest.mark.parametrize("cp_size", [2, 4, 8])
 @pytest.mark.parametrize("layout", ["interleaved", "contiguous"])
 def test_layersplit_owner_mapping_covers_layers_for_cp_sizes(cp_size, layout):
@@ -112,7 +118,13 @@ def test_layersplit_owner_mapping_covers_layers_for_cp_sizes(cp_size, layout):
 
 
 def test_layersplit_mla_transfer_params_use_global_decode_layers():
-    policy = LayerSplitPolicy(cp_rank=1, cp_size=2, start_layer=2, end_layer=6)
+    policy = LayerSplitPolicy(
+        cp_rank=1,
+        cp_size=2,
+        start_layer=2,
+        end_layer=6,
+        layout="interleaved",
+    )
 
     assert build_layersplit_mla_transfer_params(
         src_data_ptrs=[100, 101, 102, 103],
@@ -126,7 +138,13 @@ def test_layersplit_mla_transfer_params_use_global_decode_layers():
 
 
 def test_layersplit_mla_transfer_params_use_local_decode_layers_for_same_pp():
-    policy = LayerSplitPolicy(cp_rank=0, cp_size=2, start_layer=2, end_layer=6)
+    policy = LayerSplitPolicy(
+        cp_rank=0,
+        cp_size=2,
+        start_layer=2,
+        end_layer=6,
+        layout="interleaved",
+    )
 
     assert build_layersplit_mla_transfer_params(
         src_data_ptrs=[100, 101, 102, 103],

@@ -3,7 +3,11 @@ import os
 
 class Args:
     nsa_prefill_cp_kv_storage_mode = "layersplit"
-    nsa_prefill_cp_layersplit_layout = "interleaved"
+
+    def __init__(self):
+        self.nsa_prefill_cp_layersplit_layout = os.environ.get(
+            "LAYERSPLIT_LAYOUT", "contiguous"
+        )
 
 
 class Group:
@@ -133,6 +137,7 @@ def main():
     dist.init_process_group(backend="nccl")
     try:
         patch_sglang_runtime(dist)
+        layout = os.environ.get("LAYERSPLIT_LAYOUT", "contiguous")
         layer_count = smoke_layer_count(dist.get_world_size())
         dense_bytes = run_dense_pool(torch, dist, device, layer_count)
         tq_bytes = run_turboquant_storage(torch, dist, device, layer_count)
@@ -145,6 +150,7 @@ def main():
                 "LayerSplit distributed smoke passed: "
                 f"world_size={dist.get_world_size()} "
                 f"layers={layer_count} "
+                f"layout={layout} "
                 f"dense_bytes_sum={int(dense_total.item())} "
                 f"tq_bytes_sum={int(tq_total.item())}"
             )

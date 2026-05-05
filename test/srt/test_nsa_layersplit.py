@@ -77,6 +77,40 @@ def test_layersplit_contiguous_owner_mapping():
     assert policy.owner_rank(9) == 3
 
 
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("layout", ["interleaved", "contiguous"])
+def test_layersplit_owner_mapping_covers_layers_for_cp_sizes(cp_size, layout):
+    layer_count = cp_size * 2 + 1
+    start_layer = 3
+    owners = {}
+
+    for cp_rank in range(cp_size):
+        policy = LayerSplitPolicy(
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            start_layer=start_layer,
+            end_layer=start_layer + layer_count,
+            layout=layout,
+        )
+        for layer_id in policy.owned_layer_ids():
+            assert layer_id not in owners
+            owners[layer_id] = cp_rank
+
+    expected_layers = set(range(start_layer, start_layer + layer_count))
+    assert set(owners) == expected_layers
+
+    for layer_id, cp_rank in owners.items():
+        policy = LayerSplitPolicy(
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            start_layer=start_layer,
+            end_layer=start_layer + layer_count,
+            layout=layout,
+        )
+        assert policy.owns_layer(layer_id)
+        assert policy.owner_rank(layer_id) == cp_rank
+
+
 def test_layersplit_mla_transfer_params_use_global_decode_layers():
     policy = LayerSplitPolicy(cp_rank=1, cp_size=2, start_layer=2, end_layer=6)
 
@@ -133,6 +167,41 @@ def test_layersplit_transfer_params_reject_mismatched_inputs():
         )
 
 
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+def test_layersplit_transfer_params_cover_all_layers_across_cp_sizes(cp_size):
+    start_layer = 2
+    layer_count = cp_size * 2
+    src_data_ptrs = [1000 + i for i in range(layer_count)]
+    dst_data_ptrs = [2000 + i for i in range(start_layer + layer_count)]
+    item_lens = [3000 + i for i in range(layer_count)]
+    all_params = []
+
+    for cp_rank in range(cp_size):
+        policy = LayerSplitPolicy(
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            start_layer=start_layer,
+            end_layer=start_layer + layer_count,
+        )
+        all_params.extend(
+            build_layersplit_mla_transfer_params(
+                src_data_ptrs=src_data_ptrs,
+                dst_data_ptrs=dst_data_ptrs,
+                item_lens=item_lens,
+                policy=policy,
+            )
+        )
+
+    assert sorted(all_params) == sorted(
+        (
+            src_data_ptrs[local_layer_idx],
+            dst_data_ptrs[start_layer + local_layer_idx],
+            item_lens[local_layer_idx],
+        )
+        for local_layer_idx in range(layer_count)
+    )
+
+
 def test_layersplit_rejects_bad_policy():
     with pytest.raises(ValueError, match="cp_rank"):
         LayerSplitPolicy(cp_rank=2, cp_size=2, start_layer=0, end_layer=4)
@@ -184,5 +253,10 @@ def test_layersplit_server_arg_validation_rejects_invalid_configs(
         validate_layersplit_server_args(**valid_layersplit_args(**overrides))
 
 
-def test_layersplit_server_arg_validation_accepts_prefill_config():
-    validate_layersplit_server_args(**valid_layersplit_args())
+@pytest.mark.parametrize("attn_cp_size", [2, 4, 8])
+def test_layersplit_server_arg_validation_accepts_prefill_cp_configs(
+    attn_cp_size,
+):
+    validate_layersplit_server_args(
+        **valid_layersplit_args(attn_cp_size=attn_cp_size)
+    )

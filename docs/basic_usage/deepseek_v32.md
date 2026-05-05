@@ -493,6 +493,37 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
   test/manual/layers/attention/nsa/test_layersplit_pool_smoke.py
 ```
 
+For CP functionality coverage, rerun the smoke with each available CP size. The
+smoke scales its synthetic layer count with `WORLD_SIZE` so every CP rank owns
+at least one layer:
+
+```bash
+for cp_size in 2 4 8; do
+  CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((cp_size - 1))) \
+  PYTHONPATH=python \
+  python -m torch.distributed.run --standalone --nproc_per_node=${cp_size} \
+    test/manual/layers/attention/nsa/test_layersplit_pool_smoke.py
+done
+```
+
+The LayerSplit-only prefill benchmark uses the same owner-local dense KV,
+IndexCache/indexer state, CP broadcast, and dense TurboQuant compressed storage
+paths without changing Dynamo or infrastructure scripts. It is intended for the
+current bring-up loop, where CP configurations only need functional validation
+and the selected target topology is optimized for maximum throughput within a
+2-second prefill latency budget:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+PYTHONPATH=python \
+python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  test/manual/layers/attention/nsa/bench_layersplit_pool.py \
+  --matrix 8192x1k,16kx1k,32kx1k,64kx1k,128kx1k \
+  --storage turboquant \
+  --layer-count 61 \
+  --latency-budget-ms 2000
+```
+
 ### Pipeline Parallel + Context Parallel (PP + CP)
 
 This mode combines Pipeline Parallelism (PP) and Context Parallelism (CP) to scale across multiple nodes, which can achieve better throughput and Time To First Token (TTFT). Note that this method has only been tested on H20 96G.

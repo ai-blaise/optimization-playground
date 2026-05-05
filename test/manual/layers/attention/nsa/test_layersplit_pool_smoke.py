@@ -35,7 +35,11 @@ def assert_tensor_value(name, tensor, expected):
         raise AssertionError(f"{name}: expected {expected}, got {actual}")
 
 
-def run_dense_pool(torch, dist, device):
+def smoke_layer_count(world_size):
+    return int(os.environ.get("LAYERSPLIT_SMOKE_LAYERS", max(4, world_size * 2)))
+
+
+def run_dense_pool(torch, dist, device, layer_count):
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
     pool = NSATokenToKVPool(
@@ -44,22 +48,26 @@ def run_dense_pool(torch, dist, device):
         kv_lora_rank=8,
         dtype=torch.bfloat16,
         qk_rope_head_dim=4,
-        layer_num=4,
+        layer_num=layer_count,
         device=device,
         index_head_dim=128,
         enable_memory_saver=False,
         kv_cache_dim=12,
         start_layer=0,
-        end_layer=4,
+        end_layer=layer_count,
         index_buf_size=128,
     )
     rank = dist.get_rank()
-    for layer_id in range(4):
+    owned_layers = 0
+    for layer_id in range(layer_count):
         if pool.layersplit_owns_layer(layer_id):
+            owned_layers += 1
             pool.kv_buffer[layer_id].fill_(10 + layer_id)
             pool.index_k_with_scale_buffer[layer_id].fill_(40 + layer_id)
+    if owned_layers == 0:
+        raise AssertionError(f"rank {rank} owns no layers in smoke test")
     dist.barrier()
-    for layer_id in range(4):
+    for layer_id in range(layer_count):
         key, value = pool.get_kv_buffer(layer_id)
         assert value.data_ptr() == key.data_ptr()
         assert value.shape[-1] == pool.kv_lora_rank
@@ -73,7 +81,7 @@ def run_dense_pool(torch, dist, device):
     return pool.get_kv_size_bytes()
 
 
-def run_turboquant_storage(torch, dist, device):
+def run_turboquant_storage(torch, dist, device, layer_count):
     from sglang.srt.mem_cache.memory_pool import TurboQuantNSATokenToKVPool
 
     pool = TurboQuantNSATokenToKVPool(
@@ -82,24 +90,28 @@ def run_turboquant_storage(torch, dist, device):
         kv_lora_rank=128,
         dtype=torch.bfloat16,
         qk_rope_head_dim=16,
-        layer_num=4,
+        layer_num=layer_count,
         device=device,
         index_head_dim=128,
         enable_memory_saver=False,
         kv_cache_dim=144,
         start_layer=0,
-        end_layer=4,
+        end_layer=layer_count,
         index_buf_size=128,
         turboquant_dense_kv_preset="latent_2p5bit_nc",
         turboquant_execution_mode="fused_decode",
         turboquant_mla_decode_num_splits=16,
     )
     rank = dist.get_rank()
-    for layer_id in range(4):
+    owned_layers = 0
+    for layer_id in range(layer_count):
         if pool.layersplit_owns_layer(layer_id):
+            owned_layers += 1
             pool.kv_buffer[layer_id].fill_(70 + layer_id)
+    if owned_layers == 0:
+        raise AssertionError(f"rank {rank} owns no TurboQuant layers in smoke test")
     dist.barrier()
-    for layer_id in range(4):
+    for layer_id in range(layer_count):
         kv = pool._get_layersplit_kv_buffer(layer_id)
         if kv.dtype != torch.uint8:
             raise AssertionError(f"turboquant storage dtype mismatch: {kv.dtype}")
@@ -121,8 +133,9 @@ def main():
     dist.init_process_group(backend="nccl")
     try:
         patch_sglang_runtime(dist)
-        dense_bytes = run_dense_pool(torch, dist, device)
-        tq_bytes = run_turboquant_storage(torch, dist, device)
+        layer_count = smoke_layer_count(dist.get_world_size())
+        dense_bytes = run_dense_pool(torch, dist, device, layer_count)
+        tq_bytes = run_turboquant_storage(torch, dist, device, layer_count)
         dense_total = torch.tensor([dense_bytes], dtype=torch.float64, device=device)
         tq_total = torch.tensor([tq_bytes], dtype=torch.float64, device=device)
         dist.all_reduce(dense_total, op=dist.ReduceOp.SUM)
@@ -130,6 +143,8 @@ def main():
         if dist.get_rank() == 0:
             print(
                 "LayerSplit distributed smoke passed: "
+                f"world_size={dist.get_world_size()} "
+                f"layers={layer_count} "
                 f"dense_bytes_sum={int(dense_total.item())} "
                 f"tq_bytes_sum={int(tq_total.item())}"
             )

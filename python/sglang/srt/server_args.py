@@ -7233,44 +7233,27 @@ class ServerArgs:
 
         if self.nsa_prefill_cp_kv_storage_mode == "layersplit":
             from sglang.srt.configs.model_config import is_deepseek_nsa
+            from sglang.srt.environ import envs
+            from sglang.srt.layers.attention.nsa.layersplit import (
+                validate_layersplit_server_args,
+            )
 
             hf_config = self.get_model_config().hf_config
-            if not self.enable_nsa_prefill_context_parallel:
-                raise ValueError(
-                    "--nsa-prefill-cp-kv-storage-mode=layersplit requires "
-                    "--enable-nsa-prefill-context-parallel."
-                )
-            if self.attn_cp_size <= 1:
-                raise ValueError(
-                    "--nsa-prefill-cp-kv-storage-mode=layersplit requires an "
-                    "effective attention CP size greater than 1. Check --tp, "
-                    "--dp, and --attn-cp-size; a topology with CP size 1 would "
-                    "not split KV ownership across ranks."
-                )
-            if self.disaggregation_mode == "decode":
-                raise ValueError(
-                    "LayerSplit is a prefill CP KV storage policy and should not "
-                    "be enabled on decode workers."
-                )
-            if self.disaggregation_mode == "prefill":
-                from sglang.srt.environ import envs
-
-                if not envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get():
-                    raise ValueError(
-                        "--nsa-prefill-cp-kv-storage-mode=layersplit with "
-                        "disaggregated prefill requires "
-                        "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1."
-                    )
-            if not is_deepseek_nsa(hf_config):
-                raise ValueError(
-                    "--nsa-prefill-cp-kv-storage-mode=layersplit is only "
-                    "supported for DeepSeek Sparse Attention models."
-                )
-            if self.enable_turboquant_dense_kv_cache and self.turboquant_skip_layers:
-                raise ValueError(
-                    "LayerSplit with dense TurboQuant requires a uniform dense KV "
-                    "row width and does not support --turboquant-skip-layers."
-                )
+            validate_layersplit_server_args(
+                enable_nsa_prefill_context_parallel=(
+                    self.enable_nsa_prefill_context_parallel
+                ),
+                attn_cp_size=self.attn_cp_size,
+                disaggregation_mode=self.disaggregation_mode,
+                all_cp_ranks_transfer=(
+                    envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+                ),
+                is_deepseek_nsa_model=is_deepseek_nsa(hf_config),
+                enable_turboquant_dense_kv_cache=(
+                    self.enable_turboquant_dense_kv_cache
+                ),
+                turboquant_skip_layers=self.turboquant_skip_layers,
+            )
 
         if self.nsa_indexer_mode != "vanilla":
             from sglang.srt.configs.model_config import is_deepseek_nsa

@@ -465,7 +465,9 @@ constraints. The effective attention CP size must be greater than 1 after SGLang
 derives CP from `--tp`, `--dp`, and `--attn-cp-size`; otherwise there are no CP
 ranks across which to split layer ownership. The 4-GPU prefill/4-GPU decode
 REAP production profile with `--tp 4 --dp 4` keeps LayerSplit disabled for this
-reason until a CP-capable prefill topology is used.
+reason until a CP-capable prefill topology is used. Startup validation rejects
+decode workers, non-DSA models, topology CP size 1, disaggregated prefill without
+all-CP-rank transfer, and dense TurboQuant skip-layer layouts.
 
 For the REAP production path, LayerSplit is intended to feed decode-side
 HiSparse with dense TurboQuant and decode-only SMC-SD. HiSparse remains the

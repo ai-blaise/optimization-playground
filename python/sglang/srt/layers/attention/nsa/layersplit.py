@@ -7,6 +7,51 @@ NSA_PREFILL_CP_KV_STORAGE_CHOICES = ("replicated", "layersplit")
 NSA_PREFILL_CP_LAYERSPLIT_LAYOUT_CHOICES = ("interleaved", "contiguous")
 
 
+def validate_layersplit_server_args(
+    *,
+    enable_nsa_prefill_context_parallel: bool,
+    attn_cp_size: int,
+    disaggregation_mode: str,
+    all_cp_ranks_transfer: bool,
+    is_deepseek_nsa_model: bool,
+    enable_turboquant_dense_kv_cache: bool,
+    turboquant_skip_layers,
+) -> None:
+    if not enable_nsa_prefill_context_parallel:
+        raise ValueError(
+            "--nsa-prefill-cp-kv-storage-mode=layersplit requires "
+            "--enable-nsa-prefill-context-parallel."
+        )
+    if attn_cp_size <= 1:
+        raise ValueError(
+            "--nsa-prefill-cp-kv-storage-mode=layersplit requires an "
+            "effective attention CP size greater than 1. Check --tp, "
+            "--dp, and --attn-cp-size; a topology with CP size 1 would "
+            "not split KV ownership across ranks."
+        )
+    if disaggregation_mode == "decode":
+        raise ValueError(
+            "LayerSplit is a prefill CP KV storage policy and should not "
+            "be enabled on decode workers."
+        )
+    if disaggregation_mode == "prefill" and not all_cp_ranks_transfer:
+        raise ValueError(
+            "--nsa-prefill-cp-kv-storage-mode=layersplit with "
+            "disaggregated prefill requires "
+            "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1."
+        )
+    if not is_deepseek_nsa_model:
+        raise ValueError(
+            "--nsa-prefill-cp-kv-storage-mode=layersplit is only "
+            "supported for DeepSeek Sparse Attention models."
+        )
+    if enable_turboquant_dense_kv_cache and turboquant_skip_layers:
+        raise ValueError(
+            "LayerSplit with dense TurboQuant requires a uniform dense KV "
+            "row width and does not support --turboquant-skip-layers."
+        )
+
+
 @dataclass(frozen=True)
 class LayerSplitPolicy:
     cp_rank: int

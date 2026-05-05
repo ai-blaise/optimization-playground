@@ -32,6 +32,21 @@ layersplit = load_module(
 
 LayerSplitPolicy = layersplit.LayerSplitPolicy
 build_layersplit_mla_transfer_params = layersplit.build_layersplit_mla_transfer_params
+validate_layersplit_server_args = layersplit.validate_layersplit_server_args
+
+
+def valid_layersplit_args(**overrides):
+    args = {
+        "enable_nsa_prefill_context_parallel": True,
+        "attn_cp_size": 2,
+        "disaggregation_mode": "prefill",
+        "all_cp_ranks_transfer": True,
+        "is_deepseek_nsa_model": True,
+        "enable_turboquant_dense_kv_cache": True,
+        "turboquant_skip_layers": None,
+    }
+    args.update(overrides)
+    return args
 
 
 def test_layersplit_interleaved_owner_mapping():
@@ -132,3 +147,37 @@ def test_layersplit_rejects_bad_policy():
             end_layer=4,
             layout="striped",
         )
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (
+            {"enable_nsa_prefill_context_parallel": False},
+            "enable-nsa-prefill-context-parallel",
+        ),
+        ({"attn_cp_size": 1}, "effective attention CP size greater than 1"),
+        ({"disaggregation_mode": "decode"}, "decode workers"),
+        (
+            {
+                "disaggregation_mode": "prefill",
+                "all_cp_ranks_transfer": False,
+            },
+            "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1",
+        ),
+        ({"is_deepseek_nsa_model": False}, "DeepSeek Sparse Attention"),
+        (
+            {"turboquant_skip_layers": {1}},
+            "uniform dense KV row width",
+        ),
+    ],
+)
+def test_layersplit_server_arg_validation_rejects_invalid_configs(
+    overrides, message
+):
+    with pytest.raises(ValueError, match=message):
+        validate_layersplit_server_args(**valid_layersplit_args(**overrides))
+
+
+def test_layersplit_server_arg_validation_accepts_prefill_config():
+    validate_layersplit_server_args(**valid_layersplit_args())

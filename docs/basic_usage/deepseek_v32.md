@@ -483,6 +483,16 @@ rank reads a layer through the CP group. P/D transfer descriptors are validated
 against either same-PP local decode layers or a global decode layer list; other
 layouts are rejected instead of being remapped implicitly.
 
+The owner-local dense KV, NSA indexer cache, and dense TurboQuant storage path
+can be smoke-tested on one CUDA node with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+PYTHONPATH=python \
+python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  test/manual/layers/attention/nsa/test_layersplit_pool_smoke.py
+```
+
 ### Pipeline Parallel + Context Parallel (PP + CP)
 
 This mode combines Pipeline Parallelism (PP) and Context Parallelism (CP) to scale across multiple nodes, which can achieve better throughput and Time To First Token (TTFT). Note that this method has only been tested on H20 96G.

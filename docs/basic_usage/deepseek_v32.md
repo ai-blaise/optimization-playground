@@ -475,6 +475,11 @@ prefill/decode mode, LayerSplit requires
 `SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1`: each prefill CP rank owns full
 prefix pages for a subset of global layers, so the P/D transfer must collect
 all layer owners rather than filtering page indices to a single CP rank.
+Memory reporting for this mode includes the rank's owned persistent dense KV,
+owned NSA indexer state, and one full-layer scratch buffer used when a non-owner
+rank reads a layer through the CP group. P/D transfer descriptors are validated
+against either same-PP local decode layers or a global decode layer list; other
+layouts are rejected instead of being remapped implicitly.
 
 ### Pipeline Parallel + Context Parallel (PP + CP)
 

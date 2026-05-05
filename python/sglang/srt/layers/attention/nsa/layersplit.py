@@ -24,7 +24,7 @@ class LayerSplitPolicy:
             raise ValueError(
                 f"cp_rank must be in [0, {self.cp_size}), got {self.cp_rank}."
             )
-        if self.start_layer < 0 or self.end_layer < self.start_layer:
+        if self.start_layer < 0 or self.end_layer <= self.start_layer:
             raise ValueError(
                 f"invalid layer range [{self.start_layer}, {self.end_layer})."
             )
@@ -165,22 +165,6 @@ def prepare_layersplit_metadata(
     )
 
 
-def owned_buffer_infos(
-    data_ptrs: Sequence[int],
-    data_lens: Sequence[int],
-    item_lens: Sequence[int],
-    policy: LayerSplitPolicy,
-) -> Tuple[list[int], list[int], list[int]]:
-    owned_offsets = [
-        layer_id - policy.start_layer for layer_id in policy.owned_layer_ids()
-    ]
-    return (
-        [data_ptrs[i] for i in owned_offsets],
-        [data_lens[i] for i in owned_offsets],
-        [item_lens[i] for i in owned_offsets],
-    )
-
-
 def build_layersplit_mla_transfer_params(
     src_data_ptrs: Sequence[int],
     dst_data_ptrs: Sequence[int],
@@ -188,6 +172,21 @@ def build_layersplit_mla_transfer_params(
     policy: LayerSplitPolicy,
 ) -> list[tuple[int, int, int]]:
     layer_count = len(src_data_ptrs)
+    if layer_count != policy.num_layers:
+        raise ValueError(
+            f"expected {policy.num_layers} source layer pointers, got "
+            f"{layer_count}."
+        )
+    if len(item_lens) != layer_count:
+        raise ValueError(
+            f"expected {layer_count} item lengths, got {len(item_lens)}."
+        )
+    if len(dst_data_ptrs) != layer_count and len(dst_data_ptrs) < policy.end_layer:
+        raise ValueError(
+            "destination layer pointers must describe either the local PP stage "
+            "or the global decode layer range."
+        )
+
     layers_params = []
     for local_layer_idx in range(layer_count):
         layer_id = policy.start_layer + local_layer_idx

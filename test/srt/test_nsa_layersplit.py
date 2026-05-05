@@ -84,6 +84,18 @@ def test_layersplit_indexcache_source_from_pattern():
     ) == 4
 
 
+def test_layersplit_indexcache_source_from_frequency():
+    assert get_indexcache_source_layer_id(
+        0, num_layers=8, freq=4, pattern=None
+    ) == 0
+    assert get_indexcache_source_layer_id(
+        2, num_layers=8, freq=4, pattern=None
+    ) == 1
+    assert get_indexcache_source_layer_id(
+        6, num_layers=8, freq=4, pattern=None
+    ) == 5
+
+
 def test_layersplit_transfer_descriptors_keep_indexcache_source():
     policy = LayerSplitPolicy(cp_rank=0, cp_size=2, start_layer=0, end_layer=6)
     descriptors = build_layersplit_transfer_descriptors(
@@ -140,9 +152,40 @@ def test_layersplit_mla_transfer_params_use_local_decode_layers_for_same_pp():
     ]
 
 
+def test_layersplit_transfer_params_reject_mismatched_inputs():
+    policy = LayerSplitPolicy(cp_rank=0, cp_size=2, start_layer=2, end_layer=6)
+
+    with pytest.raises(ValueError, match="source layer pointers"):
+        build_layersplit_mla_transfer_params(
+            src_data_ptrs=[100, 101],
+            dst_data_ptrs=[300, 301],
+            item_lens=[10, 11],
+            policy=policy,
+        )
+
+    with pytest.raises(ValueError, match="item lengths"):
+        build_layersplit_mla_transfer_params(
+            src_data_ptrs=[100, 101, 102, 103],
+            dst_data_ptrs=[300, 301, 302, 303],
+            item_lens=[10, 11],
+            policy=policy,
+        )
+
+    with pytest.raises(ValueError, match="destination layer pointers"):
+        build_layersplit_mla_transfer_params(
+            src_data_ptrs=[100, 101, 102, 103],
+            dst_data_ptrs=[300, 301, 302],
+            item_lens=[10, 11, 12, 13],
+            policy=policy,
+        )
+
+
 def test_layersplit_rejects_bad_policy():
     with pytest.raises(ValueError, match="cp_rank"):
         LayerSplitPolicy(cp_rank=2, cp_size=2, start_layer=0, end_layer=4)
+
+    with pytest.raises(ValueError, match="invalid layer range"):
+        LayerSplitPolicy(cp_rank=0, cp_size=2, start_layer=4, end_layer=4)
 
     with pytest.raises(ValueError, match="unsupported"):
         LayerSplitPolicy(

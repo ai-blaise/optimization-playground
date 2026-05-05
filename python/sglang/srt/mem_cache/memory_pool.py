@@ -1620,12 +1620,16 @@ class MLATokenToKVPool(KVCache):
 
     def _clear_buffers(self):
         del self.kv_buffer
+        if self.layersplit_kv_buffer is not None:
+            del self.layersplit_kv_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
         for kv_cache in self.kv_buffer:
             kv_size_bytes += get_tensor_size_bytes(kv_cache)
+        if self.layersplit_kv_buffer is not None:
+            kv_size_bytes += get_tensor_size_bytes(self.layersplit_kv_buffer)
         return kv_size_bytes
 
     # for disagg
@@ -2165,6 +2169,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
         kv_size_bytes = super().get_kv_size_bytes()
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        if self.layersplit_index_k_with_scale_buffer is not None:
+            kv_size_bytes += get_tensor_size_bytes(
+                self.layersplit_index_k_with_scale_buffer
+            )
         return kv_size_bytes
 
 
@@ -2282,6 +2290,8 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
 
     def _clear_buffers(self):
         del self.kv_buffer
+        if self.layersplit_kv_buffer is not None:
+            del self.layersplit_kv_buffer
         if self._deq_buffer is not None:
             del self._deq_buffer
 

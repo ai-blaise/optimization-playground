@@ -2140,6 +2140,15 @@ class NSATokenToKVPool(MLATokenToKVPool):
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
+    def get_kv_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        kv_buffer = self._get_layersplit_kv_buffer(layer_id)
+        if self.store_dtype != self.dtype:
+            kv_buffer = kv_buffer.view(self.dtype)
+        return kv_buffer, kv_buffer[..., : self.kv_lora_rank]
+
     def get_state_buf_infos(self):
         data_ptrs = [
             self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.layer_num)
@@ -2305,6 +2314,10 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
     def get_value_buffer(self, layer_id: int):
         key_buf = self.get_key_buffer(layer_id)
         return key_buf[..., : self.kv_lora_rank]
+
+    def get_kv_buffer(self, layer_id: int):
+        key_buf = self.get_key_buffer(layer_id)
+        return key_buf, key_buf[..., : self.kv_lora_rank]
 
     def get_turboquant_selected_kv_buffer(
         self,

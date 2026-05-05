@@ -32,7 +32,6 @@ layersplit = load_module(
 
 LayerSplitPolicy = layersplit.LayerSplitPolicy
 build_layersplit_mla_transfer_params = layersplit.build_layersplit_mla_transfer_params
-filter_layers_for_cp_owner = layersplit.filter_layers_for_cp_owner
 
 
 def test_layersplit_interleaved_owner_mapping():
@@ -60,12 +59,6 @@ def test_layersplit_contiguous_owner_mapping():
 
     assert policy.owned_layer_ids() == (5, 6, 7)
     assert policy.owner_rank(9) == 3
-
-
-def test_layersplit_disaggregation_layer_owner_filter():
-    policy = LayerSplitPolicy(cp_rank=1, cp_size=2, start_layer=0, end_layer=6)
-
-    assert filter_layers_for_cp_owner([0, 1, 2, 3, 4, 5], policy) == (1, 3, 5)
 
 
 def test_layersplit_mla_transfer_params_use_global_decode_layers():

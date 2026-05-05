@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence, Tuple
+from typing import Sequence, Tuple
 
 NSA_PREFILL_CP_KV_STORAGE_CHOICES = ("replicated", "layersplit")
 NSA_PREFILL_CP_LAYERSPLIT_LAYOUT_CHOICES = ("interleaved", "contiguous")
@@ -56,13 +56,6 @@ class LayerSplitPolicy:
                 f"layer_id {layer_id} is outside "
                 f"[{self.start_layer}, {self.end_layer})."
             )
-
-
-def filter_layers_for_cp_owner(
-    layer_ids: Iterable[int],
-    policy: LayerSplitPolicy,
-) -> Tuple[int, ...]:
-    return tuple(layer_id for layer_id in layer_ids if policy.owns_layer(layer_id))
 
 
 def build_layersplit_mla_transfer_params(

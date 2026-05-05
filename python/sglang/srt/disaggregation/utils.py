@@ -520,30 +520,6 @@ def filter_kv_indices_for_cp_rank(
     return new_kv_indices, new_index_slice
 
 
-def filter_layer_ids_for_cp_owner(
-    layer_ids: list[int],
-    *,
-    cp_rank: int,
-    cp_size: int,
-    start_layer: int,
-    end_layer: int,
-    layout: str = "interleaved",
-) -> list[int]:
-    from sglang.srt.layers.attention.nsa.layersplit import (
-        LayerSplitPolicy,
-        filter_layers_for_cp_owner,
-    )
-
-    policy = LayerSplitPolicy(
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-        start_layer=start_layer,
-        end_layer=end_layer,
-        layout=layout,
-    )
-    return list(filter_layers_for_cp_owner(layer_ids, policy))
-
-
 #########################
 # Misc
 #########################

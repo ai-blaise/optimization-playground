@@ -8,7 +8,11 @@ import torch
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_group,
+    get_attention_cp_size,
+    get_attention_tp_size,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -727,6 +731,18 @@ class ModelRunnerKVCacheMixin:
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_world_group().cpu_group,
+            )
+            token_capacity = tensor.item()
+
+        if (
+            self.server_args.nsa_prefill_cp_kv_storage_mode == "layersplit"
+            and get_attention_cp_size() > 1
+        ):
+            tensor = torch.tensor(token_capacity, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_attention_cp_group().cpu_group,
             )
             token_capacity = tensor.item()
 

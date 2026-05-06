@@ -486,7 +486,10 @@ Memory reporting for this mode includes the rank's owned persistent dense KV,
 owned NSA indexer state, and one full-layer scratch buffer used when a non-owner
 rank reads a layer through the CP group. P/D transfer descriptors are validated
 against either same-PP local decode layers or a global decode layer list; other
-layouts are rejected instead of being remapped implicitly.
+layouts are rejected instead of being remapped implicitly. Because interleaved
+LayerSplit can leave different CP ranks with different owned-layer counts, the
+resolved token capacity is synchronized to the minimum value across the
+attention-CP group before pool allocation.
 
 During prefill, LayerSplit starts the owner-rank dense KV broadcast before the
 NSA indexer path and reuses that in-flight transfer at attention time. Owner
@@ -545,20 +548,26 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
 ```
 
 On `instance-20260415-161450` with dummy `deepseek-ai/DeepSeek-V3.2-Exp`,
-TP=8/CP=8, IndexCache, dense TurboQuant 2.5-bit KV, Triton FP8/MoE, and CUDA
-graphs disabled, the current strongest long-context serving check is the
-generated-shared-prefix 120K/20, c5 point in
-`/tmp/opls_layersplit_ownerstaging_cp8_conc5_120_1778076249/summary.json`.
-Replicated CP measured 113,316.62 declared input tokens/s by wall with 2.108 s
-mean TTFT and 2.847 s max TTFT; LayerSplit measured 113,542.43 declared input
-tokens/s by wall with 2.100 s mean TTFT and 2.826 s max TTFT. That is a small
-LayerSplit win (+0.20% wall throughput, +0.40% mean-TTFT throughput) within the
-relaxed 3-second long-context latency budget, but it is not yet comparable to
-the larger gains reported for the LayerSplit production environment. The
-prefill-style output-length-1 check at
-`/tmp/opls_layersplit_prefill_style_cp8_100_120_1778073782/summary.json` remains
-near parity to slightly negative, so treat LayerSplit as correct and functional
-but still requiring production-hardware validation and further optimization.
+TP=8/CP=8, IndexCache, dense TurboQuant 2.5-bit KV, Triton FP8/MoE, CUDA graphs
+disabled, a 1M token cap, eight warmed 90%-shared prefixes, and 1K output, the
+capacity-pressure serving checks show the intended LayerSplit residency win.
+At 120K/1K and concurrency 3, replicated CP measured 22,192.91 declared input
+tokens/s by wall with 13.769 s mean TTFT and 18.234 s max TTFT because the
+warmed prefixes were evicted. LayerSplit retained the 110,592-token shared
+prefix and measured 179,892.33 declared input tokens/s by wall with 1.869 s mean
+TTFT and 2.453 s max TTFT, an 8.11x wall-throughput gain while staying within
+the relaxed 3-second long-context latency budget. The same 120K/1K check with
+CP=4 measured a 1.63x LayerSplit wall-throughput gain; CP=2 was near parity
+because replicated CP still had enough capacity for the workload.
+
+The CP=8 prompt-length sweep at the same settings produced near parity for 40K,
+60K, and 80K because both modes retained cached prefixes, then opened up once
+replicated CP hit the capacity boundary: 100K measured 53,510.59 replicated vs
+172,094.26 LayerSplit declared input tokens/s by wall, and 120K measured
+22,216.26 vs 179,995.59. These H200 dummy-model numbers reproduce the
+capacity-threshold behavior behind the LayerSplit design, but not the blog's
+positive short-context deltas; those remain a production-hardware and workload
+validation item.
 
 ### Pipeline Parallel + Context Parallel (PP + CP)
 

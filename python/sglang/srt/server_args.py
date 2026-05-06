@@ -689,6 +689,10 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
+    device_collective_backend: str = "default"
+    torchcomms_ncclx_hints: str = ""
+    torchcomms_ncclx_strict: bool = False
+    enable_torchcomms_ncclx_rdma: bool = False
     pre_warm_nccl: bool = dataclasses.field(
         default_factory=lambda: is_hip()
     )  # Pre-warm NCCL/RCCL to reduce P99 TTFT cold-start latency (default: True for AMD/HIP, False for others)
@@ -866,6 +870,11 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
+
+        if self.device_collective_backend not in ["default", "ncclx"]:
+            raise ValueError(
+                f"Unsupported device_collective_backend: {self.device_collective_backend}"
+            )
 
         # Handle device-specific backends.
         self._handle_hpu_backends()
@@ -6395,6 +6404,29 @@ class ServerArgs:
             "--enable-torch-symm-mem",
             action="store_true",
             help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
+        )
+        parser.add_argument(
+            "--device-collective-backend",
+            type=str,
+            default=ServerArgs.device_collective_backend,
+            choices=["default", "ncclx"],
+            help="Select the device collective backend. 'default' keeps the existing PyTorch/NCCL/PyNCCL/custom routing; 'ncclx' routes supported device collectives through torchcomms NCCLX.",
+        )
+        parser.add_argument(
+            "--torchcomms-ncclx-hints",
+            type=str,
+            default=ServerArgs.torchcomms_ncclx_hints,
+            help="Optional torchcomms NCCLX hints as JSON or comma-separated key=value pairs.",
+        )
+        parser.add_argument(
+            "--torchcomms-ncclx-strict",
+            action="store_true",
+            help="Raise during startup if torchcomms NCCLX initialization fails instead of falling back to the default collective path.",
+        )
+        parser.add_argument(
+            "--enable-torchcomms-ncclx-rdma",
+            action="store_true",
+            help="Initialize torchcomms NCCLX CUDA allocator registration hooks for RDMA-capable transports.",
         )
         parser.add_argument(
             "--pre-warm-nccl",

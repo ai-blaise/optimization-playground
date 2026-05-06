@@ -419,6 +419,10 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-custom-all-reduce` | Disable the custom all-reduce kernel and fall back to NCCL. | `False` | bool flag (set to enable) |
 | `--enable-mscclpp` | Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL. | `False` | bool flag (set to enable) |
 | `--enable-torch-symm-mem` | Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM10 supports world size 6, 8. | `False` | bool flag (set to enable) |
+| `--device-collective-backend` | Select the device collective backend. `default` keeps existing SGLang collective routing; `ncclx` uses torchcomms NCCLX where supported. | `default` | `default`, `ncclx` |
+| `--torchcomms-ncclx-hints` | Optional torchcomms NCCLX hints, formatted as JSON or comma-separated `key=value` pairs. | `` | Type: str |
+| `--torchcomms-ncclx-strict` | Fail startup if NCCLX initialization fails instead of falling back to the default collective path. | `False` | bool flag (set to enable) |
+| `--enable-torchcomms-ncclx-rdma` | Initialize torchcomms NCCLX CUDA allocator registration hooks for RDMA-capable transports. | `False` | bool flag (set to enable) |
 | `--disable-overlap-schedule` | Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker. | `False` | bool flag (set to enable) |
 | `--enable-mixed-chunk` | Enabling mixing prefill and decode in a batch when using chunked prefill. | `False` | bool flag (set to enable) |
 | `--enable-dp-attention` | Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported. | `False` | bool flag (set to enable) |

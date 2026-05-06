@@ -226,11 +226,13 @@ class GroupCoordinator:
     use_torch_symm_mem_all_reduce: (
         bool  # a hint of whether to use TorchSymmMemAllReduce
     )
+    use_torchcomms_ncclx: bool  # a hint of whether to use torchcomms NCCLX
     use_message_queue_broadcaster: (
         bool  # a hint of whether to use message queue broadcaster
     )
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
+    torchcomms_ncclx_comm: Optional[Any]  # torchcomms NCCLX communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
@@ -244,6 +246,7 @@ class GroupCoordinator:
         use_pymscclpp: bool,
         use_custom_allreduce: bool,
         use_torch_symm_mem_all_reduce: bool,
+        use_torchcomms_ncclx: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
         use_npu_communicator: bool,
@@ -328,6 +331,7 @@ class GroupCoordinator:
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
+        self.use_torchcomms_ncclx = use_torchcomms_ncclx
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
@@ -351,6 +355,10 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.torch_symm_mem import (
             TorchSymmMemCommunicator,
         )
+        from sglang.srt.distributed.device_communicators.torchcomms_ncclx import (
+            TorchCommsNcclxCommunicator,
+            parse_torchcomms_ncclx_hints,
+        )
         from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
         self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
@@ -363,15 +371,40 @@ class GroupCoordinator:
                 qr_rocm_arch_available,
             )
 
+        self.torchcomms_ncclx_comm: Optional[TorchCommsNcclxCommunicator] = None
+        if use_torchcomms_ncclx and self.world_size > 1:
+            try:
+                self.torchcomms_ncclx_comm = TorchCommsNcclxCommunicator(
+                    group=self.cpu_group,
+                    device=self.device,
+                    name=f"{self.unique_name}:ncclx",
+                    hints=parse_torchcomms_ncclx_hints(_TORCHCOMMS_NCCLX_HINTS),
+                    timeout=_MODEL_PARALLEL_GROUP_TIMEOUT,
+                    enable_rdma_registration=_ENABLE_TORCHCOMMS_NCCLX_RDMA,
+                )
+            except Exception as e:
+                if _TORCHCOMMS_NCCLX_STRICT:
+                    raise
+                logger.warning(
+                    "Setup torchcomms NCCLX failed for %s with %s. "
+                    "Falling back to existing collectives.",
+                    self.unique_name,
+                    e,
+                )
+
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
-        if use_pynccl and self.world_size > 1:
+        if use_pynccl and self.world_size > 1 and self.torchcomms_ncclx_comm is None:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
-        if use_pymscclpp and self.world_size > 1:
+        if (
+            use_pymscclpp
+            and self.world_size > 1
+            and self.torchcomms_ncclx_comm is None
+        ):
             self.pymscclpp_comm = PyMscclppCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -379,7 +412,11 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
-        if use_custom_allreduce and self.world_size > 1:
+        if (
+            use_custom_allreduce
+            and self.world_size > 1
+            and self.torchcomms_ncclx_comm is None
+        ):
             # Initialize a custom fast all-reduce implementation.
             try:
                 CAClass = dispatch_custom_allreduce()
@@ -409,7 +446,11 @@ class GroupCoordinator:
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
-        if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
+        if (
+            self.use_torch_symm_mem_all_reduce
+            and self.world_size > 1
+            and self.torchcomms_ncclx_comm is None
+        ):
             self.torch_symm_mem_comm = TorchSymmMemCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -453,6 +494,7 @@ class GroupCoordinator:
     def __repr__(self):
         return (
             f"ranks={self.ranks} rank={self.rank} local_rank={self.local_rank} use_pynccl={self.use_pynccl} "
+            f"use_torchcomms_ncclx={self.use_torchcomms_ncclx} "
             f"device_group={self.device_group} cpu_group={self.cpu_group} unique_name={self.unique_name} "
             f"world_size={self.world_size} rank_in_group={self.rank_in_group}"
         )
@@ -551,7 +593,19 @@ class GroupCoordinator:
                 maybe_pymscclpp_context = nullcontext()
             else:
                 maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
-            with maybe_pynccl_context, maybe_pymscclpp_context:
+            torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
+            maybe_torchcomms_ncclx_context: Any
+            if not torchcomms_ncclx_comm:
+                maybe_torchcomms_ncclx_context = nullcontext()
+            else:
+                maybe_torchcomms_ncclx_context = torchcomms_ncclx_comm.change_state(
+                    enable=True
+                )
+            with (
+                maybe_pynccl_context,
+                maybe_pymscclpp_context,
+                maybe_torchcomms_ncclx_context,
+            ):
                 yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
@@ -597,6 +651,11 @@ class GroupCoordinator:
 
         outplace_all_reduce_method = None
         if (
+            self.torchcomms_ncclx_comm is not None
+            and not self.torchcomms_ncclx_comm.disabled
+        ):
+            outplace_all_reduce_method = "torchcomms_ncclx"
+        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
@@ -700,8 +759,18 @@ class GroupCoordinator:
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
+        torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
         pynccl_comm = self.pynccl_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
+        assert any(
+            [
+                qr_comm,
+                ca_comm,
+                pymscclpp_comm,
+                torch_symm_mem_comm,
+                torchcomms_ncclx_comm,
+                pynccl_comm,
+            ]
+        )
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
@@ -714,6 +783,9 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
+        elif outplace_all_reduce_method == "torchcomms_ncclx":
+            assert not torchcomms_ncclx_comm.disabled
+            out = torchcomms_ncclx_comm.outplace_all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
             with pynccl_comm.change_state(enable=True):
                 out = pynccl_comm.outplace_all_reduce(input_)
@@ -721,9 +793,15 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
+        torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        if (
+            torchcomms_ncclx_comm is not None
+            and not torchcomms_ncclx_comm.disabled
+        ):
+            torchcomms_ncclx_comm.all_reduce(input_)
+        elif pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
         elif torch_symm_mem_comm is not None and not torch_symm_mem_comm.disabled:
             torch_symm_mem_comm.all_reduce(input_)
@@ -735,8 +813,14 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and (
+        if (
+            torchcomms_ncclx_comm is not None
+            and not torchcomms_ncclx_comm.disabled
+        ):
+            torchcomms_ncclx_comm.reduce_scatter(output, input)
+        elif pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
         ):
             self.debug_check_symmetric_mempool(
@@ -772,12 +856,15 @@ class GroupCoordinator:
         sizes: Optional[List[int]] = None,
     ) -> torch.Tensor:
         world_size = self.world_size
+        torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
         pynccl_comm = self.pynccl_comm
 
-        with pynccl_comm.change_state(enable=True):
+        comm = torchcomms_ncclx_comm or pynccl_comm
+        assert comm is not None, "pynccl or torchcomms NCCLX is required for reduce_scatterv"
+        with comm.change_state(enable=True):
             assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for reduce_scatterv"
+                comm is not None and not comm.disabled
+            ), "pynccl or torchcomms NCCLX is required for reduce_scatterv"
 
             if sizes is not None:
                 assert len(sizes) == world_size
@@ -795,12 +882,18 @@ class GroupCoordinator:
             else:
                 assert output.shape == output_shape
 
-            pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
+            comm.reduce_scatter(output, input_, sizes=sizes)
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and (
+        if (
+            torchcomms_ncclx_comm is not None
+            and not torchcomms_ncclx_comm.disabled
+        ):
+            torchcomms_ncclx_comm.all_gather(output, input)
+        elif pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
         ):
             self.debug_check_symmetric_mempool(
@@ -828,6 +921,15 @@ class GroupCoordinator:
         eliminating the CPU-side launch-kernel blocking issue caused by synchronization problems.
         The specific implementation uses the interface provided by pynccl to remove the synchronization logic of events.
         """
+        torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
+        if (
+            torchcomms_ncclx_comm is not None
+            and not torchcomms_ncclx_comm.disabled
+        ):
+            torchcomms_ncclx_comm.cp_all_gather_into_tensor(
+                output, input, stream=stream
+            )
+            return
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             self.all_gather_into_tensor(output, input)
@@ -918,12 +1020,15 @@ class GroupCoordinator:
         `sizes`: a list of len(world_size) with the number of items per rank to gather.
         """
         world_size = self.world_size
+        torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
         pynccl_comm = self.pynccl_comm
 
-        with pynccl_comm.change_state(enable=True):
+        comm = torchcomms_ncclx_comm or pynccl_comm
+        assert comm is not None, "pynccl or torchcomms NCCLX is required for all_gatherv"
+        with comm.change_state(enable=True):
             assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for all_gatherv"
+                comm is not None and not comm.disabled
+            ), "pynccl or torchcomms NCCLX is required for all_gatherv"
 
             def _all_gather_allocate_output(
                 input_: torch.Tensor, sizes: Optional[List[int]] = None
@@ -955,10 +1060,10 @@ class GroupCoordinator:
                 output_list.append(output_tensor)
                 size_list.append(s)
 
-            pynccl_comm.group_start()
+            comm.group_start()
             for i, inp in enumerate(input_):
-                pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
-            pynccl_comm.group_end()
+                comm.all_gather(output_list[i], inp, sizes=size_list[i])
+            comm.group_end()
 
             return output_list
 
@@ -1007,9 +1112,17 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         # Broadcast.
-        torch.distributed.broadcast(
-            input_, src=self.ranks[src], group=self.device_group
-        )
+        torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
+        if (
+            not input_.is_cpu
+            and torchcomms_ncclx_comm is not None
+            and not torchcomms_ncclx_comm.disabled
+        ):
+            torchcomms_ncclx_comm.broadcast(input_, src)
+        else:
+            torch.distributed.broadcast(
+                input_, src=self.ranks[src], group=self.device_group
+            )
         return input_
 
     def broadcast_async(self, input_: torch.Tensor, src: int = 0):
@@ -1018,6 +1131,13 @@ class GroupCoordinator:
 
         if self.world_size == 1:
             return None
+        torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
+        if (
+            not input_.is_cpu
+            and torchcomms_ncclx_comm is not None
+            and not torchcomms_ncclx_comm.disabled
+        ):
+            return torchcomms_ncclx_comm.broadcast_async(input_, src)
         return torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group, async_op=True
         )
@@ -1365,6 +1485,13 @@ class GroupCoordinator:
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
+        torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
+        if (
+            torchcomms_ncclx_comm is not None
+            and not torchcomms_ncclx_comm.disabled
+        ):
+            torchcomms_ncclx_comm.send(tensor, dst)
+            return
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.send(tensor, dst)
@@ -1380,6 +1507,13 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
+        torchcomms_ncclx_comm = self.torchcomms_ncclx_comm
+        if (
+            torchcomms_ncclx_comm is not None
+            and not torchcomms_ncclx_comm.disabled
+        ):
+            torchcomms_ncclx_comm.recv(tensor, src)
+            return tensor
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.recv(tensor, src)
@@ -1396,6 +1530,9 @@ class GroupCoordinator:
             self.cpu_group = None
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
+        if self.torchcomms_ncclx_comm is not None:
+            self.torchcomms_ncclx_comm.finalize()
+            self.torchcomms_ncclx_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.mq_broadcaster is not None:
@@ -1421,6 +1558,7 @@ def init_world_group(
         use_pymscclpp=False,
         use_custom_allreduce=False,
         use_torch_symm_mem_all_reduce=False,
+        use_torchcomms_ncclx=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
@@ -1449,6 +1587,9 @@ def init_model_parallel_group(
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     if envs.SGLANG_DISABLE_PYNCCL.get():
         use_pynccl = False
+    use_torchcomms_ncclx = (
+        _ENABLE_TORCHCOMMS_NCCLX and not (_is_npu or _is_xpu or backend == "mooncake")
+    )
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1461,6 +1602,7 @@ def init_model_parallel_group(
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
+        use_torchcomms_ncclx=use_torchcomms_ncclx,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
         use_npu_communicator=True,
@@ -1588,6 +1730,10 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+_ENABLE_TORCHCOMMS_NCCLX = False
+_ENABLE_TORCHCOMMS_NCCLX_RDMA = False
+_TORCHCOMMS_NCCLX_HINTS = ""
+_TORCHCOMMS_NCCLX_STRICT = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1603,6 +1749,24 @@ def set_mscclpp_all_reduce(enable: bool):
 def set_torch_symm_mem_all_reduce(enable: bool):
     global _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
+
+
+def set_torchcomms_ncclx(
+    enable: bool,
+    *,
+    hints: str = "",
+    strict: bool = False,
+    enable_rdma_registration: bool = False,
+):
+    global _ENABLE_TORCHCOMMS_NCCLX
+    global _ENABLE_TORCHCOMMS_NCCLX_RDMA
+    global _TORCHCOMMS_NCCLX_HINTS
+    global _TORCHCOMMS_NCCLX_STRICT
+
+    _ENABLE_TORCHCOMMS_NCCLX = enable
+    _ENABLE_TORCHCOMMS_NCCLX_RDMA = enable_rdma_registration
+    _TORCHCOMMS_NCCLX_HINTS = hints
+    _TORCHCOMMS_NCCLX_STRICT = strict
 
 
 _DEVICE_TO_DISTRIBUTED_BACKEND = {

@@ -101,6 +101,15 @@ class DeepseekMLAForwardMixin:
 
         q_lora = None
         topk_indices = None
+        use_prefill_cp = self.use_nsa and nsa_use_prefill_cp(forward_batch)
+        has_prefill_prefix = (
+            use_prefill_cp
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and sum(forward_batch.extend_prefix_lens_cpu) > 0
+        )
+        if has_prefill_prefix:
+            token_to_kv_pool = forward_batch.token_to_kv_pool
+            token_to_kv_pool.prefetch_layersplit_kv_buffer(self.layer_id)
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -179,14 +188,37 @@ class DeepseekMLAForwardMixin:
 
             # q_lora needed by indexer
             if self.use_nsa:
+                token_to_kv_pool = forward_batch.token_to_kv_pool
+                full_kv_pool = getattr(token_to_kv_pool, "full_kv_pool", None)
+                uses_layersplit_kv = (
+                    getattr(token_to_kv_pool, "layersplit_policy", None) is not None
+                    or getattr(full_kv_pool, "layersplit_policy", None) is not None
+                )
+                if (
+                    uses_layersplit_kv
+                    and forward_batch.forward_mode.is_decode_or_idle()
+                    and hasattr(token_to_kv_pool, "materialize_layersplit_for_decode")
+                ):
+                    token_to_kv_pool.materialize_layersplit_for_decode()
+                if hasattr(
+                    token_to_kv_pool, "set_layersplit_active_rows"
+                ) and (
+                    not uses_layersplit_kv
+                    or (
+                        not use_prefill_cp
+                        and not forward_batch.forward_mode.is_decode_or_idle()
+                    )
+                    or (
+                        use_prefill_cp
+                        and forward_batch.extend_prefix_lens_cpu is None
+                    )
+                ):
+                    token_to_kv_pool.set_layersplit_active_rows(None)
                 if q_lora is None:
                     q_lora = q
-                if (
-                    nsa_use_prefill_cp(forward_batch)
-                    and sum(forward_batch.extend_prefix_lens_cpu) > 0
-                ):
-                    forward_batch.token_to_kv_pool.prefetch_layersplit_kv_buffer(
-                        self.layer_id, use_staging=True
+                if has_prefill_prefix:
+                    token_to_kv_pool.prefetch_layersplit_kv_buffer(
+                        self.layer_id
                     )
 
             # overlap q_b_proj and indexer during decode

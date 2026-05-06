@@ -54,6 +54,19 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self._layersplit_active_rows_hint = self.page_size
+
+    def _reset_layersplit_active_rows_hint(self):
+        self._layersplit_active_rows_hint = self.page_size
+
+    def _advance_layersplit_active_rows_hint(self, allocated_tokens: int):
+        self._layersplit_active_rows_hint = min(
+            self.size + self.page_size,
+            self._layersplit_active_rows_hint + allocated_tokens,
+        )
+
+    def layersplit_active_rows_hint(self):
+        return self._layersplit_active_rows_hint
 
     def debug_print(self) -> str:
         return ""
@@ -145,6 +158,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._reset_layersplit_active_rows_hint()
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
@@ -160,6 +174,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
         self.ref_counter[select_index] = 1
+        self._advance_layersplit_active_rows_hint(need_size)
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -443,6 +458,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[num_pages:]
         if out_pages.numel() > 0:
             self.ref_counter[out_pages] = 1
+        self._advance_layersplit_active_rows_hint(num_pages * self.page_size)
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -501,6 +517,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         new_pages = self.free_pages[:num_new_pages]
         if new_pages.numel() > 0:
             self.ref_counter[new_pages] = 1
+        self._advance_layersplit_active_rows_hint(num_new_pages * self.page_size)
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -543,6 +560,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         new_pages = self.free_pages[:num_new_pages]
         if new_pages.numel() > 0:
             self.ref_counter[new_pages] = 1
+        self._advance_layersplit_active_rows_hint(num_new_pages * self.page_size)
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -602,6 +620,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._reset_layersplit_active_rows_hint()
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)

@@ -1820,10 +1820,26 @@ class ServerArgs:
                         assert (
                             self.tp_size == 8
                         ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
-                        self.attn_cp_size = self.tp_size // self.dp_size
+                        max_attn_cp_size = self.tp_size // self.dp_size
+                        if self.attn_cp_size == 1:
+                            self.attn_cp_size = max_attn_cp_size
+                        else:
+                            assert (
+                                max_attn_cp_size % self.attn_cp_size == 0
+                            ), (
+                                "attn_cp_size must divide tp_size // dp_size for "
+                                "DeepSeek DSA context parallelism."
+                            )
 
                         logger.warning(
-                            f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
+                            "Enable Context Parallel opt for deeeseekv3.2-DSA, "
+                            f"Setting dp_size == {self.dp_size} and "
+                            f"moe_dense_tp_size == {self.moe_dense_tp_size}, "
+                            f"ep_size == {self.ep_size}, "
+                            f"tp_size == {self.tp_size}, "
+                            f"attn_cp_size == {self.attn_cp_size}, "
+                            f"kv_cache_dtype == {self.kv_cache_dtype}, "
+                            f"moe_a2a_backend {self.moe_a2a_backend} "
                         )
                     else:
                         # Pure TP and partial DP Attention mode is active for NSA, logging a warning

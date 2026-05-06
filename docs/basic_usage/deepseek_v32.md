@@ -488,13 +488,14 @@ rank reads a layer through the CP group. P/D transfer descriptors are validated
 against either same-PP local decode layers or a global decode layer list; other
 layouts are rejected instead of being remapped implicitly.
 
-During prefill, LayerSplit overlaps owner-rank dense KV broadcast with the NSA
-indexer path. The owner copies the cached-prefix layer KV into the LayerSplit
-scratch buffer before launching the early broadcast, then writes current-step
-rows into the persistent owner buffer later. Non-owner ranks wait for the early
-broadcast and patch the current-step rows into their scratch buffer. This keeps
-the source tensor immutable while the asynchronous broadcast is in flight and
-avoids a second full-layer broadcast before attention.
+During prefill, LayerSplit starts the owner-rank dense KV broadcast before the
+NSA indexer path and reuses that in-flight transfer at attention time. Owner
+ranks broadcast from their persistent per-layer KV buffer; non-owner ranks
+receive into a full-layer scratch buffer and patch the current-step rows into
+that scratch buffer before attention. The optional owner-staging path is covered
+by the manual smoke test, but it is not used by the selected serving path because
+the current H200 benchmark regressed when it was forced on for all prefill
+prefix broadcasts.
 
 The owner-local dense KV, NSA indexer cache, and dense TurboQuant storage path
 can be smoke-tested on one CUDA node with:
@@ -545,12 +546,19 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
 
 On `instance-20260415-161450` with dummy `deepseek-ai/DeepSeek-V3.2-Exp`,
 TP=8/CP=8, IndexCache, dense TurboQuant 2.5-bit KV, Triton FP8/MoE, and CUDA
-graphs disabled, the selected generated-shared-prefix point for this candidate
-is c16 at 19,725.53 input tokens/s and 1,569.50 ms mean TTFT. The comparable
-replicated-KV point under the same mean-2s TTFT budget is c8 at 19,034.93 input
-tokens/s. P99 TTFT is still above 2 seconds for the LayerSplit c16 point, so use
-that metric explicitly if the serving objective switches from mean TTFT to tail
-TTFT.
+graphs disabled, the current strongest long-context serving check is the
+generated-shared-prefix 120K/20, c5 point in
+`/tmp/opls_layersplit_ownerstaging_cp8_conc5_120_1778076249/summary.json`.
+Replicated CP measured 113,316.62 declared input tokens/s by wall with 2.108 s
+mean TTFT and 2.847 s max TTFT; LayerSplit measured 113,542.43 declared input
+tokens/s by wall with 2.100 s mean TTFT and 2.826 s max TTFT. That is a small
+LayerSplit win (+0.20% wall throughput, +0.40% mean-TTFT throughput) within the
+relaxed 3-second long-context latency budget, but it is not yet comparable to
+the larger gains reported for the LayerSplit production environment. The
+prefill-style output-length-1 check at
+`/tmp/opls_layersplit_prefill_style_cp8_100_120_1778073782/summary.json` remains
+near parity to slightly negative, so treat LayerSplit as correct and functional
+but still requiring production-hardware validation and further optimization.
 
 ### Pipeline Parallel + Context Parallel (PP + CP)
 

@@ -127,6 +127,41 @@ def run_dense_pool(torch, dist, device, layer_count):
         )
     if owned_layers == 0:
         raise AssertionError(f"rank {rank} owns no layers in smoke test")
+    pool.set_layersplit_active_rows(128 + pool.page_size)
+    pool.materialize_layersplit_for_decode()
+    update_loc = torch.tensor([1], dtype=torch.int64, device=device)
+    for layer_id in range(layer_count):
+        if not pool.layersplit_owns_layer(layer_id):
+            raise AssertionError(f"rank {rank} did not materialize layer {layer_id}")
+        if pool.kv_buffer[layer_id].shape[0] <= pool.page_size:
+            raise AssertionError(f"rank {rank} kept short KV for layer {layer_id}")
+        local_index_buf = pool.get_local_index_k_with_scale_buffer(layer_id)
+        if (
+            local_index_buf.data_ptr()
+            != pool.index_k_with_scale_buffer[layer_id].data_ptr()
+        ):
+            raise AssertionError("materialized index accessor copied storage")
+        cache_k_nope = torch.full(
+            (1, 1, pool.kv_lora_rank),
+            200 + layer_id,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        cache_k_rope = torch.full(
+            (1, 1, pool.qk_rope_head_dim),
+            200 + layer_id,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        pool.set_mla_kv_buffer(
+            Layer(layer_id), update_loc, cache_k_nope, cache_k_rope
+        )
+        key, _ = pool.get_kv_buffer(layer_id)
+        assert_tensor_value(
+            f"dense materialized kv rank={rank} layer={layer_id}",
+            key[update_loc[0]],
+            200 + layer_id,
+        )
     return pool.get_kv_size_bytes()
 
 
@@ -166,6 +201,20 @@ def run_turboquant_storage(torch, dist, device, layer_count):
         )
     if owned_layers == 0:
         raise AssertionError(f"rank {rank} owns no TurboQuant layers in smoke test")
+    pool.set_layersplit_active_rows(128 + pool.page_size)
+    pool.materialize_layersplit_for_decode()
+    for layer_id in range(layer_count):
+        if not pool.layersplit_owns_layer(layer_id):
+            raise AssertionError(
+                f"rank {rank} did not materialize TurboQuant layer {layer_id}"
+            )
+        if pool.kv_buffer[layer_id].shape[0] <= pool.page_size:
+            raise AssertionError(
+                f"rank {rank} kept short TurboQuant KV for layer {layer_id}"
+            )
+        kv = pool._get_layersplit_kv_buffer(layer_id)
+        if kv.dtype != torch.uint8:
+            raise AssertionError(f"materialized TurboQuant dtype mismatch: {kv.dtype}")
     return pool.get_kv_size_bytes()
 
 

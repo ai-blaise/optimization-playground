@@ -1445,13 +1445,30 @@ class HybridLinearKVPool(KVCache):
         return self.full_kv_pool.get_kv_buffer(layer_id)
 
     def prefetch_layersplit_kv_buffer(
-        self, layer_id: int, use_staging: bool = False
+        self,
+        layer_id: int,
+        use_staging: bool = False,
+        active_rows: Optional[int] = None,
     ) -> None:
         if not self.use_mla:
             return
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
-        self.full_kv_pool.prefetch_layersplit_kv_buffer(layer_id, use_staging)
+        self.full_kv_pool.prefetch_layersplit_kv_buffer(
+            layer_id, use_staging, active_rows
+        )
+
+    def prefetch_layersplit_index_k_with_scale_buffer(self, layer_id: int) -> None:
+        if not self.use_mla:
+            return
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        if hasattr(self.full_kv_pool, "prefetch_layersplit_index_k_with_scale_buffer"):
+            self.full_kv_pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
+
+    def set_layersplit_active_rows(self, active_rows: Optional[int]) -> None:
+        if self.use_mla:
+            self.full_kv_pool.set_layersplit_active_rows(active_rows)
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
@@ -1588,6 +1605,9 @@ class MLATokenToKVPool(KVCache):
         self._layersplit_kv_prefetch_buffer = None
         self._layersplit_kv_prefetch_work = None
         self._layersplit_kv_prefetch_owner_staging = False
+        self._layersplit_kv_prefetch_active_rows = None
+        self._layersplit_active_rows = None
+        self._layersplit_decode_materialized = False
 
         self._create_buffers()
 
@@ -1684,6 +1704,8 @@ class MLATokenToKVPool(KVCache):
     def layersplit_owns_layer(self, layer_id: int) -> bool:
         if self.layersplit_policy is None:
             return True
+        if self._layersplit_decode_materialized:
+            return True
         return self.layersplit_policy.owns_layer(layer_id)
 
     def _wait_layersplit_kv_prefetch(self) -> Optional[torch.Tensor]:
@@ -1695,6 +1717,7 @@ class MLATokenToKVPool(KVCache):
         self._layersplit_kv_prefetch_buffer = None
         self._layersplit_kv_prefetch_work = None
         self._layersplit_kv_prefetch_owner_staging = False
+        self._layersplit_kv_prefetch_active_rows = None
         return buffer
 
     def _finish_layersplit_kv_prefetch_for_update(
@@ -1702,19 +1725,107 @@ class MLATokenToKVPool(KVCache):
     ) -> Optional[torch.Tensor]:
         if self._layersplit_kv_prefetch_layer_id != layer_id:
             return None
+        active_rows = self._layersplit_kv_prefetch_active_rows
+        owner_staging = self._layersplit_kv_prefetch_owner_staging
         kv_buffer = self._wait_layersplit_kv_prefetch()
         assert kv_buffer is not None
         self._layersplit_kv_prefetch_layer_id = layer_id
         self._layersplit_kv_prefetch_buffer = kv_buffer
         self._layersplit_kv_prefetch_work = None
-        self._layersplit_kv_prefetch_owner_staging = False
+        self._layersplit_kv_prefetch_owner_staging = owner_staging
+        self._layersplit_kv_prefetch_active_rows = active_rows
         return kv_buffer
 
-    def prefetch_layersplit_kv_buffer(
-        self, layer_id: int, use_staging: bool = False
+    def _layersplit_active_rows_from_loc(self, loc: torch.Tensor) -> Optional[int]:
+        if loc.numel() == 0:
+            return None
+        return self._layersplit_active_rows
+
+    def set_layersplit_active_rows(self, active_rows: Optional[int]) -> None:
+        if active_rows is None:
+            self._layersplit_active_rows = None
+        else:
+            self._layersplit_active_rows = min(
+                active_rows, self.size + self.page_size
+            )
+
+    def _refresh_layersplit_data_ptrs(self) -> None:
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
+    def _ensure_layersplit_decode_kv_buffer(self, layer_idx: int) -> None:
+        assert self.layersplit_kv_buffer is not None
+        if self.kv_buffer[layer_idx].shape[0] == self.layersplit_kv_buffer.shape[0]:
+            return
+        self.kv_buffer[layer_idx] = torch.zeros_like(self.layersplit_kv_buffer)
+
+    def materialize_layersplit_for_decode(
+        self, active_rows: Optional[int] = None
     ) -> None:
         policy = self.layersplit_policy
-        if policy is None:
+        if policy is None or self._layersplit_decode_materialized:
+            return
+        assert self.layersplit_kv_buffer is not None
+        self._wait_layersplit_kv_prefetch()
+        if active_rows is None:
+            active_rows = self._layersplit_active_rows
+
+        from sglang.srt.layers.dp_attention import get_attention_cp_group
+
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            layer_idx = layer_id - self.start_layer
+            if self.layer_transfer_counter is not None:
+                self.layer_transfer_counter.wait_until(layer_idx)
+            owner_rank = policy.owner_rank(layer_id)
+            if owner_rank != policy.cp_rank:
+                self._ensure_layersplit_decode_kv_buffer(layer_idx)
+            kv_buffer = self.kv_buffer[layer_idx]
+            broadcast_buffer = self._layersplit_broadcast_buffer(
+                kv_buffer, active_rows
+            )
+            get_attention_cp_group().broadcast(broadcast_buffer, src=owner_rank)
+        self._refresh_layersplit_data_ptrs()
+        self._layersplit_decode_materialized = True
+
+    def _layersplit_broadcast_buffer(
+        self, kv_buffer: torch.Tensor, active_rows: Optional[int]
+    ) -> torch.Tensor:
+        if active_rows is None or active_rows >= kv_buffer.shape[0]:
+            return kv_buffer
+        return kv_buffer[:active_rows]
+
+    def _layersplit_broadcast_async(
+        self, buffer: torch.Tensor, owner_rank: int
+    ) -> Optional[Any]:
+        from sglang.srt.layers.dp_attention import get_attention_cp_group
+
+        return get_attention_cp_group().broadcast_async(buffer, src=owner_rank)
+
+    def _has_compatible_layersplit_kv_prefetch(
+        self, layer_id: int, active_rows: Optional[int]
+    ) -> bool:
+        if self._layersplit_kv_prefetch_layer_id != layer_id:
+            return False
+        prefetched_rows = self._layersplit_kv_prefetch_active_rows
+        if active_rows is None:
+            return prefetched_rows is None
+        return prefetched_rows is None or prefetched_rows >= active_rows
+
+    def prefetch_layersplit_kv_buffer(
+        self,
+        layer_id: int,
+        use_staging: bool = False,
+        active_rows: Optional[int] = None,
+    ) -> None:
+        policy = self.layersplit_policy
+        if policy is None or self._layersplit_decode_materialized:
+            return
+        if active_rows is None:
+            active_rows = self._layersplit_active_rows
+        if self._has_compatible_layersplit_kv_prefetch(layer_id, active_rows):
             return
         if self._layersplit_kv_prefetch_layer_id is not None:
             self._wait_layersplit_kv_prefetch()
@@ -1728,26 +1839,31 @@ class MLATokenToKVPool(KVCache):
             kv_buffer = self.kv_buffer[layer_idx]
             if use_staging:
                 assert self.layersplit_kv_buffer is not None
-                self.layersplit_kv_buffer.copy_(kv_buffer)
+                broadcast_buffer = self._layersplit_broadcast_buffer(
+                    kv_buffer, active_rows
+                )
+                self.layersplit_kv_buffer[: broadcast_buffer.shape[0]].copy_(
+                    broadcast_buffer
+                )
                 kv_buffer = self.layersplit_kv_buffer
         else:
             kv_buffer = self.layersplit_kv_buffer
 
-        from sglang.srt.layers.dp_attention import get_attention_cp_group
-
+        broadcast_buffer = self._layersplit_broadcast_buffer(kv_buffer, active_rows)
         self._layersplit_kv_prefetch_layer_id = layer_id
         self._layersplit_kv_prefetch_buffer = kv_buffer
+        self._layersplit_kv_prefetch_active_rows = active_rows
         self._layersplit_kv_prefetch_owner_staging = (
             use_staging and owner_rank == policy.cp_rank
         )
-        self._layersplit_kv_prefetch_work = get_attention_cp_group().broadcast_async(
-            kv_buffer, src=owner_rank
+        self._layersplit_kv_prefetch_work = self._layersplit_broadcast_async(
+            broadcast_buffer, owner_rank
         )
 
     def _get_layersplit_kv_buffer(self, layer_id: int) -> torch.Tensor:
         layer_idx = layer_id - self.start_layer
         policy = self.layersplit_policy
-        if policy is None:
+        if policy is None or self._layersplit_decode_materialized:
             return self.kv_buffer[layer_idx]
         if self._layersplit_kv_prefetch_layer_id == layer_id:
             owner_staging = self._layersplit_kv_prefetch_owner_staging
@@ -1803,18 +1919,22 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         layer_idx = layer_id - self.start_layer
+        active_rows = self._layersplit_active_rows_from_loc(loc)
         if not self.layersplit_owns_layer(layer_id):
-            self.prefetch_layersplit_kv_buffer(layer_id)
+            self.prefetch_layersplit_kv_buffer(layer_id, active_rows=active_rows)
             return
         assert not self.nsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
+        if self._layersplit_kv_prefetch_layer_id == layer_id:
+            self._finish_layersplit_kv_prefetch_for_update(layer_id)
+
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_idx][loc] = cache_k.view(self.store_dtype)
         else:
             self.kv_buffer[layer_idx][loc] = cache_k
-        self.prefetch_layersplit_kv_buffer(layer_id)
+        self.prefetch_layersplit_kv_buffer(layer_id, active_rows=active_rows)
 
     def _set_mla_kv_buffer_to_buffer(
         self,
@@ -1865,6 +1985,7 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         layer_idx = layer_id - self.start_layer
+        active_rows = self._layersplit_active_rows_from_loc(loc)
         if not self.layersplit_owns_layer(layer_id):
             kv_buffer = self._finish_layersplit_kv_prefetch_for_update(layer_id)
             if kv_buffer is not None:
@@ -1872,15 +1993,17 @@ class MLATokenToKVPool(KVCache):
                     kv_buffer, loc, cache_k_nope, cache_k_rope
                 )
             else:
-                self.prefetch_layersplit_kv_buffer(layer_id)
+                self.prefetch_layersplit_kv_buffer(layer_id, active_rows=active_rows)
             return
         has_prefetched_kv = self._layersplit_kv_prefetch_layer_id == layer_id
+        if has_prefetched_kv:
+            self._finish_layersplit_kv_prefetch_for_update(layer_id)
 
         self._set_mla_kv_buffer_to_buffer(
             self.kv_buffer[layer_idx], loc, cache_k_nope, cache_k_rope
         )
         if not has_prefetched_kv:
-            self.prefetch_layersplit_kv_buffer(layer_id)
+            self.prefetch_layersplit_kv_buffer(layer_id, active_rows=active_rows)
 
     def get_mla_kv_buffer(
         self,
@@ -2157,6 +2280,58 @@ class NSATokenToKVPool(MLATokenToKVPool):
         self._layersplit_index_prefetch_work = None
         self._finalize_allocation_log(size)
 
+    def _layersplit_index_active_rows(
+        self, active_rows: Optional[int]
+    ) -> Optional[int]:
+        if active_rows is None:
+            return None
+        assert self.layersplit_index_k_with_scale_buffer is not None
+        return min(
+            triton.cdiv(active_rows, self.page_size) + 1,
+            self.layersplit_index_k_with_scale_buffer.shape[0],
+        )
+
+    def _ensure_layersplit_decode_index_buffer(self, layer_idx: int) -> None:
+        assert self.layersplit_index_k_with_scale_buffer is not None
+        if (
+            self.index_k_with_scale_buffer[layer_idx].shape[0]
+            == self.layersplit_index_k_with_scale_buffer.shape[0]
+        ):
+            return
+        self.index_k_with_scale_buffer[layer_idx] = torch.zeros_like(
+            self.layersplit_index_k_with_scale_buffer
+        )
+
+    def materialize_layersplit_for_decode(
+        self, active_rows: Optional[int] = None
+    ) -> None:
+        policy = self.layersplit_policy
+        if policy is None or self._layersplit_decode_materialized:
+            return
+        if active_rows is None:
+            active_rows = self._layersplit_active_rows
+        self._wait_layersplit_index_prefetch()
+        super().materialize_layersplit_for_decode(active_rows)
+        assert self.layersplit_index_k_with_scale_buffer is not None
+        index_rows = self._layersplit_index_active_rows(active_rows)
+
+        from sglang.srt.layers.dp_attention import get_attention_cp_group
+
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            layer_idx = layer_id - self.start_layer
+            if self.layer_transfer_counter is not None:
+                self.layer_transfer_counter.wait_until(layer_idx)
+            owner_rank = policy.owner_rank(layer_id)
+            if owner_rank != policy.cp_rank:
+                self._ensure_layersplit_decode_index_buffer(layer_idx)
+            index_buffer = self.index_k_with_scale_buffer[layer_idx]
+            broadcast_buffer = (
+                index_buffer
+                if index_rows is None
+                else index_buffer[:index_rows]
+            )
+            get_attention_cp_group().broadcast(broadcast_buffer, src=owner_rank)
+
     def _wait_layersplit_index_prefetch(self) -> Optional[torch.Tensor]:
         work = self._layersplit_index_prefetch_work
         if work is not None:
@@ -2169,7 +2344,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
     def prefetch_layersplit_index_k_with_scale_buffer(self, layer_id: int) -> None:
         policy = self.layersplit_policy
-        if policy is None:
+        if policy is None or self._layersplit_decode_materialized:
+            return
+        if self._layersplit_index_prefetch_layer_id == layer_id:
             return
         if self._layersplit_index_prefetch_layer_id is not None:
             self._wait_layersplit_index_prefetch()
@@ -2184,18 +2361,16 @@ class NSATokenToKVPool(MLATokenToKVPool):
         else:
             index_k_buffer = self.layersplit_index_k_with_scale_buffer
 
-        from sglang.srt.layers.dp_attention import get_attention_cp_group
-
         self._layersplit_index_prefetch_layer_id = layer_id
         self._layersplit_index_prefetch_buffer = index_k_buffer
-        self._layersplit_index_prefetch_work = (
-            get_attention_cp_group().broadcast_async(index_k_buffer, src=owner_rank)
+        self._layersplit_index_prefetch_work = self._layersplit_broadcast_async(
+            index_k_buffer, owner_rank
         )
 
     def _get_layersplit_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         layer_idx = layer_id - self.start_layer
         policy = self.layersplit_policy
-        if policy is None:
+        if policy is None or self._layersplit_decode_materialized:
             return self.index_k_with_scale_buffer[layer_idx]
         if self._layersplit_index_prefetch_layer_id == layer_id:
             index_k_buffer = self._wait_layersplit_index_prefetch()
@@ -2306,11 +2481,14 @@ class NSATokenToKVPool(MLATokenToKVPool):
         if not self.layersplit_owns_layer(layer_id):
             self.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return
+        if self._layersplit_index_prefetch_layer_id == layer_id:
+            self._wait_layersplit_index_prefetch()
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
-        self.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
+        if not self._layersplit_decode_materialized:
+            self.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -2839,6 +3017,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
     ):
         layer_id = layer.layer_id
         layer_idx = layer_id - self.start_layer
+        active_rows = self._layersplit_active_rows_from_loc(loc)
         if not self.layersplit_owns_layer(layer_id):
             kv_buffer = self._finish_layersplit_kv_prefetch_for_update(layer_id)
             if kv_buffer is not None:
@@ -2850,8 +3029,8 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
                     self._set_mla_kv_buffer_to_buffer(
                         kv_buffer, loc, cache_k_nope, cache_k_rope
                     )
-            elif not self._uses_turboquant_layer(layer_id):
-                self.prefetch_layersplit_kv_buffer(layer_id)
+            else:
+                self.prefetch_layersplit_kv_buffer(layer_id, active_rows=active_rows)
             return
 
         if not self._uses_turboquant_layer(layer_id):
@@ -2859,6 +3038,8 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
             return
 
         has_prefetched_kv = self._layersplit_kv_prefetch_layer_id == layer_id
+        if has_prefetched_kv:
+            self._finish_layersplit_kv_prefetch_for_update(layer_id)
         self._set_turboquant_mla_kv_buffer_to_buffer(
             self.kv_buffer[layer_idx], loc, cache_k_nope, cache_k_rope
         )
@@ -2869,7 +3050,7 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
                 int(loc.max().item()) + 1,
             )
         if not has_prefetched_kv:
-            self.prefetch_layersplit_kv_buffer(layer_id)
+            self.prefetch_layersplit_kv_buffer(layer_id, active_rows=active_rows)
 
     def get_mla_kv_buffer(
         self,

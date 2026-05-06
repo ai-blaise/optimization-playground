@@ -447,6 +447,7 @@ def alloc_for_extend(
     extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+    token_allocator = batch.token_to_kv_pool_allocator
 
     # Allocate req slots
     req_pool_indices = alloc_req_slots(
@@ -472,6 +473,12 @@ def alloc_for_extend(
             seq_lens_cpu=batch.seq_lens_cpu,
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
+        )
+
+    kvcache = token_allocator.get_kvcache()
+    if hasattr(kvcache, "set_layersplit_active_rows"):
+        kvcache.set_layersplit_active_rows(
+            token_allocator.layersplit_active_rows_hint()
         )
 
     # Write to req_to_token_pool
@@ -538,6 +545,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
+        token_allocator = batch.token_to_kv_pool_allocator
         last_loc = batch.req_to_token_pool.req_to_token[
             batch.req_pool_indices, batch.seq_lens - 1
         ]
@@ -549,6 +557,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             last_loc=last_loc,
             token_per_req=token_per_req,
         )
+        kvcache = token_allocator.get_kvcache()
+        if hasattr(kvcache, "set_layersplit_active_rows"):
+            kvcache.set_layersplit_active_rows(
+                token_allocator.layersplit_active_rows_hint()
+            )
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:

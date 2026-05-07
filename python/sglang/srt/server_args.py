@@ -2718,6 +2718,27 @@ class ServerArgs:
             or self.prefill_attention_backend == "tokenspeed_mla"
             or self.decode_attention_backend == "tokenspeed_mla"
         ):
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            nsa_only_flags = []
+            if is_deepseek_nsa(model_config.hf_config):
+                nsa_only_flags.append("DeepSeek DSA/NSA model")
+            if self.enable_hisparse:
+                nsa_only_flags.append("--enable-hisparse")
+            if self.nsa_indexer_mode != "vanilla":
+                nsa_only_flags.append("--nsa-indexer-mode")
+            if self.enable_turboquant_dense_kv_cache:
+                nsa_only_flags.append("--enable-turboquant-dense-kv-cache")
+            if self.nsa_prefill_cp_kv_storage_mode == "layersplit":
+                nsa_only_flags.append("--nsa-prefill-cp-kv-storage-mode=layersplit")
+            if nsa_only_flags:
+                raise ValueError(
+                    "TokenSpeed MLA is a dense MLA backend and does not implement "
+                    "the DeepSeek DSA/NSA selected-page attention path required by "
+                    f"{', '.join(nsa_only_flags)}. Use --attention-backend nsa for "
+                    "the REAP HiSparse/IndexCache/TurboQuant production stack."
+                )
+
             if not is_sm100_supported():
                 raise ValueError(
                     "TokenSpeed MLA backend is only supported on SM100 GPUs. "

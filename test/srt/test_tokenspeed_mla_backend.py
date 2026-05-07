@@ -1,4 +1,5 @@
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,54 @@ def test_tokenspeed_mla_backend_documents_runtime_constraints():
     assert "SM100" in backend
     assert "page_size 32 or 64" in backend
     assert "tokenspeed-mla" in docs
+
+
+def test_tokenspeed_mla_rejects_nsa_only_stack_flags():
+    server_args = read_source("python/sglang/srt/server_args.py")
+
+    assert "TokenSpeed MLA is a dense MLA backend" in server_args
+    assert "DeepSeek DSA/NSA selected-page attention path" in server_args
+    assert "--enable-hisparse" in server_args
+    assert "--nsa-indexer-mode" in server_args
+    assert "--enable-turboquant-dense-kv-cache" in server_args
+    assert "--nsa-prefill-cp-kv-storage-mode=layersplit" in server_args
+
+
+def test_tokenspeed_mla_ab_script_keeps_reap_stack_separate():
+    script = read_source("scripts/playground/run-tokenspeed-mla-ab.sh")
+
+    assert "CANDIDATE_BACKEND=${CANDIDATE_BACKEND:-tokenspeed_mla}" in script
+    assert "--attention-backend" in script
+    assert "--enable-hisparse" not in script
+    assert "--nsa-indexer-mode" not in script
+    assert "--enable-turboquant-dense-kv-cache" not in script
+    assert "--speculative-algorithm" not in script
+
+
+def test_tokenspeed_mla_ab_script_dry_run_builds_baseline_and_candidate():
+    script = ROOT / "scripts/playground/run-tokenspeed-mla-ab.sh"
+    subprocess.run(["bash", "-n", str(script)], check=True)
+    result = subprocess.run(
+        ["bash", str(script)],
+        check=True,
+        env={
+            **os.environ,
+            "DRY_RUN": "1",
+            "MATRIX": "8:1",
+            "MODEL_PATH": "dummy",
+            "LOAD_FORMAT": "dummy",
+            "TP_SIZE": "1",
+            "DP_SIZE": "1",
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert "--attention-backend trtllm_mla" in result.stdout
+    assert "--attention-backend tokenspeed_mla" in result.stdout
+    assert "--random-input-len 8" in result.stdout
+    assert "--random-output-len 1" in result.stdout
+    assert "--enable-hisparse" not in result.stdout
 
 
 def _require_tokenspeed_kernel_env():

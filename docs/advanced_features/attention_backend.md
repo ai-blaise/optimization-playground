@@ -97,6 +97,19 @@ Runtime constraints:
 - Native page size must be 32 or 64.
 - KV cache dtype must be `bfloat16`, `bf16`, `fp8_e4m3`, or `auto`.
 - Prefix/paged prefill paths that TokenSpeed does not cover fall back to the existing FlashInfer MLA implementation.
+- TokenSpeed MLA does not implement the DeepSeek V3.2 DSA/NSA selected-page attention path. Do not combine it with NSA-only features such as HiSparse, IndexCache, dense TurboQuant KV, or LayerSplit storage; those profiles should keep `--attention-backend nsa`.
+
+For a dense MLA A/B harness, use `scripts/playground/run-tokenspeed-mla-ab.sh`.
+The script launches an incumbent dense MLA backend and a TokenSpeed candidate with
+the same model, page size, KV dtype, tensor-parallel size, and request matrix, then
+runs `sglang.bench_serving` for both. It deliberately does not add REAP NSA flags
+such as HiSparse, IndexCache, dense TurboQuant KV, SMC-SD, or LayerSplit because
+those belong to the `nsa` backend path.
+
+```bash
+DRY_RUN=1 scripts/playground/run-tokenspeed-mla-ab.sh
+MODEL_PATH=deepseek-ai/DeepSeek-R1 scripts/playground/run-tokenspeed-mla-ab.sh
+```
 
 To run the optional TokenSpeed kernel correctness tests, install `tokenspeed-mla` in the test environment and run:
 

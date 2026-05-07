@@ -9,6 +9,7 @@ from typing import Any
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v1"
 
 
 class BumkcArtifactError(ValueError):
@@ -83,6 +84,8 @@ def load_bumkc_artifact(
     tensor_smoke = _read_json(root / "generated" / "tensor-smoke.json")
 
     _validate_identity(manifest, runtime, engine, tensor_smoke)
+    if engine.get("schema_version") != REQUIRED_SCHEMA_VERSION:
+        raise BumkcArtifactError("BUMKC artifact uses an unsupported engine schema")
     if engine.get("engine") != "sglang":
         raise BumkcArtifactError("BUMKC artifact is not targeted at the SGLang engine")
     if engine.get("engine_profile") != "optimization_playground":

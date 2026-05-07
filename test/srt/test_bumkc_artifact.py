@@ -12,6 +12,7 @@ sys.modules[SPEC.name] = bumkc_artifact
 SPEC.loader.exec_module(bumkc_artifact)
 
 REQUIRED_VALIDATION_MODEL = bumkc_artifact.REQUIRED_VALIDATION_MODEL
+REQUIRED_SCHEMA_VERSION = bumkc_artifact.REQUIRED_SCHEMA_VERSION
 BumkcArtifactError = bumkc_artifact.BumkcArtifactError
 load_bumkc_artifact = bumkc_artifact.load_bumkc_artifact
 
@@ -57,6 +58,17 @@ def test_rejects_bumkc_artifact_with_unchecked_fallback(tmp_path):
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
 
     with pytest.raises(BumkcArtifactError, match="checked fallback"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_unsupported_bumkc_schema(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["schema_version"] = "bumkc.optimization_playground.v0"
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+
+    with pytest.raises(BumkcArtifactError, match="unsupported engine schema"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -117,7 +129,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
     write_json(
         plan_dir / "engine" / "optimization-playground.json",
         {
-            "schema_version": "bumkc.optimization_playground.v0",
+            "schema_version": REQUIRED_SCHEMA_VERSION,
             "engine": "sglang",
             "engine_profile": "optimization_playground",
             "integration_branch": "bumkc/serving-integration",

@@ -46,18 +46,39 @@ def test_tokenspeed_mla_backend_documents_runtime_constraints():
     assert "tokenspeed-mla" in docs
 
 
-def test_tokenspeed_mla_rejects_nsa_only_stack_flags():
+def test_tokenspeed_mla_routes_deepseek_nsa_through_custom_stack():
     server_args = read_source("python/sglang/srt/server_args.py")
+    nsa_backend = read_source("python/sglang/srt/layers/attention/nsa_backend.py")
 
-    assert "TokenSpeed MLA is a dense MLA backend" in server_args
-    assert "DeepSeek DSA/NSA selected-page attention path" in server_args
-    assert "--enable-hisparse" in server_args
-    assert "--nsa-indexer-mode" in server_args
+    assert '"tokenspeed_mla",' in server_args
+    assert "Routing TokenSpeed MLA through the NSA backend" in server_args
+    assert 'self.attention_backend = "nsa"' in server_args
+    assert 'self.nsa_decode_backend = "tokenspeed_mla"' in server_args
+    assert "TokenSpeed MLA is a dense MLA backend" not in server_args
+    assert "does not implement the DeepSeek DSA/NSA" not in server_args
+
+    assert '_NSA_IMPL_T: TypeAlias = Literal[' in nsa_backend
+    assert '"tokenspeed_mla"' in nsa_backend
+    assert "def _pack_tokenspeed_selected_kv(" in nsa_backend
+    assert "def _forward_tokenspeed_mla_selected(" in nsa_backend
+    assert "get_turboquant_selected_kv_buffer" in nsa_backend
+
+
+def test_tokenspeed_mla_nsa_validation_preserves_custom_stack_flags():
+    server_args = read_source("python/sglang/srt/server_args.py")
+    server_args_docs = read_source("docs/advanced_features/server_arguments.md")
+
+    assert '"bfloat16": {"flashmla_sparse", "tokenspeed_mla"}' in server_args
+    assert '"tilelang",\n                    "tokenspeed_mla",' in server_args
+    assert "TokenSpeed MLA NSA selected-page integration currently" in server_args
+    assert "`trtllm`, `tokenspeed_mla`" in server_args_docs
     assert "--enable-turboquant-dense-kv-cache" in server_args
     assert "--nsa-prefill-cp-kv-storage-mode=layersplit" in server_args
+    assert "--nsa-indexer-mode" in server_args
+    assert "--enable-hisparse" in server_args
 
 
-def test_tokenspeed_mla_ab_script_keeps_reap_stack_separate():
+def test_tokenspeed_mla_ab_script_keeps_dense_mla_comparison_separate():
     script = read_source("scripts/playground/run-tokenspeed-mla-ab.sh")
 
     assert "CANDIDATE_BACKEND=${CANDIDATE_BACKEND:-tokenspeed_mla}" in script

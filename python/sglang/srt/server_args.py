@@ -261,6 +261,7 @@ NSA_CHOICES = [
     "tilelang",
     "aiter",
     "trtllm",
+    "tokenspeed_mla",
 ]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
@@ -2720,23 +2721,24 @@ class ServerArgs:
         ):
             from sglang.srt.configs.model_config import is_deepseek_nsa
 
-            nsa_only_flags = []
+            route_to_nsa = False
             if is_deepseek_nsa(model_config.hf_config):
-                nsa_only_flags.append("DeepSeek DSA/NSA model")
-            if self.enable_hisparse:
-                nsa_only_flags.append("--enable-hisparse")
-            if self.nsa_indexer_mode != "vanilla":
-                nsa_only_flags.append("--nsa-indexer-mode")
-            if self.enable_turboquant_dense_kv_cache:
-                nsa_only_flags.append("--enable-turboquant-dense-kv-cache")
-            if self.nsa_prefill_cp_kv_storage_mode == "layersplit":
-                nsa_only_flags.append("--nsa-prefill-cp-kv-storage-mode=layersplit")
-            if nsa_only_flags:
-                raise ValueError(
-                    "TokenSpeed MLA is a dense MLA backend and does not implement "
-                    "the DeepSeek DSA/NSA selected-page attention path required by "
-                    f"{', '.join(nsa_only_flags)}. Use --attention-backend nsa for "
-                    "the REAP HiSparse/IndexCache/TurboQuant production stack."
+                route_to_nsa = True
+                if self.attention_backend == "tokenspeed_mla":
+                    self.nsa_prefill_backend = "tokenspeed_mla"
+                    self.nsa_decode_backend = "tokenspeed_mla"
+                if self.prefill_attention_backend == "tokenspeed_mla":
+                    self.nsa_prefill_backend = "tokenspeed_mla"
+                    self.prefill_attention_backend = None
+                if self.decode_attention_backend == "tokenspeed_mla":
+                    self.nsa_decode_backend = "tokenspeed_mla"
+                    self.decode_attention_backend = None
+                if self.attention_backend == "tokenspeed_mla":
+                    self.attention_backend = "nsa"
+                logger.warning(
+                    "Routing TokenSpeed MLA through the NSA backend for "
+                    "DeepSeek DSA/NSA so HiSparse, IndexCache, TurboQuant, "
+                    "and LayerSplit semantics remain active."
                 )
 
             if not is_sm100_supported():
@@ -2745,15 +2747,35 @@ class ServerArgs:
                     "Please use a different backend on this device."
                 )
 
-            if self.page_size not in [32, 64]:
+            if not route_to_nsa and self.page_size not in [32, 64]:
                 logger.warning(
                     f"TokenSpeed MLA only supports page_size 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
 
-            if self.kv_cache_dtype not in ["bfloat16", "bf16", "fp8_e4m3", "auto"]:
+            if not route_to_nsa and self.kv_cache_dtype not in [
+                "bfloat16",
+                "bf16",
+                "fp8_e4m3",
+                "auto",
+            ]:
                 raise ValueError(
                     "TokenSpeed MLA backend only supports kv-cache-dtype bfloat16, bf16, fp8_e4m3, or auto."
+                )
+
+        if "tokenspeed_mla" in (
+            self.nsa_prefill_backend,
+            self.nsa_decode_backend,
+        ):
+            if not is_sm100_supported():
+                raise ValueError(
+                    "TokenSpeed MLA NSA backend is only supported on SM100 GPUs. "
+                    "Please use a different NSA backend on this device."
+                )
+            if self.kv_cache_dtype not in ["bfloat16", "bf16"]:
+                raise ValueError(
+                    "TokenSpeed MLA NSA selected-page integration currently "
+                    "requires --kv-cache-dtype=bfloat16."
                 )
 
         if (
@@ -7338,8 +7360,9 @@ class ServerArgs:
             # Backend/dtype pairing: flashmla_sparse only takes BF16 KV;
             # flashmla_kv only supports FP8 (it always reads KV as FP8 via
             # is_fp8_kvcache=True, inline-quantizing BF16 would defeat HiSparse).
+            # tokenspeed_mla packs selected BF16 rows into native TokenSpeed pages.
             allowed_backends_for_dtype = {
-                "bfloat16": {"flashmla_sparse"},
+                "bfloat16": {"flashmla_sparse", "tokenspeed_mla"},
                 "fp8_e4m3": {"flashmla_kv"},
             }.get(self.kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"})
             for attr, label in [
@@ -7430,12 +7453,18 @@ class ServerArgs:
                     )
             if self.turboquant_execution_mode == "fused_decode" and (
                 self.nsa_decode_backend
-                not in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang")
+                not in (
+                    "fa3",
+                    "flashmla_kv",
+                    "flashmla_sparse",
+                    "tilelang",
+                    "tokenspeed_mla",
+                )
             ):
                 raise ValueError(
                     "--turboquant-execution-mode=fused_decode requires "
                     "--nsa-decode-backend=fa3, flashmla_kv, flashmla_sparse, "
-                    "or tilelang."
+                    "tilelang, or tokenspeed_mla."
                 )
             if not is_cuda():
                 raise ValueError(

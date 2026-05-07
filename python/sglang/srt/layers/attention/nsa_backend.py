@@ -36,7 +36,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -87,10 +87,24 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
 
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
+_tokenspeed_workspace_buffers: Dict[torch.device, torch.Tensor] = {}
+_TOKENSPEED_MAX_Q_LEN = 8
+_TOKENSPEED_INSTALL_HINT = (
+    "tokenspeed_mla package is not installed. Install it with "
+    "`uv pip install tokenspeed-mla`."
+)
 
 # Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
+
+
+def _require_tokenspeed_mla():
+    try:
+        import tokenspeed_mla
+    except ImportError as exc:
+        raise ImportError(_TOKENSPEED_INSTALL_HINT) from exc
+    return tokenspeed_mla
 
 
 @dataclass(frozen=True)
@@ -318,7 +332,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _NSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm", "tokenspeed_mla"
 ]
 
 
@@ -355,6 +369,7 @@ class NativeSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.v_head_dim = model_runner.model_config.v_head_dim
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -364,6 +379,25 @@ class NativeSparseAttnBackend(
             model_runner.server_args.nsa_prefill_backend
         )
         self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
+        self.use_tokenspeed_mla = "tokenspeed_mla" in (
+            self.nsa_prefill_impl,
+            self.nsa_decode_impl,
+        )
+        if self.use_tokenspeed_mla:
+            if not is_sm100_supported():
+                raise ValueError(
+                    "TokenSpeed MLA NSA backend is only supported on SM100 GPUs."
+                )
+            _require_tokenspeed_mla()
+            if (
+                self.qk_nope_head_dim != 128
+                or self.qk_rope_head_dim != 64
+                or self.v_head_dim != 128
+            ):
+                raise ValueError(
+                    "TokenSpeed MLA NSA backend requires DeepSeek MLA dimensions "
+                    "(qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128)."
+                )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -374,6 +408,8 @@ class NativeSparseAttnBackend(
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
+        self._tokenspeed_selected_kv_buffer: Optional[torch.Tensor] = None
+        self._tokenspeed_block_tables: Optional[torch.Tensor] = None
 
         if _is_hip:
             max_bs = model_runner.req_to_token_pool.size
@@ -1495,7 +1531,9 @@ class NativeSparseAttnBackend(
 
         if (
             nsa_impl in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang")
-            and getattr(
+            or nsa_impl == "tokenspeed_mla"
+        ) and (
+            getattr(
                 forward_batch.token_to_kv_pool,
                 "turboquant_execution_mode",
                 None,
@@ -1559,6 +1597,15 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+            )
+        elif nsa_impl == "tokenspeed_mla":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_tokenspeed_mla_selected(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                layer=layer,
             )
         elif nsa_impl == "fa3":
             return self._forward_fa3(
@@ -1699,7 +1746,8 @@ class NativeSparseAttnBackend(
             )
 
         if (
-            self.nsa_decode_impl in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang")
+            self.nsa_decode_impl
+            in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang", "tokenspeed_mla")
             and getattr(
                 forward_batch.token_to_kv_pool,
                 "turboquant_execution_mode",
@@ -1739,6 +1787,15 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+            )
+        elif self.nsa_decode_impl == "tokenspeed_mla":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_tokenspeed_mla_selected(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                layer=layer,
             )
         elif self.nsa_decode_impl == "tilelang":
             if q_rope is not None:
@@ -1928,6 +1985,119 @@ class NativeSparseAttnBackend(
             o = o[:, :, :num_q_heads, :]
 
         return o
+
+    def _get_tokenspeed_workspace(
+        self, device: torch.device, q_len: int
+    ) -> torch.Tensor:
+        tokenspeed_mla = _require_tokenspeed_mla()
+        needed = (
+            tokenspeed_mla.get_num_sm(device)
+            * self.num_q_heads
+            * max(q_len, _TOKENSPEED_MAX_Q_LEN)
+            * (self.kv_lora_rank + 1)
+            * 4
+        )
+        workspace = _tokenspeed_workspace_buffers.get(device)
+        if workspace is None or workspace.numel() < needed:
+            workspace = torch.empty(needed, dtype=torch.int8, device=device)
+            _tokenspeed_workspace_buffers[device] = workspace
+        return workspace
+
+    def _tokenspeed_selected_page_size(self, topk: int) -> int:
+        return 32 if topk <= 32 else 64
+
+    def _pack_tokenspeed_selected_kv(
+        self,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        if page_table_1.dim() != 2:
+            raise ValueError("TokenSpeed NSA expects a 2D selected page table.")
+        if not page_table_1.is_contiguous():
+            page_table_1 = page_table_1.contiguous()
+
+        num_queries, topk = page_table_1.shape
+        page_size = self._tokenspeed_selected_page_size(topk)
+        pages_per_query = (topk + page_size - 1) // page_size
+        total_pages = num_queries * pages_per_query
+        kv_dim = kv_cache.shape[-1]
+        flat_kv = kv_cache.reshape(-1, kv_dim)
+
+        buffer_shape = (total_pages, page_size, kv_dim)
+        if (
+            self._tokenspeed_selected_kv_buffer is None
+            or self._tokenspeed_selected_kv_buffer.shape != buffer_shape
+            or self._tokenspeed_selected_kv_buffer.dtype != kv_cache.dtype
+            or self._tokenspeed_selected_kv_buffer.device != kv_cache.device
+        ):
+            self._tokenspeed_selected_kv_buffer = torch.empty(
+                buffer_shape,
+                dtype=kv_cache.dtype,
+                device=kv_cache.device,
+            )
+        selected_kv = self._tokenspeed_selected_kv_buffer
+
+        valid = page_table_1 >= 0
+        flat_loc = page_table_1.clamp_min(0).reshape(-1).long()
+        gathered = flat_kv[flat_loc].view(num_queries, topk, kv_dim)
+        gathered = gathered.masked_fill_(~valid.unsqueeze(-1), 0)
+        selected_kv.view(num_queries, pages_per_query * page_size, kv_dim)[
+            :, :topk, :
+        ].copy_(gathered)
+
+        block_shape = (num_queries, pages_per_query)
+        if (
+            self._tokenspeed_block_tables is None
+            or self._tokenspeed_block_tables.shape != block_shape
+            or self._tokenspeed_block_tables.device != page_table_1.device
+        ):
+            self._tokenspeed_block_tables = torch.empty(
+                block_shape,
+                dtype=torch.int32,
+                device=page_table_1.device,
+            )
+        torch.arange(
+            total_pages,
+            dtype=torch.int32,
+            device=page_table_1.device,
+            out=self._tokenspeed_block_tables.view(-1),
+        )
+
+        seq_lens = valid.sum(dim=1).to(torch.int32)
+        max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() else 0
+        return selected_kv, self._tokenspeed_block_tables, seq_lens, max_seq_len
+
+    def _forward_tokenspeed_mla_selected(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+    ) -> torch.Tensor:
+        if q_all.numel() == 0:
+            return q_all.new_empty((0, layer.tp_q_head_num, layer.v_head_dim))
+
+        tokenspeed_mla = _require_tokenspeed_mla()
+        selected_kv, block_tables, seq_lens, max_seq_len = (
+            self._pack_tokenspeed_selected_kv(kv_cache, page_table_1)
+        )
+        query = q_all.view(q_all.shape[0], 1, layer.tp_q_head_num, layer.head_dim)
+        if query.dtype != selected_kv.dtype:
+            query = query.to(selected_kv.dtype)
+        out = tokenspeed_mla.tokenspeed_mla_decode(
+            query=query,
+            kv_cache=selected_kv,
+            workspace_buffer=self._get_tokenspeed_workspace(query.device, 1),
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            softmax_scale=layer.scaling,
+            output_scale=1.0,
+            enable_pdl=False,
+        )
+        return out.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
     def _forward_standard_mha(
         self,

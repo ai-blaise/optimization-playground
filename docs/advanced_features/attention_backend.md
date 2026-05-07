@@ -38,6 +38,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **FlashInfer MLA**         | 1                         | ❌               | ✅               | ✅                       | ✅              | ❌              |
 | **FlashMLA**               | 64                        | ✅               | ✅               | ✅                       | ✅              | ❌              |
 | **Cutlass MLA**            | 128                       | ✅               | ✅               | ✅                       | ✅              | ❌              |
+| **TokenSpeed MLA (Blackwell)** | 32 or 64              | ✅               | ❌               | ⚠️ (ragged no-prefix; prefix fallback) | ✅      | ❌              |
 | **TRTLLM MLA (Blackwell)** | 32 or 64                  | ✅               | ✅               | ✅                       | ✅              | ❌              |
 | **FA3 (FlashAttention 3)** | n/a                       | ❌               | ❌               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
 | **Triton**                 | n/a                       | ❌               | ❌               | ❌                       | ✅              | ⚠️ (page_size=1 only) |
@@ -83,7 +84,25 @@ MLA page-size constraints:
 - FlashInfer MLA: page_size = 1.
 - FlashMLA: page_size = 64.
 - Cutlass MLA: page_size = 128.
+- TokenSpeed MLA: page_size ∈ {32, 64}, SM100 only. The backend is opt-in via `--attention-backend tokenspeed_mla` and requires the optional `tokenspeed-mla` package.
 - TRTLLM MLA: page_size ∈ {32, 64}.
+
+#### TokenSpeed MLA
+
+TokenSpeed MLA is an opt-in Blackwell backend for DeepSeek-style MLA models. It uses TokenSpeed's CuTe DSL decode kernel and ragged no-prefix prefill kernel when selected with `--attention-backend tokenspeed_mla`, `--decode-attention-backend tokenspeed_mla`, or `--prefill-attention-backend tokenspeed_mla`.
+
+Runtime constraints:
+- The backend requires SM100-class GPUs.
+- The model must use MLA dimensions `qk_nope_head_dim=128`, `qk_rope_head_dim=64`, and `v_head_dim=128`.
+- Native page size must be 32 or 64.
+- KV cache dtype must be `bfloat16`, `bf16`, `fp8_e4m3`, or `auto`.
+- Prefix/paged prefill paths that TokenSpeed does not cover fall back to the existing FlashInfer MLA implementation.
+
+To run the optional TokenSpeed kernel correctness tests, install `tokenspeed-mla` in the test environment and run:
+
+```bash
+SGLANG_TEST_TOKENSPEED_KERNELS=1 python -m pytest test/srt/test_tokenspeed_mla_backend.py
+```
 
 ### GDN Attention Backends
 

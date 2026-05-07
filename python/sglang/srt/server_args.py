@@ -543,6 +543,9 @@ class ServerArgs:
     turboquant_skip_layers: Optional[str] = None
     turboquant_execution_mode: str = "fused_decode"
     turboquant_mla_decode_num_splits: int = 16
+    enable_bumkc: bool = False
+    bumkc_plan_path: Optional[str] = None
+    bumkc_require_executable: bool = False
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
     enable_flashsampling: bool = False
@@ -854,6 +857,7 @@ class ServerArgs:
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         self._handle_pd_disaggregation()
+        self._handle_bumkc_artifact()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Keep the dummy-model fast path, but still run lightweight defaulting and
@@ -4098,6 +4102,25 @@ class ServerArgs:
                     f"got '{self.disaggregation_transfer_backend}'."
                 )
 
+    def _handle_bumkc_artifact(self):
+        if not self.enable_bumkc:
+            if self.bumkc_plan_path is not None:
+                raise ValueError("--bumkc-plan-path requires --enable-bumkc")
+            return
+        if self.bumkc_plan_path is None:
+            raise ValueError("--enable-bumkc requires --bumkc-plan-path")
+
+        from sglang.srt.bumkc.artifact import load_bumkc_artifact
+
+        self._bumkc_artifact_summary = load_bumkc_artifact(
+            self.bumkc_plan_path,
+            require_executable=self.bumkc_require_executable,
+        )
+        logger.info(
+            "Loaded BUMKC artifact: %s",
+            self._bumkc_artifact_summary.as_log_dict(),
+        )
+
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
@@ -5771,6 +5794,24 @@ class ServerArgs:
             default=ServerArgs.turboquant_mla_decode_num_splits,
             type=int,
             help="Number of sequence splits for TurboQuant fused dense MLA decode.",
+        )
+        parser.add_argument(
+            "--enable-bumkc",
+            default=ServerArgs.enable_bumkc,
+            action="store_true",
+            help="Enable checked BUMKC megakernel artifact integration.",
+        )
+        parser.add_argument(
+            "--bumkc-plan-path",
+            default=ServerArgs.bumkc_plan_path,
+            type=str,
+            help="Path to a BUMKC plan directory or artifact root containing exactly one plan.",
+        )
+        parser.add_argument(
+            "--bumkc-require-executable",
+            default=ServerArgs.bumkc_require_executable,
+            action="store_true",
+            help="Fail startup unless the BUMKC runtime descriptor is executable.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",

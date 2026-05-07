@@ -16,6 +16,32 @@ class BumkcArtifactError(ValueError):
 
 
 @dataclasses.dataclass(frozen=True)
+class BumkcRuntimeSummary:
+    task_count: int
+    conventional_launch_count: int
+    persistent_launch_count: int
+    jit_task_count: int
+    aot_task_count: int
+    queue_capacity: int
+    task_instance_capacity: int
+    device_global_binding_count: int
+    kv_cache_binding_count: int
+
+    def as_log_dict(self) -> dict[str, int]:
+        return {
+            "task_count": self.task_count,
+            "conventional_launch_count": self.conventional_launch_count,
+            "persistent_launch_count": self.persistent_launch_count,
+            "jit_task_count": self.jit_task_count,
+            "aot_task_count": self.aot_task_count,
+            "queue_capacity": self.queue_capacity,
+            "task_instance_capacity": self.task_instance_capacity,
+            "device_global_binding_count": self.device_global_binding_count,
+            "kv_cache_binding_count": self.kv_cache_binding_count,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class BumkcArtifactSummary:
     root: Path
     plan_id: str
@@ -25,6 +51,7 @@ class BumkcArtifactSummary:
     fallback_mode: str
     runtime_executable: bool
     runtime_entrypoints: tuple[str, ...]
+    runtime_summary: BumkcRuntimeSummary
     task_count: int
     tensor_smoke_enabled: bool
     required_validation_model: str
@@ -39,6 +66,7 @@ class BumkcArtifactSummary:
             "fallback_mode": self.fallback_mode,
             "runtime_executable": self.runtime_executable,
             "runtime_entrypoints": list(self.runtime_entrypoints),
+            "runtime_summary": self.runtime_summary.as_log_dict(),
             "task_count": self.task_count,
             "tensor_smoke_enabled": self.tensor_smoke_enabled,
             "required_validation_model": self.required_validation_model,
@@ -70,6 +98,7 @@ def load_bumkc_artifact(
     if require_executable and not runtime.get("executable"):
         raise BumkcArtifactError("BUMKC artifact is not executable")
 
+    runtime_summary = _load_runtime_summary(engine, runtime)
     entrypoints = tuple(
         entrypoint.get("name", "") for entrypoint in runtime.get("entrypoints", [])
     )
@@ -82,7 +111,8 @@ def load_bumkc_artifact(
         fallback_mode=engine["fallback_mode"],
         runtime_executable=bool(runtime["executable"]),
         runtime_entrypoints=entrypoints,
-        task_count=int(runtime["task_count"]),
+        runtime_summary=runtime_summary,
+        task_count=runtime_summary.task_count,
         tensor_smoke_enabled=bool(tensor_smoke["enabled"]),
         required_validation_model=engine["required_validation_model"],
     )
@@ -120,3 +150,38 @@ def _validate_identity(*objects: dict[str, Any]) -> None:
         raise BumkcArtifactError("BUMKC artifact plan IDs do not match")
     if len(program_ids) != 1 or None in program_ids:
         raise BumkcArtifactError("BUMKC artifact program IDs do not match")
+
+
+def _load_runtime_summary(
+    engine: dict[str, Any], runtime: dict[str, Any]
+) -> BumkcRuntimeSummary:
+    summary = engine.get("runtime_summary")
+    if not isinstance(summary, dict):
+        raise BumkcArtifactError("BUMKC engine runtime summary is missing")
+
+    execution_model = _read_object(runtime, "execution_model")
+    queue_plan = _read_object(runtime, "queue_plan")
+    memory_plan = _read_object(runtime, "memory_plan")
+    expected = {
+        "task_count": runtime.get("task_count"),
+        "conventional_launch_count": execution_model.get("conventional_launch_count"),
+        "persistent_launch_count": execution_model.get("persistent_launch_count"),
+        "jit_task_count": queue_plan.get("jit_task_count"),
+        "aot_task_count": queue_plan.get("aot_task_count"),
+        "queue_capacity": queue_plan.get("queue_capacity"),
+        "task_instance_capacity": queue_plan.get("task_instance_capacity"),
+        "device_global_binding_count": memory_plan.get("device_global_binding_count"),
+        "kv_cache_binding_count": memory_plan.get("kv_cache_binding_count"),
+    }
+    for key, value in expected.items():
+        if summary.get(key) is None or value is None or summary.get(key) != value:
+            raise BumkcArtifactError(f"BUMKC engine runtime summary mismatch: {key}")
+
+    return BumkcRuntimeSummary(**{key: int(value) for key, value in expected.items()})
+
+
+def _read_object(parent: dict[str, Any], key: str) -> dict[str, Any]:
+    value = parent.get(key)
+    if not isinstance(value, dict):
+        raise BumkcArtifactError(f"BUMKC runtime {key} object is missing")
+    return value

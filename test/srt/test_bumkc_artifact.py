@@ -24,6 +24,9 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.root == plan_dir
     assert summary.runtime_executable
     assert summary.runtime_entrypoints == ("cuda_tensor_smoke",)
+    assert summary.runtime_summary.task_instance_capacity == 2
+    assert summary.runtime_summary.kv_cache_binding_count == 1
+    assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
     assert summary.fallback_mode == "checked"
 
@@ -57,6 +60,17 @@ def test_rejects_bumkc_artifact_with_unchecked_fallback(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_runtime_summary_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["runtime_summary"]["kv_cache_binding_count"] = 7
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+
+    with pytest.raises(BumkcArtifactError, match="runtime summary mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
 def write_bumkc_artifact(tmp_path, *, executable):
     plan_id = "plan_test"
     program_id = "program_test"
@@ -84,6 +98,20 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 else []
             ),
             "task_count": 2,
+            "execution_model": {
+                "conventional_launch_count": 2,
+                "persistent_launch_count": 1,
+            },
+            "queue_plan": {
+                "jit_task_count": 0,
+                "aot_task_count": 2,
+                "queue_capacity": 64,
+                "task_instance_capacity": 2,
+            },
+            "memory_plan": {
+                "device_global_binding_count": 4,
+                "kv_cache_binding_count": 1,
+            },
         },
     )
     write_json(
@@ -99,6 +127,17 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "gpu_count": 8,
             "fallback_mode": "checked",
             "runtime_executable": executable,
+            "runtime_summary": {
+                "task_count": 2,
+                "conventional_launch_count": 2,
+                "persistent_launch_count": 1,
+                "jit_task_count": 0,
+                "aot_task_count": 2,
+                "queue_capacity": 64,
+                "task_instance_capacity": 2,
+                "device_global_binding_count": 4,
+                "kv_cache_binding_count": 1,
+            },
             "preserve_custom_optimizations": True,
             "required_validation_model": REQUIRED_VALIDATION_MODEL,
         },

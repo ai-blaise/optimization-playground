@@ -24,6 +24,7 @@ validates:
 - checked fallback mode,
 - preservation of custom optimizations,
 - matching engine/runtime executable flags,
+- runtime summary fields against the runtime descriptor,
 - and the required REAP validation model contract.
 
 Add `--bumkc-require-executable` when startup must fail unless the runtime

@@ -53,6 +53,20 @@ class CompileArgs:
         )
 
 
+def _compile_warmup_input_ids(server_args: ServerArgs) -> list[int]:
+    num_tokens = 4
+    if (
+        server_args.enable_nsa_prefill_context_parallel
+        and server_args.nsa_prefill_cp_kv_storage_mode == "layersplit"
+    ):
+        num_tokens = max(
+            num_tokens,
+            server_args.attn_cp_size * server_args.page_size,
+            envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get(),
+        )
+    return list(range(num_tokens))
+
+
 @warmup("compile-deep-gemm")
 async def warm_up_compile(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
@@ -60,7 +74,7 @@ async def warm_up_compile(
     print("\nGenerate warm up request for compiling DeepGEMM...\n")
     server_args = tokenizer_manager.server_args
     dp_size = server_args.dp_size
-    base_ids = [0, 1, 2, 3]
+    base_ids = _compile_warmup_input_ids(server_args)
     sampling_params = {
         "temperature": 0.0,
         "max_new_tokens": 8,
@@ -121,7 +135,7 @@ def launch_server_process_and_send_one_request(
                 # Rank-0 node send a request to sync with other node and then return.
                 if server_args.node_rank == 0:
                     dp_size = server_args.dp_size
-                    base_ids = [0, 1, 2, 3]
+                    base_ids = _compile_warmup_input_ids(server_args)
                     payload = {
                         "sampling_params": {
                             "max_new_tokens": 8,

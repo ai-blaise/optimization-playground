@@ -8,7 +8,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Callable, Dict, List, Tuple
 
 
 @contextlib.contextmanager
@@ -37,6 +37,13 @@ def _run_probe_command(cmd: List[str]) -> Dict[str, Any]:
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
     }
+
+
+def _optional_backend_value(method: Callable[[], Any]) -> Any:
+    try:
+        return method()
+    except RuntimeError as exc:
+        return {"unavailable": str(exc)}
 
 
 def rdma_probe() -> Dict[str, Any]:
@@ -101,13 +108,19 @@ def _parse_hints(raw_hints: str) -> Dict[str, str]:
     return hints
 
 
-def _new_ncclx_comm(device, name: str, hints: Dict[str, str], enable_rdma: bool):
+def _new_ncclx_comm(
+    device,
+    name: str,
+    hints: Dict[str, str],
+    enable_rdma: bool,
+    abort_on_timeout: bool,
+):
     import torch.distributed as dist
     import torchcomms
     from torch.distributed import PrefixStore, distributed_c10d
 
     if enable_rdma:
-        from torchcomms import ncclx
+        from torchcomms import _comms_ncclx as ncclx
 
         ncclx.init_caching_allocator_hook()
 
@@ -122,6 +135,7 @@ def _new_ncclx_comm(device, name: str, hints: Dict[str, str], enable_rdma: bool)
         return torchcomms.new_comm(
             "ncclx",
             device,
+            abort_process_on_timeout_or_error=abort_on_timeout,
             store=store,
             name=name,
             hints=hints or None,
@@ -132,6 +146,13 @@ def _mb_to_numel(size_mb: int, dtype) -> int:
     import torch
 
     return max(1, size_mb * 1024 * 1024 // torch.tensor([], dtype=dtype).element_size())
+
+
+def _variable_splits(rank: int, world_size: int, numel: int) -> Tuple[List[int], List[int]]:
+    base = max(1, numel // (2 * world_size))
+    input_splits = [base * (1 + ((rank + peer) % 3)) for peer in range(world_size)]
+    output_splits = [base * (1 + ((peer + rank) % 3)) for peer in range(world_size)]
+    return output_splits, input_splits
 
 
 def _time_op(fn, warmup: int, iters: int):
@@ -162,6 +183,12 @@ def _bench_default(op: str, size_mb: int, dtype, warmup: int, iters: int, device
         def run():
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
+    elif op == "reduce":
+        tensor = torch.full((numel,), float(rank + 1), dtype=dtype, device=device)
+
+        def run():
+            dist.reduce(tensor, dst=0, op=dist.ReduceOp.SUM)
+
     elif op == "all_gather":
         tensor = torch.full((numel,), float(rank), dtype=dtype, device=device)
         output = torch.empty((numel * world_size,), dtype=dtype, device=device)
@@ -177,6 +204,92 @@ def _bench_default(op: str, size_mb: int, dtype, warmup: int, iters: int, device
 
         def run():
             dist.reduce_scatter_tensor(output, tensor, op=dist.ReduceOp.SUM)
+
+    elif op == "reduce_scatter_quantized":
+        numel = _mb_to_numel(size_mb, torch.float32)
+        tensor = torch.full(
+            (numel * world_size,), float(rank + 1), dtype=torch.float32, device=device
+        )
+        output = torch.empty((numel,), dtype=torch.float32, device=device)
+
+        def run():
+            dist.reduce_scatter_tensor(output, tensor, op=dist.ReduceOp.SUM)
+
+    elif op == "all_to_all_single":
+        tensor = torch.full(
+            (numel * world_size,), float(rank + 1), dtype=dtype, device=device
+        )
+        output = torch.empty_like(tensor)
+
+        def run():
+            dist.all_to_all_single(output, tensor)
+
+    elif op in ("all_to_all_v_single", "device_alltoallv_single"):
+        output_splits, input_splits = _variable_splits(rank, world_size, numel)
+        tensor = torch.full(
+            (sum(input_splits),), float(rank + 1), dtype=dtype, device=device
+        )
+        output = torch.empty((sum(output_splits),), dtype=dtype, device=device)
+
+        def run():
+            dist.all_to_all_single(
+                output,
+                tensor,
+                output_split_sizes=output_splits,
+                input_split_sizes=input_splits,
+            )
+
+    elif op == "all_to_all":
+        input_list = [
+            torch.full((numel,), float(rank + 1), dtype=dtype, device=device)
+            for _ in range(world_size)
+        ]
+        output_list = [
+            torch.empty((numel,), dtype=dtype, device=device)
+            for _ in range(world_size)
+        ]
+
+        def run():
+            dist.all_to_all(output_list, input_list)
+
+    elif op == "broadcast":
+        tensor = torch.full((numel,), float(rank), dtype=dtype, device=device)
+
+        def run():
+            dist.broadcast(tensor, src=0)
+
+    elif op == "scatter":
+        output = torch.empty((numel,), dtype=dtype, device=device)
+        input_list = (
+            [
+                torch.full((numel,), float(peer), dtype=dtype, device=device)
+                for peer in range(world_size)
+            ]
+            if rank == 0
+            else None
+        )
+
+        def run():
+            dist.scatter(output, scatter_list=input_list, src=0)
+
+    elif op == "gather":
+        tensor = torch.full((numel,), float(rank), dtype=dtype, device=device)
+        output_list = (
+            [
+                torch.empty((numel,), dtype=dtype, device=device)
+                for _ in range(world_size)
+            ]
+            if rank == 0
+            else None
+        )
+
+        def run():
+            dist.gather(tensor, gather_list=output_list, dst=0)
+
+    elif op == "barrier":
+
+        def run():
+            dist.barrier()
 
     else:
         raise ValueError(op)
@@ -210,6 +323,12 @@ def _bench_ncclx(op: str, size_mb: int, dtype, warmup: int, iters: int, device, 
         def run():
             comm.all_reduce(tensor, torchcomms.ReduceOp.SUM, async_op=False)
 
+    elif op == "reduce":
+        tensor = torch.full((numel,), float(rank + 1), dtype=dtype, device=device)
+
+        def run():
+            comm.reduce(tensor, 0, torchcomms.ReduceOp.SUM, async_op=False)
+
     elif op == "all_gather":
         tensor = torch.full((numel,), float(rank), dtype=dtype, device=device)
         output = torch.empty((numel * world_size,), dtype=dtype, device=device)
@@ -228,11 +347,134 @@ def _bench_ncclx(op: str, size_mb: int, dtype, warmup: int, iters: int, device, 
                 output, tensor, torchcomms.ReduceOp.SUM, async_op=False
             )
 
+    elif op == "reduce_scatter_quantized":
+        numel = _mb_to_numel(size_mb, torch.float32)
+        tensor = torch.full(
+            (numel * world_size,), float(rank + 1), dtype=torch.float32, device=device
+        )
+        output = torch.empty((numel,), dtype=torch.float32, device=device)
+        seed = torch.tensor([42 + rank], dtype=torch.int64, device=device)
+        backend = comm.get_backend_impl()
+
+        def run():
+            backend.reduce_scatter_quantized(
+                output,
+                tensor,
+                torchcomms.ReduceOp.SUM,
+                seed,
+                async_op=False,
+            )
+
+    elif op == "all_to_all_single":
+        tensor = torch.full(
+            (numel * world_size,), float(rank + 1), dtype=dtype, device=device
+        )
+        output = torch.empty_like(tensor)
+
+        def run():
+            comm.all_to_all_single(output, tensor, async_op=False)
+
+    elif op == "all_to_all_v_single":
+        output_splits, input_splits = _variable_splits(rank, world_size, numel)
+        tensor = torch.full(
+            (sum(input_splits),), float(rank + 1), dtype=dtype, device=device
+        )
+        output = torch.empty((sum(output_splits),), dtype=dtype, device=device)
+
+        def run():
+            comm.all_to_all_v_single(
+                output,
+                tensor,
+                output_splits,
+                input_splits,
+                async_op=False,
+            )
+
+    elif op == "device_alltoallv_single":
+        output_splits, input_splits = _variable_splits(rank, world_size, numel)
+        tensor = torch.full(
+            (sum(input_splits),), float(rank + 1), dtype=dtype, device=device
+        )
+        output = torch.empty((sum(output_splits),), dtype=dtype, device=device)
+        output_splits_tensor = torch.tensor(
+            output_splits, dtype=torch.int64, device=device
+        )
+        input_splits_tensor = torch.tensor(
+            input_splits, dtype=torch.int64, device=device
+        )
+        backend = comm.get_backend_impl()
+
+        def run():
+            backend.device_alltoallv_single(
+                output,
+                tensor,
+                output_splits_tensor,
+                input_splits_tensor,
+                async_op=False,
+            )
+
+    elif op == "all_to_all":
+        input_list = [
+            torch.full((numel,), float(rank + 1), dtype=dtype, device=device)
+            for _ in range(world_size)
+        ]
+        output_list = [
+            torch.empty((numel,), dtype=dtype, device=device)
+            for _ in range(world_size)
+        ]
+
+        def run():
+            comm.all_to_all(output_list, input_list, async_op=False)
+
+    elif op == "broadcast":
+        tensor = torch.full((numel,), float(rank), dtype=dtype, device=device)
+
+        def run():
+            comm.broadcast(tensor, 0, async_op=False)
+
+    elif op == "scatter":
+        output = torch.empty((numel,), dtype=dtype, device=device)
+        input_list = (
+            [
+                torch.full((numel,), float(peer), dtype=dtype, device=device)
+                for peer in range(world_size)
+            ]
+            if rank == 0
+            else []
+        )
+
+        def run():
+            comm.scatter(output, input_list, 0, async_op=False)
+
+    elif op == "gather":
+        tensor = torch.full((numel,), float(rank), dtype=dtype, device=device)
+        output_list = (
+            [
+                torch.empty((numel,), dtype=dtype, device=device)
+                for _ in range(world_size)
+            ]
+            if rank == 0
+            else []
+        )
+
+        def run():
+            comm.gather(output_list, tensor, 0, async_op=False)
+
+    elif op == "barrier":
+
+        def run():
+            comm.barrier(async_op=False)
+
     else:
         raise ValueError(op)
 
+    comm_dump = None
+    if op == "device_alltoallv_single":
+        method = getattr(comm.get_backend_impl(), "comm_dump", lambda: None)
+        comm_dump = _optional_backend_value(method)
+
     elapsed = _time_op(run, warmup, iters)
-    return {
+    result = {
         "backend": "ncclx",
         "op": op,
         "size_mb": size_mb,
@@ -242,6 +484,9 @@ def _bench_ncclx(op: str, size_mb: int, dtype, warmup: int, iters: int, device, 
         "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
         "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
     }
+    if comm_dump is not None:
+        result["comm_dump"] = comm_dump
+    return result
 
 
 def run_collective_bench(args) -> Dict[str, Any]:
@@ -266,7 +511,14 @@ def run_collective_bench(args) -> Dict[str, Any]:
             f"bench_ncclx_{int(time.time())}",
             _parse_hints(args.torchcomms_ncclx_hints),
             args.enable_torchcomms_ncclx_rdma,
+            args.torchcomms_ncclx_abort_on_timeout,
         )
+        results["ncclx_backend"] = {
+            "name": ncclx_comm.get_backend(),
+            "version": _optional_backend_value(ncclx_comm.get_backend_version),
+            "rank": ncclx_comm.get_rank(),
+            "world_size": ncclx_comm.get_size(),
+        }
 
     try:
         for size_mb in args.sizes_mb:
@@ -297,6 +549,16 @@ def run_collective_bench(args) -> Dict[str, Any]:
     return results
 
 
+def write_output(path: Path, payload: Dict[str, Any], text: str) -> None:
+    rank = payload.get("rank")
+    if isinstance(rank, int):
+        rank_path = path.with_name(f"{path.stem}.rank{rank}{path.suffix}")
+        rank_path.write_text(text + "\n")
+        if rank != 0:
+            return
+    path.write_text(text + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--probe-only", action="store_true")
@@ -305,7 +567,14 @@ def main():
         "--backend", choices=["default", "ncclx", "both"], default="both"
     )
     parser.add_argument(
-        "--ops", nargs="+", default=["all_reduce", "all_gather", "reduce_scatter"]
+        "--ops",
+        nargs="+",
+        default=[
+            "all_reduce",
+            "all_gather",
+            "reduce_scatter",
+            "all_to_all_single",
+        ],
     )
     parser.add_argument("--sizes-mb", nargs="+", type=int, default=[1, 8, 64, 256])
     parser.add_argument("--warmup", type=int, default=10)
@@ -315,6 +584,7 @@ def main():
     )
     parser.add_argument("--torchcomms-ncclx-hints", default="")
     parser.add_argument("--enable-torchcomms-ncclx-rdma", action="store_true")
+    parser.add_argument("--torchcomms-ncclx-abort-on-timeout", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -326,7 +596,7 @@ def main():
     text = json.dumps(payload, indent=2, sort_keys=True)
     print(text)
     if args.output is not None:
-        args.output.write_text(text + "\n")
+        write_output(args.output, payload, text)
 
 
 if __name__ == "__main__":

@@ -110,7 +110,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.output_ids = []
         for req in self.reqs:
             self.output_ids.append(req.output_ids[-1])
-            maybe_cache_unfinished_req(req, self.tree_cache)
+            if not (self.spec_algorithm.is_smc() and req.smc_group_id is None):
+                maybe_cache_unfinished_req(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
@@ -181,5 +182,22 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 )
                 future_map.store_to_map_for_new_batch(
                     spec_info.future_indices, spec_info
+                )
+            self.spec_info = spec_info
+        elif self.spec_algorithm.is_smc():
+            from sglang.srt.smc.smc_info import SMCDraftInput
+
+            spec_info = SMCDraftInput(
+                verified_id=self.output_ids.to(dtype=torch.int32),
+                new_seq_lens=self.seq_lens,
+                num_tokens_per_req=server_args.speculative_num_draft_tokens,
+            )
+            if self.enable_overlap:
+                spec_info.future_indices = future_map.alloc_future_indices(
+                    len(self.seq_lens)
+                )
+                future_map.store_to_map_for_new_smc_batch(
+                    spec_info.future_indices,
+                    spec_info,
                 )
             self.spec_info = spec_info

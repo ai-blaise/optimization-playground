@@ -365,23 +365,36 @@ def get_local_attention_dp_size() -> int:
 
 @contextmanager
 def disable_dp_size():
-    """Patch the tp group temporarily until this function ends.
+    """Disable DP attention metadata inside speculative draft workers.
 
     This method is for draft workers of speculative decoding to run draft model
     with different tp degree from that of target model workers.
-
-    Args:
-        tp_group (GroupCoordinator): the tp group coordinator
     """
-    global _ATTN_DP_SIZE
+    global _ATTN_DP_RANK, _ATTN_DP_SIZE
+    global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
     assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
+    assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
+    assert _LOCAL_ATTN_DP_SIZE is not None, "dp attention not initialized!"
+    assert _LOCAL_ATTN_DP_RANK is not None, "dp attention not initialized!"
 
+    old_dp_rank = _ATTN_DP_RANK
     old_dp_size = _ATTN_DP_SIZE
+    old_local_dp_rank = _LOCAL_ATTN_DP_RANK
+    old_local_dp_size = _LOCAL_ATTN_DP_SIZE
+    old_enable_dp_attention_flag = _ENABLE_DP_ATTENTION_FLAG
+    _ATTN_DP_RANK = 0
     _ATTN_DP_SIZE = 1
+    _LOCAL_ATTN_DP_RANK = 0
+    _LOCAL_ATTN_DP_SIZE = 1
+    _ENABLE_DP_ATTENTION_FLAG = False
     try:
         yield
     finally:
+        _ATTN_DP_RANK = old_dp_rank
         _ATTN_DP_SIZE = old_dp_size
+        _LOCAL_ATTN_DP_RANK = old_local_dp_rank
+        _LOCAL_ATTN_DP_SIZE = old_local_dp_size
+        _ENABLE_DP_ATTENTION_FLAG = old_enable_dp_attention_flag
 
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:

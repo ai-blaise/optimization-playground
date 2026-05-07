@@ -171,6 +171,26 @@ class TestHiSparseUnit(unittest.TestCase):
     # ==================================================================
     # Low-level helpers
     # ==================================================================
+    def test_layersplit_active_rows_hint_uses_logical_allocator(self):
+        fill_len = self.page_size
+        device = self.allocator.device
+
+        self.assertEqual(self.allocator.layersplit_active_rows_hint(), self.page_size)
+        kv_loc = self.allocator.alloc_extend(
+            prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+            last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+            extend_num_tokens=fill_len,
+        )
+        self.assertIsNotNone(kv_loc)
+        self.assertEqual(
+            self.allocator.layersplit_active_rows_hint(),
+            self.allocator.logical_attn_allocator.layersplit_active_rows_hint(),
+        )
+
+        self.allocator.free(kv_loc)
 
     def _alloc_req_slot(self, req):
         """Allocate a req_pool_idx for the request."""

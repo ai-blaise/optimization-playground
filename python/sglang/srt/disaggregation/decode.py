@@ -336,16 +336,18 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        if self.scheduler.enable_hisparse:
+        if self._hisparse_direct_to_host_transfer():
             # Direct-to-host: register host pool pointers so P writes to D's host memory
             host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 host_pool.get_contiguous_buf_infos()
             )
+            kv_data_mem_types = ["DRAM"] * len(kv_data_ptrs)
         else:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
+            kv_data_mem_types = ["VRAM"] * len(kv_data_ptrs)
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -355,13 +357,17 @@ class DecodePreallocQueue:
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            kv_data_mem_types += ["VRAM"] * len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        # HiSparse Host pool has page_size=1; use it when hisparse is enabled
+        kv_args.kv_data_mem_types = kv_data_mem_types
+        # Direct-to-host HiSparse registers token-addressed host rows.
         kv_args.page_size = (
-            1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
+            1
+            if self._hisparse_direct_to_host_transfer()
+            else self.token_to_kv_pool.page_size
         )
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -395,6 +401,12 @@ class DecodePreallocQueue:
                         kv_pool.k_buffer, kv_pool.v_buffer, kv_pool.page_size
                     )
         return kv_manager
+
+    def _hisparse_direct_to_host_transfer(self) -> bool:
+        return (
+            self.scheduler.enable_hisparse
+            and self.transfer_backend != TransferBackend.NIXL
+        )
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
@@ -912,6 +924,14 @@ class DecodePreallocQueue:
             available_size = (
                 self.token_to_kv_pool_allocator.logical_attn_allocator.available_size()
             )
+            if not self._hisparse_direct_to_host_transfer():
+                hisparse_available_size = (
+                    self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+                )
+                available_size = min(
+                    available_size,
+                    hisparse_available_size,
+                )
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
             # Include evictable decode-radix cache entries in the budget -- they
@@ -1023,27 +1043,49 @@ class DecodePreallocQueue:
             # this path on the upstream full-allocation semantics.
             assert prefix_len == 0
 
-            # Direct-to-host path: only allocate logical indices (no hisparse
-            # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
+            req.hisparse_direct_transfer = self._hisparse_direct_to_host_transfer()
             device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
-            )
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc(fill_len)
-            if host_indices is None:
-                raise RuntimeError(
-                    f"HiSparse host mem pool alloc failed for {fill_len} tokens "
-                    f"in _pre_alloc (req {req.rid})"
+            if req.hisparse_direct_transfer:
+                kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                    extend_num_tokens=fill_len,
                 )
-            host_indices = host_indices.to(device=coordinator.device)
-            coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+                if kv_loc is None:
+                    raise RuntimeError(
+                        f"HiSparse logical allocation failed for {fill_len} "
+                        f"tokens in _pre_alloc (req {req.rid})"
+                    )
+                host_indices = coordinator.mem_pool_host.alloc(fill_len)
+                if host_indices is None:
+                    raise RuntimeError(
+                        f"HiSparse host mem pool alloc failed for {fill_len} tokens "
+                        f"in _pre_alloc (req {req.rid})"
+                    )
+                host_indices = host_indices.to(device=coordinator.device)
+                coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+            else:
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                    extend_num_tokens=fill_len,
+                )
+                if kv_loc is None:
+                    raise RuntimeError(
+                        f"HiSparse device transfer allocation failed for {fill_len} "
+                        f"tokens in _pre_alloc (req {req.rid})"
+                    )
+                mapping = (
+                    self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+                )
+                transfer_kv_loc = mapping[kv_loc].to(dtype=kv_loc.dtype)
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
@@ -1094,7 +1136,7 @@ class DecodePreallocQueue:
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
-            return host_indices
+            return host_indices if req.hisparse_direct_transfer else transfer_kv_loc
         return kv_loc
 
 
@@ -1531,9 +1573,18 @@ class SchedulerDisaggregationDecodeMixin:
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
             if self.enable_hisparse:
+                direct_reqs = []
                 for req in transferred_reqs:
-                    # Direct-to-host: KV data already in host pool, skip staging
-                    self.hisparse_coordinator.admit_request_direct(req)
-                self.waiting_queue.extend(transferred_reqs)
+                    if getattr(req, "hisparse_direct_transfer", False):
+                        self.hisparse_coordinator.admit_request_direct(req)
+                        direct_reqs.append(req)
+                    else:
+                        self.hisparse_coordinator.admit_request_into_staging(req)
+                self.waiting_queue.extend(direct_reqs)
             else:
                 self.waiting_queue.extend(transferred_reqs)
+
+            if self.enable_hisparse:
+                self.waiting_queue.extend(
+                    self.hisparse_coordinator.collect_ready_reqs()
+                )

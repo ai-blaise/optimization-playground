@@ -848,6 +848,28 @@ class MLATokenToKVPoolHost(HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    def _needs_bytewise_layer_transfer(self) -> bool:
+        return self.layout == "layer_first" and self.token_stride_size % 8 != 0
+
+    def _copy_layer_host_to_device(
+        self, device_pool, host_indices, device_indices, layer_id
+    ) -> None:
+        host_indices_cpu = host_indices.cpu() if host_indices.is_cuda else host_indices
+        dst = device_pool.kv_buffer[layer_id]
+        src = self.kv_buffer[layer_id][host_indices_cpu].to(
+            device=dst.device, non_blocking=True
+        )
+        dst[device_indices] = src
+
+    def _copy_layer_device_to_host(
+        self, device_pool, host_indices, device_indices, layer_id
+    ) -> None:
+        host_indices_cpu = host_indices.cpu() if host_indices.is_cuda else host_indices
+        src = device_pool.kv_buffer[layer_id][device_indices].to(
+            device=self.kv_buffer.device, non_blocking=True
+        )
+        self.kv_buffer[layer_id][host_indices_cpu] = src
+
     def init_kv_buffer(self):
         if self.layout == "layer_first":
             dims = (
@@ -927,7 +949,11 @@ class MLATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                if self.can_use_jit:
+                if self._needs_bytewise_layer_transfer():
+                    self._copy_layer_host_to_device(
+                        device_pool, host_indices, device_indices, layer_id
+                    )
+                elif self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
                         cache_dst=device_pool.kv_buffer[layer_id],
                         cache_src=self.kv_buffer[layer_id],
@@ -1010,7 +1036,12 @@ class MLATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                if self.can_use_jit:
+                if self._needs_bytewise_layer_transfer():
+                    for layer_id in range(self.layer_num):
+                        self._copy_layer_device_to_host(
+                            device_pool, host_indices, device_indices, layer_id
+                        )
+                elif self.can_use_jit:
                     jit_transfer_hicache_all_layer_mla(
                         ptr_dst=self.data_ptrs,
                         indices_dst=host_indices,

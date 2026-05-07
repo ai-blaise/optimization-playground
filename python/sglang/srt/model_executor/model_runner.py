@@ -1160,6 +1160,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             hints=self.server_args.torchcomms_ncclx_hints,
             strict=self.server_args.torchcomms_ncclx_strict,
             enable_rdma_registration=self.server_args.enable_torchcomms_ncclx_rdma,
+            abort_on_timeout=self.server_args.torchcomms_ncclx_abort_on_timeout,
         )
 
         if not self.is_draft_worker:

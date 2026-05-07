@@ -422,7 +422,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--device-collective-backend` | Select the device collective backend. `default` keeps existing SGLang collective routing; `ncclx` uses torchcomms NCCLX where supported. | `default` | `default`, `ncclx` |
 | `--torchcomms-ncclx-hints` | Optional torchcomms NCCLX hints, formatted as JSON or comma-separated `key=value` pairs. | `` | Type: str |
 | `--torchcomms-ncclx-strict` | Fail startup if NCCLX initialization fails instead of falling back to the default collective path. | `False` | bool flag (set to enable) |
-| `--enable-torchcomms-ncclx-rdma` | Initialize torchcomms NCCLX CUDA allocator registration hooks for RDMA-capable transports. | `False` | bool flag (set to enable) |
+| `--enable-torchcomms-ncclx-rdma` | Initialize torchcomms NCCLX CUDA allocator registration hooks for RDMA-capable transports after host RDMA probing passes. | `False` | bool flag (set to enable) |
+| `--torchcomms-ncclx-abort-on-timeout` | Ask torchcomms NCCLX to abort the process on communicator timeout or error. | `False` | bool flag (set to enable) |
 | `--disable-overlap-schedule` | Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker. | `False` | bool flag (set to enable) |
 | `--enable-mixed-chunk` | Enabling mixing prefill and decode in a batch when using chunked prefill. | `False` | bool flag (set to enable) |
 | `--enable-dp-attention` | Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported. | `False` | bool flag (set to enable) |

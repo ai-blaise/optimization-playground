@@ -633,9 +633,7 @@ class HiSparseCoordinator:
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_allocated_len
         ]
-        self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
-            allocated_locs
-        ] = 0
+        self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
         host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]
         host_indices = host_indices[host_indices >= 0]

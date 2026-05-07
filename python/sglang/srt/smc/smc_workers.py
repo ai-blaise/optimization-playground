@@ -31,10 +31,14 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.smc.smc_debug_utils import append_smc_probe_record, smc_probe_enabled
-from sglang.srt.smc.smc_info import SMCDraftInput
+from sglang.srt.smc.smc_info import SMCDraftInput, SMCVerifyInput
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import empty_context
@@ -404,6 +408,8 @@ class SMCWorker(BaseSpecWorker):
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             return self._forward_extend(batch)
+        if batch.forward_mode.is_idle() or batch.spec_info is None:
+            return self._forward_idle(batch)
         else:
             return self._forward_decode(batch)
 
@@ -806,6 +812,29 @@ class SMCWorker(BaseSpecWorker):
         )
 
     def _forward_idle(self, batch: ModelWorkerBatch):
+        if self.server_args.enable_dp_attention and batch.global_num_tokens is not None:
+            verify_input = SMCVerifyInput(
+                draft_token_num=self.speculative_num_draft_tokens,
+                positions=torch.empty(0, dtype=torch.int64, device=self.device),
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                seq_lens_sum=0,
+                seq_lens_cpu=torch.empty(0, dtype=torch.int64),
+                num_tokens_per_req=self.speculative_num_draft_tokens,
+            )
+            verify_batch = copy.copy(batch)
+            verify_batch.forward_mode = ForwardMode.IDLE
+            verify_batch.spec_info = verify_input
+            verify_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            verify_forward_batch = ForwardBatch.init_new(
+                verify_batch, self._target_worker.model_runner
+            )
+            verify_forward_batch.disable_graph_runner = True
+            self._target_worker.forward_batch_generation(
+                model_worker_batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+            )
+
         return GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=torch.empty(0, dtype=torch.int64, device=self.device),

@@ -25,12 +25,12 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
+if(SGL_KERNEL_ENABLE_SM100A AND ${CUDA_VERSION} VERSION_GREATER 12.8)
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
     )
 endif()
-if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
+if(SGL_KERNEL_ENABLE_SM100A AND ${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     # Patch FlashMLA sources for SM103a support.
     # These patches are only needed (and only valid) with CUDA 13+.
 
@@ -113,6 +113,13 @@ set(FlashMLA_SOURCES
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu
 
+    ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/dense_fp8_python_api.cpp
+    ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu
+)
+
+if(SGL_KERNEL_ENABLE_SM100A)
+    list(APPEND FlashMLA_SOURCES
     # sm100 dense prefill/bwd.
     ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
@@ -128,11 +135,8 @@ set(FlashMLA_SOURCES
     ${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/v32.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/model1.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu
-
-    ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/dense_fp8_python_api.cpp
-    ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu
-)
+    )
+endif()
 
 Python_add_library(flashmla_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FlashMLA_SOURCES})
 target_compile_options(flashmla_ops PRIVATE
@@ -150,6 +154,9 @@ target_include_directories(flashmla_ops PRIVATE
 )
 
 target_link_libraries(flashmla_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+if(SGL_KERNEL_ENABLE_SM100A)
+    target_compile_definitions(flashmla_ops PRIVATE SGL_KERNEL_ENABLE_SM100A)
+endif()
 
 install(TARGETS flashmla_ops LIBRARY DESTINATION "sgl_kernel")
 

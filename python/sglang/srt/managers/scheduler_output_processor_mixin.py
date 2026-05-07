@@ -632,6 +632,14 @@ class SchedulerOutputProcessorMixin:
                     assert smc_filtered_rows is not None
                     smc_filtered_rows.append(i)
 
+                if req.finished() and req.smc_group_id is None:
+                    root_node = getattr(self.tree_cache, "root_node", None)
+                    last_node = getattr(req, "last_node", None)
+                    if last_node is None or last_node is root_node:
+                        req.cache_protected_len = 0
+                    self._handle_finished_req(req, i, logits_output)
+                    continue
+
                 if (
                     self.server_args.disaggregation_decode_enable_offload_kvcache
                     and not req.finished()

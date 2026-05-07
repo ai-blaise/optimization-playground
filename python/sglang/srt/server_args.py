@@ -693,6 +693,7 @@ class ServerArgs:
     torchcomms_ncclx_hints: str = ""
     torchcomms_ncclx_strict: bool = False
     enable_torchcomms_ncclx_rdma: bool = False
+    torchcomms_ncclx_abort_on_timeout: bool = False
     pre_warm_nccl: bool = dataclasses.field(
         default_factory=lambda: is_hip()
     )  # Pre-warm NCCL/RCCL to reduce P99 TTFT cold-start latency (default: True for AMD/HIP, False for others)
@@ -1827,8 +1828,12 @@ class ServerArgs:
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
                         assert (
-                            self.tp_size == 8
-                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                            self.nnodes == 1
+                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only supports a single node."
+                        if self.nsa_prefill_cp_kv_storage_mode != "layersplit":
+                            assert (
+                                self.tp_size == 8
+                            ), "Replicated DSA context parallelism currently requires tp_size == 8."
                         max_attn_cp_size = self.tp_size // self.dp_size
                         if self.attn_cp_size == 1:
                             self.attn_cp_size = max_attn_cp_size
@@ -6427,6 +6432,11 @@ class ServerArgs:
             "--enable-torchcomms-ncclx-rdma",
             action="store_true",
             help="Initialize torchcomms NCCLX CUDA allocator registration hooks for RDMA-capable transports.",
+        )
+        parser.add_argument(
+            "--torchcomms-ncclx-abort-on-timeout",
+            action="store_true",
+            help="Ask torchcomms NCCLX to abort the process on communicator timeout or error.",
         )
         parser.add_argument(
             "--pre-warm-nccl",

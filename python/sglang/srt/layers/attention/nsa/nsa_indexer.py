@@ -48,6 +48,10 @@ _hisa_paged_decode_min_seq_len = get_int_env_var(
 _hisa_profile_path = os.environ.get("SGLANG_NSA_HISA_PROFILE_PATH")
 _hisa_profile_sync = get_bool_env_var("SGLANG_NSA_HISA_PROFILE_SYNC")
 _hisa_profile_lock = threading.Lock()
+_deep_gemm_mqa_q_alignment = get_int_env_var("SGLANG_DEEP_GEMM_MQA_Q_ALIGNMENT", 128)
+_torch_mqa_fallback_max_elements = get_int_env_var(
+    "SGLANG_TORCH_MQA_FALLBACK_MAX_ELEMENTS", 8_000_000
+)
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 if _is_cuda:
@@ -61,6 +65,100 @@ def _deep_gemm_paged_mqa_context_lens(deep_gemm_module, seqlens: torch.Tensor):
     if hasattr(deep_gemm_module, "fp8_fp4_paged_mqa_logits") and seqlens.dim() == 1:
         return seqlens.view(-1, 1)
     return seqlens
+
+
+def _pad_first_dim(tensor: torch.Tensor, pad_len: int) -> torch.Tensor:
+    if pad_len == 0:
+        return tensor
+    return torch.cat(
+        [tensor, tensor[-1:].expand((pad_len,) + tuple(tensor.shape[1:]))],
+        dim=0,
+    )
+
+
+def _torch_fp8_mqa_logits(
+    q_fp8: torch.Tensor,
+    kv_fp8: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+) -> torch.Tensor:
+    q = q_fp8.to(torch.float32)
+    if q.dim() == 2:
+        q = q.unsqueeze(1)
+    k = kv_fp8[0].to(torch.float32)
+    k_scale = kv_fp8[1].to(torch.float32).reshape(-1)
+    weights = weights.to(torch.float32)
+    if weights.dim() == 1:
+        weights = weights.unsqueeze(-1)
+    elif weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+
+    q_len, n_heads, _ = q.shape
+    k_len = k.shape[0]
+    max_rows = max(1, _torch_mqa_fallback_max_elements // max(k_len * n_heads, 1))
+    columns = torch.arange(k_len, device=q.device)
+    out = []
+    for start in range(0, q_len, max_rows):
+        end = min(start + max_rows, q_len)
+        logits = torch.einsum("qhd,kd->qkh", q[start:end], k)
+        logits = torch.relu(logits)
+        logits = logits * weights[start:end].unsqueeze(1)
+        logits = logits.sum(dim=-1) * k_scale.unsqueeze(0)
+        valid = (columns.unsqueeze(0) >= ks[start:end].unsqueeze(1)) & (
+            columns.unsqueeze(0) < ke[start:end].unsqueeze(1)
+        )
+        out.append(logits.masked_fill(~valid, float("-inf")))
+    return torch.cat(out, dim=0)
+
+
+def _deep_gemm_fp8_mqa_logits(
+    q_fp8: torch.Tensor,
+    kv_fp8: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    *,
+    clean_logits: bool,
+) -> torch.Tensor:
+    q_len = q_fp8.shape[0]
+    alignment = _deep_gemm_mqa_q_alignment
+    if alignment > 1:
+        spans = ke - ks
+        if q_len % alignment != 0 or bool(torch.any(spans % alignment != 0).item()):
+            return _torch_fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
+
+    pad_len = 0 if alignment <= 1 else (-q_len) % alignment
+    if pad_len:
+        q_fp8 = _pad_first_dim(q_fp8, pad_len)
+        weights = _pad_first_dim(weights, pad_len)
+        ks = torch.cat([ks, ks[-1:].expand(pad_len)], dim=0)
+        ke = torch.cat([ke, ke[-1:].expand(pad_len)], dim=0)
+
+    kv_len = kv_fp8[0].shape[0]
+    kv_target_len = kv_len
+    if alignment > 1 and kv_target_len % alignment != 0:
+        kv_target_len = ((kv_target_len + alignment - 1) // alignment) * alignment
+    kv_pad_len = max(0, kv_target_len - kv_len)
+    if kv_pad_len:
+        kv_fp8 = (
+            _pad_first_dim(kv_fp8[0], kv_pad_len),
+            _pad_first_dim(kv_fp8[1], kv_pad_len),
+        )
+
+    logits = deep_gemm.fp8_mqa_logits(
+        q_fp8,
+        kv_fp8,
+        weights,
+        ks,
+        ke,
+        clean_logits=clean_logits,
+    )
+    if pad_len:
+        logits = logits[:q_len]
+    if kv_pad_len:
+        logits = logits[:, :kv_len]
+    return logits
 
 
 def _hisa_profile_enabled() -> bool:
@@ -270,6 +368,8 @@ class Indexer(MultiPlatformOp):
         self.hisa_block_topk = hisa_block_topk
         self.hisa_min_seq_len = hisa_min_seq_len
         self.hisa_execution_mode = hisa_execution_mode
+        server_args = get_global_server_args()
+        self.enable_hisparse = bool(getattr(server_args, "enable_hisparse", False))
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
@@ -280,7 +380,7 @@ class Indexer(MultiPlatformOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            pp_size = get_global_server_args().pp_size
+            pp_size = server_args.pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
@@ -317,7 +417,7 @@ class Indexer(MultiPlatformOp):
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
-            device=get_global_server_args().device,
+            device=server_args.device,
         )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
@@ -476,6 +576,7 @@ class Indexer(MultiPlatformOp):
         x: torch.Tensor,
         positions: torch.Tensor,
         enable_dual_stream: bool,
+        forward_batch: ForwardBatch,
     ):
         # Compute only key, skip query
         key, _ = self.wk(x)
@@ -487,6 +588,13 @@ class Indexer(MultiPlatformOp):
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
+        if forward_batch.attn_cp_metadata is not None and self.nsa_enable_prefill_cp:
+            key = cp_all_gather_rerange_output(
+                key.contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
 
         return key
 
@@ -661,7 +769,7 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
         seqlens_32: torch.Tensor,
     ) -> bool:
-        if not uses_hisa(self.nsa_indexer_mode):
+        if not (uses_hisa(self.nsa_indexer_mode) or self.enable_hisparse):
             return False
         if self.hisa_execution_mode != "optimized":
             return False
@@ -767,17 +875,19 @@ class Indexer(MultiPlatformOp):
     def _should_use_hisa_extend(
         self, forward_batch: ForwardBatch, metadata: BaseIndexerMetadata
     ) -> bool:
-        if not uses_hisa(self.nsa_indexer_mode):
+        if not (uses_hisa(self.nsa_indexer_mode) or self.enable_hisparse):
             return False
         if self.hisa_execution_mode != "optimized":
             return False
-        if not _is_cuda or _is_fp8_fnuz or not envs.SGLANG_NSA_FUSE_TOPK.get():
+        fuse_topk = envs.SGLANG_NSA_FUSE_TOPK.get()
+        if not _is_cuda or _is_fp8_fnuz or not fuse_topk:
             return False
-        if self.nsa_enable_prefill_cp:
+        if self.nsa_enable_prefill_cp and not self.enable_hisparse:
             return False
         if not forward_batch.forward_mode.is_extend_without_speculative():
             return False
-        if self.hisa_block_size * self.hisa_block_topk < self.index_topk:
+        hisa_capacity = self.hisa_block_size * self.hisa_block_topk
+        if hisa_capacity < self.index_topk:
             return False
         seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
@@ -787,7 +897,10 @@ class Indexer(MultiPlatformOp):
             self._hisa_boundary_len(),
             _hisa_paged_min_seq_len,
         )
-        return int(seq_lens_cpu.max().item()) > min_seq_len
+        max_seq_len = int(seq_lens_cpu.max().item())
+        if max_seq_len <= min_seq_len:
+            return False
+        return True
 
     def _get_topk_hisa_extend(
         self,
@@ -997,7 +1110,7 @@ class Indexer(MultiPlatformOp):
                         q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
                     )
                 else:
-                    logits = deep_gemm.fp8_mqa_logits(
+                    logits = _deep_gemm_fp8_mqa_logits(
                         q_fp8[:q_offset],
                         kv_fp8,
                         weights[:q_offset],
@@ -1064,7 +1177,7 @@ class Indexer(MultiPlatformOp):
                         ke[start:end],
                     )
                 else:
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
+                    logits_chunk = _deep_gemm_fp8_mqa_logits(
                         q_fp8[start:end],
                         kv_fp8,
                         weights[start:end],
@@ -1137,7 +1250,7 @@ class Indexer(MultiPlatformOp):
         x_meta = x[0] if isinstance(x, tuple) else x
 
         # Fast path: only compute and store k cache, skip all q and weights ops
-        key = self._get_k_bf16(x, positions, enable_dual_stream)
+        key = self._get_k_bf16(x, positions, enable_dual_stream, forward_batch)
 
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
@@ -1244,7 +1357,7 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = _deep_gemm_fp8_mqa_logits(
                     q_fp8,
                     kv_fp8,
                     weights,
@@ -1288,7 +1401,7 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
 
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = _deep_gemm_fp8_mqa_logits(
                     q_fp8,
                     kv_fp8,
                     weights,
@@ -1506,7 +1619,7 @@ class Indexer(MultiPlatformOp):
                 skip_logits_computation = max_kv_len <= self.index_topk
 
         # Optimization: fast path when skipping topk computation
-        if skip_logits_computation and (not self.nsa_enable_prefill_cp):
+        if skip_logits_computation:
             return self._forward_cuda_k_only(
                 x,
                 positions,

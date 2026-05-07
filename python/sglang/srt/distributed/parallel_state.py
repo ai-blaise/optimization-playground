@@ -380,6 +380,9 @@ class GroupCoordinator:
                     name=f"{self.unique_name}:ncclx",
                     hints=parse_torchcomms_ncclx_hints(_TORCHCOMMS_NCCLX_HINTS),
                     timeout=_MODEL_PARALLEL_GROUP_TIMEOUT,
+                    abort_process_on_timeout_or_error=(
+                        _TORCHCOMMS_NCCLX_ABORT_ON_TIMEOUT
+                    ),
                     enable_rdma_registration=_ENABLE_TORCHCOMMS_NCCLX_RDMA,
                 )
             except Exception as e:
@@ -1734,6 +1737,7 @@ _ENABLE_TORCHCOMMS_NCCLX = False
 _ENABLE_TORCHCOMMS_NCCLX_RDMA = False
 _TORCHCOMMS_NCCLX_HINTS = ""
 _TORCHCOMMS_NCCLX_STRICT = False
+_TORCHCOMMS_NCCLX_ABORT_ON_TIMEOUT = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1757,16 +1761,19 @@ def set_torchcomms_ncclx(
     hints: str = "",
     strict: bool = False,
     enable_rdma_registration: bool = False,
+    abort_on_timeout: bool = False,
 ):
     global _ENABLE_TORCHCOMMS_NCCLX
     global _ENABLE_TORCHCOMMS_NCCLX_RDMA
     global _TORCHCOMMS_NCCLX_HINTS
     global _TORCHCOMMS_NCCLX_STRICT
+    global _TORCHCOMMS_NCCLX_ABORT_ON_TIMEOUT
 
     _ENABLE_TORCHCOMMS_NCCLX = enable
     _ENABLE_TORCHCOMMS_NCCLX_RDMA = enable_rdma_registration
     _TORCHCOMMS_NCCLX_HINTS = hints
     _TORCHCOMMS_NCCLX_STRICT = strict
+    _TORCHCOMMS_NCCLX_ABORT_ON_TIMEOUT = abort_on_timeout
 
 
 _DEVICE_TO_DISTRIBUTED_BACKEND = {

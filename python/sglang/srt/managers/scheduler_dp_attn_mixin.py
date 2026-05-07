@@ -138,6 +138,7 @@ def prepare_mlp_sync_batch_raw(
     disable_cuda_graph: bool,
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
+    force_cpu_mlp_sync: bool,
     offload_tags: set[str],
 ):
     # Check if other DP workers have running batches
@@ -174,10 +175,14 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and (
+    use_device_mlp_sync = len(offload_tags) == 0 and (
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
-    ):
+    )
+    if force_cpu_mlp_sync:
+        use_device_mlp_sync = False
+
+    if use_device_mlp_sync:
         group = tp_group.device_group
         device = tp_group.device
     else:
@@ -237,6 +242,10 @@ class SchedulerDPAttnMixin:
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
+            force_cpu_mlp_sync=(
+                self.server_args.disaggregation_mode == "decode"
+                and self.server_args.enable_dp_attention_local_control_broadcast
+            ),
             offload_tags=self.offload_tags,
         )
 

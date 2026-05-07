@@ -2,7 +2,7 @@ import json
 import logging
 from contextlib import contextmanager
 from datetime import timedelta
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -48,6 +48,7 @@ class TorchCommsNcclxCommunicator:
         name: str,
         hints: Optional[Dict[str, str]] = None,
         timeout: Optional[timedelta] = None,
+        abort_process_on_timeout_or_error: bool = False,
         enable_rdma_registration: bool = False,
     ):
         if isinstance(group, StatelessProcessGroup):
@@ -87,7 +88,7 @@ class TorchCommsNcclxCommunicator:
 
         if enable_rdma_registration:
             try:
-                from torchcomms import ncclx
+                from torchcomms import _comms_ncclx as ncclx
 
                 ncclx.init_caching_allocator_hook()
             except Exception as exc:
@@ -114,16 +115,29 @@ class TorchCommsNcclxCommunicator:
                 name=name,
                 hints=self.hints or None,
                 timeout=timeout,
+                abort_process_on_timeout_or_error=(
+                    abort_process_on_timeout_or_error
+                ),
             )
 
         self.available = True
         self.disabled = False
         if self.rank == 0:
+            backend_version = self._optional_backend_value(
+                self.comm.get_backend_version
+            )
             logger.info(
                 "sglang is using torchcomms NCCLX backend version %s for %s",
-                self.comm.get_backend_version(),
+                backend_version,
                 name,
             )
+
+    @staticmethod
+    def _optional_backend_value(method: Callable[[], Any]) -> Any:
+        try:
+            return method()
+        except RuntimeError as exc:
+            return {"unavailable": str(exc)}
 
     def _check_tensor(self, tensor: torch.Tensor) -> None:
         assert tensor.device == self.device, (
@@ -132,20 +146,26 @@ class TorchCommsNcclxCommunicator:
         )
         assert tensor.is_contiguous(), "torchcomms NCCLX requires contiguous tensors"
 
+    def _check_tensors(self, tensors: Iterable[torch.Tensor]) -> None:
+        for tensor in tensors:
+            self._check_tensor(tensor)
+
+    def _backend_method(self, method_name: str) -> Callable[..., Any]:
+        backend = self.comm.get_backend_impl()
+        method = getattr(backend, method_name, None)
+        if method is None:
+            raise RuntimeError(
+                f"torchcomms NCCLX backend does not expose {method_name}"
+            )
+        return method
+
     @staticmethod
     def _to_torchcomms_reduce_op(op: ReduceOp) -> Any:
         import torchcomms
 
-        if op == ReduceOp.SUM:
-            return torchcomms.ReduceOp.SUM
-        if op == ReduceOp.PRODUCT:
-            return torchcomms.ReduceOp.PRODUCT
-        if op == ReduceOp.MIN:
-            return torchcomms.ReduceOp.MIN
-        if op == ReduceOp.MAX:
-            return torchcomms.ReduceOp.MAX
-        if op == ReduceOp.AVG:
-            return torchcomms.ReduceOp.AVG
+        for name in ("SUM", "PRODUCT", "MIN", "MAX", "AVG", "BAND", "BOR", "BXOR"):
+            if hasattr(ReduceOp, name) and op == getattr(ReduceOp, name):
+                return getattr(torchcomms.ReduceOp, name)
         raise ValueError(f"Unsupported torchcomms NCCLX reduce op: {op}")
 
     def _current_stream_context(self):
@@ -177,6 +197,17 @@ class TorchCommsNcclxCommunicator:
         out_tensor.copy_(in_tensor)
         self.all_reduce(out_tensor, op=op)
         return out_tensor
+
+    def reduce(
+        self, tensor: torch.Tensor, dst: int, op: ReduceOp = ReduceOp.SUM
+    ) -> None:
+        if self.disabled:
+            return
+        self._check_tensor(tensor)
+        with self._current_stream_context():
+            self.comm.reduce(
+                tensor, dst, self._to_torchcomms_reduce_op(op), async_op=False
+            )
 
     def all_gather(
         self,
@@ -234,6 +265,50 @@ class TorchCommsNcclxCommunicator:
                     output_tensor, input_list, tc_op, async_op=False
                 )
 
+    def all_to_all_single(
+        self, output_tensor: torch.Tensor, input_tensor: torch.Tensor
+    ) -> None:
+        if self.disabled:
+            return
+        self._check_tensor(output_tensor)
+        self._check_tensor(input_tensor)
+        with self._current_stream_context():
+            self.comm.all_to_all_single(output_tensor, input_tensor, async_op=False)
+
+    def all_to_all_v_single(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        output_split_sizes: List[int],
+        input_split_sizes: List[int],
+    ) -> None:
+        if self.disabled:
+            return
+        self._check_tensor(output_tensor)
+        self._check_tensor(input_tensor)
+        with self._current_stream_context():
+            self.comm.all_to_all_v_single(
+                output_tensor,
+                input_tensor,
+                output_split_sizes,
+                input_split_sizes,
+                async_op=False,
+            )
+
+    def all_to_all(
+        self,
+        output_tensor_list: List[torch.Tensor],
+        input_tensor_list: List[torch.Tensor],
+    ) -> None:
+        if self.disabled:
+            return
+        self._check_tensors(output_tensor_list)
+        self._check_tensors(input_tensor_list)
+        with self._current_stream_context():
+            self.comm.all_to_all(
+                output_tensor_list, input_tensor_list, async_op=False
+            )
+
     def send(self, tensor: torch.Tensor, dst: int):
         if self.disabled:
             return
@@ -261,6 +336,272 @@ class TorchCommsNcclxCommunicator:
         self._check_tensor(tensor)
         with self._current_stream_context():
             return self.comm.broadcast(tensor, src, async_op=True)
+
+    def barrier(self) -> None:
+        if self.disabled:
+            return
+        with self._current_stream_context():
+            self.comm.barrier(async_op=False)
+
+    def scatter(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor_list: List[torch.Tensor],
+        src: int,
+    ) -> None:
+        if self.disabled:
+            return
+        self._check_tensor(output_tensor)
+        self._check_tensors(input_tensor_list)
+        with self._current_stream_context():
+            self.comm.scatter(
+                output_tensor, input_tensor_list, src, async_op=False
+            )
+
+    def gather(
+        self,
+        output_tensor_list: List[torch.Tensor],
+        input_tensor: torch.Tensor,
+        dst: int,
+    ) -> None:
+        if self.disabled:
+            return
+        self._check_tensors(output_tensor_list)
+        self._check_tensor(input_tensor)
+        with self._current_stream_context():
+            self.comm.gather(output_tensor_list, input_tensor, dst, async_op=False)
+
+    def gather_single(
+        self, output_tensor: torch.Tensor, input_tensor: torch.Tensor, dst: int
+    ) -> None:
+        if self.disabled:
+            return
+        self._check_tensor(output_tensor)
+        self._check_tensor(input_tensor)
+        with self._current_stream_context():
+            self.comm.gather_single(output_tensor, input_tensor, dst, async_op=False)
+
+    def split(self, ranks: List[int], name: str):
+        if self.disabled:
+            return None
+        return self.comm.split(
+            ranks, name, hints=self.hints or None, timeout=self.timeout
+        )
+
+    def new_window(self, tensor: Optional[torch.Tensor] = None):
+        if self.disabled:
+            return None
+        if tensor is not None:
+            self._check_tensor(tensor)
+        return self.comm.new_window(tensor)
+
+    def get_device_transport(self):
+        if self.comm is None:
+            return None
+        return self.comm.get_device_transport()
+
+    @property
+    def mem_allocator(self):
+        if self.comm is None:
+            return None
+        return self.comm.mem_allocator
+
+    def batch_op_create(self):
+        if self.comm is None:
+            return None
+        return self.comm.batch_op_create()
+
+    def register_pre_hook(self, callback: Callable[..., None]):
+        if self.comm is None:
+            return None
+        return self.comm.register_pre_hook(callback)
+
+    def register_post_hook(self, callback: Callable[..., None]):
+        if self.comm is None:
+            return None
+        return self.comm.register_post_hook(callback)
+
+    def register_abort_hook(self, callback: Callable[[], None]):
+        if self.comm is None:
+            return None
+        return self.comm.register_abort_hook(callback)
+
+    def all_gather_p_init(self, output_tensor: torch.Tensor):
+        if self.disabled:
+            return None
+        self._check_tensor(output_tensor)
+        return self.comm.all_gather_p_init(
+            output_tensor, hints=self.hints or None, timeout=self.timeout
+        )
+
+    def all_gather_p_exec(self, handle: Any, input_tensor: torch.Tensor):
+        if self.disabled:
+            return None
+        self._check_tensor(input_tensor)
+        with self._current_stream_context():
+            return self.comm.all_gather_p_exec(
+                handle, input_tensor, async_op=False
+            )
+
+    def all_gather_p_free(self, handle: Any) -> None:
+        if self.comm is not None:
+            self.comm.all_gather_p_free(handle)
+
+    def device_alltoallv_single(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        output_split_sizes: torch.Tensor,
+        input_split_sizes: torch.Tensor,
+    ) -> None:
+        if self.disabled:
+            return
+        self._check_tensor(output_tensor)
+        self._check_tensor(input_tensor)
+        self._check_tensor(output_split_sizes)
+        self._check_tensor(input_split_sizes)
+        with self._current_stream_context():
+            self._backend_method("device_alltoallv_single")(
+                output_tensor,
+                input_tensor,
+                output_split_sizes,
+                input_split_sizes,
+                async_op=False,
+            )
+
+    def alltoallv_dynamic_dispatch(
+        self,
+        output_tensor_list: List[torch.Tensor],
+        output_chunk_sizes_per_rank: torch.Tensor,
+        input_tensor: torch.Tensor,
+        input_chunk_sizes: torch.Tensor,
+        input_chunk_indices: torch.Tensor,
+        input_chunk_count_per_rank: torch.Tensor,
+        hidden_dim: int,
+    ) -> None:
+        if self.disabled:
+            return
+        self._check_tensors(output_tensor_list)
+        self._check_tensor(output_chunk_sizes_per_rank)
+        self._check_tensor(input_tensor)
+        self._check_tensor(input_chunk_sizes)
+        self._check_tensor(input_chunk_indices)
+        self._check_tensor(input_chunk_count_per_rank)
+        with self._current_stream_context():
+            self._backend_method("alltoallv_dynamic_dispatch")(
+                output_tensor_list,
+                output_chunk_sizes_per_rank,
+                input_tensor,
+                input_chunk_sizes,
+                input_chunk_indices,
+                input_chunk_count_per_rank,
+                hidden_dim,
+                async_op=False,
+            )
+
+    def alltoallv_dynamic_combine(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        input_chunk_sizes: torch.Tensor,
+        input_chunk_indices: torch.Tensor,
+        input_chunk_count_per_rank: torch.Tensor,
+        hidden_dim: int,
+    ) -> None:
+        if self.disabled:
+            return
+        self._check_tensor(output_tensor)
+        self._check_tensor(input_tensor)
+        self._check_tensor(input_chunk_sizes)
+        self._check_tensor(input_chunk_indices)
+        self._check_tensor(input_chunk_count_per_rank)
+        with self._current_stream_context():
+            self._backend_method("alltoallv_dynamic_combine")(
+                output_tensor,
+                input_tensor,
+                input_chunk_sizes,
+                input_chunk_indices,
+                input_chunk_count_per_rank,
+                hidden_dim,
+                async_op=False,
+            )
+
+    def reduce_scatter_quantized(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        seed: torch.Tensor,
+        op: ReduceOp = ReduceOp.SUM,
+    ) -> None:
+        if self.disabled:
+            return
+        self._check_tensor(output_tensor)
+        self._check_tensor(input_tensor)
+        self._check_tensor(seed)
+        tc_op = self._to_torchcomms_reduce_op(op)
+        with self._current_stream_context():
+            self._backend_method("reduce_scatter_quantized")(
+                output_tensor,
+                input_tensor,
+                tc_op,
+                seed,
+                async_op=False,
+            )
+
+    def comm_dump(self) -> Optional[Dict[str, str]]:
+        if self.comm is None:
+            return None
+        method = getattr(self.comm.get_backend_impl(), "comm_dump", None)
+        if method is None:
+            return None
+        return self._optional_backend_value(method)
+
+    def backend_info(self) -> Dict[str, Any]:
+        if self.comm is None:
+            return {
+                "available": False,
+                "disabled": self.disabled,
+                "name": self.name,
+            }
+        info = {
+            "available": self.available,
+            "disabled": self.disabled,
+            "name": self.comm.get_name(),
+            "backend": self.comm.get_backend(),
+            "backend_version": self._optional_backend_value(
+                self.comm.get_backend_version
+            ),
+            "rank": self.comm.get_rank(),
+            "world_size": self.comm.get_size(),
+            "abort_enabled": self.comm.abort_enabled(),
+            "is_aborted": self.comm.is_aborted(),
+        }
+        comm_dump = self.comm_dump()
+        if comm_dump is not None:
+            info["comm_dump"] = comm_dump
+        return info
+
+    def get_init_handle(self):
+        if self.comm is None:
+            return None
+        return self.comm.get_init_handle()
+
+    def reconfigure(self, uuid: int, init_handles: Union[List[str], set]):
+        if self.comm is None:
+            return None
+        return self.comm.reconfigure(
+            uuid, init_handles, timeout=self.timeout, hints=self.hints or None
+        )
+
+    def abort(self) -> None:
+        if self.comm is not None:
+            self.comm.abort()
+
+    def abort_enabled(self) -> bool:
+        return bool(self.comm is not None and self.comm.abort_enabled())
+
+    def is_aborted(self) -> bool:
+        return bool(self.comm is not None and self.comm.is_aborted())
 
     def group_start(self):
         return None

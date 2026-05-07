@@ -300,6 +300,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size(),
         )
 
+    def layersplit_active_rows_hint(self):
+        return self.logical_attn_allocator.layersplit_active_rows_hint()
+
     def alloc(self, need_size: int):
         raise NotImplementedError(
             "Page size = 1 is not supported in HiSparse allocator"

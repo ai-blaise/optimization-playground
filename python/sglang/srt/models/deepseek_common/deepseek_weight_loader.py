@@ -812,9 +812,14 @@ class DeepseekV2WeightLoaderMixin:
                         torch.bfloat16
                     )
 
-            w_kc, w_vc = w.unflatten(
-                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+            head_width = self_attn.qk_nope_head_dim + self_attn.v_head_dim
+            expected_output = self_attn.num_local_heads * head_width
+            if w.shape[0] != expected_output and w.shape[1] == expected_output:
+                w = w.t().contiguous()
+
+            w_kc, w_vc = w.unflatten(0, (-1, head_width)).split(
+                [self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1
+            )
 
             if (
                 _use_aiter_gfx95

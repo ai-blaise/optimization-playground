@@ -220,7 +220,7 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if (SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120a,code=sm_120a"
@@ -247,7 +247,6 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
-    set(SGL_KERNEL_ENABLE_FA3 ON)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
@@ -355,19 +354,21 @@ set_target_properties(common_ops_sm90_build PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
 )
 
-# =========================== Common SM100+ Build ============================= #
-# Build SM100+ library with precise math (same namespace, different directory)
-Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+if (SGL_KERNEL_ENABLE_SM100A)
+    # =========================== Common SM100+ Build ============================= #
+    # Build SM100+ library with precise math (same namespace, different directory)
+    Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-target_compile_options(common_ops_sm100_build PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
-)
-target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
-# Set output name and separate build directory to avoid conflicts
-set_target_properties(common_ops_sm100_build PROPERTIES
-    OUTPUT_NAME "common_ops"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
-)
+    target_compile_options(common_ops_sm100_build PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
+    )
+    target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
+    # Set output name and separate build directory to avoid conflicts
+    set_target_properties(common_ops_sm100_build PROPERTIES
+        OUTPUT_NAME "common_ops"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
+    )
+endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
@@ -395,7 +396,9 @@ add_subdirectory(
 )
 
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
-target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+if (SGL_KERNEL_ENABLE_SM100A)
+    target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+endif()
 
 # sparse flash attention
 target_compile_definitions(common_ops_sm90_build PRIVATE
@@ -403,17 +406,21 @@ target_compile_definitions(common_ops_sm90_build PRIVATE
     FLASHATTENTION_DISABLE_DROPOUT
     FLASHATTENTION_DISABLE_UNEVEN_K
 )
-target_compile_definitions(common_ops_sm100_build PRIVATE
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    FLASHATTENTION_DISABLE_UNEVEN_K
-)
+if (SGL_KERNEL_ENABLE_SM100A)
+    target_compile_definitions(common_ops_sm100_build PRIVATE
+        FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        FLASHATTENTION_DISABLE_UNEVEN_K
+    )
+endif()
 
 # Install to different subdirectories
 # CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
 # and install them to the specified destinations
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
-install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
+if (SGL_KERNEL_ENABLE_SM100A)
+    install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
+endif()
 
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file

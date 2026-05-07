@@ -1684,7 +1684,10 @@ class MLATokenToKVPool(KVCache):
         )
         from sglang.srt.server_args import get_global_server_args
 
-        server_args = get_global_server_args()
+        try:
+            server_args = get_global_server_args()
+        except ValueError:
+            return None
         if (
             getattr(server_args, "nsa_prefill_cp_kv_storage_mode", "replicated")
             != "layersplit"

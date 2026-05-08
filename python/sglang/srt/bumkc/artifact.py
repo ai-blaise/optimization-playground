@@ -18,6 +18,8 @@ REQUIRED_CLI_FLAGS = (
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
+REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
+REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
 REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v13"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v11"
@@ -471,6 +473,10 @@ def load_bumkc_artifact(
         runtime_smoke,
         tensor_smoke,
     )
+    if manifest.get("schema_version") != REQUIRED_PLAN_SCHEMA_VERSION:
+        raise BumkcArtifactError("BUMKC artifact uses an unsupported plan schema")
+    if manifest.get("capability_level") != REQUIRED_CAPABILITY_LEVEL:
+        raise BumkcArtifactError("BUMKC artifact capability is unsupported")
     if engine.get("schema_version") != REQUIRED_SCHEMA_VERSION:
         raise BumkcArtifactError("BUMKC artifact uses an unsupported engine schema")
     if engine.get("engine") != "sglang":

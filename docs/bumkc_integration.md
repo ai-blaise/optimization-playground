@@ -20,7 +20,9 @@ validates:
 
 - matching plan and program IDs across manifest, HVM compiler, runtime,
   engine, simulation, and tensor smoke artifacts,
-- `schema_version == "bumkc.optimization_playground.v13"`,
+- manifest `schema_version == "bumkc.plan.v1"`,
+- manifest `capability_level == "hvm_rooted_runtime_descriptor"`,
+- engine export `schema_version == "bumkc.optimization_playground.v13"`,
 - `runtime_abi_version == "bumkc.runtime.v1"`,
 - runtime smoke schema `bumkc.cuda_smoke.v11`,
 - `engine == "sglang"`,

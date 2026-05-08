@@ -14,6 +14,8 @@ sys.modules[SPEC.name] = bumkc_artifact
 SPEC.loader.exec_module(bumkc_artifact)
 
 REQUIRED_VALIDATION_MODEL = bumkc_artifact.REQUIRED_VALIDATION_MODEL
+REQUIRED_PLAN_SCHEMA_VERSION = bumkc_artifact.REQUIRED_PLAN_SCHEMA_VERSION
+REQUIRED_CAPABILITY_LEVEL = bumkc_artifact.REQUIRED_CAPABILITY_LEVEL
 REQUIRED_SCHEMA_VERSION = bumkc_artifact.REQUIRED_SCHEMA_VERSION
 REQUIRED_RUNTIME_ABI_VERSION = bumkc_artifact.REQUIRED_RUNTIME_ABI_VERSION
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = (
@@ -153,6 +155,30 @@ def test_rejects_unsupported_bumkc_schema(tmp_path):
     refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="unsupported engine schema"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_unsupported_bumkc_plan_schema(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    manifest_path = plan_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = "bumkc.plan.v0"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="unsupported plan schema"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_unsupported_bumkc_capability(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    manifest_path = plan_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["capability_level"] = "scaffold"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="capability"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -470,6 +496,8 @@ def write_bumkc_artifact(tmp_path, *, executable):
     write_json(
         plan_dir / "manifest.json",
         {
+            "schema_version": REQUIRED_PLAN_SCHEMA_VERSION,
+            "capability_level": REQUIRED_CAPABILITY_LEVEL,
             "plan_id": plan_id,
             "program_id": program_id,
             "target_arch": "sm90",

@@ -34,6 +34,10 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.runtime_summary.collective_task_count == 1
     assert summary.runtime_summary.collective_group_size_sum == 8
     assert summary.runtime_summary.collective_kind_code_sum == 1
+    assert summary.runtime_summary.serving_task_count == 1
+    assert summary.runtime_summary.serving_dependency_count == 2
+    assert summary.runtime_summary.serving_kind_code_sum == 5
+    assert summary.runtime_summary.serving_symbol_count == 1
     assert summary.target_arch == "sm90"
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
@@ -102,6 +106,17 @@ def test_rejects_bumkc_runtime_summary_mismatch(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_serving_state_summary_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["runtime_summary"]["serving_dependency_count"] = 7
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+
+    with pytest.raises(BumkcArtifactError, match="runtime summary mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
 def write_bumkc_artifact(tmp_path, *, executable):
     plan_id = "plan_test"
     program_id = "program_test"
@@ -161,6 +176,12 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "collective_group_size_sum": 8,
                 "collective_kind_code_sum": 1,
             },
+            "serving_state_plan": {
+                "serving_task_count": 1,
+                "serving_dependency_count": 2,
+                "serving_kind_code_sum": 5,
+                "serving_symbol_count": 1,
+            },
         },
     )
     write_json(
@@ -198,6 +219,10 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "collective_task_count": 1,
                 "collective_group_size_sum": 8,
                 "collective_kind_code_sum": 1,
+                "serving_task_count": 1,
+                "serving_dependency_count": 2,
+                "serving_kind_code_sum": 5,
+                "serving_symbol_count": 1,
             },
             "preserve_custom_optimizations": True,
             "required_validation_model": REQUIRED_VALIDATION_MODEL,

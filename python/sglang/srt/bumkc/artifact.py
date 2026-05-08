@@ -9,7 +9,7 @@ from typing import Any
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v5"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v6"
 
 
 class BumkcArtifactError(ValueError):
@@ -38,6 +38,10 @@ class BumkcRuntimeSummary:
     collective_task_count: int
     collective_group_size_sum: int
     collective_kind_code_sum: int
+    serving_task_count: int
+    serving_dependency_count: int
+    serving_kind_code_sum: int
+    serving_symbol_count: int
 
     def as_log_dict(self) -> dict[str, int]:
         return {
@@ -61,6 +65,10 @@ class BumkcRuntimeSummary:
             "collective_task_count": self.collective_task_count,
             "collective_group_size_sum": self.collective_group_size_sum,
             "collective_kind_code_sum": self.collective_kind_code_sum,
+            "serving_task_count": self.serving_task_count,
+            "serving_dependency_count": self.serving_dependency_count,
+            "serving_kind_code_sum": self.serving_kind_code_sum,
+            "serving_symbol_count": self.serving_symbol_count,
         }
 
 
@@ -194,6 +202,7 @@ def _load_runtime_summary(
     memory_plan = _read_object(runtime, "memory_plan")
     scale_up_plan = _read_object(runtime, "scale_up_plan")
     communication_plan = _read_object(runtime, "communication_plan")
+    serving_state_plan = _read_object(runtime, "serving_state_plan")
     dependency_plan = _read_object(runtime, "dependency_plan")
     expected = {
         "task_count": runtime.get("task_count"),
@@ -224,6 +233,12 @@ def _load_runtime_summary(
         "collective_kind_code_sum": communication_plan.get(
             "collective_kind_code_sum"
         ),
+        "serving_task_count": serving_state_plan.get("serving_task_count"),
+        "serving_dependency_count": serving_state_plan.get(
+            "serving_dependency_count"
+        ),
+        "serving_kind_code_sum": serving_state_plan.get("serving_kind_code_sum"),
+        "serving_symbol_count": serving_state_plan.get("serving_symbol_count"),
     }
     for key, value in expected.items():
         if summary.get(key) is None or value is None or summary.get(key) != value:

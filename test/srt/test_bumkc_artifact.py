@@ -196,6 +196,40 @@ def test_rejects_unsupported_bumkc_model_source_schema(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_hvm_source_without_canonical_main(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    write_text(plan_dir / "source" / "hvm-core-book.hvm", "%main = 0\n")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="HVM Core source main"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_hvm_source_tensor_island_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    source_path = plan_dir / "source" / "hvm-core-book.hvm"
+    source = source_path.read_text(encoding="utf-8")
+    source_path.write_text(source.replace("#BumkcTensorIsland{}", "#Nil{}", 1))
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="tensor island count"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_hvm_core_book_unknown_tensor_island(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    hvm_path = plan_dir / "ir" / "hvm-core-book.json"
+    hvm_core_book = json.loads(hvm_path.read_text(encoding="utf-8"))
+    hvm_core_book["regions"][0]["nodes"][1]["kind"]["tensor_island"][
+        "island"
+    ] = "island_missing"
+    hvm_path.write_text(json.dumps(hvm_core_book), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="tensor island is unknown"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_unsupported_bumkc_plan_schema(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     manifest_path = plan_dir / "manifest.json"
@@ -669,6 +703,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
             ],
             "islands": [
                 {
+                    "id": "island_native",
                     "operator": "matmul",
                     "coverage_status": "native_eligible",
                     "communication": None,
@@ -676,6 +711,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
                     "side_effects": [],
                 },
                 {
+                    "id": "island_collective",
                     "operator": "collective",
                     "coverage_status": "native_eligible",
                     "communication": {
@@ -694,6 +730,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
                     "side_effects": ["collective"],
                 },
                 {
+                    "id": "island_fallback",
                     "operator": "unknown",
                     "coverage_status": "fallback_only",
                     "communication": None,
@@ -711,7 +748,35 @@ def write_bumkc_artifact(tmp_path, *, executable):
             ],
         },
     )
-    write_text(plan_dir / "source" / "hvm-core-book.hvm", "%main = 0\n")
+    write_text(
+        plan_dir / "source" / "hvm-core-book.hvm",
+        "\n".join(
+            [
+                "@main = @bumkc_program_program_test",
+                "",
+                (
+                    "@bumkc_program_program_test = "
+                    "#BumkcProgram{@bumkc_region_region_test_root, "
+                    "@bumkc_regions_program_test, "
+                    "@bumkc_tensor_islands_program_test, "
+                    "@bumkc_shape_symbols_program_test, "
+                    "@bumkc_fallback_bridges_program_test, "
+                    "@bumkc_tensor_descriptors_program_test, "
+                    "@bumkc_quantization_program_test}"
+                ),
+                "@bumkc_tensor_island_island_native = #BumkcTensorIsland{}",
+                "@bumkc_tensor_island_island_collective = #BumkcTensorIsland{}",
+                "@bumkc_tensor_island_island_fallback = #BumkcTensorIsland{}",
+                "@bumkc_shape_symbol_sequence = #BumkcShapeSymbol{1, 4096, 16}",
+                (
+                    "@bumkc_fallback_bridge_island_fallback_island_native_tensor_hidden "
+                    "= #BumkcFallbackBridge{}"
+                ),
+                "@bumkc_quantization_program_test = #BumkcQuantization{}",
+                "",
+            ]
+        ),
+    )
     write_json(
         plan_dir / "source" / "model-source.json",
         {
@@ -767,6 +832,52 @@ def write_bumkc_artifact(tmp_path, *, executable):
         {
             "plan_id": plan_id,
             "program_id": program_id,
+            "source": {
+                "frontend": "internal_test",
+                "model": "matmul-chain",
+            },
+            "root_region": "region_test_root",
+            "regions": [
+                {
+                    "id": "region_test_root",
+                    "kind": "root",
+                    "nodes": [
+                        {
+                            "id": "node_model_entry",
+                            "kind": {
+                                "model_entry": {
+                                    "model": "matmul-chain",
+                                }
+                            },
+                        },
+                        {
+                            "id": "node_native",
+                            "kind": {
+                                "tensor_island": {
+                                    "island": "island_native",
+                                }
+                            },
+                        },
+                        {
+                            "id": "node_collective",
+                            "kind": {
+                                "tensor_island": {
+                                    "island": "island_collective",
+                                }
+                            },
+                        },
+                        {
+                            "id": "node_fallback",
+                            "kind": {
+                                "tensor_island": {
+                                    "island": "island_fallback",
+                                }
+                            },
+                        },
+                    ],
+                }
+            ],
+            "coverage_status": "native_eligible",
         },
     )
     write_json(

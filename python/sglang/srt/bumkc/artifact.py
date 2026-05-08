@@ -539,6 +539,7 @@ def load_bumkc_artifact(
     root = _resolve_plan_dir(Path(path))
     manifest = _read_json(root / "manifest.json")
     model_source = _read_json(root / "source" / "model-source.json")
+    hvm_core_book = _read_json(root / "ir" / "hvm-core-book.json")
     tensor_islands = _read_json(root / "ir" / "hvm-tensor-islands.json")
     block_plan = _read_json(root / "ir" / "hvm-block-role-pipelines.json")
     event_tensors = _read_json(root / "ir" / "hvm-event-tensors.json")
@@ -551,6 +552,7 @@ def load_bumkc_artifact(
     _validate_identity(
         manifest,
         model_source,
+        hvm_core_book,
         tensor_islands,
         block_plan,
         event_tensors,
@@ -585,6 +587,15 @@ def load_bumkc_artifact(
     if artifact_paths.get("artifact_digests") != ARTIFACT_DIGEST_PATH.as_posix():
         raise BumkcArtifactError("BUMKC artifact digest path is not canonical")
     artifact_digest_count = _validate_artifact_digests(root, manifest)
+    hvm_core_source = _read_text(root / "source" / "hvm-core-book.hvm")
+    _validate_hvm_core_book(
+        hvm_core_book,
+        hvm_core_source,
+        model_source,
+        manifest,
+        tensor_islands,
+        engine,
+    )
     if engine.get("target_arch") != manifest.get("target_arch"):
         raise BumkcArtifactError(
             "BUMKC engine target architecture does not match manifest"
@@ -677,6 +688,15 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise BumkcArtifactError(f"BUMKC artifact file is not a JSON object: {path}")
     return value
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise BumkcArtifactError(f"missing BUMKC artifact file: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise BumkcArtifactError(f"invalid BUMKC artifact text: {path}") from exc
 
 
 def _validate_identity(*objects: dict[str, Any]) -> None:
@@ -896,6 +916,94 @@ def _validate_source_artifact(
             "BUMKC model source summary mismatch: "
             "quantization_weight_zero_point_enabled"
         )
+
+
+def _validate_hvm_core_book(
+    hvm_core_book: dict[str, Any],
+    hvm_core_source: str,
+    model_source: dict[str, Any],
+    manifest: dict[str, Any],
+    tensor_islands: dict[str, Any],
+    engine: dict[str, Any],
+) -> None:
+    if _read_object(hvm_core_book, "source") != _read_object(manifest, "source"):
+        raise BumkcArtifactError("BUMKC HVM Core Book source mismatches manifest")
+    if hvm_core_book.get("coverage_status") != model_source.get("hvm_capture_status"):
+        raise BumkcArtifactError("BUMKC HVM Core Book coverage mismatches source")
+
+    program_id = _read_str(engine, "program_id")
+    program_ref = _hvm_symbol("bumkc_program", program_id)
+    expected_main = f"@main = @{program_ref}\n"
+    if not hvm_core_source.startswith(expected_main):
+        raise BumkcArtifactError("BUMKC HVM Core source main is not canonical")
+
+    required_refs = (
+        program_ref,
+        _hvm_symbol("bumkc_regions", program_id),
+        _hvm_symbol("bumkc_tensor_islands", program_id),
+        _hvm_symbol("bumkc_shape_symbols", program_id),
+        _hvm_symbol("bumkc_fallback_bridges", program_id),
+        _hvm_symbol("bumkc_tensor_descriptors", program_id),
+        _hvm_symbol("bumkc_quantization", program_id),
+    )
+    if any(f"@{reference}" not in hvm_core_source for reference in required_refs):
+        raise BumkcArtifactError("BUMKC HVM Core source missing canonical references")
+    if "#BumkcProgram{" not in hvm_core_source:
+        raise BumkcArtifactError("BUMKC HVM Core source missing program term")
+    if hvm_core_source.count("#BumkcTensorIsland{") != _read_int(
+        model_source, "tensor_island_count"
+    ):
+        raise BumkcArtifactError("BUMKC HVM Core source tensor island count mismatch")
+    if hvm_core_source.count("#BumkcShapeSymbol{") != _read_int(
+        model_source, "shape_symbol_count"
+    ):
+        raise BumkcArtifactError("BUMKC HVM Core source shape symbol count mismatch")
+    if hvm_core_source.count("#BumkcFallbackBridge{") != _read_int(
+        model_source, "fallback_bridge_count"
+    ):
+        raise BumkcArtifactError("BUMKC HVM Core source fallback bridge count mismatch")
+
+    root_region = _read_str(hvm_core_book, "root_region")
+    regions = _read_list(hvm_core_book, "regions")
+    region_ids = {_read_str(region, "id") for region in regions}
+    if root_region not in region_ids:
+        raise BumkcArtifactError("BUMKC HVM Core Book root region is missing")
+
+    known_islands = {
+        _read_str(island, "id") for island in _read_list(tensor_islands, "islands")
+    }
+    manifest_source = _read_object(manifest, "source")
+    model_entry_count = 0
+    tensor_node_islands = set()
+    for region in regions:
+        _read_str(region, "kind")
+        for node in _read_list(region, "nodes"):
+            kind = _read_object(node, "kind")
+            if len(kind) != 1:
+                raise BumkcArtifactError("BUMKC HVM Core node kind is malformed")
+            tag, payload = next(iter(kind.items()))
+            if not isinstance(payload, dict):
+                raise BumkcArtifactError("BUMKC HVM Core node payload is malformed")
+            if tag == "model_entry":
+                if payload.get("model") != manifest_source.get("model"):
+                    raise BumkcArtifactError("BUMKC HVM Core model entry mismatches")
+                model_entry_count += 1
+            elif tag == "tensor_island":
+                island = _read_str(payload, "island")
+                if island not in known_islands:
+                    raise BumkcArtifactError("BUMKC HVM Core tensor island is unknown")
+                tensor_node_islands.add(island)
+            elif tag == "fallback_boundary":
+                if not _read_str(payload, "reason"):
+                    raise BumkcArtifactError("BUMKC HVM Core fallback reason is empty")
+            else:
+                raise BumkcArtifactError(
+                    f"BUMKC HVM Core node kind is unsupported: {tag}"
+                )
+    if model_entry_count != 1:
+        raise BumkcArtifactError("BUMKC HVM Core must contain one model entry")
+    if tensor_node_islands != known_islands:
+        raise BumkcArtifactError("BUMKC HVM Core does not cover every tensor island")
 
 
 def _artifact_file_paths(root: Path) -> list[str]:
@@ -1737,6 +1845,24 @@ def _dtype_code(parent: dict[str, Any], key: str) -> int:
     if value not in _DTYPE_CODES:
         raise BumkcArtifactError(f"BUMKC dtype is unsupported: {value}")
     return _DTYPE_CODES[value]
+
+
+def _hvm_symbol(prefix: str, value: str) -> str:
+    return f"{prefix}_{_hvm_name(value)}"
+
+
+def _hvm_name(value: str) -> str:
+    name = []
+    for char in value:
+        if char.isascii() and (char.isalnum() or char == "_"):
+            name.append(char)
+        elif char == "-":
+            name.append("_dash_")
+        elif char == ".":
+            name.append("_dot_")
+        else:
+            name.append("_")
+    return "".join(name)
 
 
 def _optional_bool_code(parent: dict[str, Any], key: str) -> int:

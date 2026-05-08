@@ -36,6 +36,10 @@ validates:
 - canonical artifact paths for the model-source export, HVM core book, tensor
   islands, block pipelines, Event Tensor plan, SM task runtime, runtime
   descriptor, CPU reference, and generated CUDA smoke plans/sources,
+- canonical HVM Core source shape, including the `@main` program reference,
+  required BUMKC HVM references, HVM tensor-island/source counts, HVM shape
+  symbols, fallback bridges, root region, model entry, and tensor-island node
+  ownership,
 - model-source provenance, quantization metadata including scale layout, and
   summary fields against the manifest, engine export, and HVM tensor island
   artifact,

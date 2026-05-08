@@ -629,6 +629,52 @@ def test_rejects_bumkc_runtime_launch_bucket_mismatch(tmp_path):
         )
 
 
+def test_rejects_bumkc_runtime_default_bucket_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["substitution_plan"]["shape_symbols"][0]["max"] = 4097
+    runtime["substitution_plan"]["shape_symbols"][0]["default_value"] = 4097
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["runtime_summary"]["substitution_symbol_max_sum"] = 4097
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    smoke_path = plan_dir / "generated" / "runtime-smoke.json"
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["expected_substitution_symbol_max_sum"] = 4097
+    populate_runtime_smoke_contracts(smoke)
+    smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="default bucket"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_runtime_substitution_unknown_serving_kind(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["substitution_plan"]["serving_state"][0]["kind"] = "prefill_window"
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="serving-state kind"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_runtime_substitution_unknown_symbol(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["substitution_plan"]["serving_state"][0]["symbol"] = "missing"
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="serving-state symbol"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_bumkc_runtime_launch_serving_mismatch(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     summary = load_bumkc_artifact(plan_dir)

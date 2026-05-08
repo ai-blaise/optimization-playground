@@ -639,7 +639,10 @@ def load_bumkc_artifact(
         compiler_summary,
     )
     runtime_shape_symbols = _load_shape_symbol_bindings(runtime)
-    runtime_serving_state = _load_serving_state_bindings(runtime)
+    runtime_serving_state = _load_serving_state_bindings(
+        runtime,
+        runtime_shape_symbols,
+    )
     entrypoints = tuple(
         entrypoint.get("name", "") for entrypoint in runtime.get("entrypoints", [])
     )
@@ -1777,6 +1780,11 @@ def _load_shape_symbol_bindings(
             raise BumkcArtifactError(
                 f"BUMKC runtime shape symbol {binding.symbol} has invalid default"
             )
+        if binding.bucketed_value(binding.default_value) > binding.max:
+            raise BumkcArtifactError(
+                "BUMKC runtime shape symbol "
+                f"{binding.symbol} has invalid default bucket"
+            )
         if binding.symbol in seen_symbols:
             raise BumkcArtifactError(
                 f"BUMKC runtime shape symbol {binding.symbol} is duplicated"
@@ -1788,16 +1796,27 @@ def _load_shape_symbol_bindings(
 
 def _load_serving_state_bindings(
     runtime: dict[str, Any],
+    shape_symbols: tuple[BumkcRuntimeShapeSymbolBinding, ...],
 ) -> tuple[BumkcRuntimeServingStateBinding, ...]:
     substitution_plan = _read_object(runtime, "substitution_plan")
     bindings = []
     seen_bindings = set()
+    known_shape_symbols = {binding.symbol for binding in shape_symbols}
     for entry in _read_list(substitution_plan, "serving_state"):
         binding = BumkcRuntimeServingStateBinding(
             kind=_read_str(entry, "kind"),
             symbol=_read_optional_str(entry, "symbol"),
             required=_read_bool(entry, "required"),
         )
+        if binding.kind not in _SERVING_STATE_KIND_CODES:
+            raise BumkcArtifactError(
+                f"BUMKC runtime serving-state kind is unsupported: {binding.kind}"
+            )
+        if binding.symbol is not None and binding.symbol not in known_shape_symbols:
+            raise BumkcArtifactError(
+                "BUMKC runtime serving-state symbol is not declared: "
+                f"{binding.symbol}"
+            )
         if binding.key() in seen_bindings:
             raise BumkcArtifactError(
                 "BUMKC runtime serving-state binding "

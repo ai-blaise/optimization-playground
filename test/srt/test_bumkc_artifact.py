@@ -89,10 +89,17 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.runtime_shape_symbols[0].symbol == "sequence"
     assert summary.runtime_serving_state[0].key() == ("sequence", "sequence")
     assert summary.target_arch == "sm90"
+    assert summary.plan_schema_version == REQUIRED_PLAN_SCHEMA_VERSION
+    assert summary.capability_level == REQUIRED_CAPABILITY_LEVEL
+    assert summary.engine_schema_version == REQUIRED_SCHEMA_VERSION
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
     assert summary.artifact_digest_count == 15
     assert summary.fallback_mode == "checked"
+    log_dict = summary.as_log_dict()
+    assert log_dict["plan_schema_version"] == REQUIRED_PLAN_SCHEMA_VERSION
+    assert log_dict["capability_level"] == REQUIRED_CAPABILITY_LEVEL
+    assert log_dict["engine_schema_version"] == REQUIRED_SCHEMA_VERSION
 
     launch_plan = summary.validate_runtime_launch(
         shape_symbols={"sequence": 17},

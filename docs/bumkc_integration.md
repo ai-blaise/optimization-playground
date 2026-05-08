@@ -66,6 +66,10 @@ serving-state bindings. Startup also validates the artifact's default launch
 context through `validate_default_runtime_launch()` when `--enable-bumkc` loads
 the artifact.
 
+`BumkcArtifactSummary.as_log_dict()` includes the accepted manifest schema,
+capability level, and engine schema so startup logs can audit the exact BUMKC
+contract that was loaded.
+
 Add `--bumkc-require-executable` when startup must fail unless the runtime
 descriptor is executable. Without that flag, non-executable BUMKC artifacts are
 accepted only as checked fallback metadata.

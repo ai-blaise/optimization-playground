@@ -326,6 +326,9 @@ class BumkcArtifactSummary:
     model: str
     gpu_count: int
     target_arch: str | None
+    plan_schema_version: str
+    capability_level: str
+    engine_schema_version: str
     fallback_mode: str
     runtime_executable: bool
     runtime_entrypoints: tuple[str, ...]
@@ -429,6 +432,9 @@ class BumkcArtifactSummary:
             "model": self.model,
             "gpu_count": self.gpu_count,
             "target_arch": self.target_arch,
+            "plan_schema_version": self.plan_schema_version,
+            "capability_level": self.capability_level,
+            "engine_schema_version": self.engine_schema_version,
             "fallback_mode": self.fallback_mode,
             "runtime_executable": self.runtime_executable,
             "runtime_entrypoints": list(self.runtime_entrypoints),
@@ -541,6 +547,9 @@ def load_bumkc_artifact(
         model=engine["model"],
         gpu_count=int(engine["gpu_count"]),
         target_arch=engine.get("target_arch"),
+        plan_schema_version=manifest["schema_version"],
+        capability_level=manifest["capability_level"],
+        engine_schema_version=engine["schema_version"],
         fallback_mode=engine["fallback_mode"],
         runtime_executable=bool(runtime["executable"]),
         runtime_entrypoints=entrypoints,

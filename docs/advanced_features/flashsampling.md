@@ -110,6 +110,40 @@ CUDA graph was disabled because the baseline server hit a FusedAddRMSNorm graph
 capture issue before FlashSampling was enabled; ordinary CUDA graph capture
 remained enabled.
 
+Qwen3-32B was also validated on the same H200 VM as a larger paper model. The
+paper reports low-single-digit Qwen3-32B gains because attention and FFN dominate
+decode time at that size. With the same AIME prompt set, output length 256,
+ordinary CUDA graphs enabled, and piecewise CUDA graph disabled, the five-run
+matrix showed lower median TPOT and higher output throughput at every tested
+concurrency:
+
+| Concurrency | Baseline TPOT (ms) | FlashSampling TPOT (ms) | TPOT gain |
+| ----------- | ------------------ | ----------------------- | --------- |
+| 1 | 18.0475 | 17.8713 | 0.98% |
+| 2 | 18.4875 | 18.2819 | 1.11% |
+| 4 | 18.6956 | 18.5073 | 1.01% |
+| 8 | 18.9468 | 18.7237 | 1.18% |
+| 16 | 19.2199 | 18.9511 | 1.40% |
+| 32 | 20.4078 | 20.1787 | 1.12% |
+| 64 | 22.5932 | 21.4922 | 4.87% |
+
+For paper-style sweeps that force `--flashsampling-min-batch-size 1`, explicit
+warmup buckets can reduce high-concurrency first-use overhead:
+
+```bash
+FLASHSAMPLING_WARMUP_BATCH_SIZES='1 2 4 8 16 32 64 128'
+```
+
+On Qwen3-32B this produced a 3-run candidate-only median of 21.4619 ms at
+concurrency 64, a 5.01% TPOT gain over the same baseline median. It was neutral
+to slightly mixed at lower concurrencies, so it remains an A/B tuning knob rather
+than a production default.
+
+Direct IKP kernel profiling for the Qwen3-32B shape showed the fused kernel is
+substantially faster in isolation: 10.44% to 34.14% faster than dense
+matmul-plus-sampling for batch sizes 1 through 128. The smaller end-to-end gain
+is expected on 32B because the sampler is a smaller fraction of decode TPOT.
+
 The IKP serving profiler captures kernel-level traces for the same baseline and
 FlashSampling variants:
 

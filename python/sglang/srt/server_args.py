@@ -5608,9 +5608,9 @@ class ServerArgs:
         parser.add_argument(
             "--flashsampling-provider",
             type=str,
-            choices=["triton", "auto"],
+            choices=["triton", "target", "auto"],
             default=ServerArgs.flashsampling_provider,
-            help="FlashSampling kernel provider. 'auto' currently selects the Triton fused matmul-sampling kernel.",
+            help="FlashSampling kernel provider. 'triton' uses the persistent fused kernel. 'target' uses a non-persistent kernel optimized for TP-sharded vocab shapes (tiles <= NUM_SMS). 'auto' selects 'triton'.",
         )
         parser.add_argument(
             "--flashsampling-fallback",

@@ -21,6 +21,25 @@ python -m sglang.launch_server \
 FlashSampling is opt-in and falls back to the normal logits path when a request
 batch is not eligible.
 
+## Kernel Providers
+
+```bash
+--flashsampling-provider triton   # persistent fused kernel (default)
+--flashsampling-provider target   # non-persistent kernel for TP-sharded shapes
+--flashsampling-provider auto     # selects triton
+```
+
+The `target` provider uses a non-persistent grid-launch kernel optimized for
+shapes where the total number of (V, H) tiles fits in a single SM wave
+(tiles <= NUM_SMS). This is the typical case for TP-sharded vocab sizes
+(e.g. V=16160 on TP=8 DeepSeek-V3.2-REAP). When tiles exceed NUM_SMS, the
+target provider falls back to the persistent kernel automatically.
+
+IKP-validated performance on H200 (V=16160, D=7168, TP=8):
+- Kernel-only: 0.061ms (3.80 TB/s, 79% peak) vs persistent: 0.086ms (2.68 TB/s)
+- End-to-end with reduce: 27-34% faster at BS=1..64
+- Bit-exact greedy match at all batch sizes
+
 ## Supported Batches
 
 The fast path currently supports decode batches with:

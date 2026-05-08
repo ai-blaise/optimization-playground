@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.flashsampling.tp_info import TPInfo
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
@@ -177,10 +178,18 @@ class FlashSamplingRuntime:
 
         temperature = self._temperature_tensor(info, sampling_info)
         seed = self._next_seed()
-        from sglang.srt.layers.flashsampling.core import (
-            MIN_BLOCK_SIZE_V,
-            fused_mm_sample_triton,
-        )
+        from sglang.srt.layers.flashsampling.core import MIN_BLOCK_SIZE_V
+
+        server_args = get_global_server_args()
+        use_target = getattr(server_args, "flashsampling_provider", "triton") == "target"
+        if use_target:
+            from sglang.srt.layers.flashsampling.target_kernel import (
+                fused_mm_sample_target as _fused_mm_sample,
+            )
+        else:
+            from sglang.srt.layers.flashsampling.core import (
+                fused_mm_sample_triton as _fused_mm_sample,
+            )
 
         need_scores = tp_size > 1
         workspaces = (
@@ -192,7 +201,7 @@ class FlashSamplingRuntime:
                 hidden_states.shape[0],
             )
         )
-        result = fused_mm_sample_triton(
+        result = _fused_mm_sample(
             weights=info.lm_head_weight,
             hidden_states=hidden_states,
             num_samples=1,

@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -57,6 +58,7 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.target_arch == "sm90"
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
+    assert summary.artifact_digest_count == 4
     assert summary.fallback_mode == "checked"
 
     launch_plan = summary.validate_runtime_launch(
@@ -81,6 +83,7 @@ def test_rejects_bumkc_identity_mismatch(tmp_path):
     runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
     runtime["program_id"] = "program_other"
     runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="program IDs"):
         load_bumkc_artifact(plan_dir)
@@ -92,6 +95,7 @@ def test_rejects_bumkc_artifact_with_unchecked_fallback(tmp_path):
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
     engine["fallback_mode"] = "disabled"
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="checked fallback"):
         load_bumkc_artifact(plan_dir)
@@ -103,6 +107,7 @@ def test_rejects_unsupported_bumkc_schema(tmp_path):
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
     engine["schema_version"] = "bumkc.optimization_playground.v4"
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="unsupported engine schema"):
         load_bumkc_artifact(plan_dir)
@@ -114,6 +119,7 @@ def test_rejects_bumkc_target_arch_mismatch(tmp_path):
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
     engine["target_arch"] = "sm80"
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="target architecture"):
         load_bumkc_artifact(plan_dir)
@@ -125,6 +131,7 @@ def test_rejects_bumkc_runtime_summary_mismatch(tmp_path):
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
     engine["runtime_summary"]["kv_cache_binding_count"] = 7
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="runtime summary mismatch"):
         load_bumkc_artifact(plan_dir)
@@ -136,6 +143,7 @@ def test_rejects_bumkc_serving_state_summary_mismatch(tmp_path):
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
     engine["runtime_summary"]["serving_dependency_count"] = 7
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="runtime summary mismatch"):
         load_bumkc_artifact(plan_dir)
@@ -147,8 +155,20 @@ def test_rejects_bumkc_substitution_summary_mismatch(tmp_path):
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
     engine["runtime_summary"]["substitution_symbol_max_sum"] = 7
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="runtime summary mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_digest_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["task_count"] = 3
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+
+    with pytest.raises(BumkcArtifactError, match="digest"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -173,6 +193,7 @@ def test_rejects_bumkc_runtime_launch_bucket_mismatch(tmp_path):
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
     engine["runtime_summary"]["substitution_symbol_max_sum"] = 4097
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
     summary = load_bumkc_artifact(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="buckets"):
@@ -215,6 +236,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
     (plan_dir / "runtime").mkdir(parents=True)
     (plan_dir / "engine").mkdir()
     (plan_dir / "generated").mkdir()
+    (plan_dir / "reports").mkdir()
 
     write_json(
         plan_dir / "manifest.json",
@@ -343,6 +365,9 @@ def write_bumkc_artifact(tmp_path, *, executable):
             },
             "preserve_custom_optimizations": True,
             "required_validation_model": REQUIRED_VALIDATION_MODEL,
+            "artifact_paths": {
+                "artifact_digests": "reports/artifact-digests.json",
+            },
         },
     )
     write_json(
@@ -353,8 +378,33 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "enabled": executable,
         },
     )
+    refresh_bumkc_digests(plan_dir)
     return plan_dir
 
 
 def write_json(path, value):
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def refresh_bumkc_digests(plan_dir):
+    files = []
+    digest_path = plan_dir / "reports" / "artifact-digests.json"
+    for path in sorted(plan_dir.rglob("*")):
+        if path.is_dir() or path == digest_path:
+            continue
+        contents = path.read_bytes()
+        files.append(
+            {
+                "path": path.relative_to(plan_dir).as_posix(),
+                "bytes": len(contents),
+                "sha256": hashlib.sha256(contents).hexdigest(),
+            }
+        )
+    write_json(
+        digest_path,
+        {
+            "schema_version": "bumkc.artifact_digests.v0",
+            "plan_id": "plan_test",
+            "files": files,
+        },
+    )

@@ -20,9 +20,11 @@ validates:
 
 - matching plan and program IDs across manifest, runtime, engine, and tensor
   smoke artifacts,
-- `schema_version == "bumkc.optimization_playground.v7"`,
+- `schema_version == "bumkc.optimization_playground.v8"`,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
+- `reports/artifact-digests.json` byte counts and SHA-256 hashes before
+  runtime metadata is trusted,
 - matching target architecture between manifest and engine export,
 - checked fallback mode,
 - `--bumkc-fallback-mode checked` when BUMKC is enabled,

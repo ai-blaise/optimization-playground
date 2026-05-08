@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 import dataclasses
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 
+ARTIFACT_DIGEST_PATH = Path("reports/artifact-digests.json")
+REQUIRED_DIGEST_SCHEMA_VERSION = "bumkc.artifact_digests.v0"
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v7"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v8"
 
 
 class BumkcArtifactError(ValueError):
@@ -134,6 +137,7 @@ class BumkcArtifactSummary:
     runtime_serving_state: tuple[BumkcRuntimeServingStateBinding, ...]
     task_count: int
     tensor_smoke_enabled: bool
+    artifact_digest_count: int
     required_validation_model: str
 
     def validate_runtime_launch(
@@ -240,6 +244,7 @@ class BumkcArtifactSummary:
             ],
             "task_count": self.task_count,
             "tensor_smoke_enabled": self.tensor_smoke_enabled,
+            "artifact_digest_count": self.artifact_digest_count,
             "required_validation_model": self.required_validation_model,
         }
 
@@ -260,6 +265,10 @@ def load_bumkc_artifact(
         raise BumkcArtifactError("BUMKC artifact is not targeted at the SGLang engine")
     if engine.get("engine_profile") != "optimization_playground":
         raise BumkcArtifactError("BUMKC artifact is not for optimization-playground")
+    artifact_paths = _read_object(engine, "artifact_paths")
+    if artifact_paths.get("artifact_digests") != ARTIFACT_DIGEST_PATH.as_posix():
+        raise BumkcArtifactError("BUMKC artifact digest path is not canonical")
+    artifact_digest_count = _validate_artifact_digests(root, manifest)
     if engine.get("target_arch") != manifest.get("target_arch"):
         raise BumkcArtifactError("BUMKC engine target architecture does not match manifest")
     if engine.get("fallback_mode") != "checked":
@@ -294,6 +303,7 @@ def load_bumkc_artifact(
         runtime_serving_state=runtime_serving_state,
         task_count=runtime_summary.task_count,
         tensor_smoke_enabled=bool(tensor_smoke["enabled"]),
+        artifact_digest_count=artifact_digest_count,
         required_validation_model=engine["required_validation_model"],
     )
 
@@ -330,6 +340,90 @@ def _validate_identity(*objects: dict[str, Any]) -> None:
         raise BumkcArtifactError("BUMKC artifact plan IDs do not match")
     if len(program_ids) != 1 or None in program_ids:
         raise BumkcArtifactError("BUMKC artifact program IDs do not match")
+
+
+def _validate_artifact_digests(root: Path, manifest: dict[str, Any]) -> int:
+    digest = _read_json(root / ARTIFACT_DIGEST_PATH)
+    if digest.get("schema_version") != REQUIRED_DIGEST_SCHEMA_VERSION:
+        raise BumkcArtifactError("BUMKC artifact digest schema is unsupported")
+    if digest.get("plan_id") != manifest.get("plan_id"):
+        raise BumkcArtifactError("BUMKC artifact digest plan ID does not match")
+
+    files = _read_list(digest, "files")
+    expected_paths = []
+    for entry in files:
+        relative_path = _read_digest_path(entry, "path")
+        if relative_path == ARTIFACT_DIGEST_PATH.as_posix():
+            raise BumkcArtifactError("BUMKC artifact digest cannot contain itself")
+        expected_paths.append(relative_path)
+    if len(set(expected_paths)) != len(expected_paths):
+        raise BumkcArtifactError("BUMKC artifact digest contains duplicate paths")
+
+    actual_paths = _artifact_file_paths(root)
+    if sorted(expected_paths) != actual_paths:
+        raise BumkcArtifactError("BUMKC artifact digest file list does not match")
+
+    for entry in files:
+        relative_path = _read_digest_path(entry, "path")
+        expected_bytes = _read_digest_int(entry, "bytes")
+        expected_sha256 = _read_digest_sha256(entry, "sha256")
+        path = root / relative_path
+        if path.is_symlink():
+            raise BumkcArtifactError("BUMKC artifact digest rejects symlinks")
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError as exc:
+            raise BumkcArtifactError(
+                f"missing BUMKC artifact digest file: {relative_path}"
+            ) from exc
+        if len(data) != expected_bytes:
+            raise BumkcArtifactError(
+                f"BUMKC artifact digest byte mismatch: {relative_path}"
+            )
+        if hashlib.sha256(data).hexdigest() != expected_sha256:
+            raise BumkcArtifactError(
+                f"BUMKC artifact digest SHA-256 mismatch: {relative_path}"
+            )
+    return len(files)
+
+
+def _artifact_file_paths(root: Path) -> list[str]:
+    paths = []
+    for path in root.rglob("*"):
+        if path.is_dir():
+            continue
+        if path.is_symlink():
+            raise BumkcArtifactError("BUMKC artifact digest rejects symlinks")
+        relative_path = path.relative_to(root).as_posix()
+        if relative_path != ARTIFACT_DIGEST_PATH.as_posix():
+            paths.append(relative_path)
+    return sorted(paths)
+
+
+def _read_digest_path(parent: dict[str, Any], key: str) -> str:
+    value = parent.get(key)
+    if not isinstance(value, str) or not value:
+        raise BumkcArtifactError(f"BUMKC artifact digest {key} string is missing")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise BumkcArtifactError(f"BUMKC artifact digest {key} path is invalid")
+    return path.as_posix()
+
+
+def _read_digest_int(parent: dict[str, Any], key: str) -> int:
+    value = parent.get(key)
+    if not _is_strict_int(value) or value < 0:
+        raise BumkcArtifactError(f"BUMKC artifact digest {key} integer is missing")
+    return value
+
+
+def _read_digest_sha256(parent: dict[str, Any], key: str) -> str:
+    value = parent.get(key)
+    if not isinstance(value, str) or len(value) != 64:
+        raise BumkcArtifactError(f"BUMKC artifact digest {key} SHA-256 is missing")
+    if any(char not in "0123456789abcdef" for char in value):
+        raise BumkcArtifactError(f"BUMKC artifact digest {key} SHA-256 is invalid")
+    return value
 
 
 def _load_runtime_summary(

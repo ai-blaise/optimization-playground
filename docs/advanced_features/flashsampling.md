@@ -89,6 +89,27 @@ FLASHSAMPLING_MIN_BATCH_SIZE=128 \
 scripts/playground/run-flashsampling-paper-ab.sh
 ```
 
+For Qwen3-8B paper-style validation on H200, use the paper gate rather than the
+conservative production gate:
+
+```bash
+MODELS='Qwen/Qwen3-8B' \
+CONCURRENCIES='1 2 4 8 16 32 64' \
+NUM_RUNS=5 \
+WARMUP_REQUESTS=concurrency \
+FLASHSAMPLING_MIN_BATCH_SIZE=1 \
+FLASHSAMPLING_MAX_BATCH_SIZE=128 \
+DISABLE_PIECEWISE_CUDA_GRAPH=1 \
+scripts/playground/run-flashsampling-paper-ab.sh
+```
+
+On `instance-20260415-161450` with Qwen3-8B and output length 256, that harness
+showed median TPOT improvements of 4.08% to 6.30% across concurrency 1 to 64,
+with median output throughput improving at every tested concurrency. Piecewise
+CUDA graph was disabled because the baseline server hit a FusedAddRMSNorm graph
+capture issue before FlashSampling was enabled; ordinary CUDA graph capture
+remained enabled.
+
 The IKP serving profiler captures kernel-level traces for the same baseline and
 FlashSampling variants:
 

@@ -21,10 +21,12 @@ REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
 REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
 LEGACY_SCHEMA_VERSION = "bumkc.optimization_playground.v20"
 PREVIOUS_SCHEMA_VERSION = "bumkc.optimization_playground.v21"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v22"
+SCALE_UP_SCHEMA_VERSION = "bumkc.optimization_playground.v22"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v23"
 SUPPORTED_SCHEMA_VERSIONS = (
     LEGACY_SCHEMA_VERSION,
     PREVIOUS_SCHEMA_VERSION,
+    SCALE_UP_SCHEMA_VERSION,
     REQUIRED_SCHEMA_VERSION,
 )
 REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v11"
@@ -755,7 +757,7 @@ def load_bumkc_artifact(
         runtime_summary=runtime_summary,
         scale_up_summary=scale_up_summary,
         quantization_summary=quantization_summary,
-        serving_hints=_build_serving_hints(quantization_summary),
+        serving_hints=_load_serving_hints(engine, quantization_summary),
         runtime_shape_symbols=runtime_shape_symbols,
         runtime_serving_state=runtime_serving_state,
         task_count=runtime_summary.task_count,
@@ -1171,6 +1173,43 @@ def _build_serving_hints(
         quantization=quantization_method,
         moe_runner_backend=moe_runner_backend,
     )
+
+
+def _load_serving_hints(
+    engine: dict[str, Any],
+    quantization: BumkcQuantizationSummary,
+) -> BumkcServingHints:
+    expected = _build_serving_hints(quantization)
+    summary_record = _read_optional_object(engine, "serving_hints")
+    if engine.get("schema_version") == REQUIRED_SCHEMA_VERSION:
+        if summary_record is None:
+            raise BumkcArtifactError("BUMKC engine serving hints are missing")
+        summary = _read_serving_hints(summary_record)
+        _validate_serving_hints(summary, expected)
+        return summary
+    if summary_record is not None:
+        summary = _read_serving_hints(summary_record)
+        _validate_serving_hints(summary, expected)
+    return expected
+
+
+def _read_serving_hints(
+    summary: dict[str, Any],
+) -> BumkcServingHints:
+    return BumkcServingHints(
+        quantization=_read_optional_str(summary, "quantization"),
+        moe_runner_backend=_read_optional_str(summary, "moe_runner_backend"),
+    )
+
+
+def _validate_serving_hints(
+    summary: BumkcServingHints,
+    expected: BumkcServingHints,
+) -> None:
+    for field in dataclasses.fields(BumkcServingHints):
+        name = field.name
+        if getattr(summary, name) != getattr(expected, name):
+            raise BumkcArtifactError(f"BUMKC engine serving hint mismatch: {name}")
 
 
 def _validate_hvm_core_book(

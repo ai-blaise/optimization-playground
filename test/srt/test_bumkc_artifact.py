@@ -675,6 +675,48 @@ def test_accepts_previous_bumkc_engine_without_scale_up_summary(tmp_path):
     assert summary.scale_up_summary.runtime_rank_count == 8
 
 
+def test_rejects_bumkc_engine_serving_hint_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["serving_hints"]["quantization"] = "fp8"
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(
+        BumkcArtifactError,
+        match="engine serving hint mismatch: quantization",
+    ):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_required_bumkc_engine_without_serving_hints(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    del engine["serving_hints"]
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="serving hints are missing"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_accepts_scale_up_schema_bumkc_engine_without_serving_hints(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["schema_version"] = bumkc_artifact.SCALE_UP_SCHEMA_VERSION
+    del engine["serving_hints"]
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    summary = load_bumkc_artifact(plan_dir)
+
+    assert summary.engine_schema_version == bumkc_artifact.SCALE_UP_SCHEMA_VERSION
+    assert summary.serving_hints.quantization == "modelopt_fp4"
+
+
 def test_accepts_legacy_bumkc_engine_without_quantization_summary(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     engine_path = plan_dir / "engine" / "optimization-playground.json"
@@ -1496,6 +1538,10 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "gated_norm": True,
                 "spinquant": True,
                 "ignored_module_count": 2,
+            },
+            "serving_hints": {
+                "quantization": "modelopt_fp4",
+                "moe_runner_backend": "flashinfer_trtllm",
             },
             "preserve_custom_optimizations": True,
             "required_validation_model": REQUIRED_VALIDATION_MODEL,

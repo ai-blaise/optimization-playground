@@ -22,10 +22,11 @@ validates:
   engine, simulation, and tensor smoke artifacts,
 - manifest `schema_version == "bumkc.plan.v1"`,
 - manifest `capability_level == "hvm_rooted_runtime_descriptor"`,
-- engine export `schema_version == "bumkc.optimization_playground.v22"`; the
+- engine export `schema_version == "bumkc.optimization_playground.v23"`; the
   loader can still read legacy `v20` artifacts by deriving the engine
   quantization summary from tensor islands and previous `v21` artifacts by
-  deriving the engine scale-up summary from the runtime descriptor,
+  deriving the engine scale-up summary from the runtime descriptor, while `v22`
+  artifacts derive serving hints from quantization metadata,
 - model-source export `schema_version == "bumkc.source.v11"`,
 - engine-exported manifest schema/capability fields matching `manifest.json`,
 - engine-exported source schema matching `source/model-source.json`,

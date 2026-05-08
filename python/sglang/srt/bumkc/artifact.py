@@ -19,7 +19,51 @@ REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
 REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v10"
-REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v9"
+REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v10"
+_CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
+_CONTRACT_HASH_PRIME = 0x00000100000001B3
+_U64_MASK = (1 << 64) - 1
+_DESCRIPTOR_CONTRACT_DOMAIN = "bumkc.cuda_smoke.descriptors.v1"
+_SOURCE_CONTRACT_DOMAIN = "bumkc.cuda_smoke.source.v1"
+_SOURCE_CONTRACT_KEYS = (
+    "expected_task_count",
+    "expected_conventional_launch_count",
+    "expected_persistent_launch_count",
+    "expected_launch_reduction_per_mille",
+    "expected_jit_task_count",
+    "expected_aot_task_count",
+    "expected_queue_capacity",
+    "expected_task_instance_capacity",
+    "expected_predecessor_event_count_sum",
+    "expected_dependency_edge_count",
+    "expected_dependency_scope_code_sum",
+    "expected_launch_domain_rank_sum",
+    "expected_launch_domain_element_sum",
+    "expected_operator_code_sum",
+    "expected_kv_cache_binding_count",
+    "expected_communication_task_count",
+    "expected_communication_group_size_sum",
+    "expected_communication_kind_code_sum",
+    "expected_side_effecting_task_count",
+    "expected_task_side_effect_count",
+    "expected_task_side_effect_code_sum",
+    "expected_serving_task_count",
+    "expected_serving_dependency_count",
+    "expected_serving_kind_code_sum",
+    "expected_serving_symbol_count",
+    "expected_substitution_shape_symbol_count",
+    "expected_substitution_serving_binding_count",
+    "expected_substitution_symbol_max_sum",
+    "expected_substitution_symbol_bucket_sum",
+    "expected_rank_group_size_sum",
+    "expected_rank_id_sum",
+    "expected_event_tensor_count",
+    "expected_event_predecessor_edge_count",
+    "expected_event_successor_edge_count",
+    "expected_event_notification_count",
+    "expected_event_execution_count",
+    "expected_event_simulation_violation_count",
+)
 _SIDE_EFFECT_CODES = {
     "kv_cache_read": 1,
     "kv_cache_write": 2,
@@ -43,6 +87,29 @@ _SCHEDULING_POLICY_CODES = {
     "static_aot": 0,
     "dynamic_jit": 1,
 }
+
+
+def _contract_hash_str(value: str) -> int:
+    return _mix_contract_str(_CONTRACT_HASH_OFFSET, value)
+
+
+def _mix_contract_str(hash_value: int, value: str) -> int:
+    hash_value = _mix_contract_u64(hash_value, len(value.encode("utf-8")))
+    for byte in value.encode("utf-8"):
+        hash_value = _mix_contract_byte(hash_value, byte)
+    return hash_value
+
+
+def _mix_contract_u64(hash_value: int, value: int) -> int:
+    if value < 0 or value > _U64_MASK:
+        raise BumkcArtifactError("BUMKC runtime smoke contract value is out of range")
+    for byte in value.to_bytes(8, byteorder="little", signed=False):
+        hash_value = _mix_contract_byte(hash_value, byte)
+    return hash_value
+
+
+def _mix_contract_byte(hash_value: int, byte: int) -> int:
+    return ((hash_value ^ byte) * _CONTRACT_HASH_PRIME) & _U64_MASK
 
 
 class BumkcArtifactError(ValueError):
@@ -815,6 +882,11 @@ def _validate_runtime_smoke_plan(
         runtime_smoke,
         task_descriptors,
     )
+    _validate_runtime_smoke_contracts(
+        runtime_smoke,
+        event_descriptors,
+        task_descriptors,
+    )
 
 
 def _validate_runtime_smoke_event_descriptors(
@@ -940,6 +1012,143 @@ def _validate_runtime_smoke_task_descriptors(
     for key, value in expected.items():
         if _read_int(runtime_smoke, key) != value:
             raise BumkcArtifactError(f"BUMKC runtime smoke descriptor mismatch: {key}")
+
+
+def _validate_runtime_smoke_contracts(
+    runtime_smoke: dict[str, Any],
+    event_descriptors: list[dict[str, Any]],
+    task_descriptors: list[dict[str, Any]],
+) -> None:
+    descriptor_hash = _runtime_smoke_descriptor_contract_hash(
+        event_descriptors,
+        task_descriptors,
+    )
+    expected = {
+        "expected_schema_hash": _contract_hash_str(
+            REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION
+        ),
+        "expected_runtime_abi_hash": _contract_hash_str(
+            _read_str(runtime_smoke, "runtime_abi_version")
+        ),
+        "expected_plan_id_hash": _contract_hash_str(
+            _read_str(runtime_smoke, "plan_id")
+        ),
+        "expected_program_id_hash": _contract_hash_str(
+            _read_str(runtime_smoke, "program_id")
+        ),
+        "expected_descriptor_contract_hash": descriptor_hash,
+        "expected_source_contract_hash": _runtime_smoke_source_contract_hash(
+            runtime_smoke,
+            descriptor_hash,
+        ),
+    }
+    for key, value in expected.items():
+        if _read_int(runtime_smoke, key) != value:
+            raise BumkcArtifactError(f"BUMKC runtime smoke contract mismatch: {key}")
+
+
+def _runtime_smoke_descriptor_contract_hash(
+    event_descriptors: list[dict[str, Any]],
+    task_descriptors: list[dict[str, Any]],
+) -> int:
+    hash_value = _mix_contract_str(_CONTRACT_HASH_OFFSET, _DESCRIPTOR_CONTRACT_DOMAIN)
+    hash_value = _mix_contract_u64(hash_value, len(event_descriptors))
+    hash_value = _mix_contract_u64(hash_value, len(task_descriptors))
+    for ordinal, event in enumerate(event_descriptors):
+        hash_value = _mix_contract_u64(hash_value, ordinal)
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(event, "predecessor_event_count"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(event, "successor_event_count"),
+        )
+    for ordinal, task in enumerate(task_descriptors):
+        operator = _read_str(task, "operator")
+        policy = _read_str(task, "scheduling_policy")
+        hash_value = _mix_contract_u64(hash_value, ordinal)
+        hash_value = _mix_contract_u64(hash_value, _OPERATOR_CODES[operator])
+        hash_value = _mix_contract_u64(hash_value, _SCHEDULING_POLICY_CODES[policy])
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "predecessor_event_count"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "dependency_edge_count"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "dependency_scope_code_sum"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "launch_domain_rank"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "launch_domain_elements"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "kv_cache_binding_count"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "communication_kind_code"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "communication_group_size"),
+        )
+        hash_value = _mix_contract_u64(hash_value, _read_int(task, "side_effect_count"))
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "side_effect_code_sum"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "serving_dependency_count"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "serving_kind_code_sum"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(task, "serving_symbol_count"),
+        )
+        hash_value = _mix_contract_u64(hash_value, _read_int(task, "rank_group_size"))
+        hash_value = _mix_contract_u64(hash_value, _read_int(task, "rank_id_sum"))
+    return hash_value
+
+
+def _runtime_smoke_source_contract_hash(
+    runtime_smoke: dict[str, Any],
+    descriptor_hash: int,
+) -> int:
+    hash_value = _mix_contract_str(_CONTRACT_HASH_OFFSET, _SOURCE_CONTRACT_DOMAIN)
+    hash_value = _mix_contract_u64(
+        hash_value,
+        _read_int(runtime_smoke, "expected_schema_hash"),
+    )
+    hash_value = _mix_contract_u64(
+        hash_value,
+        _read_int(runtime_smoke, "expected_runtime_abi_hash"),
+    )
+    hash_value = _mix_contract_u64(
+        hash_value,
+        _read_int(runtime_smoke, "expected_plan_id_hash"),
+    )
+    hash_value = _mix_contract_u64(
+        hash_value,
+        _read_int(runtime_smoke, "expected_program_id_hash"),
+    )
+    hash_value = _mix_contract_u64(hash_value, descriptor_hash)
+    for key in _SOURCE_CONTRACT_KEYS:
+        hash_value = _mix_contract_u64(hash_value, _read_int(runtime_smoke, key))
+    return hash_value
 
 
 def _load_shape_symbol_bindings(

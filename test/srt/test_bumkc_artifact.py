@@ -244,6 +244,18 @@ def test_rejects_bumkc_runtime_smoke_descriptor_mismatch(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_runtime_smoke_contract_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    smoke_path = plan_dir / "generated" / "runtime-smoke.json"
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["expected_source_contract_hash"] += 1
+    smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="runtime smoke contract mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_unknown_bumkc_tensor_island_coverage(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     island_path = plan_dir / "ir" / "hvm-tensor-islands.json"
@@ -315,6 +327,7 @@ def test_rejects_bumkc_runtime_launch_bucket_mismatch(tmp_path):
     smoke_path = plan_dir / "generated" / "runtime-smoke.json"
     smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
     smoke["expected_substitution_symbol_max_sum"] = 4097
+    populate_runtime_smoke_contracts(smoke)
     smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
     refresh_bumkc_digests(plan_dir)
     summary = load_bumkc_artifact(plan_dir)
@@ -624,114 +637,113 @@ def write_bumkc_artifact(tmp_path, *, executable):
             },
         },
     )
-    write_json(
-        plan_dir / "generated" / "runtime-smoke.json",
-        {
-            "schema_version": "bumkc.cuda_smoke.v9",
-            "plan_id": plan_id,
-            "program_id": program_id,
-            "runtime_abi_version": "bumkc.runtime.v0",
-            "source_path": "generated/runtime_smoke.cu",
-            "binary_name": "runtime_smoke",
-            "expected_task_count": 2,
-            "expected_conventional_launch_count": 2,
-            "expected_persistent_launch_count": 1,
-            "expected_launch_reduction_per_mille": 2000,
-            "expected_jit_task_count": 0,
-            "expected_aot_task_count": 2,
-            "expected_queue_capacity": 64,
-            "expected_task_instance_capacity": 2,
-            "expected_predecessor_event_count_sum": 1,
-            "expected_dependency_edge_count": 1,
-            "expected_dependency_scope_code_sum": 1,
-            "expected_launch_domain_rank_sum": 4,
-            "expected_launch_domain_element_sum": 2,
-            "expected_operator_code_sum": 10,
-            "expected_kv_cache_binding_count": 1,
-            "expected_communication_task_count": 1,
-            "expected_communication_group_size_sum": 8,
-            "expected_communication_kind_code_sum": 1,
-            "expected_side_effecting_task_count": 1,
-            "expected_task_side_effect_count": 1,
-            "expected_task_side_effect_code_sum": 3,
-            "expected_serving_task_count": 1,
-            "expected_serving_dependency_count": 2,
-            "expected_serving_kind_code_sum": 5,
-            "expected_serving_symbol_count": 1,
-            "expected_substitution_shape_symbol_count": 1,
-            "expected_substitution_serving_binding_count": 2,
-            "expected_substitution_symbol_max_sum": 4096,
-            "expected_substitution_symbol_bucket_sum": 16,
-            "expected_rank_group_size_sum": 16,
-            "expected_rank_id_sum": 56,
-            "expected_event_tensor_count": 2,
-            "expected_event_predecessor_edge_count": 1,
-            "expected_event_successor_edge_count": 1,
-            "expected_event_notification_count": 1,
-            "expected_event_execution_count": 2,
-            "expected_event_simulation_violation_count": 0,
-            "event_descriptors": [
-                {
-                    "ordinal": 0,
-                    "event_id": "event_first",
-                    "predecessor_event_count": 0,
-                    "successor_event_count": 1,
-                },
-                {
-                    "ordinal": 1,
-                    "event_id": "event_second",
-                    "predecessor_event_count": 1,
-                    "successor_event_count": 0,
-                },
-            ],
-            "task_descriptors": [
-                {
-                    "ordinal": 0,
-                    "task_id": "task_first",
-                    "source_event_tensor": "event_first",
-                    "operator": "matmul",
-                    "scheduling_policy": "static_aot",
-                    "predecessor_event_count": 0,
-                    "dependency_edge_count": 0,
-                    "dependency_scope_code_sum": 0,
-                    "launch_domain_rank": 2,
-                    "launch_domain_elements": 1,
-                    "kv_cache_binding_count": 0,
-                    "communication_kind_code": 0,
-                    "communication_group_size": 0,
-                    "side_effect_count": 0,
-                    "side_effect_code_sum": 0,
-                    "serving_dependency_count": 0,
-                    "serving_kind_code_sum": 0,
-                    "serving_symbol_count": 0,
-                    "rank_group_size": 8,
-                    "rank_id_sum": 28,
-                },
-                {
-                    "ordinal": 1,
-                    "task_id": "task_second",
-                    "source_event_tensor": "event_second",
-                    "operator": "collective",
-                    "scheduling_policy": "static_aot",
-                    "predecessor_event_count": 1,
-                    "dependency_edge_count": 1,
-                    "dependency_scope_code_sum": 1,
-                    "launch_domain_rank": 2,
-                    "launch_domain_elements": 1,
-                    "kv_cache_binding_count": 1,
-                    "communication_kind_code": 1,
-                    "communication_group_size": 8,
-                    "side_effect_count": 1,
-                    "side_effect_code_sum": 3,
-                    "serving_dependency_count": 2,
-                    "serving_kind_code_sum": 5,
-                    "serving_symbol_count": 1,
-                    "rank_group_size": 8,
-                    "rank_id_sum": 28,
-                },
-            ],
-        },
-    )
+    runtime_smoke = {
+        "schema_version": "bumkc.cuda_smoke.v10",
+        "plan_id": plan_id,
+        "program_id": program_id,
+        "runtime_abi_version": "bumkc.runtime.v0",
+        "source_path": "generated/runtime_smoke.cu",
+        "binary_name": "runtime_smoke",
+        "expected_task_count": 2,
+        "expected_conventional_launch_count": 2,
+        "expected_persistent_launch_count": 1,
+        "expected_launch_reduction_per_mille": 2000,
+        "expected_jit_task_count": 0,
+        "expected_aot_task_count": 2,
+        "expected_queue_capacity": 64,
+        "expected_task_instance_capacity": 2,
+        "expected_predecessor_event_count_sum": 1,
+        "expected_dependency_edge_count": 1,
+        "expected_dependency_scope_code_sum": 1,
+        "expected_launch_domain_rank_sum": 4,
+        "expected_launch_domain_element_sum": 2,
+        "expected_operator_code_sum": 10,
+        "expected_kv_cache_binding_count": 1,
+        "expected_communication_task_count": 1,
+        "expected_communication_group_size_sum": 8,
+        "expected_communication_kind_code_sum": 1,
+        "expected_side_effecting_task_count": 1,
+        "expected_task_side_effect_count": 1,
+        "expected_task_side_effect_code_sum": 3,
+        "expected_serving_task_count": 1,
+        "expected_serving_dependency_count": 2,
+        "expected_serving_kind_code_sum": 5,
+        "expected_serving_symbol_count": 1,
+        "expected_substitution_shape_symbol_count": 1,
+        "expected_substitution_serving_binding_count": 2,
+        "expected_substitution_symbol_max_sum": 4096,
+        "expected_substitution_symbol_bucket_sum": 16,
+        "expected_rank_group_size_sum": 16,
+        "expected_rank_id_sum": 56,
+        "expected_event_tensor_count": 2,
+        "expected_event_predecessor_edge_count": 1,
+        "expected_event_successor_edge_count": 1,
+        "expected_event_notification_count": 1,
+        "expected_event_execution_count": 2,
+        "expected_event_simulation_violation_count": 0,
+        "event_descriptors": [
+            {
+                "ordinal": 0,
+                "event_id": "event_first",
+                "predecessor_event_count": 0,
+                "successor_event_count": 1,
+            },
+            {
+                "ordinal": 1,
+                "event_id": "event_second",
+                "predecessor_event_count": 1,
+                "successor_event_count": 0,
+            },
+        ],
+        "task_descriptors": [
+            {
+                "ordinal": 0,
+                "task_id": "task_first",
+                "source_event_tensor": "event_first",
+                "operator": "matmul",
+                "scheduling_policy": "static_aot",
+                "predecessor_event_count": 0,
+                "dependency_edge_count": 0,
+                "dependency_scope_code_sum": 0,
+                "launch_domain_rank": 2,
+                "launch_domain_elements": 1,
+                "kv_cache_binding_count": 0,
+                "communication_kind_code": 0,
+                "communication_group_size": 0,
+                "side_effect_count": 0,
+                "side_effect_code_sum": 0,
+                "serving_dependency_count": 0,
+                "serving_kind_code_sum": 0,
+                "serving_symbol_count": 0,
+                "rank_group_size": 8,
+                "rank_id_sum": 28,
+            },
+            {
+                "ordinal": 1,
+                "task_id": "task_second",
+                "source_event_tensor": "event_second",
+                "operator": "collective",
+                "scheduling_policy": "static_aot",
+                "predecessor_event_count": 1,
+                "dependency_edge_count": 1,
+                "dependency_scope_code_sum": 1,
+                "launch_domain_rank": 2,
+                "launch_domain_elements": 1,
+                "kv_cache_binding_count": 1,
+                "communication_kind_code": 1,
+                "communication_group_size": 8,
+                "side_effect_count": 1,
+                "side_effect_code_sum": 3,
+                "serving_dependency_count": 2,
+                "serving_kind_code_sum": 5,
+                "serving_symbol_count": 1,
+                "rank_group_size": 8,
+                "rank_id_sum": 28,
+            },
+        ],
+    }
+    populate_runtime_smoke_contracts(runtime_smoke)
+    write_json(plan_dir / "generated" / "runtime-smoke.json", runtime_smoke)
     write_text(
         plan_dir / "generated" / "runtime_smoke.cu",
         "int main() { return 0; }\n",
@@ -755,6 +767,32 @@ def write_text(path, value):
 
 def write_json(path, value):
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def populate_runtime_smoke_contracts(smoke):
+    descriptor_hash = bumkc_artifact._runtime_smoke_descriptor_contract_hash(
+        smoke["event_descriptors"],
+        smoke["task_descriptors"],
+    )
+    smoke["expected_schema_hash"] = bumkc_artifact._contract_hash_str(
+        smoke["schema_version"]
+    )
+    smoke["expected_runtime_abi_hash"] = bumkc_artifact._contract_hash_str(
+        smoke["runtime_abi_version"]
+    )
+    smoke["expected_plan_id_hash"] = bumkc_artifact._contract_hash_str(
+        smoke["plan_id"]
+    )
+    smoke["expected_program_id_hash"] = bumkc_artifact._contract_hash_str(
+        smoke["program_id"]
+    )
+    smoke["expected_descriptor_contract_hash"] = descriptor_hash
+    smoke["expected_source_contract_hash"] = (
+        bumkc_artifact._runtime_smoke_source_contract_hash(
+            smoke,
+            descriptor_hash,
+        )
+    )
 
 
 def refresh_bumkc_digests(plan_dir):

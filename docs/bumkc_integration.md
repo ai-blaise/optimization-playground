@@ -45,7 +45,8 @@ validates:
   summary, runtime ABI, expected source path, expected binary name, task
   descriptors, and Event Tensor descriptors, including descriptor-row
   aggregate recomputation for task, dependency, launch-domain, side-effect,
-  serving-state, communication, and rank-topology fields,
+  serving-state, communication, and rank-topology fields plus schema, runtime
+  ABI, plan, program, descriptor-table, and source contract hashes,
 - and the required REAP validation model contract.
 
 Before invoking any BUMKC runtime entrypoint, the serving path must call

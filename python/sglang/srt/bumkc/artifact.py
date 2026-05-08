@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 ARTIFACT_DIGEST_PATH = Path("reports/artifact-digests.json")
 REQUIRED_DIGEST_SCHEMA_VERSION = "bumkc.artifact_digests.v0"
 REQUIRED_CLI_FLAGS = (
@@ -20,10 +19,10 @@ REQUIRED_VALIDATION_MODEL = (
 )
 REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
 REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v17"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v18"
 REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v8"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
-REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v11"
+REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v12"
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
 _CONTRACT_HASH_PRIME = 0x00000100000001B3
 _U64_MASK = (1 << 64) - 1
@@ -68,6 +67,13 @@ _SOURCE_CONTRACT_KEYS = (
     "expected_event_notification_count",
     "expected_event_execution_count",
     "expected_event_simulation_violation_count",
+    "expected_diagnostic_heartbeat_slot_count",
+    "expected_diagnostic_queue_snapshot_slot_count",
+    "expected_diagnostic_event_counter_snapshot_count",
+    "expected_diagnostic_last_completed_task_slot_count",
+    "expected_diagnostic_blocked_event_slot_count",
+    "expected_watchdog_poll_interval_us",
+    "expected_watchdog_timeout_us",
 )
 _SIDE_EFFECT_CODES = {
     "kv_cache_read": 1,
@@ -283,6 +289,13 @@ class BumkcRuntimeSummary:
     substitution_serving_binding_count: int
     substitution_symbol_max_sum: int
     substitution_symbol_bucket_sum: int
+    diagnostic_heartbeat_slot_count: int
+    diagnostic_queue_snapshot_slot_count: int
+    diagnostic_event_counter_snapshot_count: int
+    diagnostic_last_completed_task_slot_count: int
+    diagnostic_blocked_event_slot_count: int
+    watchdog_poll_interval_us: int
+    watchdog_timeout_us: int
 
     def as_log_dict(self) -> dict[str, int]:
         return {
@@ -322,6 +335,21 @@ class BumkcRuntimeSummary:
             ),
             "substitution_symbol_max_sum": self.substitution_symbol_max_sum,
             "substitution_symbol_bucket_sum": self.substitution_symbol_bucket_sum,
+            "diagnostic_heartbeat_slot_count": (self.diagnostic_heartbeat_slot_count),
+            "diagnostic_queue_snapshot_slot_count": (
+                self.diagnostic_queue_snapshot_slot_count
+            ),
+            "diagnostic_event_counter_snapshot_count": (
+                self.diagnostic_event_counter_snapshot_count
+            ),
+            "diagnostic_last_completed_task_slot_count": (
+                self.diagnostic_last_completed_task_slot_count
+            ),
+            "diagnostic_blocked_event_slot_count": (
+                self.diagnostic_blocked_event_slot_count
+            ),
+            "watchdog_poll_interval_us": self.watchdog_poll_interval_us,
+            "watchdog_timeout_us": self.watchdog_timeout_us,
         }
 
 
@@ -829,6 +857,7 @@ def _load_runtime_summary(
     if not isinstance(summary, dict):
         raise BumkcArtifactError("BUMKC engine runtime summary is missing")
 
+    target_plan = _read_object(runtime, "target_plan")
     execution_model = _read_object(runtime, "execution_model")
     queue_plan = _read_object(runtime, "queue_plan")
     memory_plan = _read_object(runtime, "memory_plan")
@@ -840,6 +869,34 @@ def _load_runtime_summary(
     substitution_shape_symbols = _read_list(substitution_plan, "shape_symbols")
     substitution_serving_state = _read_list(substitution_plan, "serving_state")
     dependency_plan = _read_object(runtime, "dependency_plan")
+    diagnostics_plan = _read_object(runtime, "diagnostics_plan")
+    worker_count = _read_int(target_plan, "worker_count")
+    scheduler_count = _read_int(target_plan, "scheduler_count")
+    if _read_int(diagnostics_plan, "heartbeat_slot_count") != (
+        worker_count + scheduler_count
+    ):
+        raise BumkcArtifactError("BUMKC runtime diagnostic heartbeat count mismatch")
+    if _read_int(diagnostics_plan, "worker_heartbeat_slot_count") != worker_count:
+        raise BumkcArtifactError("BUMKC runtime worker heartbeat count mismatch")
+    if _read_int(diagnostics_plan, "scheduler_heartbeat_slot_count") != scheduler_count:
+        raise BumkcArtifactError("BUMKC runtime scheduler heartbeat count mismatch")
+    if _read_int(diagnostics_plan, "queue_snapshot_slot_count") != (
+        _read_int(queue_plan, "worker_queue_count")
+        + _read_int(queue_plan, "scheduler_queue_count")
+    ):
+        raise BumkcArtifactError("BUMKC runtime queue snapshot count mismatch")
+    if _read_int(diagnostics_plan, "event_counter_snapshot_count") != _read_int(
+        queue_plan, "event_counter_count"
+    ):
+        raise BumkcArtifactError("BUMKC runtime event counter snapshot count mismatch")
+    if _read_int(diagnostics_plan, "last_completed_task_slot_count") != worker_count:
+        raise BumkcArtifactError("BUMKC runtime last-completed task count mismatch")
+    if _read_int(diagnostics_plan, "blocked_event_slot_count") != scheduler_count:
+        raise BumkcArtifactError("BUMKC runtime blocked-event count mismatch")
+    if _read_int(diagnostics_plan, "watchdog_timeout_us") <= _read_int(
+        diagnostics_plan, "watchdog_poll_interval_us"
+    ):
+        raise BumkcArtifactError("BUMKC runtime watchdog timing is invalid")
     dependency_descriptors = _read_list(dependency_plan, "dependency_descriptors")
     dependency_descriptor_hash = _dependency_descriptor_hash(dependency_descriptors)
     if _read_int(dependency_plan, "dependency_descriptor_count") != len(
@@ -902,6 +959,21 @@ def _load_runtime_summary(
         "substitution_symbol_bucket_sum": sum(
             _read_int(symbol, "bucket") for symbol in substitution_shape_symbols
         ),
+        "diagnostic_heartbeat_slot_count": diagnostics_plan.get("heartbeat_slot_count"),
+        "diagnostic_queue_snapshot_slot_count": diagnostics_plan.get(
+            "queue_snapshot_slot_count"
+        ),
+        "diagnostic_event_counter_snapshot_count": diagnostics_plan.get(
+            "event_counter_snapshot_count"
+        ),
+        "diagnostic_last_completed_task_slot_count": diagnostics_plan.get(
+            "last_completed_task_slot_count"
+        ),
+        "diagnostic_blocked_event_slot_count": diagnostics_plan.get(
+            "blocked_event_slot_count"
+        ),
+        "watchdog_poll_interval_us": diagnostics_plan.get("watchdog_poll_interval_us"),
+        "watchdog_timeout_us": diagnostics_plan.get("watchdog_timeout_us"),
     }
     for key, value in expected.items():
         if value is None or _read_summary_int(summary, key) != value:
@@ -1087,6 +1159,25 @@ def _validate_runtime_smoke_plan(
         "expected_event_simulation_violation_count": (
             compiler_summary.event_simulation_violation_count
         ),
+        "expected_diagnostic_heartbeat_slot_count": (
+            runtime_summary.diagnostic_heartbeat_slot_count
+        ),
+        "expected_diagnostic_queue_snapshot_slot_count": (
+            runtime_summary.diagnostic_queue_snapshot_slot_count
+        ),
+        "expected_diagnostic_event_counter_snapshot_count": (
+            runtime_summary.diagnostic_event_counter_snapshot_count
+        ),
+        "expected_diagnostic_last_completed_task_slot_count": (
+            runtime_summary.diagnostic_last_completed_task_slot_count
+        ),
+        "expected_diagnostic_blocked_event_slot_count": (
+            runtime_summary.diagnostic_blocked_event_slot_count
+        ),
+        "expected_watchdog_poll_interval_us": (
+            runtime_summary.watchdog_poll_interval_us
+        ),
+        "expected_watchdog_timeout_us": runtime_summary.watchdog_timeout_us,
     }
     for key, value in expected.items():
         if _read_int(runtime_smoke, key) != value:

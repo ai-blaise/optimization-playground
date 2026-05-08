@@ -90,6 +90,13 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.runtime_summary.substitution_serving_binding_count == 2
     assert summary.runtime_summary.substitution_symbol_max_sum == 4096
     assert summary.runtime_summary.substitution_symbol_bucket_sum == 16
+    assert summary.runtime_summary.diagnostic_heartbeat_slot_count == 72
+    assert summary.runtime_summary.diagnostic_queue_snapshot_slot_count == 72
+    assert summary.runtime_summary.diagnostic_event_counter_snapshot_count == 2
+    assert summary.runtime_summary.diagnostic_last_completed_task_slot_count == 64
+    assert summary.runtime_summary.diagnostic_blocked_event_slot_count == 8
+    assert summary.runtime_summary.watchdog_poll_interval_us == 1000
+    assert summary.runtime_summary.watchdog_timeout_us == 30_000_000
     assert summary.runtime_shape_symbols[0].symbol == "sequence"
     assert summary.runtime_serving_state[0].key() == ("sequence", "sequence")
     assert summary.target_arch == "sm90"
@@ -110,6 +117,8 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert log_dict["model_source_frontend"] == "internal_test"
     assert log_dict["hvm_capture_status"] == "native_eligible"
     assert log_dict["engine_schema_version"] == REQUIRED_SCHEMA_VERSION
+    assert log_dict["runtime_summary"]["diagnostic_heartbeat_slot_count"] == 72
+    assert log_dict["runtime_summary"]["watchdog_timeout_us"] == 30_000_000
 
     launch_plan = summary.validate_runtime_launch(
         shape_symbols={"sequence": 17},
@@ -268,6 +277,18 @@ def test_rejects_bumkc_runtime_summary_mismatch(tmp_path):
     refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="runtime summary mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_runtime_diagnostic_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["diagnostics_plan"]["heartbeat_slot_count"] = 1
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="diagnostic heartbeat"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -761,16 +782,25 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 else []
             ),
             "task_count": 2,
+            "target_plan": {
+                "gpu_count": 8,
+                "target_arch": "sm90",
+                "worker_count": 64,
+                "scheduler_count": 8,
+            },
             "execution_model": {
                 "conventional_launch_count": 2,
                 "persistent_launch_count": 1,
                 "launch_reduction_per_mille": 2000,
             },
             "queue_plan": {
+                "worker_queue_count": 64,
+                "scheduler_queue_count": 8,
                 "jit_task_count": 0,
                 "aot_task_count": 2,
                 "queue_capacity": 64,
                 "task_instance_capacity": 2,
+                "event_counter_count": 2,
             },
             "memory_plan": {
                 "device_global_binding_count": 4,
@@ -829,6 +859,17 @@ def write_bumkc_artifact(tmp_path, *, executable):
                         "required": True,
                     },
                 ],
+            },
+            "diagnostics_plan": {
+                "heartbeat_slot_count": 72,
+                "worker_heartbeat_slot_count": 64,
+                "scheduler_heartbeat_slot_count": 8,
+                "queue_snapshot_slot_count": 72,
+                "event_counter_snapshot_count": 2,
+                "last_completed_task_slot_count": 64,
+                "blocked_event_slot_count": 8,
+                "watchdog_poll_interval_us": 1000,
+                "watchdog_timeout_us": 30_000_000,
             },
         },
     )
@@ -915,6 +956,13 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "substitution_serving_binding_count": 2,
                 "substitution_symbol_max_sum": 4096,
                 "substitution_symbol_bucket_sum": 16,
+                "diagnostic_heartbeat_slot_count": 72,
+                "diagnostic_queue_snapshot_slot_count": 72,
+                "diagnostic_event_counter_snapshot_count": 2,
+                "diagnostic_last_completed_task_slot_count": 64,
+                "diagnostic_blocked_event_slot_count": 8,
+                "watchdog_poll_interval_us": 1000,
+                "watchdog_timeout_us": 30_000_000,
             },
             "preserve_custom_optimizations": True,
             "required_validation_model": REQUIRED_VALIDATION_MODEL,
@@ -982,6 +1030,13 @@ def write_bumkc_artifact(tmp_path, *, executable):
         "expected_event_notification_count": 1,
         "expected_event_execution_count": 2,
         "expected_event_simulation_violation_count": 0,
+        "expected_diagnostic_heartbeat_slot_count": 72,
+        "expected_diagnostic_queue_snapshot_slot_count": 72,
+        "expected_diagnostic_event_counter_snapshot_count": 2,
+        "expected_diagnostic_last_completed_task_slot_count": 64,
+        "expected_diagnostic_blocked_event_slot_count": 8,
+        "expected_watchdog_poll_interval_us": 1000,
+        "expected_watchdog_timeout_us": 30_000_000,
         "event_descriptors": [
             {
                 "ordinal": 0,

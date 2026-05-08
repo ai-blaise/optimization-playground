@@ -22,12 +22,12 @@ validates:
   engine, simulation, and tensor smoke artifacts,
 - manifest `schema_version == "bumkc.plan.v1"`,
 - manifest `capability_level == "hvm_rooted_runtime_descriptor"`,
-- engine export `schema_version == "bumkc.optimization_playground.v17"`,
+- engine export `schema_version == "bumkc.optimization_playground.v18"`,
 - model-source export `schema_version == "bumkc.source.v8"`,
 - engine-exported manifest schema/capability fields matching `manifest.json`,
 - engine-exported source schema matching `source/model-source.json`,
 - `runtime_abi_version == "bumkc.runtime.v1"`,
-- runtime smoke schema `bumkc.cuda_smoke.v11`,
+- runtime smoke schema `bumkc.cuda_smoke.v12`,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
 - exported serving CLI flags,
@@ -53,14 +53,14 @@ validates:
   communication-plan collective counts, side-effect counts and code sums,
   serving-state dependency counts, dependency tensor count, dependency
   descriptor count/hash including dependency tensor IDs, and runtime
-  substitution bounds,
+  substitution bounds, diagnostic slots, and watchdog timing,
 - generated CUDA runtime-smoke metadata against the runtime summary, compiler
   summary, runtime ABI, expected source path, expected binary name, task
   descriptors, and Event Tensor descriptors, including descriptor-row
   aggregate recomputation for task, dependency, dependency tensor,
   launch-domain, side-effect, serving-state, communication, and rank-topology
-  fields plus schema, runtime ABI, plan, program, descriptor-table, and source
-  contract hashes,
+  fields, runtime diagnostic fields, schema, runtime ABI, plan, program,
+  descriptor-table, and source contract hashes,
 - and the required REAP validation model contract.
 
 Before invoking any BUMKC runtime entrypoint, the serving path must call
@@ -73,8 +73,8 @@ the artifact.
 
 `BumkcArtifactSummary.as_log_dict()` includes the accepted manifest schema,
 capability level, source schema, model-source frontend, HVM capture status, and
-engine schema so startup logs can audit the exact BUMKC contract that was
-loaded.
+engine schema, plus runtime diagnostic and watchdog summary fields, so startup
+logs can audit the exact BUMKC contract that was loaded.
 
 Add `--bumkc-require-executable` when startup must fail unless the runtime
 descriptor is executable. Without that flag, non-executable BUMKC artifacts are

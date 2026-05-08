@@ -97,6 +97,29 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.runtime_summary.diagnostic_blocked_event_slot_count == 8
     assert summary.runtime_summary.watchdog_poll_interval_us == 1000
     assert summary.runtime_summary.watchdog_timeout_us == 30_000_000
+    assert summary.quantization_summary.scheme == "W4A4KV4+IndexerK8"
+    assert summary.quantization_summary.scheme_hash != 0
+    assert summary.quantization_summary.weight_format == "nv_fp4"
+    assert summary.quantization_summary.weight_format_code == 1
+    assert summary.quantization_summary.weight_bits == 4
+    assert summary.quantization_summary.weight_scale_layout == "tensor_group"
+    assert summary.quantization_summary.weight_scale_layout_code == 2
+    assert summary.quantization_summary.weight_group_size == 16
+    assert summary.quantization_summary.weight_scale_dtype == "fp8_e4m3"
+    assert summary.quantization_summary.weight_scale_dtype_code == 7
+    assert summary.quantization_summary.weight_symmetric is True
+    assert summary.quantization_summary.weight_symmetric_code == 1
+    assert not summary.quantization_summary.weight_zero_point
+    assert summary.quantization_summary.activation_bits == 4
+    assert summary.quantization_summary.kv_bits == 4
+    assert summary.quantization_summary.kv_format == "nv_fp4"
+    assert summary.quantization_summary.kv_format_code == 1
+    assert summary.quantization_summary.indexer_k_bits == 8
+    assert summary.quantization_summary.indexer_k_format == "fp8_e4m3"
+    assert summary.quantization_summary.indexer_k_format_code == 2
+    assert summary.quantization_summary.gated_norm is True
+    assert summary.quantization_summary.spinquant is True
+    assert summary.quantization_summary.ignored_module_count == 2
     assert summary.runtime_shape_symbols[0].symbol == "sequence"
     assert summary.runtime_serving_state[0].key() == ("sequence", "sequence")
     assert summary.target_arch == "sm90"
@@ -119,6 +142,8 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert log_dict["engine_schema_version"] == REQUIRED_SCHEMA_VERSION
     assert log_dict["runtime_summary"]["diagnostic_heartbeat_slot_count"] == 72
     assert log_dict["runtime_summary"]["watchdog_timeout_us"] == 30_000_000
+    assert log_dict["quantization_summary"]["indexer_k_bits"] == 8
+    assert log_dict["quantization_summary"]["gated_norm"]
 
     launch_plan = summary.validate_runtime_launch(
         shape_symbols={"sequence": 17},
@@ -448,6 +473,36 @@ def test_rejects_bumkc_quantization_summary_mismatch(tmp_path):
 
     with pytest.raises(BumkcArtifactError, match="quantization_indexer_k_bits"):
         load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_engine_quantization_summary_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["quantization_summary"]["indexer_k_bits"] = 4
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(
+        BumkcArtifactError,
+        match="engine quantization summary mismatch: indexer_k_bits",
+    ):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_accepts_legacy_bumkc_engine_without_quantization_summary(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["schema_version"] = bumkc_artifact.LEGACY_SCHEMA_VERSION
+    del engine["quantization_summary"]
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    summary = load_bumkc_artifact(plan_dir)
+
+    assert summary.engine_schema_version == bumkc_artifact.LEGACY_SCHEMA_VERSION
+    assert summary.quantization_summary.indexer_k_bits == 8
 
 
 def test_rejects_bumkc_compiler_summary_non_integer(tmp_path):
@@ -1216,6 +1271,31 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "diagnostic_blocked_event_slot_count": 8,
                 "watchdog_poll_interval_us": 1000,
                 "watchdog_timeout_us": 30_000_000,
+            },
+            "quantization_summary": {
+                "scheme": "W4A4KV4+IndexerK8",
+                "scheme_hash": quantization_scheme_hash,
+                "weight_format": "nv_fp4",
+                "weight_format_code": 1,
+                "weight_bits": 4,
+                "weight_scale_layout": "tensor_group",
+                "weight_scale_layout_code": 2,
+                "weight_group_size": 16,
+                "weight_scale_dtype": "fp8_e4m3",
+                "weight_scale_dtype_code": 7,
+                "weight_symmetric": True,
+                "weight_symmetric_code": 1,
+                "weight_zero_point": False,
+                "activation_bits": 4,
+                "kv_bits": 4,
+                "kv_format": "nv_fp4",
+                "kv_format_code": 1,
+                "indexer_k_bits": 8,
+                "indexer_k_format": "fp8_e4m3",
+                "indexer_k_format_code": 2,
+                "gated_norm": True,
+                "spinquant": True,
+                "ignored_module_count": 2,
             },
             "preserve_custom_optimizations": True,
             "required_validation_model": REQUIRED_VALIDATION_MODEL,

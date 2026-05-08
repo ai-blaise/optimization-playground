@@ -19,7 +19,9 @@ REQUIRED_VALIDATION_MODEL = (
 )
 REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
 REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v20"
+LEGACY_SCHEMA_VERSION = "bumkc.optimization_playground.v20"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v21"
+SUPPORTED_SCHEMA_VERSIONS = (LEGACY_SCHEMA_VERSION, REQUIRED_SCHEMA_VERSION)
 REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v11"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v13"
@@ -397,6 +399,36 @@ class BumkcRuntimeSummary:
 
 
 @dataclasses.dataclass(frozen=True)
+class BumkcQuantizationSummary:
+    scheme: str | None
+    scheme_hash: int
+    weight_format: str | None
+    weight_format_code: int
+    weight_bits: int | None
+    weight_scale_layout: str | None
+    weight_scale_layout_code: int
+    weight_group_size: int | None
+    weight_scale_dtype: str | None
+    weight_scale_dtype_code: int
+    weight_symmetric: bool | None
+    weight_symmetric_code: int
+    weight_zero_point: bool
+    activation_bits: int | None
+    kv_bits: int | None
+    kv_format: str | None
+    kv_format_code: int
+    indexer_k_bits: int | None
+    indexer_k_format: str | None
+    indexer_k_format_code: int
+    gated_norm: bool
+    spinquant: bool
+    ignored_module_count: int
+
+    def as_log_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
 class BumkcArtifactSummary:
     root: Path
     plan_id: str
@@ -415,6 +447,7 @@ class BumkcArtifactSummary:
     runtime_entrypoints: tuple[str, ...]
     compiler_summary: BumkcCompilerSummary
     runtime_summary: BumkcRuntimeSummary
+    quantization_summary: BumkcQuantizationSummary
     runtime_shape_symbols: tuple[BumkcRuntimeShapeSymbolBinding, ...]
     runtime_serving_state: tuple[BumkcRuntimeServingStateBinding, ...]
     task_count: int
@@ -524,6 +557,7 @@ class BumkcArtifactSummary:
             "runtime_entrypoints": list(self.runtime_entrypoints),
             "compiler_summary": self.compiler_summary.as_log_dict(),
             "runtime_summary": self.runtime_summary.as_log_dict(),
+            "quantization_summary": self.quantization_summary.as_log_dict(),
             "runtime_shape_symbols": [
                 dataclasses.asdict(binding) for binding in self.runtime_shape_symbols
             ],
@@ -570,7 +604,7 @@ def load_bumkc_artifact(
         raise BumkcArtifactError("BUMKC artifact uses an unsupported plan schema")
     if manifest.get("capability_level") != REQUIRED_CAPABILITY_LEVEL:
         raise BumkcArtifactError("BUMKC artifact capability is unsupported")
-    if engine.get("schema_version") != REQUIRED_SCHEMA_VERSION:
+    if engine.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
         raise BumkcArtifactError("BUMKC artifact uses an unsupported engine schema")
     if engine.get("manifest_schema_version") != manifest.get("schema_version"):
         raise BumkcArtifactError("BUMKC engine manifest schema does not match manifest")
@@ -617,6 +651,7 @@ def load_bumkc_artifact(
     _validate_source_artifact(
         model_source, manifest, engine, hvm_core_book, tensor_islands
     )
+    quantization_summary = _load_quantization_summary(engine, tensor_islands)
     if engine.get("runtime_executable") != runtime.get("executable"):
         raise BumkcArtifactError("BUMKC engine and runtime executable flags disagree")
     if runtime.get("runtime_abi_version") != REQUIRED_RUNTIME_ABI_VERSION:
@@ -665,6 +700,7 @@ def load_bumkc_artifact(
         runtime_entrypoints=entrypoints,
         compiler_summary=compiler_summary,
         runtime_summary=runtime_summary,
+        quantization_summary=quantization_summary,
         runtime_shape_symbols=runtime_shape_symbols,
         runtime_serving_state=runtime_serving_state,
         task_count=runtime_summary.task_count,
@@ -965,6 +1001,102 @@ def _validate_source_artifact(
             "BUMKC model source summary mismatch: "
             "quantization_weight_zero_point_enabled"
         )
+
+
+def _load_quantization_summary(
+    engine: dict[str, Any],
+    tensor_islands: dict[str, Any],
+) -> BumkcQuantizationSummary:
+    expected = _expected_quantization_summary(
+        _read_object(tensor_islands, "quantization")
+    )
+    summary_record = _read_optional_object(engine, "quantization_summary")
+    if engine.get("schema_version") == REQUIRED_SCHEMA_VERSION:
+        if summary_record is None:
+            raise BumkcArtifactError("BUMKC engine quantization summary is missing")
+        summary = _read_quantization_summary(summary_record)
+        _validate_quantization_summary(summary, expected)
+        return summary
+    if summary_record is not None:
+        summary = _read_quantization_summary(summary_record)
+        _validate_quantization_summary(summary, expected)
+    return expected
+
+
+def _validate_quantization_summary(
+    summary: BumkcQuantizationSummary,
+    expected: BumkcQuantizationSummary,
+) -> None:
+    for field in dataclasses.fields(BumkcQuantizationSummary):
+        name = field.name
+        if getattr(summary, name) != getattr(expected, name):
+            raise BumkcArtifactError(
+                f"BUMKC engine quantization summary mismatch: {name}"
+            )
+
+
+def _expected_quantization_summary(
+    quantization: dict[str, Any],
+) -> BumkcQuantizationSummary:
+    return BumkcQuantizationSummary(
+        scheme=_read_optional_str(quantization, "scheme"),
+        scheme_hash=_stable_name_hash(_read_optional_str(quantization, "scheme")),
+        weight_format=_read_optional_str(quantization, "weight_format"),
+        weight_format_code=_quantization_format_code(quantization, "weight_format"),
+        weight_bits=_read_nullable_int(quantization, "weight_bits"),
+        weight_scale_layout=_read_optional_str(quantization, "weight_scale_layout"),
+        weight_scale_layout_code=_quantization_scale_layout_code(
+            quantization, "weight_scale_layout"
+        ),
+        weight_group_size=_read_nullable_int(quantization, "weight_group_size"),
+        weight_scale_dtype=_read_optional_str(quantization, "weight_scale_dtype"),
+        weight_scale_dtype_code=_dtype_code(quantization, "weight_scale_dtype"),
+        weight_symmetric=_read_nullable_bool(quantization, "weight_symmetric"),
+        weight_symmetric_code=_optional_bool_code(quantization, "weight_symmetric"),
+        weight_zero_point=_read_bool(quantization, "weight_zero_point"),
+        activation_bits=_read_nullable_int(quantization, "activation_bits"),
+        kv_bits=_read_nullable_int(quantization, "kv_bits"),
+        kv_format=_read_optional_str(quantization, "kv_format"),
+        kv_format_code=_quantization_format_code(quantization, "kv_format"),
+        indexer_k_bits=_read_nullable_int(quantization, "indexer_k_bits"),
+        indexer_k_format=_read_optional_str(quantization, "indexer_k_format"),
+        indexer_k_format_code=_quantization_format_code(
+            quantization, "indexer_k_format"
+        ),
+        gated_norm=_read_bool(quantization, "gated_norm"),
+        spinquant=_read_bool(quantization, "spinquant"),
+        ignored_module_count=_read_int(quantization, "ignored_module_count"),
+    )
+
+
+def _read_quantization_summary(
+    summary: dict[str, Any],
+) -> BumkcQuantizationSummary:
+    return BumkcQuantizationSummary(
+        scheme=_read_optional_str(summary, "scheme"),
+        scheme_hash=_read_int(summary, "scheme_hash"),
+        weight_format=_read_optional_str(summary, "weight_format"),
+        weight_format_code=_read_int(summary, "weight_format_code"),
+        weight_bits=_read_nullable_int(summary, "weight_bits"),
+        weight_scale_layout=_read_optional_str(summary, "weight_scale_layout"),
+        weight_scale_layout_code=_read_int(summary, "weight_scale_layout_code"),
+        weight_group_size=_read_nullable_int(summary, "weight_group_size"),
+        weight_scale_dtype=_read_optional_str(summary, "weight_scale_dtype"),
+        weight_scale_dtype_code=_read_int(summary, "weight_scale_dtype_code"),
+        weight_symmetric=_read_nullable_bool(summary, "weight_symmetric"),
+        weight_symmetric_code=_read_int(summary, "weight_symmetric_code"),
+        weight_zero_point=_read_bool(summary, "weight_zero_point"),
+        activation_bits=_read_nullable_int(summary, "activation_bits"),
+        kv_bits=_read_nullable_int(summary, "kv_bits"),
+        kv_format=_read_optional_str(summary, "kv_format"),
+        kv_format_code=_read_int(summary, "kv_format_code"),
+        indexer_k_bits=_read_nullable_int(summary, "indexer_k_bits"),
+        indexer_k_format=_read_optional_str(summary, "indexer_k_format"),
+        indexer_k_format_code=_read_int(summary, "indexer_k_format_code"),
+        gated_norm=_read_bool(summary, "gated_norm"),
+        spinquant=_read_bool(summary, "spinquant"),
+        ignored_module_count=_read_int(summary, "ignored_module_count"),
+    )
 
 
 def _validate_hvm_core_book(
@@ -1997,6 +2129,15 @@ def _read_optional_int(parent: dict[str, Any], key: str) -> int:
     return value
 
 
+def _read_nullable_int(parent: dict[str, Any], key: str) -> int | None:
+    value = parent.get(key)
+    if value is None:
+        return None
+    if not _is_strict_int(value):
+        raise BumkcArtifactError(f"BUMKC runtime {key} integer is invalid")
+    return value
+
+
 def _read_str(parent: dict[str, Any], key: str) -> str:
     value = parent.get(key)
     if not isinstance(value, str) or not value:
@@ -2017,6 +2158,15 @@ def _read_bool(parent: dict[str, Any], key: str) -> bool:
     value = parent.get(key)
     if not isinstance(value, bool):
         raise BumkcArtifactError(f"BUMKC runtime {key} boolean is missing")
+    return value
+
+
+def _read_nullable_bool(parent: dict[str, Any], key: str) -> bool | None:
+    value = parent.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise BumkcArtifactError(f"BUMKC runtime {key} boolean is invalid")
     return value
 
 

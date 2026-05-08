@@ -19,6 +19,7 @@ REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
 REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v9"
+REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v8"
 
 
 class BumkcArtifactError(ValueError):
@@ -285,6 +286,7 @@ def load_bumkc_artifact(
     simulation = _read_json(root / "reports" / "simulation.json")
     runtime = _read_json(root / "runtime" / "plan.json")
     engine = _read_json(root / "engine" / "optimization-playground.json")
+    runtime_smoke = _read_json(root / "generated" / "runtime-smoke.json")
     tensor_smoke = _read_json(root / "generated" / "tensor-smoke.json")
 
     _validate_identity(
@@ -295,6 +297,7 @@ def load_bumkc_artifact(
         simulation,
         runtime,
         engine,
+        runtime_smoke,
         tensor_smoke,
     )
     if engine.get("schema_version") != REQUIRED_SCHEMA_VERSION:
@@ -306,7 +309,7 @@ def load_bumkc_artifact(
     if tuple(engine.get("cli_flags", ())) != REQUIRED_CLI_FLAGS:
         raise BumkcArtifactError("BUMKC artifact serving CLI flags are unsupported")
     artifact_paths = _read_object(engine, "artifact_paths")
-    _validate_artifact_paths(artifact_paths)
+    _validate_artifact_paths(root, artifact_paths)
     if artifact_paths.get("artifact_digests") != ARTIFACT_DIGEST_PATH.as_posix():
         raise BumkcArtifactError("BUMKC artifact digest path is not canonical")
     artifact_digest_count = _validate_artifact_digests(root, manifest)
@@ -331,6 +334,12 @@ def load_bumkc_artifact(
         simulation,
     )
     runtime_summary = _load_runtime_summary(engine, runtime)
+    _validate_runtime_smoke_plan(
+        runtime_smoke,
+        runtime,
+        runtime_summary,
+        compiler_summary,
+    )
     runtime_shape_symbols = _load_shape_symbol_bindings(runtime)
     runtime_serving_state = _load_serving_state_bindings(runtime)
     entrypoints = tuple(
@@ -436,17 +445,28 @@ def _validate_artifact_digests(root: Path, manifest: dict[str, Any]) -> int:
     return len(files)
 
 
-def _validate_artifact_paths(artifact_paths: dict[str, Any]) -> None:
+def _validate_artifact_paths(root: Path, artifact_paths: dict[str, Any]) -> None:
     expected = {
         "artifact_digests": "reports/artifact-digests.json",
+        "cpu_reference_report": "reports/cpu-reference.json",
+        "cuda_smoke_plan": "generated/runtime-smoke.json",
+        "cuda_smoke_source": "generated/runtime_smoke.cu",
+        "cuda_tensor_smoke_plan": "generated/tensor-smoke.json",
+        "cuda_tensor_smoke_source": "generated/tensor_smoke.cu",
         "hvm_block_role_pipelines": "ir/hvm-block-role-pipelines.json",
+        "hvm_core_book": "ir/hvm-core-book.json",
+        "hvm_core_book_source": "source/hvm-core-book.hvm",
         "hvm_event_tensors": "ir/hvm-event-tensors.json",
+        "hvm_sm_task_runtime": "ir/hvm-sm-task-runtime.json",
         "hvm_tensor_islands": "ir/hvm-tensor-islands.json",
+        "manifest": "manifest.json",
         "runtime_plan": "runtime/plan.json",
     }
     for key, value in expected.items():
         if artifact_paths.get(key) != value:
             raise BumkcArtifactError(f"BUMKC artifact path mismatch: {key}")
+        if not (root / value).is_file():
+            raise BumkcArtifactError(f"BUMKC artifact path is missing: {key}")
 
 
 def _artifact_file_paths(root: Path) -> list[str]:
@@ -608,6 +628,92 @@ def _load_compiler_summary(
             raise BumkcArtifactError(f"BUMKC engine compiler summary mismatch: {key}")
 
     return BumkcCompilerSummary(**{key: int(value) for key, value in expected.items()})
+
+
+def _validate_runtime_smoke_plan(
+    runtime_smoke: dict[str, Any],
+    runtime: dict[str, Any],
+    runtime_summary: BumkcRuntimeSummary,
+    compiler_summary: BumkcCompilerSummary,
+) -> None:
+    if runtime_smoke.get("schema_version") != REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION:
+        raise BumkcArtifactError("BUMKC runtime smoke schema is unsupported")
+    if runtime_smoke.get("runtime_abi_version") != runtime.get("runtime_abi_version"):
+        raise BumkcArtifactError("BUMKC runtime smoke ABI does not match runtime")
+    if runtime_smoke.get("source_path") != "generated/runtime_smoke.cu":
+        raise BumkcArtifactError("BUMKC runtime smoke source path is not canonical")
+    if runtime_smoke.get("binary_name") != "runtime_smoke":
+        raise BumkcArtifactError("BUMKC runtime smoke binary name is not canonical")
+
+    execution_model = _read_object(runtime, "execution_model")
+    expected = {
+        "expected_task_count": runtime_summary.task_count,
+        "expected_conventional_launch_count": (
+            runtime_summary.conventional_launch_count
+        ),
+        "expected_persistent_launch_count": runtime_summary.persistent_launch_count,
+        "expected_launch_reduction_per_mille": _read_int(
+            execution_model, "launch_reduction_per_mille"
+        ),
+        "expected_jit_task_count": runtime_summary.jit_task_count,
+        "expected_aot_task_count": runtime_summary.aot_task_count,
+        "expected_queue_capacity": runtime_summary.queue_capacity,
+        "expected_task_instance_capacity": runtime_summary.task_instance_capacity,
+        "expected_dependency_edge_count": runtime_summary.task_dependency_count,
+        "expected_dependency_scope_code_sum": (
+            runtime_summary.dependency_scope_code_sum
+        ),
+        "expected_kv_cache_binding_count": runtime_summary.kv_cache_binding_count,
+        "expected_communication_task_count": runtime_summary.collective_task_count,
+        "expected_communication_group_size_sum": (
+            runtime_summary.collective_group_size_sum
+        ),
+        "expected_communication_kind_code_sum": (
+            runtime_summary.collective_kind_code_sum
+        ),
+        "expected_serving_task_count": runtime_summary.serving_task_count,
+        "expected_serving_dependency_count": runtime_summary.serving_dependency_count,
+        "expected_serving_kind_code_sum": runtime_summary.serving_kind_code_sum,
+        "expected_serving_symbol_count": runtime_summary.serving_symbol_count,
+        "expected_substitution_shape_symbol_count": (
+            runtime_summary.substitution_shape_symbol_count
+        ),
+        "expected_substitution_serving_binding_count": (
+            runtime_summary.substitution_serving_binding_count
+        ),
+        "expected_substitution_symbol_max_sum": (
+            runtime_summary.substitution_symbol_max_sum
+        ),
+        "expected_substitution_symbol_bucket_sum": (
+            runtime_summary.substitution_symbol_bucket_sum
+        ),
+        "expected_rank_group_size_sum": runtime_summary.task_rank_reference_count,
+        "expected_rank_id_sum": runtime_summary.rank_id_sum,
+        "expected_event_tensor_count": compiler_summary.event_tensor_count,
+        "expected_event_predecessor_edge_count": (
+            compiler_summary.event_predecessor_edge_count
+        ),
+        "expected_event_successor_edge_count": (
+            compiler_summary.event_successor_edge_count
+        ),
+        "expected_event_notification_count": (
+            compiler_summary.event_notification_count
+        ),
+        "expected_event_execution_count": compiler_summary.event_execution_count,
+        "expected_event_simulation_violation_count": (
+            compiler_summary.event_simulation_violation_count
+        ),
+    }
+    for key, value in expected.items():
+        if _read_int(runtime_smoke, key) != value:
+            raise BumkcArtifactError(f"BUMKC runtime smoke mismatch: {key}")
+
+    event_descriptors = _read_list(runtime_smoke, "event_descriptors")
+    task_descriptors = _read_list(runtime_smoke, "task_descriptors")
+    if len(event_descriptors) != compiler_summary.event_tensor_count:
+        raise BumkcArtifactError("BUMKC runtime smoke event descriptor count mismatches")
+    if len(task_descriptors) != runtime_summary.task_count:
+        raise BumkcArtifactError("BUMKC runtime smoke task descriptor count mismatches")
 
 
 def _load_shape_symbol_bindings(

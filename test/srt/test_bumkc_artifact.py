@@ -69,7 +69,7 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.target_arch == "sm90"
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
-    assert summary.artifact_digest_count == 8
+    assert summary.artifact_digest_count == 15
     assert summary.fallback_mode == "checked"
 
     launch_plan = summary.validate_runtime_launch(
@@ -184,6 +184,18 @@ def test_rejects_bumkc_compiler_summary_non_integer(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_runtime_smoke_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    smoke_path = plan_dir / "generated" / "runtime-smoke.json"
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["expected_event_execution_count"] = 7
+    smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="runtime smoke mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_unknown_bumkc_tensor_island_coverage(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     island_path = plan_dir / "ir" / "hvm-tensor-islands.json"
@@ -252,6 +264,10 @@ def test_rejects_bumkc_runtime_launch_bucket_mismatch(tmp_path):
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
     engine["runtime_summary"]["substitution_symbol_max_sum"] = 4097
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    smoke_path = plan_dir / "generated" / "runtime-smoke.json"
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["expected_substitution_symbol_max_sum"] = 4097
+    smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
     refresh_bumkc_digests(plan_dir)
     summary = load_bumkc_artifact(plan_dir)
 
@@ -297,6 +313,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
     (plan_dir / "engine").mkdir()
     (plan_dir / "generated").mkdir()
     (plan_dir / "reports").mkdir()
+    (plan_dir / "source").mkdir()
 
     write_json(
         plan_dir / "manifest.json",
@@ -326,6 +343,14 @@ def write_bumkc_artifact(tmp_path, *, executable):
             ],
         },
     )
+    write_text(plan_dir / "source" / "hvm-core-book.hvm", "%main = 0\n")
+    write_json(
+        plan_dir / "ir" / "hvm-core-book.json",
+        {
+            "plan_id": plan_id,
+            "program_id": program_id,
+        },
+    )
     write_json(
         plan_dir / "ir" / "hvm-block-role-pipelines.json",
         {
@@ -352,6 +377,13 @@ def write_bumkc_artifact(tmp_path, *, executable):
         },
     )
     write_json(
+        plan_dir / "ir" / "hvm-sm-task-runtime.json",
+        {
+            "plan_id": plan_id,
+            "program_id": program_id,
+        },
+    )
+    write_json(
         plan_dir / "reports" / "simulation.json",
         {
             "plan_id": plan_id,
@@ -362,10 +394,18 @@ def write_bumkc_artifact(tmp_path, *, executable):
         },
     )
     write_json(
+        plan_dir / "reports" / "cpu-reference.json",
+        {
+            "plan_id": plan_id,
+            "program_id": program_id,
+        },
+    )
+    write_json(
         plan_dir / "runtime" / "plan.json",
         {
             "plan_id": plan_id,
             "program_id": program_id,
+            "runtime_abi_version": "bumkc.runtime.v0",
             "executable": executable,
             "entrypoints": (
                 [{"name": "cuda_tensor_smoke", "symbol": "bumkc_tensor_smoke"}]
@@ -376,6 +416,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "execution_model": {
                 "conventional_launch_count": 2,
                 "persistent_launch_count": 1,
+                "launch_reduction_per_mille": 2000,
             },
             "queue_plan": {
                 "jit_task_count": 0,
@@ -500,13 +541,66 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "required_validation_model": REQUIRED_VALIDATION_MODEL,
             "artifact_paths": {
                 "artifact_digests": "reports/artifact-digests.json",
+                "cpu_reference_report": "reports/cpu-reference.json",
+                "cuda_smoke_plan": "generated/runtime-smoke.json",
+                "cuda_smoke_source": "generated/runtime_smoke.cu",
+                "cuda_tensor_smoke_plan": "generated/tensor-smoke.json",
+                "cuda_tensor_smoke_source": "generated/tensor_smoke.cu",
                 "hvm_block_role_pipelines": "ir/hvm-block-role-pipelines.json",
+                "hvm_core_book": "ir/hvm-core-book.json",
+                "hvm_core_book_source": "source/hvm-core-book.hvm",
                 "hvm_event_tensors": "ir/hvm-event-tensors.json",
+                "hvm_sm_task_runtime": "ir/hvm-sm-task-runtime.json",
                 "hvm_tensor_islands": "ir/hvm-tensor-islands.json",
+                "manifest": "manifest.json",
                 "runtime_plan": "runtime/plan.json",
             },
         },
     )
+    write_json(
+        plan_dir / "generated" / "runtime-smoke.json",
+        {
+            "schema_version": "bumkc.cuda_smoke.v8",
+            "plan_id": plan_id,
+            "program_id": program_id,
+            "runtime_abi_version": "bumkc.runtime.v0",
+            "source_path": "generated/runtime_smoke.cu",
+            "binary_name": "runtime_smoke",
+            "expected_task_count": 2,
+            "expected_conventional_launch_count": 2,
+            "expected_persistent_launch_count": 1,
+            "expected_launch_reduction_per_mille": 2000,
+            "expected_jit_task_count": 0,
+            "expected_aot_task_count": 2,
+            "expected_queue_capacity": 64,
+            "expected_task_instance_capacity": 2,
+            "expected_dependency_edge_count": 1,
+            "expected_dependency_scope_code_sum": 1,
+            "expected_kv_cache_binding_count": 1,
+            "expected_communication_task_count": 1,
+            "expected_communication_group_size_sum": 8,
+            "expected_communication_kind_code_sum": 1,
+            "expected_serving_task_count": 1,
+            "expected_serving_dependency_count": 2,
+            "expected_serving_kind_code_sum": 5,
+            "expected_serving_symbol_count": 1,
+            "expected_substitution_shape_symbol_count": 1,
+            "expected_substitution_serving_binding_count": 2,
+            "expected_substitution_symbol_max_sum": 4096,
+            "expected_substitution_symbol_bucket_sum": 16,
+            "expected_rank_group_size_sum": 16,
+            "expected_rank_id_sum": 56,
+            "expected_event_tensor_count": 2,
+            "expected_event_predecessor_edge_count": 1,
+            "expected_event_successor_edge_count": 1,
+            "expected_event_notification_count": 1,
+            "expected_event_execution_count": 2,
+            "expected_event_simulation_violation_count": 0,
+            "event_descriptors": [{}, {}],
+            "task_descriptors": [{}, {}],
+        },
+    )
+    write_text(plan_dir / "generated" / "runtime_smoke.cu", "int main() { return 0; }\n")
     write_json(
         plan_dir / "generated" / "tensor-smoke.json",
         {
@@ -515,8 +609,13 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "enabled": executable,
         },
     )
+    write_text(plan_dir / "generated" / "tensor_smoke.cu", "int main() { return 0; }\n")
     refresh_bumkc_digests(plan_dir)
     return plan_dir
+
+
+def write_text(path, value):
+    path.write_text(value, encoding="utf-8")
 
 
 def write_json(path, value):

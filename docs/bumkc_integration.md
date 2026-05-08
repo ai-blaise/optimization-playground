@@ -26,6 +26,9 @@ validates:
 - exported serving CLI flags,
 - `reports/artifact-digests.json` byte counts and SHA-256 hashes before
   runtime metadata is trusted,
+- canonical artifact paths for the HVM core book, tensor islands, block
+  pipelines, Event Tensor plan, SM task runtime, runtime descriptor, CPU
+  reference, and generated CUDA smoke plans/sources,
 - matching target architecture between manifest and engine export,
 - checked fallback mode,
 - `--bumkc-fallback-mode checked` when BUMKC is enabled,
@@ -38,6 +41,9 @@ validates:
 - runtime summary fields against the runtime descriptor, including
   communication-plan collective counts, serving-state dependency counts, and
   runtime substitution bounds,
+- generated CUDA runtime-smoke metadata against the runtime summary, compiler
+  summary, runtime ABI, expected source path, expected binary name, task
+  descriptors, and Event Tensor descriptors,
 - and the required REAP validation model contract.
 
 Before invoking any BUMKC runtime entrypoint, the serving path must call

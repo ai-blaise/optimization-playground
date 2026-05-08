@@ -59,8 +59,9 @@ validates:
 - runtime summary fields against the runtime descriptor, including
   communication-plan collective counts, side-effect counts and code sums,
   serving-state dependency counts, dependency tensor count, dependency
-  descriptor count/hash including dependency tensor IDs, and runtime
-  substitution bounds, diagnostic slots, and watchdog timing,
+  descriptor count/hash including dependency tensor IDs, dependency scope,
+  scope-specific wait expressions, and runtime substitution bounds,
+  diagnostic slots, and watchdog timing,
 - generated CUDA runtime-smoke metadata against the runtime summary, compiler
   summary, runtime ABI, expected source path, expected binary name, task
   descriptors, and Event Tensor descriptors, including descriptor-row

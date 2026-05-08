@@ -342,13 +342,32 @@ def test_rejects_bumkc_runtime_dependency_descriptor_mismatch(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     runtime_path = plan_dir / "runtime" / "plan.json"
     runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-    runtime["dependency_plan"]["dependency_descriptors"][0][
-        "wait_expression"
-    ] = "bad_wait_expression"
+    runtime["dependency_plan"]["dependency_descriptors"][0]["task"] = "task_other"
     runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
     refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="dependency descriptor hash"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_runtime_dependency_wait_scope_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    descriptor = runtime["dependency_plan"]["dependency_descriptors"][0]
+    descriptor["wait_expression"] = "all_producer_tiles_complete"
+    dependency_hash = bumkc_artifact._dependency_descriptor_hash(
+        runtime["dependency_plan"]["dependency_descriptors"]
+    )
+    runtime["dependency_plan"]["dependency_descriptor_hash"] = dependency_hash
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["runtime_summary"]["dependency_descriptor_hash"] = dependency_hash
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="wait expression"):
         load_bumkc_artifact(plan_dir)
 
 

@@ -110,6 +110,10 @@ _DEPENDENCY_SCOPE_CODES = {
     "tile_overlap": 1,
     "whole_producer": 2,
 }
+_DEPENDENCY_WAIT_EXPRESSIONS = {
+    "tile_overlap": "same_logical_tile_ready",
+    "whole_producer": "all_producer_tiles_complete",
+}
 _SERVING_STATE_KIND_CODES = {
     "batch": 1,
     "sequence": 2,
@@ -1135,6 +1139,7 @@ def _load_runtime_summary(
     ):
         raise BumkcArtifactError("BUMKC runtime watchdog timing is invalid")
     dependency_descriptors = _read_list(dependency_plan, "dependency_descriptors")
+    _validate_dependency_descriptors(dependency_descriptors)
     dependency_descriptor_hash = _dependency_descriptor_hash(dependency_descriptors)
     if _read_int(dependency_plan, "dependency_descriptor_count") != len(
         dependency_descriptors
@@ -1217,6 +1222,23 @@ def _load_runtime_summary(
             raise BumkcArtifactError(f"BUMKC engine runtime summary mismatch: {key}")
 
     return BumkcRuntimeSummary(**{key: int(value) for key, value in expected.items()})
+
+
+def _validate_dependency_descriptors(descriptors: list[dict[str, Any]]) -> None:
+    for descriptor in descriptors:
+        scope = _read_str(descriptor, "scope")
+        wait_expression = _read_str(descriptor, "wait_expression")
+        expected_wait_expression = _DEPENDENCY_WAIT_EXPRESSIONS.get(scope)
+        if expected_wait_expression is None:
+            raise BumkcArtifactError(f"BUMKC dependency scope is unsupported: {scope}")
+        if wait_expression != expected_wait_expression:
+            raise BumkcArtifactError(
+                "BUMKC runtime dependency wait expression mismatch"
+            )
+        if scope == "tile_overlap" and not _read_any_list(descriptor, "tensors"):
+            raise BumkcArtifactError(
+                "BUMKC tile-overlap dependency requires tensor flow"
+            )
 
 
 def _load_compiler_summary(

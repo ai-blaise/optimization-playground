@@ -20,7 +20,7 @@ REQUIRED_VALIDATION_MODEL = (
 )
 REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
 REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v16"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v17"
 REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v8"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v11"
@@ -335,6 +335,9 @@ class BumkcArtifactSummary:
     target_arch: str | None
     plan_schema_version: str
     capability_level: str
+    source_schema_version: str
+    model_source_frontend: str
+    hvm_capture_status: str
     engine_schema_version: str
     fallback_mode: str
     runtime_executable: bool
@@ -441,6 +444,9 @@ class BumkcArtifactSummary:
             "target_arch": self.target_arch,
             "plan_schema_version": self.plan_schema_version,
             "capability_level": self.capability_level,
+            "source_schema_version": self.source_schema_version,
+            "model_source_frontend": self.model_source_frontend,
+            "hvm_capture_status": self.hvm_capture_status,
             "engine_schema_version": self.engine_schema_version,
             "fallback_mode": self.fallback_mode,
             "runtime_executable": self.runtime_executable,
@@ -499,6 +505,8 @@ def load_bumkc_artifact(
         raise BumkcArtifactError(
             "BUMKC engine manifest capability does not match manifest"
         )
+    if engine.get("source_schema_version") != REQUIRED_SOURCE_SCHEMA_VERSION:
+        raise BumkcArtifactError("BUMKC engine source schema is unsupported")
     if engine.get("engine") != "sglang":
         raise BumkcArtifactError("BUMKC artifact is not targeted at the SGLang engine")
     if engine.get("engine_profile") != "optimization_playground":
@@ -551,6 +559,7 @@ def load_bumkc_artifact(
     entrypoints = tuple(
         entrypoint.get("name", "") for entrypoint in runtime.get("entrypoints", [])
     )
+    model_source_record = _read_object(model_source, "source")
     return BumkcArtifactSummary(
         root=root,
         plan_id=engine["plan_id"],
@@ -560,6 +569,9 @@ def load_bumkc_artifact(
         target_arch=engine.get("target_arch"),
         plan_schema_version=manifest["schema_version"],
         capability_level=manifest["capability_level"],
+        source_schema_version=model_source["schema_version"],
+        model_source_frontend=_read_str(model_source_record, "frontend"),
+        hvm_capture_status=_read_str(model_source, "hvm_capture_status"),
         engine_schema_version=engine["schema_version"],
         fallback_mode=engine["fallback_mode"],
         runtime_executable=bool(runtime["executable"]),

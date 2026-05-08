@@ -22,9 +22,10 @@ validates:
   engine, simulation, and tensor smoke artifacts,
 - manifest `schema_version == "bumkc.plan.v1"`,
 - manifest `capability_level == "hvm_rooted_runtime_descriptor"`,
-- engine export `schema_version == "bumkc.optimization_playground.v16"`,
+- engine export `schema_version == "bumkc.optimization_playground.v17"`,
 - model-source export `schema_version == "bumkc.source.v8"`,
 - engine-exported manifest schema/capability fields matching `manifest.json`,
+- engine-exported source schema matching `source/model-source.json`,
 - `runtime_abi_version == "bumkc.runtime.v1"`,
 - runtime smoke schema `bumkc.cuda_smoke.v11`,
 - `engine == "sglang"`,
@@ -71,8 +72,9 @@ context through `validate_default_runtime_launch()` when `--enable-bumkc` loads
 the artifact.
 
 `BumkcArtifactSummary.as_log_dict()` includes the accepted manifest schema,
-capability level, and engine schema so startup logs can audit the exact BUMKC
-contract that was loaded.
+capability level, source schema, model-source frontend, HVM capture status, and
+engine schema so startup logs can audit the exact BUMKC contract that was
+loaded.
 
 Add `--bumkc-require-executable` when startup must fail unless the runtime
 descriptor is executable. Without that flag, non-executable BUMKC artifacts are

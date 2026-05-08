@@ -95,6 +95,9 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.target_arch == "sm90"
     assert summary.plan_schema_version == REQUIRED_PLAN_SCHEMA_VERSION
     assert summary.capability_level == REQUIRED_CAPABILITY_LEVEL
+    assert summary.source_schema_version == REQUIRED_SOURCE_SCHEMA_VERSION
+    assert summary.model_source_frontend == "internal_test"
+    assert summary.hvm_capture_status == "native_eligible"
     assert summary.engine_schema_version == REQUIRED_SCHEMA_VERSION
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
@@ -103,6 +106,9 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     log_dict = summary.as_log_dict()
     assert log_dict["plan_schema_version"] == REQUIRED_PLAN_SCHEMA_VERSION
     assert log_dict["capability_level"] == REQUIRED_CAPABILITY_LEVEL
+    assert log_dict["source_schema_version"] == REQUIRED_SOURCE_SCHEMA_VERSION
+    assert log_dict["model_source_frontend"] == "internal_test"
+    assert log_dict["hvm_capture_status"] == "native_eligible"
     assert log_dict["engine_schema_version"] == REQUIRED_SCHEMA_VERSION
 
     launch_plan = summary.validate_runtime_launch(
@@ -226,6 +232,18 @@ def test_rejects_bumkc_engine_manifest_capability_mismatch(tmp_path):
     refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="manifest capability"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_engine_source_schema_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["source_schema_version"] = "bumkc.source.v0"
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="engine source schema"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -825,6 +843,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "program_id": program_id,
             "manifest_schema_version": REQUIRED_PLAN_SCHEMA_VERSION,
             "manifest_capability_level": REQUIRED_CAPABILITY_LEVEL,
+            "source_schema_version": REQUIRED_SOURCE_SCHEMA_VERSION,
             "model": "matmul-chain",
             "gpu_count": 8,
             "target_arch": "sm90",

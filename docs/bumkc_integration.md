@@ -22,7 +22,7 @@ validates:
   engine, simulation, and tensor smoke artifacts,
 - manifest `schema_version == "bumkc.plan.v1"`,
 - manifest `capability_level == "hvm_rooted_runtime_descriptor"`,
-- engine export `schema_version == "bumkc.optimization_playground.v14"`,
+- engine export `schema_version == "bumkc.optimization_playground.v15"`,
 - engine-exported manifest schema/capability fields matching `manifest.json`,
 - `runtime_abi_version == "bumkc.runtime.v1"`,
 - runtime smoke schema `bumkc.cuda_smoke.v11`,
@@ -41,7 +41,8 @@ validates:
 - matching engine/runtime executable flags,
 - compiler summary fields against the HVM tensor island, block pipeline, Event
   Tensor, and simulation artifacts, including native/fallback coverage,
-  fallback bridges, side-effect counts and code sums, Event Tensor edge counts,
+  fallback bridges, MoE dispatch counts across tensor islands, block ops, and
+  Event Tensors, side-effect counts and code sums, Event Tensor edge counts,
   dependency tensor counts, notifications, execution count, and violation
   count,
 - runtime summary fields against the runtime descriptor, including

@@ -49,7 +49,9 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.compiler_summary.tensor_island_side_effect_count == 1
     assert summary.compiler_summary.tensor_island_side_effect_code_sum == 3
     assert summary.compiler_summary.fallback_bridge_count == 1
+    assert summary.compiler_summary.moe_dispatch_tensor_island_count == 0
     assert summary.compiler_summary.block_op_count == 2
+    assert summary.compiler_summary.moe_dispatch_block_op_count == 0
     assert summary.compiler_summary.side_effecting_block_op_count == 1
     assert summary.compiler_summary.block_side_effect_count == 1
     assert summary.compiler_summary.block_side_effect_code_sum == 3
@@ -57,6 +59,7 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.compiler_summary.side_effecting_event_tensor_count == 1
     assert summary.compiler_summary.event_side_effect_count == 1
     assert summary.compiler_summary.event_side_effect_code_sum == 3
+    assert summary.compiler_summary.moe_dispatch_event_tensor_count == 0
     assert summary.compiler_summary.event_predecessor_edge_count == 1
     assert summary.compiler_summary.event_successor_edge_count == 1
     assert summary.compiler_summary.event_dependency_tensor_count == 1
@@ -540,9 +543,21 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "plan_id": plan_id,
             "program_id": program_id,
             "islands": [
-                {"coverage_status": "native_eligible", "side_effects": []},
-                {"coverage_status": "native_eligible", "side_effects": ["collective"]},
-                {"coverage_status": "fallback_only", "side_effects": []},
+                {
+                    "operator": "matmul",
+                    "coverage_status": "native_eligible",
+                    "side_effects": [],
+                },
+                {
+                    "operator": "collective",
+                    "coverage_status": "native_eligible",
+                    "side_effects": ["collective"],
+                },
+                {
+                    "operator": "unknown",
+                    "coverage_status": "fallback_only",
+                    "side_effects": [],
+                },
             ],
             "fallback_bridges": [
                 {
@@ -567,7 +582,10 @@ def write_bumkc_artifact(tmp_path, *, executable):
         {
             "plan_id": plan_id,
             "program_id": program_id,
-            "block_ops": [{"side_effects": []}, {"side_effects": ["collective"]}],
+            "block_ops": [
+                {"operator": "matmul", "side_effects": []},
+                {"operator": "collective", "side_effects": ["collective"]},
+            ],
         },
     )
     write_json(
@@ -577,12 +595,14 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "program_id": program_id,
             "event_tensors": [
                 {
+                    "operator": "matmul",
                     "side_effects": [],
                     "predecessor_events": [],
                     "predecessor_edges": [],
                     "successor_events": ["event_second"],
                 },
                 {
+                    "operator": "collective",
                     "side_effects": ["collective"],
                     "predecessor_events": ["event_first"],
                     "predecessor_edges": [
@@ -730,7 +750,9 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "tensor_island_side_effect_count": 1,
                 "tensor_island_side_effect_code_sum": 3,
                 "fallback_bridge_count": 1,
+                "moe_dispatch_tensor_island_count": 0,
                 "block_op_count": 2,
+                "moe_dispatch_block_op_count": 0,
                 "side_effecting_block_op_count": 1,
                 "block_side_effect_count": 1,
                 "block_side_effect_code_sum": 3,
@@ -738,6 +760,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "side_effecting_event_tensor_count": 1,
                 "event_side_effect_count": 1,
                 "event_side_effect_code_sum": 3,
+                "moe_dispatch_event_tensor_count": 0,
                 "event_predecessor_edge_count": 1,
                 "event_successor_edge_count": 1,
                 "event_dependency_tensor_count": 1,

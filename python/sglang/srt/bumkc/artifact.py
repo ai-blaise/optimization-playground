@@ -20,7 +20,7 @@ REQUIRED_VALIDATION_MODEL = (
 )
 REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
 REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v14"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v15"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v11"
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
@@ -221,11 +221,14 @@ class BumkcCompilerSummary:
     tensor_island_side_effect_count: int
     tensor_island_side_effect_code_sum: int
     fallback_bridge_count: int
+    moe_dispatch_tensor_island_count: int
     block_op_count: int
+    moe_dispatch_block_op_count: int
     side_effecting_block_op_count: int
     block_side_effect_count: int
     block_side_effect_code_sum: int
     event_tensor_count: int
+    moe_dispatch_event_tensor_count: int
     side_effecting_event_tensor_count: int
     event_side_effect_count: int
     event_side_effect_code_sum: int
@@ -866,7 +869,17 @@ def _load_compiler_summary(
             island_side_effects
         ),
         "fallback_bridge_count": len(fallback_bridges),
+        "moe_dispatch_tensor_island_count": sum(
+            1
+            for island in islands
+            if _read_str(island, "operator") == "moe_dispatch"
+        ),
         "block_op_count": len(block_ops),
+        "moe_dispatch_block_op_count": sum(
+            1
+            for block in block_ops
+            if _read_str(block, "operator") == "moe_dispatch"
+        ),
         "side_effecting_block_op_count": sum(
             1 for side_effects in block_side_effects if side_effects
         ),
@@ -882,6 +895,11 @@ def _load_compiler_summary(
             len(side_effects) for side_effects in event_side_effects
         ),
         "event_side_effect_code_sum": _side_effect_code_sum(event_side_effects),
+        "moe_dispatch_event_tensor_count": sum(
+            1
+            for event in events
+            if _read_str(event, "operator") == "moe_dispatch"
+        ),
         "event_predecessor_edge_count": sum(
             len(_read_any_list(event, "predecessor_events")) for event in events
         ),

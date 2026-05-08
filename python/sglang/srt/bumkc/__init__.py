@@ -1,6 +1,7 @@
 from sglang.srt.bumkc.artifact import (
     BumkcArtifactError,
     BumkcArtifactSummary,
+    BumkcCompilerSummary,
     BumkcRuntimeLaunchPlan,
     BumkcRuntimeServingStateBinding,
     BumkcRuntimeShapeSymbolBinding,
@@ -11,6 +12,7 @@ from sglang.srt.bumkc.artifact import (
 __all__ = [
     "BumkcArtifactError",
     "BumkcArtifactSummary",
+    "BumkcCompilerSummary",
     "BumkcRuntimeLaunchPlan",
     "BumkcRuntimeServingStateBinding",
     "BumkcRuntimeShapeSymbolBinding",

@@ -36,6 +36,17 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.root == plan_dir
     assert summary.runtime_executable
     assert summary.runtime_entrypoints == ("cuda_tensor_smoke",)
+    assert summary.compiler_summary.tensor_island_count == 3
+    assert summary.compiler_summary.native_tensor_island_count == 2
+    assert summary.compiler_summary.fallback_tensor_island_count == 1
+    assert summary.compiler_summary.fallback_bridge_count == 1
+    assert summary.compiler_summary.block_op_count == 2
+    assert summary.compiler_summary.event_tensor_count == 2
+    assert summary.compiler_summary.event_predecessor_edge_count == 1
+    assert summary.compiler_summary.event_successor_edge_count == 1
+    assert summary.compiler_summary.event_notification_count == 1
+    assert summary.compiler_summary.event_execution_count == 2
+    assert summary.compiler_summary.event_simulation_violation_count == 0
     assert summary.runtime_summary.task_instance_capacity == 2
     assert summary.runtime_summary.kv_cache_binding_count == 1
     assert summary.runtime_summary.rank_count == 8
@@ -58,7 +69,7 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.target_arch == "sm90"
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
-    assert summary.artifact_digest_count == 4
+    assert summary.artifact_digest_count == 8
     assert summary.fallback_mode == "checked"
 
     launch_plan = summary.validate_runtime_launch(
@@ -146,6 +157,42 @@ def test_rejects_bumkc_runtime_summary_mismatch(tmp_path):
     refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="runtime summary mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_compiler_summary_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["compiler_summary"]["event_notification_count"] = 7
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="compiler summary mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_compiler_summary_non_integer(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["compiler_summary"]["event_notification_count"] = True
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="engine summary"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_unknown_bumkc_tensor_island_coverage(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    island_path = plan_dir / "ir" / "hvm-tensor-islands.json"
+    islands = json.loads(island_path.read_text(encoding="utf-8"))
+    islands["islands"][0]["coverage_status"] = "maybe_native"
+    island_path.write_text(json.dumps(islands), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="coverage status"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -245,6 +292,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
     plan_id = "plan_test"
     program_id = "program_test"
     plan_dir = tmp_path / plan_id
+    (plan_dir / "ir").mkdir(parents=True)
     (plan_dir / "runtime").mkdir(parents=True)
     (plan_dir / "engine").mkdir()
     (plan_dir / "generated").mkdir()
@@ -256,6 +304,61 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "plan_id": plan_id,
             "program_id": program_id,
             "target_arch": "sm90",
+        },
+    )
+    write_json(
+        plan_dir / "ir" / "hvm-tensor-islands.json",
+        {
+            "plan_id": plan_id,
+            "program_id": program_id,
+            "islands": [
+                {"coverage_status": "native_eligible"},
+                {"coverage_status": "native_eligible"},
+                {"coverage_status": "fallback_only"},
+            ],
+            "fallback_bridges": [
+                {
+                    "tensor": "tensor_hidden",
+                    "producer_island": "island_fallback",
+                    "consumer_island": "island_native",
+                    "direction": "fallback_to_native",
+                }
+            ],
+        },
+    )
+    write_json(
+        plan_dir / "ir" / "hvm-block-role-pipelines.json",
+        {
+            "plan_id": plan_id,
+            "program_id": program_id,
+            "block_ops": [{}, {}],
+        },
+    )
+    write_json(
+        plan_dir / "ir" / "hvm-event-tensors.json",
+        {
+            "plan_id": plan_id,
+            "program_id": program_id,
+            "event_tensors": [
+                {
+                    "predecessor_events": [],
+                    "successor_events": ["event_second"],
+                },
+                {
+                    "predecessor_events": ["event_first"],
+                    "successor_events": [],
+                },
+            ],
+        },
+    )
+    write_json(
+        plan_dir / "reports" / "simulation.json",
+        {
+            "plan_id": plan_id,
+            "program_id": program_id,
+            "notification_count": 1,
+            "execution_order": ["event_first", "event_second"],
+            "violations": [],
         },
     )
     write_json(
@@ -350,6 +453,19 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "--bumkc-plan-path <artifact-root>/<plan-id>",
                 "--bumkc-fallback-mode checked",
             ],
+            "compiler_summary": {
+                "tensor_island_count": 3,
+                "native_tensor_island_count": 2,
+                "fallback_tensor_island_count": 1,
+                "fallback_bridge_count": 1,
+                "block_op_count": 2,
+                "event_tensor_count": 2,
+                "event_predecessor_edge_count": 1,
+                "event_successor_edge_count": 1,
+                "event_notification_count": 1,
+                "event_execution_count": 2,
+                "event_simulation_violation_count": 0,
+            },
             "runtime_summary": {
                 "task_count": 2,
                 "conventional_launch_count": 2,
@@ -384,6 +500,10 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "required_validation_model": REQUIRED_VALIDATION_MODEL,
             "artifact_paths": {
                 "artifact_digests": "reports/artifact-digests.json",
+                "hvm_block_role_pipelines": "ir/hvm-block-role-pipelines.json",
+                "hvm_event_tensors": "ir/hvm-event-tensors.json",
+                "hvm_tensor_islands": "ir/hvm-tensor-islands.json",
+                "runtime_plan": "runtime/plan.json",
             },
         },
     )

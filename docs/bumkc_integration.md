@@ -18,9 +18,9 @@ The loader accepts either a concrete BUMKC plan directory containing
 `manifest.json`, or an artifact root containing exactly one plan directory. It
 validates:
 
-- matching plan and program IDs across manifest, runtime, engine, and tensor
-  smoke artifacts,
-- `schema_version == "bumkc.optimization_playground.v8"`,
+- matching plan and program IDs across manifest, HVM compiler, runtime,
+  engine, simulation, and tensor smoke artifacts,
+- `schema_version == "bumkc.optimization_playground.v9"`,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
 - exported serving CLI flags,
@@ -31,6 +31,10 @@ validates:
 - `--bumkc-fallback-mode checked` when BUMKC is enabled,
 - preservation of custom optimizations,
 - matching engine/runtime executable flags,
+- compiler summary fields against the HVM tensor island, block pipeline, Event
+  Tensor, and simulation artifacts, including native/fallback coverage,
+  fallback bridges, Event Tensor edge counts, notifications, execution count,
+  and violation count,
 - runtime summary fields against the runtime descriptor, including
   communication-plan collective counts, serving-state dependency counts, and
   runtime substitution bounds,

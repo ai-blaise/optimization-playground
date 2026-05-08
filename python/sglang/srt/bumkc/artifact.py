@@ -18,7 +18,7 @@ REQUIRED_CLI_FLAGS = (
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v8"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v9"
 
 
 class BumkcArtifactError(ValueError):
@@ -58,6 +58,24 @@ class BumkcRuntimeShapeSymbolValue:
 class BumkcRuntimeLaunchPlan:
     shape_symbols: tuple[BumkcRuntimeShapeSymbolValue, ...]
     serving_state: tuple[BumkcRuntimeServingStateBinding, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class BumkcCompilerSummary:
+    tensor_island_count: int
+    native_tensor_island_count: int
+    fallback_tensor_island_count: int
+    fallback_bridge_count: int
+    block_op_count: int
+    event_tensor_count: int
+    event_predecessor_edge_count: int
+    event_successor_edge_count: int
+    event_notification_count: int
+    event_execution_count: int
+    event_simulation_violation_count: int
+
+    def as_log_dict(self) -> dict[str, int]:
+        return dataclasses.asdict(self)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -137,6 +155,7 @@ class BumkcArtifactSummary:
     fallback_mode: str
     runtime_executable: bool
     runtime_entrypoints: tuple[str, ...]
+    compiler_summary: BumkcCompilerSummary
     runtime_summary: BumkcRuntimeSummary
     runtime_shape_symbols: tuple[BumkcRuntimeShapeSymbolBinding, ...]
     runtime_serving_state: tuple[BumkcRuntimeServingStateBinding, ...]
@@ -239,6 +258,7 @@ class BumkcArtifactSummary:
             "fallback_mode": self.fallback_mode,
             "runtime_executable": self.runtime_executable,
             "runtime_entrypoints": list(self.runtime_entrypoints),
+            "compiler_summary": self.compiler_summary.as_log_dict(),
             "runtime_summary": self.runtime_summary.as_log_dict(),
             "runtime_shape_symbols": [
                 dataclasses.asdict(binding)
@@ -259,11 +279,24 @@ def load_bumkc_artifact(
 ) -> BumkcArtifactSummary:
     root = _resolve_plan_dir(Path(path))
     manifest = _read_json(root / "manifest.json")
+    tensor_islands = _read_json(root / "ir" / "hvm-tensor-islands.json")
+    block_plan = _read_json(root / "ir" / "hvm-block-role-pipelines.json")
+    event_tensors = _read_json(root / "ir" / "hvm-event-tensors.json")
+    simulation = _read_json(root / "reports" / "simulation.json")
     runtime = _read_json(root / "runtime" / "plan.json")
     engine = _read_json(root / "engine" / "optimization-playground.json")
     tensor_smoke = _read_json(root / "generated" / "tensor-smoke.json")
 
-    _validate_identity(manifest, runtime, engine, tensor_smoke)
+    _validate_identity(
+        manifest,
+        tensor_islands,
+        block_plan,
+        event_tensors,
+        simulation,
+        runtime,
+        engine,
+        tensor_smoke,
+    )
     if engine.get("schema_version") != REQUIRED_SCHEMA_VERSION:
         raise BumkcArtifactError("BUMKC artifact uses an unsupported engine schema")
     if engine.get("engine") != "sglang":
@@ -273,6 +306,7 @@ def load_bumkc_artifact(
     if tuple(engine.get("cli_flags", ())) != REQUIRED_CLI_FLAGS:
         raise BumkcArtifactError("BUMKC artifact serving CLI flags are unsupported")
     artifact_paths = _read_object(engine, "artifact_paths")
+    _validate_artifact_paths(artifact_paths)
     if artifact_paths.get("artifact_digests") != ARTIFACT_DIGEST_PATH.as_posix():
         raise BumkcArtifactError("BUMKC artifact digest path is not canonical")
     artifact_digest_count = _validate_artifact_digests(root, manifest)
@@ -289,6 +323,13 @@ def load_bumkc_artifact(
     if require_executable and not runtime.get("executable"):
         raise BumkcArtifactError("BUMKC artifact is not executable")
 
+    compiler_summary = _load_compiler_summary(
+        engine,
+        tensor_islands,
+        block_plan,
+        event_tensors,
+        simulation,
+    )
     runtime_summary = _load_runtime_summary(engine, runtime)
     runtime_shape_symbols = _load_shape_symbol_bindings(runtime)
     runtime_serving_state = _load_serving_state_bindings(runtime)
@@ -305,6 +346,7 @@ def load_bumkc_artifact(
         fallback_mode=engine["fallback_mode"],
         runtime_executable=bool(runtime["executable"]),
         runtime_entrypoints=entrypoints,
+        compiler_summary=compiler_summary,
         runtime_summary=runtime_summary,
         runtime_shape_symbols=runtime_shape_symbols,
         runtime_serving_state=runtime_serving_state,
@@ -392,6 +434,19 @@ def _validate_artifact_digests(root: Path, manifest: dict[str, Any]) -> int:
                 f"BUMKC artifact digest SHA-256 mismatch: {relative_path}"
             )
     return len(files)
+
+
+def _validate_artifact_paths(artifact_paths: dict[str, Any]) -> None:
+    expected = {
+        "artifact_digests": "reports/artifact-digests.json",
+        "hvm_block_role_pipelines": "ir/hvm-block-role-pipelines.json",
+        "hvm_event_tensors": "ir/hvm-event-tensors.json",
+        "hvm_tensor_islands": "ir/hvm-tensor-islands.json",
+        "runtime_plan": "runtime/plan.json",
+    }
+    for key, value in expected.items():
+        if artifact_paths.get(key) != value:
+            raise BumkcArtifactError(f"BUMKC artifact path mismatch: {key}")
 
 
 def _artifact_file_paths(root: Path) -> list[str]:
@@ -495,10 +550,64 @@ def _load_runtime_summary(
         ),
     }
     for key, value in expected.items():
-        if summary.get(key) is None or value is None or summary.get(key) != value:
+        if value is None or _read_summary_int(summary, key) != value:
             raise BumkcArtifactError(f"BUMKC engine runtime summary mismatch: {key}")
 
     return BumkcRuntimeSummary(**{key: int(value) for key, value in expected.items()})
+
+
+def _load_compiler_summary(
+    engine: dict[str, Any],
+    tensor_islands: dict[str, Any],
+    block_plan: dict[str, Any],
+    event_tensors: dict[str, Any],
+    simulation: dict[str, Any],
+) -> BumkcCompilerSummary:
+    summary = engine.get("compiler_summary")
+    if not isinstance(summary, dict):
+        raise BumkcArtifactError("BUMKC engine compiler summary is missing")
+
+    islands = _read_list(tensor_islands, "islands")
+    fallback_bridges = _read_list(tensor_islands, "fallback_bridges")
+    block_ops = _read_list(block_plan, "block_ops")
+    events = _read_list(event_tensors, "event_tensors")
+    execution_order = _read_any_list(simulation, "execution_order")
+    violations = _read_list(simulation, "violations")
+    native_island_count = 0
+    fallback_island_count = 0
+    for island in islands:
+        coverage_status = _read_str(island, "coverage_status")
+        if coverage_status in ("native_eligible", "native_compiled"):
+            native_island_count += 1
+        elif coverage_status == "fallback_only":
+            fallback_island_count += 1
+        else:
+            raise BumkcArtifactError(
+                f"BUMKC tensor island coverage status is unsupported: {coverage_status}"
+            )
+
+    expected = {
+        "tensor_island_count": len(islands),
+        "native_tensor_island_count": native_island_count,
+        "fallback_tensor_island_count": fallback_island_count,
+        "fallback_bridge_count": len(fallback_bridges),
+        "block_op_count": len(block_ops),
+        "event_tensor_count": len(events),
+        "event_predecessor_edge_count": sum(
+            len(_read_any_list(event, "predecessor_events")) for event in events
+        ),
+        "event_successor_edge_count": sum(
+            len(_read_any_list(event, "successor_events")) for event in events
+        ),
+        "event_notification_count": _read_int(simulation, "notification_count"),
+        "event_execution_count": len(execution_order),
+        "event_simulation_violation_count": len(violations),
+    }
+    for key, value in expected.items():
+        if _read_summary_int(summary, key) != value:
+            raise BumkcArtifactError(f"BUMKC engine compiler summary mismatch: {key}")
+
+    return BumkcCompilerSummary(**{key: int(value) for key, value in expected.items()})
 
 
 def _load_shape_symbol_bindings(
@@ -571,6 +680,20 @@ def _read_list(parent: dict[str, Any], key: str) -> list[dict[str, Any]]:
         raise BumkcArtifactError(f"BUMKC runtime {key} list is missing")
     if not all(isinstance(entry, dict) for entry in value):
         raise BumkcArtifactError(f"BUMKC runtime {key} list has non-object entries")
+    return value
+
+
+def _read_any_list(parent: dict[str, Any], key: str) -> list[Any]:
+    value = parent.get(key)
+    if not isinstance(value, list):
+        raise BumkcArtifactError(f"BUMKC runtime {key} list is missing")
+    return value
+
+
+def _read_summary_int(parent: dict[str, Any], key: str) -> int:
+    value = parent.get(key)
+    if not _is_strict_int(value):
+        raise BumkcArtifactError(f"BUMKC engine summary {key} integer is missing")
     return value
 
 

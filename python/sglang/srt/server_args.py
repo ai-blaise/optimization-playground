@@ -4124,6 +4124,11 @@ class ServerArgs:
         self._bumkc_artifact_summary.validate_scale_up_domain(
             gpu_count=self.tp_size * self.pp_size,
         )
+        device_sm = get_device_sm()
+        serving_target_arch = f"sm{device_sm}" if device_sm > 0 else None
+        self._bumkc_artifact_summary.validate_target_architecture(
+            target_arch=serving_target_arch,
+        )
         self._bumkc_default_launch_plan = (
             self._bumkc_artifact_summary.validate_default_runtime_launch()
         )

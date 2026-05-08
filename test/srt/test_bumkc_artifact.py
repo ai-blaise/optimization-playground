@@ -35,7 +35,9 @@ def test_server_args_exposes_checked_bumkc_fallback_mode():
     assert '"--bumkc-fallback-mode must be checked"' in source
     assert "self._bumkc_artifact_summary.serving_hints" in source
     assert "validate_scale_up_domain" in source
+    assert "validate_target_architecture" in source
     assert "gpu_count=self.tp_size * self.pp_size" in source
+    assert 'serving_target_arch = f"sm{device_sm}"' in source
     assert "self.quantization = serving_hints.quantization" in source
     assert "self.moe_runner_backend = serving_hints.moe_runner_backend" in source
 
@@ -213,6 +215,15 @@ def test_rejects_invalid_bumkc_serving_gpu_count(tmp_path):
 
     with pytest.raises(BumkcArtifactError, match="GPU count is invalid"):
         summary.validate_scale_up_domain(gpu_count=0)
+
+
+def test_rejects_bumkc_target_architecture_mismatch(tmp_path):
+    write_bumkc_artifact(tmp_path, executable=True)
+    summary = load_bumkc_artifact(tmp_path)
+
+    summary.validate_target_architecture(target_arch="sm90")
+    with pytest.raises(BumkcArtifactError, match="target architecture"):
+        summary.validate_target_architecture(target_arch="sm80")
 
 
 def test_derives_bumkc_fp8_serving_hints():

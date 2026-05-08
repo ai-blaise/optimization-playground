@@ -528,6 +528,13 @@ class BumkcArtifactSummary:
                 f"rank_count={self.runtime_summary.rank_count}, serving={gpu_count}"
             )
 
+    def validate_target_architecture(self, *, target_arch: str | None) -> None:
+        if self.target_arch != target_arch:
+            raise BumkcArtifactError(
+                "BUMKC artifact target architecture does not match serving domain: "
+                f"artifact={self.target_arch}, serving={target_arch}"
+            )
+
     def validate_runtime_launch(
         self,
         *,

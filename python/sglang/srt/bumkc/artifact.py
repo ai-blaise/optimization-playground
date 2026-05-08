@@ -9,7 +9,7 @@ from typing import Any
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v6"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v7"
 
 
 class BumkcArtifactError(ValueError):
@@ -42,6 +42,10 @@ class BumkcRuntimeSummary:
     serving_dependency_count: int
     serving_kind_code_sum: int
     serving_symbol_count: int
+    substitution_shape_symbol_count: int
+    substitution_serving_binding_count: int
+    substitution_symbol_max_sum: int
+    substitution_symbol_bucket_sum: int
 
     def as_log_dict(self) -> dict[str, int]:
         return {
@@ -69,6 +73,12 @@ class BumkcRuntimeSummary:
             "serving_dependency_count": self.serving_dependency_count,
             "serving_kind_code_sum": self.serving_kind_code_sum,
             "serving_symbol_count": self.serving_symbol_count,
+            "substitution_shape_symbol_count": self.substitution_shape_symbol_count,
+            "substitution_serving_binding_count": (
+                self.substitution_serving_binding_count
+            ),
+            "substitution_symbol_max_sum": self.substitution_symbol_max_sum,
+            "substitution_symbol_bucket_sum": self.substitution_symbol_bucket_sum,
         }
 
 
@@ -203,6 +213,9 @@ def _load_runtime_summary(
     scale_up_plan = _read_object(runtime, "scale_up_plan")
     communication_plan = _read_object(runtime, "communication_plan")
     serving_state_plan = _read_object(runtime, "serving_state_plan")
+    substitution_plan = _read_object(runtime, "substitution_plan")
+    substitution_shape_symbols = _read_list(substitution_plan, "shape_symbols")
+    substitution_serving_state = _read_list(substitution_plan, "serving_state")
     dependency_plan = _read_object(runtime, "dependency_plan")
     expected = {
         "task_count": runtime.get("task_count"),
@@ -239,6 +252,14 @@ def _load_runtime_summary(
         ),
         "serving_kind_code_sum": serving_state_plan.get("serving_kind_code_sum"),
         "serving_symbol_count": serving_state_plan.get("serving_symbol_count"),
+        "substitution_shape_symbol_count": len(substitution_shape_symbols),
+        "substitution_serving_binding_count": len(substitution_serving_state),
+        "substitution_symbol_max_sum": sum(
+            _read_int(symbol, "max") for symbol in substitution_shape_symbols
+        ),
+        "substitution_symbol_bucket_sum": sum(
+            _read_int(symbol, "bucket") for symbol in substitution_shape_symbols
+        ),
     }
     for key, value in expected.items():
         if summary.get(key) is None or value is None or summary.get(key) != value:
@@ -251,4 +272,20 @@ def _read_object(parent: dict[str, Any], key: str) -> dict[str, Any]:
     value = parent.get(key)
     if not isinstance(value, dict):
         raise BumkcArtifactError(f"BUMKC runtime {key} object is missing")
+    return value
+
+
+def _read_list(parent: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = parent.get(key)
+    if not isinstance(value, list):
+        raise BumkcArtifactError(f"BUMKC runtime {key} list is missing")
+    if not all(isinstance(entry, dict) for entry in value):
+        raise BumkcArtifactError(f"BUMKC runtime {key} list has non-object entries")
+    return value
+
+
+def _read_int(parent: dict[str, Any], key: str) -> int:
+    value = parent.get(key)
+    if not isinstance(value, int):
+        raise BumkcArtifactError(f"BUMKC runtime {key} integer is missing")
     return value

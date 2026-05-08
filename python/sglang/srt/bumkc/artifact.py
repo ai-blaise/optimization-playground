@@ -20,7 +20,8 @@ REQUIRED_VALIDATION_MODEL = (
 )
 REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
 REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v15"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v16"
+REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v8"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v11"
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
@@ -95,6 +96,13 @@ _DEPENDENCY_SCOPE_CODES = {
     "tile_overlap": 1,
     "whole_producer": 2,
 }
+_SERVING_STATE_KIND_CODES = {
+    "batch": 1,
+    "sequence": 2,
+    "decode_step": 3,
+    "token_ids": 4,
+    "kv_cache_pages": 5,
+}
 _DEPENDENCY_HASH_OFFSET = 14695981039346656037
 _DEPENDENCY_HASH_PRIME = 1099511628211
 
@@ -125,9 +133,7 @@ def _mix_contract_byte(hash_value: int, byte: int) -> int:
 def _dependency_descriptor_hash(descriptors: list[dict[str, Any]]) -> int:
     hash_value = _DEPENDENCY_HASH_OFFSET
     for descriptor in descriptors:
-        hash_value = _mix_dependency_hash_str(
-            hash_value, _read_str(descriptor, "task")
-        )
+        hash_value = _mix_dependency_hash_str(hash_value, _read_str(descriptor, "task"))
         hash_value = _mix_dependency_hash_str(
             hash_value, _read_str(descriptor, "consumer_event")
         )
@@ -147,9 +153,7 @@ def _dependency_descriptor_hash(descriptors: list[dict[str, Any]]) -> int:
             hash_value = _mix_dependency_hash_str(hash_value, tensor)
         scope = _read_str(descriptor, "scope")
         if scope not in _DEPENDENCY_SCOPE_CODES:
-            raise BumkcArtifactError(
-                f"BUMKC dependency scope is unsupported: {scope}"
-            )
+            raise BumkcArtifactError(f"BUMKC dependency scope is unsupported: {scope}")
         hash_value = _mix_dependency_hash_u64(
             hash_value, _DEPENDENCY_SCOPE_CODES[scope]
         )
@@ -444,8 +448,7 @@ class BumkcArtifactSummary:
             "compiler_summary": self.compiler_summary.as_log_dict(),
             "runtime_summary": self.runtime_summary.as_log_dict(),
             "runtime_shape_symbols": [
-                dataclasses.asdict(binding)
-                for binding in self.runtime_shape_symbols
+                dataclasses.asdict(binding) for binding in self.runtime_shape_symbols
             ],
             "runtime_serving_state": [
                 dataclasses.asdict(binding) for binding in self.runtime_serving_state
@@ -462,6 +465,7 @@ def load_bumkc_artifact(
 ) -> BumkcArtifactSummary:
     root = _resolve_plan_dir(Path(path))
     manifest = _read_json(root / "manifest.json")
+    model_source = _read_json(root / "source" / "model-source.json")
     tensor_islands = _read_json(root / "ir" / "hvm-tensor-islands.json")
     block_plan = _read_json(root / "ir" / "hvm-block-role-pipelines.json")
     event_tensors = _read_json(root / "ir" / "hvm-event-tensors.json")
@@ -473,6 +477,7 @@ def load_bumkc_artifact(
 
     _validate_identity(
         manifest,
+        model_source,
         tensor_islands,
         block_plan,
         event_tensors,
@@ -491,7 +496,9 @@ def load_bumkc_artifact(
     if engine.get("manifest_schema_version") != manifest.get("schema_version"):
         raise BumkcArtifactError("BUMKC engine manifest schema does not match manifest")
     if engine.get("manifest_capability_level") != manifest.get("capability_level"):
-        raise BumkcArtifactError("BUMKC engine manifest capability does not match manifest")
+        raise BumkcArtifactError(
+            "BUMKC engine manifest capability does not match manifest"
+        )
     if engine.get("engine") != "sglang":
         raise BumkcArtifactError("BUMKC artifact is not targeted at the SGLang engine")
     if engine.get("engine_profile") != "optimization_playground":
@@ -517,6 +524,7 @@ def load_bumkc_artifact(
         raise BumkcArtifactError(
             "BUMKC artifact validation model is not the REAP target"
         )
+    _validate_source_artifact(model_source, manifest, engine, tensor_islands)
     if engine.get("runtime_executable") != runtime.get("executable"):
         raise BumkcArtifactError("BUMKC engine and runtime executable flags disagree")
     if runtime.get("runtime_abi_version") != REQUIRED_RUNTIME_ABI_VERSION:
@@ -661,6 +669,7 @@ def _validate_artifact_paths(root: Path, artifact_paths: dict[str, Any]) -> None
         "hvm_sm_task_runtime": "ir/hvm-sm-task-runtime.json",
         "hvm_tensor_islands": "ir/hvm-tensor-islands.json",
         "manifest": "manifest.json",
+        "model_source": "source/model-source.json",
         "runtime_plan": "runtime/plan.json",
     }
     for key, value in expected.items():
@@ -668,6 +677,98 @@ def _validate_artifact_paths(root: Path, artifact_paths: dict[str, Any]) -> None
             raise BumkcArtifactError(f"BUMKC artifact path mismatch: {key}")
         if not (root / value).is_file():
             raise BumkcArtifactError(f"BUMKC artifact path is missing: {key}")
+
+
+def _validate_source_artifact(
+    model_source: dict[str, Any],
+    manifest: dict[str, Any],
+    engine: dict[str, Any],
+    tensor_islands: dict[str, Any],
+) -> None:
+    if model_source.get("schema_version") != REQUIRED_SOURCE_SCHEMA_VERSION:
+        raise BumkcArtifactError("BUMKC model source schema is unsupported")
+    if _read_object(model_source, "source") != _read_object(manifest, "source"):
+        raise BumkcArtifactError("BUMKC model source provenance mismatches manifest")
+    if model_source["source"].get("model") != engine.get("model"):
+        raise BumkcArtifactError("BUMKC model source provenance mismatches engine")
+
+    expected_manifest_fields = {
+        "gpu_count": manifest.get("gpu_count"),
+        "target_arch": manifest.get("target_arch"),
+        "engine": manifest.get("engine"),
+        "engine_profile": manifest.get("engine_profile"),
+        "fallback_mode": manifest.get("fallback_mode"),
+        "runtime_mode": manifest.get("runtime_mode"),
+    }
+    for key, value in expected_manifest_fields.items():
+        if model_source.get(key) != value:
+            raise BumkcArtifactError(f"BUMKC model source manifest mismatch: {key}")
+    if model_source.get("gpu_count") != engine.get("gpu_count"):
+        raise BumkcArtifactError("BUMKC model source GPU count mismatches engine")
+    if model_source.get("target_arch") != engine.get("target_arch"):
+        raise BumkcArtifactError(
+            "BUMKC model source target architecture mismatches engine"
+        )
+    if model_source.get("fallback_mode") != engine.get("fallback_mode"):
+        raise BumkcArtifactError("BUMKC model source fallback mode mismatches engine")
+    if model_source.get("hvm_core_book_source_path") != "source/hvm-core-book.hvm":
+        raise BumkcArtifactError("BUMKC model source HVM path is not canonical")
+    _source_coverage_status(model_source, "hvm_capture_status")
+
+    islands = _read_list(tensor_islands, "islands")
+    fallback_bridges = _read_list(tensor_islands, "fallback_bridges")
+    shape_symbols = _read_list(tensor_islands, "shape_symbols")
+    island_side_effects = [
+        _read_side_effect_list(island, "side_effects") for island in islands
+    ]
+    island_serving_state = [_read_list(island, "serving_state") for island in islands]
+    coverage_statuses = [
+        _source_coverage_status(island, "coverage_status") for island in islands
+    ]
+    expected = {
+        "tensor_island_count": len(islands),
+        "native_eligible_island_count": sum(
+            1 for status in coverage_statuses if status == "native_eligible"
+        ),
+        "fallback_island_count": sum(
+            1 for status in coverage_statuses if status == "fallback_only"
+        ),
+        "fallback_bridge_count": len(fallback_bridges),
+        "side_effecting_island_count": sum(
+            1 for side_effects in island_side_effects if side_effects
+        ),
+        "collective_island_count": sum(
+            1 for island in islands if _read_optional_object(island, "communication")
+        ),
+        "moe_dispatch_island_count": sum(
+            1 for island in islands if _read_str(island, "operator") == "moe_dispatch"
+        ),
+        "serving_state_island_count": sum(
+            1 for serving_state in island_serving_state if serving_state
+        ),
+        "serving_state_dependency_count": sum(
+            len(serving_state) for serving_state in island_serving_state
+        ),
+        "serving_state_kind_code_sum": _serving_state_kind_code_sum(
+            island_serving_state
+        ),
+        "serving_state_symbol_count": sum(
+            1
+            for serving_state in island_serving_state
+            for dependency in serving_state
+            if _read_optional_str(dependency, "symbol") is not None
+        ),
+        "shape_symbol_count": len(shape_symbols),
+        "shape_symbol_max_sum": sum(
+            _read_int(symbol, "max") for symbol in shape_symbols
+        ),
+        "shape_symbol_bucket_sum": sum(
+            _read_int(symbol, "bucket") for symbol in shape_symbols
+        ),
+    }
+    for key, value in expected.items():
+        if _read_int(model_source, key) != value:
+            raise BumkcArtifactError(f"BUMKC model source summary mismatch: {key}")
 
 
 def _artifact_file_paths(root: Path) -> list[str]:
@@ -727,33 +828,22 @@ def _load_runtime_summary(
     substitution_shape_symbols = _read_list(substitution_plan, "shape_symbols")
     substitution_serving_state = _read_list(substitution_plan, "serving_state")
     dependency_plan = _read_object(runtime, "dependency_plan")
-    dependency_descriptors = _read_list(
-        dependency_plan, "dependency_descriptors"
-    )
-    dependency_descriptor_hash = _dependency_descriptor_hash(
-        dependency_descriptors
-    )
+    dependency_descriptors = _read_list(dependency_plan, "dependency_descriptors")
+    dependency_descriptor_hash = _dependency_descriptor_hash(dependency_descriptors)
     if _read_int(dependency_plan, "dependency_descriptor_count") != len(
         dependency_descriptors
     ):
-        raise BumkcArtifactError(
-            "BUMKC runtime dependency descriptor count mismatch"
-        )
+        raise BumkcArtifactError("BUMKC runtime dependency descriptor count mismatch")
     if (
         _read_int(dependency_plan, "dependency_descriptor_hash")
         != dependency_descriptor_hash
     ):
-        raise BumkcArtifactError(
-            "BUMKC runtime dependency descriptor hash mismatch"
-        )
+        raise BumkcArtifactError("BUMKC runtime dependency descriptor hash mismatch")
     dependency_tensor_count = sum(
         len(_read_any_list(descriptor, "tensors"))
         for descriptor in dependency_descriptors
     )
-    if (
-        _read_int(dependency_plan, "dependency_tensor_count")
-        != dependency_tensor_count
-    ):
+    if _read_int(dependency_plan, "dependency_tensor_count") != dependency_tensor_count:
         raise BumkcArtifactError("BUMKC runtime dependency tensor count mismatch")
     expected = {
         "task_count": runtime.get("task_count"),
@@ -784,20 +874,12 @@ def _load_runtime_summary(
         "collective_group_size_sum": communication_plan.get(
             "collective_group_size_sum"
         ),
-        "collective_kind_code_sum": communication_plan.get(
-            "collective_kind_code_sum"
-        ),
-        "side_effecting_task_count": side_effect_plan.get(
-            "side_effecting_task_count"
-        ),
+        "collective_kind_code_sum": communication_plan.get("collective_kind_code_sum"),
+        "side_effecting_task_count": side_effect_plan.get("side_effecting_task_count"),
         "task_side_effect_count": side_effect_plan.get("task_side_effect_count"),
-        "task_side_effect_code_sum": side_effect_plan.get(
-            "task_side_effect_code_sum"
-        ),
+        "task_side_effect_code_sum": side_effect_plan.get("task_side_effect_code_sum"),
         "serving_task_count": serving_state_plan.get("serving_task_count"),
-        "serving_dependency_count": serving_state_plan.get(
-            "serving_dependency_count"
-        ),
+        "serving_dependency_count": serving_state_plan.get("serving_dependency_count"),
         "serving_kind_code_sum": serving_state_plan.get("serving_kind_code_sum"),
         "serving_symbol_count": serving_state_plan.get("serving_symbol_count"),
         "substitution_shape_symbol_count": len(substitution_shape_symbols),
@@ -870,15 +952,11 @@ def _load_compiler_summary(
         ),
         "fallback_bridge_count": len(fallback_bridges),
         "moe_dispatch_tensor_island_count": sum(
-            1
-            for island in islands
-            if _read_str(island, "operator") == "moe_dispatch"
+            1 for island in islands if _read_str(island, "operator") == "moe_dispatch"
         ),
         "block_op_count": len(block_ops),
         "moe_dispatch_block_op_count": sum(
-            1
-            for block in block_ops
-            if _read_str(block, "operator") == "moe_dispatch"
+            1 for block in block_ops if _read_str(block, "operator") == "moe_dispatch"
         ),
         "side_effecting_block_op_count": sum(
             1 for side_effects in block_side_effects if side_effects
@@ -896,9 +974,7 @@ def _load_compiler_summary(
         ),
         "event_side_effect_code_sum": _side_effect_code_sum(event_side_effects),
         "moe_dispatch_event_tensor_count": sum(
-            1
-            for event in events
-            if _read_str(event, "operator") == "moe_dispatch"
+            1 for event in events if _read_str(event, "operator") == "moe_dispatch"
         ),
         "event_predecessor_edge_count": sum(
             len(_read_any_list(event, "predecessor_events")) for event in events
@@ -1129,17 +1205,13 @@ def _validate_runtime_smoke_task_descriptors(
         )
         expected["expected_communication_kind_code_sum"] += communication_kind_code
         side_effect_count = _read_int(task, "side_effect_count")
-        expected["expected_side_effecting_task_count"] += int(
-            side_effect_count != 0
-        )
+        expected["expected_side_effecting_task_count"] += int(side_effect_count != 0)
         expected["expected_task_side_effect_count"] += side_effect_count
         expected["expected_task_side_effect_code_sum"] += _read_int(
             task, "side_effect_code_sum"
         )
         serving_dependency_count = _read_int(task, "serving_dependency_count")
-        expected["expected_serving_task_count"] += int(
-            serving_dependency_count != 0
-        )
+        expected["expected_serving_task_count"] += int(serving_dependency_count != 0)
         expected["expected_serving_dependency_count"] += serving_dependency_count
         expected["expected_serving_kind_code_sum"] += _read_int(
             task, "serving_kind_code_sum"
@@ -1147,9 +1219,7 @@ def _validate_runtime_smoke_task_descriptors(
         expected["expected_serving_symbol_count"] += _read_int(
             task, "serving_symbol_count"
         )
-        expected["expected_rank_group_size_sum"] += _read_int(
-            task, "rank_group_size"
-        )
+        expected["expected_rank_group_size_sum"] += _read_int(task, "rank_group_size")
         expected["expected_rank_id_sum"] += _read_int(task, "rank_id_sum")
     for key, value in expected.items():
         if _read_int(runtime_smoke, key) != value:
@@ -1361,6 +1431,15 @@ def _read_object(parent: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+def _read_optional_object(parent: dict[str, Any], key: str) -> dict[str, Any] | None:
+    value = parent.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise BumkcArtifactError(f"BUMKC runtime {key} object is invalid")
+    return value
+
+
 def _read_list(parent: dict[str, Any], key: str) -> list[dict[str, Any]]:
     value = parent.get(key)
     if not isinstance(value, list):
@@ -1393,6 +1472,30 @@ def _side_effect_code_sum(side_effect_lists: Iterable[list[str]]) -> int:
         for side_effects in side_effect_lists
         for side_effect in side_effects
     )
+
+
+def _source_coverage_status(parent: dict[str, Any], key: str) -> str:
+    status = _read_str(parent, key)
+    if status not in ("fallback_only", "native_eligible", "native_compiled"):
+        raise BumkcArtifactError(
+            f"BUMKC model source coverage status is unsupported: {status}"
+        )
+    return status
+
+
+def _serving_state_kind_code_sum(
+    serving_state_lists: Iterable[list[dict[str, Any]]],
+) -> int:
+    code_sum = 0
+    for serving_state in serving_state_lists:
+        for dependency in serving_state:
+            kind = _read_str(dependency, "kind")
+            if kind not in _SERVING_STATE_KIND_CODES:
+                raise BumkcArtifactError(
+                    f"BUMKC serving-state kind is unsupported: {kind}"
+                )
+            code_sum += _SERVING_STATE_KIND_CODES[kind]
+    return code_sum
 
 
 def _event_dependency_tensor_count(events: list[dict[str, Any]]) -> int:

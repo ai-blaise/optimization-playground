@@ -22,7 +22,8 @@ validates:
   engine, simulation, and tensor smoke artifacts,
 - manifest `schema_version == "bumkc.plan.v1"`,
 - manifest `capability_level == "hvm_rooted_runtime_descriptor"`,
-- engine export `schema_version == "bumkc.optimization_playground.v15"`,
+- engine export `schema_version == "bumkc.optimization_playground.v16"`,
+- model-source export `schema_version == "bumkc.source.v8"`,
 - engine-exported manifest schema/capability fields matching `manifest.json`,
 - `runtime_abi_version == "bumkc.runtime.v1"`,
 - runtime smoke schema `bumkc.cuda_smoke.v11`,
@@ -31,9 +32,11 @@ validates:
 - exported serving CLI flags,
 - `reports/artifact-digests.json` byte counts and SHA-256 hashes before
   runtime metadata is trusted,
-- canonical artifact paths for the HVM core book, tensor islands, block
-  pipelines, Event Tensor plan, SM task runtime, runtime descriptor, CPU
-  reference, and generated CUDA smoke plans/sources,
+- canonical artifact paths for the model-source export, HVM core book, tensor
+  islands, block pipelines, Event Tensor plan, SM task runtime, runtime
+  descriptor, CPU reference, and generated CUDA smoke plans/sources,
+- model-source provenance and summary fields against the manifest, engine
+  export, and HVM tensor island artifact,
 - matching target architecture between manifest and engine export,
 - checked fallback mode,
 - `--bumkc-fallback-mode checked` when BUMKC is enabled,

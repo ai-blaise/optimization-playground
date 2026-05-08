@@ -17,6 +17,7 @@ REQUIRED_VALIDATION_MODEL = bumkc_artifact.REQUIRED_VALIDATION_MODEL
 REQUIRED_PLAN_SCHEMA_VERSION = bumkc_artifact.REQUIRED_PLAN_SCHEMA_VERSION
 REQUIRED_CAPABILITY_LEVEL = bumkc_artifact.REQUIRED_CAPABILITY_LEVEL
 REQUIRED_SCHEMA_VERSION = bumkc_artifact.REQUIRED_SCHEMA_VERSION
+REQUIRED_SOURCE_SCHEMA_VERSION = bumkc_artifact.REQUIRED_SOURCE_SCHEMA_VERSION
 REQUIRED_RUNTIME_ABI_VERSION = bumkc_artifact.REQUIRED_RUNTIME_ABI_VERSION
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = (
     bumkc_artifact.REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION
@@ -97,7 +98,7 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.engine_schema_version == REQUIRED_SCHEMA_VERSION
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
-    assert summary.artifact_digest_count == 15
+    assert summary.artifact_digest_count == 16
     assert summary.fallback_mode == "checked"
     log_dict = summary.as_log_dict()
     assert log_dict["plan_schema_version"] == REQUIRED_PLAN_SCHEMA_VERSION
@@ -165,6 +166,18 @@ def test_rejects_unsupported_bumkc_schema(tmp_path):
     refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="unsupported engine schema"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_unsupported_bumkc_model_source_schema(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    source_path = plan_dir / "source" / "model-source.json"
+    model_source = json.loads(source_path.read_text(encoding="utf-8"))
+    model_source["schema_version"] = "bumkc.source.v0"
+    source_path.write_text(json.dumps(model_source), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="model source schema"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -306,6 +319,18 @@ def test_rejects_bumkc_compiler_summary_mismatch(tmp_path):
     refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="compiler summary mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_model_source_summary_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    source_path = plan_dir / "source" / "model-source.json"
+    model_source = json.loads(source_path.read_text(encoding="utf-8"))
+    model_source["collective_island_count"] = 0
+    source_path.write_text(json.dumps(model_source), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="model source summary mismatch"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -534,7 +559,16 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "capability_level": REQUIRED_CAPABILITY_LEVEL,
             "plan_id": plan_id,
             "program_id": program_id,
+            "source": {
+                "frontend": "internal_test",
+                "model": "matmul-chain",
+            },
+            "gpu_count": 8,
             "target_arch": "sm90",
+            "engine": "sglang",
+            "engine_profile": "optimization_playground",
+            "fallback_mode": "checked",
+            "runtime_mode": "debug",
         },
     )
     write_json(
@@ -542,20 +576,45 @@ def write_bumkc_artifact(tmp_path, *, executable):
         {
             "plan_id": plan_id,
             "program_id": program_id,
+            "shape_symbols": [
+                {
+                    "id": "sequence",
+                    "min": 1,
+                    "max": 4096,
+                    "bucket": 16,
+                }
+            ],
             "islands": [
                 {
                     "operator": "matmul",
                     "coverage_status": "native_eligible",
+                    "communication": None,
+                    "serving_state": [],
                     "side_effects": [],
                 },
                 {
                     "operator": "collective",
                     "coverage_status": "native_eligible",
+                    "communication": {
+                        "kind": "all_reduce",
+                        "group_size": 8,
+                    },
+                    "serving_state": [
+                        {
+                            "kind": "sequence",
+                            "symbol": "sequence",
+                        },
+                        {
+                            "kind": "decode_step",
+                        },
+                    ],
                     "side_effects": ["collective"],
                 },
                 {
                     "operator": "unknown",
                     "coverage_status": "fallback_only",
+                    "communication": None,
+                    "serving_state": [],
                     "side_effects": [],
                 },
             ],
@@ -570,6 +629,40 @@ def write_bumkc_artifact(tmp_path, *, executable):
         },
     )
     write_text(plan_dir / "source" / "hvm-core-book.hvm", "%main = 0\n")
+    write_json(
+        plan_dir / "source" / "model-source.json",
+        {
+            "schema_version": REQUIRED_SOURCE_SCHEMA_VERSION,
+            "plan_id": plan_id,
+            "program_id": program_id,
+            "source": {
+                "frontend": "internal_test",
+                "model": "matmul-chain",
+            },
+            "gpu_count": 8,
+            "target_arch": "sm90",
+            "engine": "sglang",
+            "engine_profile": "optimization_playground",
+            "fallback_mode": "checked",
+            "runtime_mode": "debug",
+            "hvm_core_book_source_path": "source/hvm-core-book.hvm",
+            "hvm_capture_status": "native_eligible",
+            "tensor_island_count": 3,
+            "native_eligible_island_count": 2,
+            "fallback_island_count": 1,
+            "fallback_bridge_count": 1,
+            "side_effecting_island_count": 1,
+            "collective_island_count": 1,
+            "moe_dispatch_island_count": 0,
+            "serving_state_island_count": 1,
+            "serving_state_dependency_count": 2,
+            "serving_state_kind_code_sum": 5,
+            "serving_state_symbol_count": 1,
+            "shape_symbol_count": 1,
+            "shape_symbol_max_sum": 4096,
+            "shape_symbol_bucket_sum": 16,
+        },
+    )
     write_json(
         plan_dir / "ir" / "hvm-core-book.json",
         {
@@ -820,6 +913,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "hvm_sm_task_runtime": "ir/hvm-sm-task-runtime.json",
                 "hvm_tensor_islands": "ir/hvm-tensor-islands.json",
                 "manifest": "manifest.json",
+                "model_source": "source/model-source.json",
                 "runtime_plan": "runtime/plan.json",
             },
         },
@@ -970,9 +1064,7 @@ def populate_runtime_smoke_contracts(smoke):
     smoke["expected_runtime_abi_hash"] = bumkc_artifact._contract_hash_str(
         smoke["runtime_abi_version"]
     )
-    smoke["expected_plan_id_hash"] = bumkc_artifact._contract_hash_str(
-        smoke["plan_id"]
-    )
+    smoke["expected_plan_id_hash"] = bumkc_artifact._contract_hash_str(smoke["plan_id"])
     smoke["expected_program_id_hash"] = bumkc_artifact._contract_hash_str(
         smoke["program_id"]
     )

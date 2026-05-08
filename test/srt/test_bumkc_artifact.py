@@ -168,6 +168,72 @@ def test_rejects_required_non_executable_bumkc_artifact(tmp_path):
         load_bumkc_artifact(tmp_path, require_executable=True)
 
 
+def test_derives_bumkc_fp8_serving_hints():
+    quantization = bumkc_artifact.BumkcQuantizationSummary(
+        scheme="FP8",
+        scheme_hash=bumkc_artifact._stable_name_hash("FP8"),
+        weight_format="fp8_e4m3",
+        weight_format_code=2,
+        weight_bits=8,
+        weight_scale_layout=None,
+        weight_scale_layout_code=0,
+        weight_group_size=None,
+        weight_scale_dtype=None,
+        weight_scale_dtype_code=0,
+        weight_symmetric=None,
+        weight_symmetric_code=0,
+        weight_zero_point=False,
+        activation_bits=None,
+        kv_bits=None,
+        kv_format=None,
+        kv_format_code=0,
+        indexer_k_bits=None,
+        indexer_k_format=None,
+        indexer_k_format_code=0,
+        gated_norm=False,
+        spinquant=False,
+        ignored_module_count=0,
+    )
+
+    hints = bumkc_artifact._build_serving_hints(quantization)
+
+    assert hints.quantization == "fp8"
+    assert hints.moe_runner_backend == "flashinfer_trtllm"
+
+
+def test_leaves_unknown_bumkc_serving_hints_unset():
+    quantization = bumkc_artifact.BumkcQuantizationSummary(
+        scheme="INT4",
+        scheme_hash=bumkc_artifact._stable_name_hash("INT4"),
+        weight_format="int4",
+        weight_format_code=4,
+        weight_bits=4,
+        weight_scale_layout=None,
+        weight_scale_layout_code=0,
+        weight_group_size=None,
+        weight_scale_dtype=None,
+        weight_scale_dtype_code=0,
+        weight_symmetric=None,
+        weight_symmetric_code=0,
+        weight_zero_point=False,
+        activation_bits=None,
+        kv_bits=None,
+        kv_format=None,
+        kv_format_code=0,
+        indexer_k_bits=None,
+        indexer_k_format=None,
+        indexer_k_format_code=0,
+        gated_norm=False,
+        spinquant=False,
+        ignored_module_count=0,
+    )
+
+    hints = bumkc_artifact._build_serving_hints(quantization)
+
+    assert hints.quantization is None
+    assert hints.moe_runner_backend is None
+
+
 def test_rejects_bumkc_identity_mismatch(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     runtime_path = plan_dir / "runtime" / "plan.json"

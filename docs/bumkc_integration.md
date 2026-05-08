@@ -35,7 +35,9 @@ Before invoking any BUMKC runtime entrypoint, the serving path must call
 `BumkcArtifactSummary.validate_runtime_launch()` with concrete dynamic shape
 values and serving-state keys. The guard rejects missing, unknown,
 out-of-range, or out-of-bucket shape substitutions and missing or unknown
-serving-state bindings.
+serving-state bindings. Startup also validates the artifact's default launch
+context through `validate_default_runtime_launch()` when `--enable-bumkc` loads
+the artifact.
 
 Add `--bumkc-require-executable` when startup must fail unless the runtime
 descriptor is executable. Without that flag, non-executable BUMKC artifacts are

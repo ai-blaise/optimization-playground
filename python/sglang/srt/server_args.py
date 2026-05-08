@@ -4116,6 +4116,9 @@ class ServerArgs:
             self.bumkc_plan_path,
             require_executable=self.bumkc_require_executable,
         )
+        self._bumkc_default_launch_plan = (
+            self._bumkc_artifact_summary.validate_default_runtime_launch()
+        )
         logger.info(
             "Loaded BUMKC artifact: %s",
             self._bumkc_artifact_summary.as_log_dict(),

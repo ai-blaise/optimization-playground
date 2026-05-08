@@ -206,6 +206,19 @@ class BumkcArtifactSummary:
             serving_state=tuple(self.runtime_serving_state),
         )
 
+    def validate_default_runtime_launch(self) -> BumkcRuntimeLaunchPlan:
+        return self.validate_runtime_launch(
+            shape_symbols={
+                binding.symbol: binding.default_value
+                for binding in self.runtime_shape_symbols
+            },
+            serving_state=[
+                binding.key()
+                for binding in self.runtime_serving_state
+                if binding.required
+            ],
+        )
+
     def as_log_dict(self) -> dict[str, Any]:
         return {
             "root": str(self.root),

@@ -54,6 +54,8 @@ def test_loads_executable_bumkc_artifact(tmp_path):
         serving_state=[("sequence", "sequence"), ("decode_step", None)],
     )
     assert launch_plan.shape_symbols[0].bucketed_value == 32
+    default_launch_plan = summary.validate_default_runtime_launch()
+    assert default_launch_plan.shape_symbols[0].value == 1
 
 
 def test_rejects_required_non_executable_bumkc_artifact(tmp_path):

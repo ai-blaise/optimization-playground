@@ -57,6 +57,7 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.compiler_summary.event_side_effect_code_sum == 3
     assert summary.compiler_summary.event_predecessor_edge_count == 1
     assert summary.compiler_summary.event_successor_edge_count == 1
+    assert summary.compiler_summary.event_dependency_tensor_count == 1
     assert summary.compiler_summary.event_notification_count == 1
     assert summary.compiler_summary.event_execution_count == 2
     assert summary.compiler_summary.event_simulation_violation_count == 0
@@ -269,6 +270,18 @@ def test_rejects_bumkc_side_effect_summary_mismatch(tmp_path):
     refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="compiler summary mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_event_dependency_edge_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    event_path = plan_dir / "ir" / "hvm-event-tensors.json"
+    events = json.loads(event_path.read_text(encoding="utf-8"))
+    events["event_tensors"][1]["predecessor_edges"] = []
+    event_path.write_text(json.dumps(events), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="Event Tensor edge count"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -507,11 +520,15 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 {
                     "side_effects": [],
                     "predecessor_events": [],
+                    "predecessor_edges": [],
                     "successor_events": ["event_second"],
                 },
                 {
                     "side_effects": ["collective"],
                     "predecessor_events": ["event_first"],
+                    "predecessor_edges": [
+                        {"tensors": ["tensor_hidden"]},
+                    ],
                     "successor_events": [],
                 },
             ],
@@ -662,6 +679,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "event_side_effect_code_sum": 3,
                 "event_predecessor_edge_count": 1,
                 "event_successor_edge_count": 1,
+                "event_dependency_tensor_count": 1,
                 "event_notification_count": 1,
                 "event_execution_count": 2,
                 "event_simulation_violation_count": 0,

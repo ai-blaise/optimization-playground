@@ -18,7 +18,7 @@ REQUIRED_CLI_FLAGS = (
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v12"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v13"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v11"
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
@@ -229,6 +229,7 @@ class BumkcCompilerSummary:
     event_side_effect_code_sum: int
     event_predecessor_edge_count: int
     event_successor_edge_count: int
+    event_dependency_tensor_count: int
     event_notification_count: int
     event_execution_count: int
     event_simulation_violation_count: int
@@ -868,6 +869,7 @@ def _load_compiler_summary(
         "event_successor_edge_count": sum(
             len(_read_any_list(event, "successor_events")) for event in events
         ),
+        "event_dependency_tensor_count": _event_dependency_tensor_count(events),
         "event_notification_count": _read_int(simulation, "notification_count"),
         "event_execution_count": len(execution_order),
         "event_simulation_violation_count": len(violations),
@@ -1354,6 +1356,23 @@ def _side_effect_code_sum(side_effect_lists: Iterable[list[str]]) -> int:
         for side_effects in side_effect_lists
         for side_effect in side_effects
     )
+
+
+def _event_dependency_tensor_count(events: list[dict[str, Any]]) -> int:
+    count = 0
+    for event in events:
+        edges = _read_list(event, "predecessor_edges")
+        if len(edges) != len(_read_any_list(event, "predecessor_events")):
+            raise BumkcArtifactError("BUMKC Event Tensor edge count mismatch")
+        for edge in edges:
+            tensors = _read_any_list(edge, "tensors")
+            for tensor in tensors:
+                if not isinstance(tensor, str) or not tensor:
+                    raise BumkcArtifactError(
+                        "BUMKC Event Tensor dependency tensor is malformed"
+                    )
+            count += len(tensors)
+    return count
 
 
 def _read_summary_int(parent: dict[str, Any], key: str) -> int:

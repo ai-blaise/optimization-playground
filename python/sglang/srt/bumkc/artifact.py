@@ -22,11 +22,13 @@ REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
 LEGACY_SCHEMA_VERSION = "bumkc.optimization_playground.v20"
 PREVIOUS_SCHEMA_VERSION = "bumkc.optimization_playground.v21"
 SCALE_UP_SCHEMA_VERSION = "bumkc.optimization_playground.v22"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v23"
+SERVING_HINTS_SCHEMA_VERSION = "bumkc.optimization_playground.v23"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v24"
 SUPPORTED_SCHEMA_VERSIONS = (
     LEGACY_SCHEMA_VERSION,
     PREVIOUS_SCHEMA_VERSION,
     SCALE_UP_SCHEMA_VERSION,
+    SERVING_HINTS_SCHEMA_VERSION,
     REQUIRED_SCHEMA_VERSION,
 )
 REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v11"
@@ -426,6 +428,24 @@ class BumkcScaleUpSummary:
 
 
 @dataclasses.dataclass(frozen=True)
+class BumkcLaunchSummary:
+    shape_symbol_count: int
+    shape_symbol_min_sum: int
+    shape_symbol_max_sum: int
+    shape_symbol_bucket_sum: int
+    default_shape_value_sum: int
+    default_bucketed_shape_value_sum: int
+    serving_binding_count: int
+    required_serving_binding_count: int
+    optional_serving_binding_count: int
+    serving_kind_code_sum: int
+    serving_symbol_count: int
+
+    def as_log_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
 class BumkcQuantizationSummary:
     scheme: str | None
     scheme_hash: int
@@ -484,6 +504,7 @@ class BumkcArtifactSummary:
     compiler_summary: BumkcCompilerSummary
     runtime_summary: BumkcRuntimeSummary
     scale_up_summary: BumkcScaleUpSummary
+    launch_summary: BumkcLaunchSummary
     quantization_summary: BumkcQuantizationSummary
     serving_hints: BumkcServingHints
     runtime_shape_symbols: tuple[BumkcRuntimeShapeSymbolBinding, ...]
@@ -610,6 +631,7 @@ class BumkcArtifactSummary:
             "compiler_summary": self.compiler_summary.as_log_dict(),
             "runtime_summary": self.runtime_summary.as_log_dict(),
             "scale_up_summary": self.scale_up_summary.as_log_dict(),
+            "launch_summary": self.launch_summary.as_log_dict(),
             "quantization_summary": self.quantization_summary.as_log_dict(),
             "serving_hints": self.serving_hints.as_log_dict(),
             "runtime_shape_symbols": [
@@ -722,6 +744,7 @@ def load_bumkc_artifact(
     )
     runtime_summary = _load_runtime_summary(engine, runtime)
     scale_up_summary = _load_scale_up_summary(engine, runtime)
+    launch_summary = _load_launch_summary(engine, runtime)
     _validate_runtime_smoke_plan(
         runtime_smoke,
         runtime,
@@ -756,6 +779,7 @@ def load_bumkc_artifact(
         compiler_summary=compiler_summary,
         runtime_summary=runtime_summary,
         scale_up_summary=scale_up_summary,
+        launch_summary=launch_summary,
         quantization_summary=quantization_summary,
         serving_hints=_load_serving_hints(engine, quantization_summary),
         runtime_shape_symbols=runtime_shape_symbols,
@@ -1369,9 +1393,7 @@ def _load_runtime_summary(
     if rank_count != engine_gpu_count:
         raise BumkcArtifactError("BUMKC runtime scale-up rank count mismatches engine")
     if target_plan.get("target_arch") != engine.get("target_arch"):
-        raise BumkcArtifactError(
-            "BUMKC runtime target architecture mismatches engine"
-        )
+        raise BumkcArtifactError("BUMKC runtime target architecture mismatches engine")
     if _read_int(diagnostics_plan, "heartbeat_slot_count") != (
         worker_count + scheduler_count
     ):
@@ -1558,6 +1580,103 @@ def _validate_scale_up_summary(
         name = field.name
         if getattr(summary, name) != getattr(expected, name):
             raise BumkcArtifactError(f"BUMKC engine scale-up summary mismatch: {name}")
+
+
+def _load_launch_summary(
+    engine: dict[str, Any],
+    runtime: dict[str, Any],
+) -> BumkcLaunchSummary:
+    expected = _expected_launch_summary(runtime)
+    summary_record = _read_optional_object(engine, "launch_summary")
+    if engine.get("schema_version") == REQUIRED_SCHEMA_VERSION:
+        if summary_record is None:
+            raise BumkcArtifactError("BUMKC engine launch summary is missing")
+        summary = _read_launch_summary(summary_record)
+        _validate_launch_summary(summary, expected)
+        return summary
+    if summary_record is not None:
+        summary = _read_launch_summary(summary_record)
+        _validate_launch_summary(summary, expected)
+    return expected
+
+
+def _expected_launch_summary(runtime: dict[str, Any]) -> BumkcLaunchSummary:
+    substitution_plan = _read_object(runtime, "substitution_plan")
+    shape_symbols = _read_list(substitution_plan, "shape_symbols")
+    serving_state = _read_list(substitution_plan, "serving_state")
+    serving_kind_code_sum = 0
+    serving_symbol_count = 0
+    for binding in serving_state:
+        kind = _read_str(binding, "kind")
+        if kind not in _SERVING_STATE_KIND_CODES:
+            raise BumkcArtifactError(
+                f"BUMKC runtime serving-state kind is unsupported: {kind}"
+            )
+        serving_kind_code_sum += _SERVING_STATE_KIND_CODES[kind]
+        if _read_optional_str(binding, "symbol") is not None:
+            serving_symbol_count += 1
+
+    return BumkcLaunchSummary(
+        shape_symbol_count=len(shape_symbols),
+        shape_symbol_min_sum=sum(_read_int(symbol, "min") for symbol in shape_symbols),
+        shape_symbol_max_sum=sum(_read_int(symbol, "max") for symbol in shape_symbols),
+        shape_symbol_bucket_sum=sum(
+            _read_int(symbol, "bucket") for symbol in shape_symbols
+        ),
+        default_shape_value_sum=sum(
+            _read_int(symbol, "default_value") for symbol in shape_symbols
+        ),
+        default_bucketed_shape_value_sum=sum(
+            _bucket_shape_value(
+                _read_int(symbol, "default_value"),
+                _read_int(symbol, "bucket"),
+            )
+            for symbol in shape_symbols
+        ),
+        serving_binding_count=len(serving_state),
+        required_serving_binding_count=sum(
+            1 for binding in serving_state if _read_bool(binding, "required")
+        ),
+        optional_serving_binding_count=sum(
+            1 for binding in serving_state if not _read_bool(binding, "required")
+        ),
+        serving_kind_code_sum=serving_kind_code_sum,
+        serving_symbol_count=serving_symbol_count,
+    )
+
+
+def _read_launch_summary(
+    summary: dict[str, Any],
+) -> BumkcLaunchSummary:
+    return BumkcLaunchSummary(
+        shape_symbol_count=_read_int(summary, "shape_symbol_count"),
+        shape_symbol_min_sum=_read_int(summary, "shape_symbol_min_sum"),
+        shape_symbol_max_sum=_read_int(summary, "shape_symbol_max_sum"),
+        shape_symbol_bucket_sum=_read_int(summary, "shape_symbol_bucket_sum"),
+        default_shape_value_sum=_read_int(summary, "default_shape_value_sum"),
+        default_bucketed_shape_value_sum=_read_int(
+            summary, "default_bucketed_shape_value_sum"
+        ),
+        serving_binding_count=_read_int(summary, "serving_binding_count"),
+        required_serving_binding_count=_read_int(
+            summary, "required_serving_binding_count"
+        ),
+        optional_serving_binding_count=_read_int(
+            summary, "optional_serving_binding_count"
+        ),
+        serving_kind_code_sum=_read_int(summary, "serving_kind_code_sum"),
+        serving_symbol_count=_read_int(summary, "serving_symbol_count"),
+    )
+
+
+def _validate_launch_summary(
+    summary: BumkcLaunchSummary,
+    expected: BumkcLaunchSummary,
+) -> None:
+    for field in dataclasses.fields(BumkcLaunchSummary):
+        name = field.name
+        if getattr(summary, name) != getattr(expected, name):
+            raise BumkcArtifactError(f"BUMKC engine launch summary mismatch: {name}")
 
 
 def _validate_dependency_descriptors(descriptors: list[dict[str, Any]]) -> None:
@@ -2147,8 +2266,7 @@ def _load_serving_state_bindings(
             )
         if binding.symbol is not None and binding.symbol not in known_shape_symbols:
             raise BumkcArtifactError(
-                "BUMKC runtime serving-state symbol is not declared: "
-                f"{binding.symbol}"
+                f"BUMKC runtime serving-state symbol is not declared: {binding.symbol}"
             )
         if binding.key() in seen_bindings:
             raise BumkcArtifactError(
@@ -2273,6 +2391,10 @@ def _target_arch_code(value: str | None) -> int:
     if value == "sm100":
         return 100
     raise BumkcArtifactError(f"BUMKC target architecture is unsupported: {value}")
+
+
+def _bucket_shape_value(value: int, bucket: int) -> int:
+    return ((value + bucket - 1) // bucket) * bucket
 
 
 def _hvm_symbol(prefix: str, value: str) -> str:

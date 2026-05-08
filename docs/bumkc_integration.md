@@ -22,11 +22,12 @@ validates:
   engine, simulation, and tensor smoke artifacts,
 - manifest `schema_version == "bumkc.plan.v1"`,
 - manifest `capability_level == "hvm_rooted_runtime_descriptor"`,
-- engine export `schema_version == "bumkc.optimization_playground.v23"`; the
+- engine export `schema_version == "bumkc.optimization_playground.v24"`; the
   loader can still read legacy `v20` artifacts by deriving the engine
   quantization summary from tensor islands and previous `v21` artifacts by
   deriving the engine scale-up summary from the runtime descriptor, while `v22`
-  artifacts derive serving hints from quantization metadata,
+  artifacts derive serving hints from quantization metadata and `v23`
+  artifacts derive the launch summary from the runtime substitution plan,
 - model-source export `schema_version == "bumkc.source.v11"`,
 - engine-exported manifest schema/capability fields matching `manifest.json`,
 - engine-exported source schema matching `source/model-source.json`,
@@ -67,6 +68,10 @@ validates:
   scope-specific wait expressions, runtime substitution bounds, default
   shape-bucket validity, serving-state kind enums, serving-state shape-symbol
   ownership, diagnostic slots, and watchdog timing,
+- engine launch summary fields against the runtime substitution plan, including
+  shape-symbol count, min/max/bucket aggregates, default substitution
+  aggregates, serving-state binding counts, serving-state kind-code summary,
+  and serving-state symbol count,
 - generated CUDA runtime-smoke metadata against the runtime summary, compiler
   summary, runtime ABI, expected source path, expected binary name, task
   descriptors, and Event Tensor descriptors, including descriptor-row
@@ -89,9 +94,9 @@ bindings. Startup also validates the artifact's default launch context through
 
 `BumkcArtifactSummary.as_log_dict()` includes the accepted manifest schema,
 capability level, source schema, model-source frontend, HVM capture status,
-engine schema, scale-up summary, and quantization summary, plus runtime
-diagnostic and watchdog summary fields, so startup logs can audit the exact
-BUMKC contract that was loaded.
+engine schema, scale-up summary, launch summary, and quantization summary, plus
+runtime diagnostic and watchdog summary fields, so startup logs can audit the
+exact BUMKC contract that was loaded.
 
 When `--enable-bumkc` is active, the validated artifact can supply serving
 hints for existing SGLang controls. NVFP4 weight artifacts default unset

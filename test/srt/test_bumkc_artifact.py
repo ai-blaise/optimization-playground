@@ -115,6 +115,17 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.scale_up_summary.collective_task_count == 1
     assert summary.scale_up_summary.collective_group_size_sum == 8
     assert summary.scale_up_summary.collective_kind_code_sum == 1
+    assert summary.launch_summary.shape_symbol_count == 1
+    assert summary.launch_summary.shape_symbol_min_sum == 1
+    assert summary.launch_summary.shape_symbol_max_sum == 4096
+    assert summary.launch_summary.shape_symbol_bucket_sum == 16
+    assert summary.launch_summary.default_shape_value_sum == 1
+    assert summary.launch_summary.default_bucketed_shape_value_sum == 16
+    assert summary.launch_summary.serving_binding_count == 2
+    assert summary.launch_summary.required_serving_binding_count == 2
+    assert summary.launch_summary.optional_serving_binding_count == 0
+    assert summary.launch_summary.serving_kind_code_sum == 5
+    assert summary.launch_summary.serving_symbol_count == 1
     assert summary.quantization_summary.scheme == "W4A4KV4+IndexerK8"
     assert summary.quantization_summary.scheme_hash != 0
     assert summary.quantization_summary.weight_format == "nv_fp4"
@@ -164,6 +175,8 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert log_dict["runtime_summary"]["watchdog_timeout_us"] == 30_000_000
     assert log_dict["scale_up_summary"]["runtime_rank_count"] == 8
     assert log_dict["scale_up_summary"]["target_arch_code"] == 90
+    assert log_dict["launch_summary"]["default_bucketed_shape_value_sum"] == 16
+    assert log_dict["launch_summary"]["serving_kind_code_sum"] == 5
     assert log_dict["quantization_summary"]["indexer_k_bits"] == 8
     assert log_dict["quantization_summary"]["gated_norm"]
     assert log_dict["serving_hints"]["quantization"] == "modelopt_fp4"
@@ -352,9 +365,9 @@ def test_rejects_bumkc_hvm_core_book_unknown_tensor_island(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     hvm_path = plan_dir / "ir" / "hvm-core-book.json"
     hvm_core_book = json.loads(hvm_path.read_text(encoding="utf-8"))
-    hvm_core_book["regions"][0]["nodes"][1]["kind"]["tensor_island"][
-        "island"
-    ] = "island_missing"
+    hvm_core_book["regions"][0]["nodes"][1]["kind"]["tensor_island"]["island"] = (
+        "island_missing"
+    )
     hvm_path.write_text(json.dumps(hvm_core_book), encoding="utf-8")
     refresh_bumkc_digests(plan_dir)
 
@@ -675,6 +688,48 @@ def test_accepts_previous_bumkc_engine_without_scale_up_summary(tmp_path):
     assert summary.scale_up_summary.runtime_rank_count == 8
 
 
+def test_rejects_bumkc_engine_launch_summary_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["launch_summary"]["default_bucketed_shape_value_sum"] = 1
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(
+        BumkcArtifactError,
+        match="engine launch summary mismatch: default_bucketed_shape_value_sum",
+    ):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_required_bumkc_engine_without_launch_summary(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    del engine["launch_summary"]
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="launch summary is missing"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_accepts_serving_hints_schema_bumkc_engine_without_launch_summary(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["schema_version"] = bumkc_artifact.SERVING_HINTS_SCHEMA_VERSION
+    del engine["launch_summary"]
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    summary = load_bumkc_artifact(plan_dir)
+
+    assert summary.engine_schema_version == bumkc_artifact.SERVING_HINTS_SCHEMA_VERSION
+    assert summary.launch_summary.default_bucketed_shape_value_sum == 16
+
+
 def test_rejects_bumkc_engine_serving_hint_mismatch(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     engine_path = plan_dir / "engine" / "optimization-playground.json"
@@ -895,6 +950,7 @@ def test_rejects_bumkc_runtime_launch_bucket_mismatch(tmp_path):
     engine_path = plan_dir / "engine" / "optimization-playground.json"
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
     engine["runtime_summary"]["substitution_symbol_max_sum"] = 4097
+    engine["launch_summary"]["shape_symbol_max_sum"] = 4097
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
     smoke_path = plan_dir / "generated" / "runtime-smoke.json"
     smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
@@ -921,6 +977,9 @@ def test_rejects_bumkc_runtime_default_bucket_mismatch(tmp_path):
     engine_path = plan_dir / "engine" / "optimization-playground.json"
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
     engine["runtime_summary"]["substitution_symbol_max_sum"] = 4097
+    engine["launch_summary"]["shape_symbol_max_sum"] = 4097
+    engine["launch_summary"]["default_shape_value_sum"] = 4097
+    engine["launch_summary"]["default_bucketed_shape_value_sum"] = 4112
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
     smoke_path = plan_dir / "generated" / "runtime-smoke.json"
     smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
@@ -1513,6 +1572,19 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "collective_task_count": 1,
                 "collective_group_size_sum": 8,
                 "collective_kind_code_sum": 1,
+            },
+            "launch_summary": {
+                "shape_symbol_count": 1,
+                "shape_symbol_min_sum": 1,
+                "shape_symbol_max_sum": 4096,
+                "shape_symbol_bucket_sum": 16,
+                "default_shape_value_sum": 1,
+                "default_bucketed_shape_value_sum": 16,
+                "serving_binding_count": 2,
+                "required_serving_binding_count": 2,
+                "optional_serving_binding_count": 0,
+                "serving_kind_code_sum": 5,
+                "serving_symbol_count": 1,
             },
             "quantization_summary": {
                 "scheme": "W4A4KV4+IndexerK8",

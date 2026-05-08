@@ -244,6 +244,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
 
   /*
+   * From csrc/moe/warp_decode_cute
+   */
+  m.def(
+      "warp_decode_cute_moe_forward(Tensor hidden_states, Tensor w_gate, "
+      "Tensor w_up, Tensor w_down, Tensor topk_ids, Tensor topk_weights, "
+      "bool inplace) -> Tensor");
+  m.impl("warp_decode_cute_moe_forward", torch::kCUDA, &warp_decode_cute_moe_forward);
+
+  m.def(
+      "warp_decode_cute_moe_packed_forward(Tensor hidden_states, Tensor w13, "
+      "Tensor w2, Tensor topk_ids, Tensor topk_weights, "
+      "int intermediate_size, bool inplace) -> Tensor");
+  m.impl("warp_decode_cute_moe_packed_forward", torch::kCUDA, &warp_decode_cute_moe_packed_forward);
+
+  /*
    * From csrc/speculative
    */
   m.def(

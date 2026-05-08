@@ -35,6 +35,7 @@ Targets SM100 (B200, 232KB SMEM, 148 SMs) but works on SM80+.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -42,6 +43,42 @@ import triton
 import triton.language as tl
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# CuTe kernel availability detection
+# ---------------------------------------------------------------------------
+# Try to import the CuTe-based warp decode kernels from sgl_kernel.
+# When available and enabled via SGLANG_WARP_DECODE_CUTE=1 (or when on
+# SM100+ where CuTe is strictly better), dispatch to the CUDA kernels
+# instead of the Triton fallbacks below.
+# ---------------------------------------------------------------------------
+
+_CUTE_AVAILABLE = False
+_CUTE_ENABLED = os.environ.get("SGLANG_WARP_DECODE_CUTE", "auto")
+
+try:
+    import sgl_kernel
+    if hasattr(sgl_kernel, "warp_decode_cute_moe_packed_forward"):
+        _CUTE_AVAILABLE = True
+        logger.info("CuTe warp decode kernels available via sgl_kernel")
+except ImportError:
+    pass
+
+
+def _should_use_cute() -> bool:
+    """Determine whether to dispatch to CuTe kernels."""
+    if not _CUTE_AVAILABLE:
+        return False
+    if _CUTE_ENABLED == "0":
+        return False
+    if _CUTE_ENABLED == "1":
+        return True
+    # "auto": use CuTe on SM100+ (Blackwell), Triton elsewhere
+    if torch.cuda.is_available():
+        cc = torch.cuda.get_device_capability()
+        if cc[0] >= 10:  # SM100+
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +621,9 @@ def warp_decode_moe(
 ) -> torch.Tensor:
     """Run warp decode MoE with separate gate/up/down weights.
 
+    Dispatches to CuTe CUDA kernels when available (SM100+ or
+    SGLANG_WARP_DECODE_CUTE=1), otherwise uses Triton kernels.
+
     Args:
         hidden_states: Input activations [num_tokens, hidden_size].
         w_gate: Gate projection weights [E, N, K] in BF16.
@@ -596,6 +636,13 @@ def warp_decode_moe(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
+    # CuTe dispatch
+    if _should_use_cute():
+        return sgl_kernel.warp_decode_cute_moe_forward(
+            hidden_states, w_gate, w_up, w_down,
+            topk_ids, topk_weights, inplace,
+        )
+
     # Input validation
     assert hidden_states.ndim == 2, f"hidden_states must be 2D, got {hidden_states.ndim}D"
     assert hidden_states.dtype == torch.bfloat16, (
@@ -722,6 +769,9 @@ def warp_decode_moe_packed(
 ) -> torch.Tensor:
     """Run warp decode MoE with packed gate+up (w13) and down (w2) weights.
 
+    Dispatches to CuTe CUDA kernels when available (SM100+ or
+    SGLANG_WARP_DECODE_CUTE=1), otherwise uses Triton kernels.
+
     This is the standard sglang weight layout where gate and up projections
     are concatenated along the output dimension.
 
@@ -737,6 +787,15 @@ def warp_decode_moe_packed(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
+    # CuTe dispatch
+    if _should_use_cute():
+        isize = intermediate_size if intermediate_size is not None else (w13.shape[1] // 2)
+        return sgl_kernel.warp_decode_cute_moe_packed_forward(
+            hidden_states, w13, w2,
+            topk_ids, topk_weights,
+            isize, inplace,
+        )
+
     # Input validation
     assert hidden_states.ndim == 2, f"hidden_states must be 2D, got {hidden_states.ndim}D"
     assert hidden_states.dtype == torch.bfloat16, (

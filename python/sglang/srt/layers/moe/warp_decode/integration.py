@@ -18,6 +18,10 @@ forward pass should use warp decode (small batch, decode mode) and
 dispatches accordingly.  Falls through to the normal expert-centric
 path when warp decode is not applicable.
 
+When CuTe CUDA kernels are available (via sgl_kernel), they are used
+automatically on SM100+ (Blackwell B200) or when explicitly enabled
+via SGLANG_WARP_DECODE_CUTE=1. Otherwise falls back to Triton kernels.
+
 Usage in ``FusedMoE.forward_impl``::
 
     from sglang.srt.layers.moe.warp_decode.integration import (
@@ -34,6 +38,8 @@ Environment variables:
     SGLANG_ENABLE_WARP_DECODE: Set to ``1`` to enable. Default off.
     SGLANG_WARP_DECODE_MAX_BATCH: Maximum batch size for warp decode
         (default 64). Batches larger than this fall through.
+    SGLANG_WARP_DECODE_CUTE: ``1`` = force CuTe, ``0`` = force Triton,
+        ``auto`` = CuTe on SM100+, Triton elsewhere. Default ``auto``.
 """
 
 from __future__ import annotations

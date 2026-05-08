@@ -379,6 +379,27 @@ void cutlass_w4a8_moe_mm(
     int64_t chunk_size,
     int64_t topk);
 /*
+ * From csrc/moe/warp_decode_cute
+ */
+torch::Tensor warp_decode_cute_moe_forward(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& w_gate,
+    const torch::Tensor& w_up,
+    const torch::Tensor& w_down,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights,
+    bool inplace);
+
+torch::Tensor warp_decode_cute_moe_packed_forward(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& w13,
+    const torch::Tensor& w2,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights,
+    int64_t intermediate_size,
+    bool inplace);
+
+/*
  * From csrc/speculative
  */
 void tree_speculative_sampling_target_only(

@@ -177,6 +177,72 @@ def benchmark_torch_reference(
     return (elapsed / iters) * 1e6  # us
 
 
+def benchmark_cute_warp_decode(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    intermediate_size: int,
+    warmup: int = 10,
+    iters: int = 100,
+) -> Tuple[float, float]:
+    """Benchmark CuTe warp decode kernel.
+
+    Returns:
+        Tuple of (mean_latency_us, bandwidth_gb_s), or (-1, -1) if unavailable.
+    """
+    try:
+        import sgl_kernel
+        if not hasattr(sgl_kernel, "warp_decode_cute_moe_packed_forward"):
+            return -1.0, -1.0
+    except ImportError:
+        return -1.0, -1.0
+
+    # Warmup
+    for _ in range(warmup):
+        sgl_kernel.warp_decode_cute_moe_packed_forward(
+            hidden_states, w13, w2, topk_ids, topk_weights,
+            intermediate_size, False,
+        )
+    torch.cuda.synchronize()
+
+    # Benchmark
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+
+    for i in range(iters):
+        start_events[i].record()
+        sgl_kernel.warp_decode_cute_moe_packed_forward(
+            hidden_states, w13, w2, topk_ids, topk_weights,
+            intermediate_size, False,
+        )
+        end_events[i].record()
+
+    torch.cuda.synchronize()
+
+    latencies_ms = [
+        start_events[i].elapsed_time(end_events[i]) for i in range(iters)
+    ]
+    mean_latency_ms = sum(latencies_ms) / len(latencies_ms)
+    mean_latency_us = mean_latency_ms * 1000
+
+    # Calculate bandwidth (same formula as Triton benchmark)
+    B = hidden_states.shape[0]
+    K = topk_ids.shape[1]
+    D = hidden_states.shape[1]
+    N = intermediate_size
+    bytes_per_element = 2  # BF16
+    bytes_input = B * D * bytes_per_element
+    bytes_w13 = B * K * 2 * N * D * bytes_per_element
+    bytes_w2 = B * K * D * N * bytes_per_element
+    bytes_routing = B * K * 4
+    total_bytes = bytes_input + bytes_w13 + bytes_w2 + bytes_routing
+    bandwidth_gb_s = (total_bytes / 1e9) / (mean_latency_ms / 1e3)
+
+    return mean_latency_us, bandwidth_gb_s
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark warp decode MoE")
     parser.add_argument("--hidden-size", type=int, default=1024)
@@ -194,12 +260,21 @@ def main():
 
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
 
+    # Check CuTe availability
+    cute_available = False
+    try:
+        import sgl_kernel
+        cute_available = hasattr(sgl_kernel, "warp_decode_cute_moe_packed_forward")
+    except ImportError:
+        pass
+
     print(f"Configuration:")
     print(f"  hidden_size = {args.hidden_size}")
     print(f"  intermediate_size = {args.intermediate_size}")
     print(f"  num_experts = {args.num_experts}")
     print(f"  top_k = {args.top_k}")
     print(f"  warmup = {args.warmup}, iters = {args.iters}")
+    print(f"  cute_available = {cute_available}")
     print()
 
     gpu_name = torch.cuda.get_device_name(0)
@@ -209,11 +284,13 @@ def main():
     print(f"  SMEM/SM: {gpu_props.max_shared_memory_per_multiprocessor // 1024} KB")
     print()
 
-    print(f"{'Batch':>6} | {'WD Lat (us)':>12} | {'WD BW (GB/s)':>13} |", end="")
+    header = f"{'Batch':>6} | {'Triton (us)':>12} | {'Triton BW':>10} |"
+    if cute_available:
+        header += f" {'CuTe (us)':>12} | {'CuTe BW':>10} | {'CuTe/Tri':>9} |"
     if not args.skip_reference:
-        print(f" {'Ref Lat (us)':>12} | {'Speedup':>8} |", end="")
-    print()
-    print("-" * 80)
+        header += f" {'Ref (us)':>12} | {'Speedup':>8} |"
+    print(header)
+    print("-" * len(header))
 
     for B in batch_sizes:
         hs, w13, w2, ids, wts = generate_moe_data(
@@ -226,19 +303,31 @@ def main():
             warmup=args.warmup, iters=args.iters,
         )
 
-        print(f"{B:>6} | {wd_lat:>12.1f} | {wd_bw:>13.2f} |", end="")
+        line = f"{B:>6} | {wd_lat:>12.1f} | {wd_bw:>9.2f}G |"
+
+        if cute_available:
+            cute_lat, cute_bw = benchmark_cute_warp_decode(
+                hs, w13, w2, ids, wts, args.intermediate_size,
+                warmup=args.warmup, iters=args.iters,
+            )
+            if cute_lat > 0:
+                ratio = wd_lat / cute_lat
+                line += f" {cute_lat:>12.1f} | {cute_bw:>9.2f}G | {ratio:>8.2f}x |"
+            else:
+                line += f" {'N/A':>12} | {'N/A':>10} | {'N/A':>9} |"
 
         if not args.skip_reference and B <= 16:
             ref_lat = benchmark_torch_reference(
                 hs, w13, w2, ids, wts, args.intermediate_size,
                 warmup=3, iters=5,
             )
-            speedup = ref_lat / wd_lat
-            print(f" {ref_lat:>12.1f} | {speedup:>7.2f}x |", end="")
+            best_lat = min(wd_lat, cute_lat) if cute_available and cute_lat > 0 else wd_lat
+            speedup = ref_lat / best_lat
+            line += f" {ref_lat:>12.1f} | {speedup:>7.2f}x |"
         elif not args.skip_reference:
-            print(f" {'(skipped)':>12} | {'N/A':>8} |", end="")
+            line += f" {'(skipped)':>12} | {'N/A':>8} |"
 
-        print()
+        print(line)
 
 
 if __name__ == "__main__":

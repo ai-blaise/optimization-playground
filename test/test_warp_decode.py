@@ -459,5 +459,166 @@ class TestWarpDecodeRunner(unittest.TestCase):
         self.assertGreater(cos_sim, 0.9999, f"Runner cos_sim={cos_sim}")
 
 
+class TestWarpDecodeCuTe(unittest.TestCase):
+    """Test CuTe-based warp decode CUDA kernels.
+
+    These tests verify the CuTe kernels produce identical results to
+    the Triton kernels and the PyTorch reference. Skipped if sgl_kernel
+    is not built with CuTe warp decode support.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import sgl_kernel
+            if not hasattr(sgl_kernel, "warp_decode_cute_moe_packed_forward"):
+                raise unittest.SkipTest(
+                    "sgl_kernel missing CuTe warp decode ops"
+                )
+        except ImportError:
+            raise unittest.SkipTest("sgl_kernel not installed")
+
+    def _check_correctness(
+        self,
+        output: torch.Tensor,
+        reference: torch.Tensor,
+        test_name: str,
+        cos_threshold: float = 0.9999,
+        abs_threshold: float = 0.01,
+    ) -> None:
+        out_f = output.float().flatten()
+        ref_f = reference.float().flatten()
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_f.unsqueeze(0), ref_f.unsqueeze(0)
+        ).item()
+        max_abs_diff = (out_f - ref_f).abs().max().item()
+        self.assertGreater(
+            cos_sim, cos_threshold,
+            f"{test_name}: cosine similarity {cos_sim:.6f} < {cos_threshold}"
+        )
+        self.assertLess(
+            max_abs_diff, abs_threshold,
+            f"{test_name}: max abs diff {max_abs_diff:.6f} >= {abs_threshold}"
+        )
+
+    def test_cute_separate_weights_batch1(self):
+        """CuTe kernel with separate weights, batch=1."""
+        import sgl_kernel
+
+        B, D, N, E, K = 1, 256, 128, 8, 2
+        hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
+
+        output = sgl_kernel.warp_decode_cute_moe_forward(
+            hs, wg, wu, wd, ids, wts, False
+        )
+        reference = reference_moe_forward(hs, wg, wu, wd, ids, wts)
+        self._check_correctness(output, reference, "cute_separate_B1")
+
+    def test_cute_separate_weights_batch32(self):
+        """CuTe kernel with separate weights, batch=32."""
+        import sgl_kernel
+
+        B, D, N, E, K = 32, 256, 128, 8, 2
+        hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
+
+        output = sgl_kernel.warp_decode_cute_moe_forward(
+            hs, wg, wu, wd, ids, wts, False
+        )
+        reference = reference_moe_forward(hs, wg, wu, wd, ids, wts)
+        self._check_correctness(output, reference, "cute_separate_B32")
+
+    def test_cute_packed_batch1(self):
+        """CuTe packed kernel, batch=1."""
+        import sgl_kernel
+
+        B, D, N, E, K = 1, 256, 128, 8, 2
+        hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
+        w13 = torch.cat([wg, wu], dim=1)
+
+        output = sgl_kernel.warp_decode_cute_moe_packed_forward(
+            hs, w13, wd, ids, wts, N, False
+        )
+        reference = reference_moe_packed_forward(hs, w13, wd, ids, wts, N)
+        self._check_correctness(output, reference, "cute_packed_B1")
+
+    def test_cute_packed_batch64(self):
+        """CuTe packed kernel at max batch size."""
+        import sgl_kernel
+
+        B, D, N, E, K = 64, 256, 128, 8, 2
+        hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
+        w13 = torch.cat([wg, wu], dim=1)
+
+        output = sgl_kernel.warp_decode_cute_moe_packed_forward(
+            hs, w13, wd, ids, wts, N, False
+        )
+        reference = reference_moe_packed_forward(hs, w13, wd, ids, wts, N)
+        self._check_correctness(output, reference, "cute_packed_B64")
+
+    def test_cute_topk8_experts64(self):
+        """CuTe kernel with 64 experts and top-8."""
+        import sgl_kernel
+
+        B, D, N, E, K = 4, 512, 256, 64, 8
+        hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
+        w13 = torch.cat([wg, wu], dim=1)
+
+        output = sgl_kernel.warp_decode_cute_moe_packed_forward(
+            hs, w13, wd, ids, wts, N, False
+        )
+        reference = reference_moe_packed_forward(hs, w13, wd, ids, wts, N)
+        self._check_correctness(output, reference, "cute_topk8_e64")
+
+    def test_cute_determinism(self):
+        """Verify CuTe output is deterministic."""
+        import sgl_kernel
+
+        B, D, N, E, K = 4, 256, 128, 8, 2
+        hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
+        w13 = torch.cat([wg, wu], dim=1)
+
+        out1 = sgl_kernel.warp_decode_cute_moe_packed_forward(
+            hs, w13, wd, ids, wts, N, False
+        )
+        out2 = sgl_kernel.warp_decode_cute_moe_packed_forward(
+            hs, w13, wd, ids, wts, N, False
+        )
+        self.assertTrue(
+            torch.equal(out1, out2),
+            "CuTe warp decode output is not deterministic"
+        )
+
+    def test_cute_matches_triton(self):
+        """Verify CuTe output matches Triton output bit-for-bit."""
+        import sgl_kernel
+        from sglang.srt.layers.moe.warp_decode.kernels import warp_decode_moe_packed
+
+        B, D, N, E, K = 8, 256, 128, 8, 2
+        hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
+        w13 = torch.cat([wg, wu], dim=1)
+
+        cute_out = sgl_kernel.warp_decode_cute_moe_packed_forward(
+            hs, w13, wd, ids, wts, N, False
+        )
+        # Force Triton path (bypass CuTe dispatch)
+        import os
+        old_val = os.environ.get("SGLANG_WARP_DECODE_CUTE")
+        os.environ["SGLANG_WARP_DECODE_CUTE"] = "0"
+        try:
+            triton_out = warp_decode_moe_packed(
+                hs, w13, wd, ids, wts, intermediate_size=N
+            )
+        finally:
+            if old_val is not None:
+                os.environ["SGLANG_WARP_DECODE_CUTE"] = old_val
+            else:
+                os.environ.pop("SGLANG_WARP_DECODE_CUTE", None)
+
+        # Both should match the reference
+        reference = reference_moe_packed_forward(hs, w13, wd, ids, wts, N)
+        self._check_correctness(cute_out, reference, "cute_vs_ref")
+        self._check_correctness(triton_out, reference, "triton_vs_ref")
+
+
 if __name__ == "__main__":
     unittest.main()

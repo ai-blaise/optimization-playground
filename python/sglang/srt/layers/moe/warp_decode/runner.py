@@ -155,7 +155,11 @@ class WarpDecodeRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> RunnerOutput:
-        """Run warp decode or fall back to expert-centric."""
+        """Run warp decode or fall back to expert-centric.
+
+        Dispatches to CuTe CUDA kernels when available (SM100+ or
+        SGLANG_WARP_DECODE_CUTE=1), otherwise uses Triton kernels.
+        """
         from sglang.srt.layers.moe.warp_decode.kernels import warp_decode_moe_packed
 
         if not isinstance(runner_input, WarpDecodeRunnerInput):

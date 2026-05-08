@@ -9,7 +9,7 @@ from typing import Any
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v2"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v3"
 
 
 class BumkcArtifactError(ValueError):
@@ -31,6 +31,10 @@ class BumkcRuntimeSummary:
     task_rank_group_count: int
     task_rank_reference_count: int
     rank_id_sum: int
+    task_dependency_count: int
+    tile_overlap_dependency_count: int
+    whole_producer_dependency_count: int
+    dependency_scope_code_sum: int
 
     def as_log_dict(self) -> dict[str, int]:
         return {
@@ -47,6 +51,10 @@ class BumkcRuntimeSummary:
             "task_rank_group_count": self.task_rank_group_count,
             "task_rank_reference_count": self.task_rank_reference_count,
             "rank_id_sum": self.rank_id_sum,
+            "task_dependency_count": self.task_dependency_count,
+            "tile_overlap_dependency_count": self.tile_overlap_dependency_count,
+            "whole_producer_dependency_count": self.whole_producer_dependency_count,
+            "dependency_scope_code_sum": self.dependency_scope_code_sum,
         }
 
 
@@ -174,6 +182,7 @@ def _load_runtime_summary(
     queue_plan = _read_object(runtime, "queue_plan")
     memory_plan = _read_object(runtime, "memory_plan")
     scale_up_plan = _read_object(runtime, "scale_up_plan")
+    dependency_plan = _read_object(runtime, "dependency_plan")
     expected = {
         "task_count": runtime.get("task_count"),
         "conventional_launch_count": execution_model.get("conventional_launch_count"),
@@ -188,6 +197,14 @@ def _load_runtime_summary(
         "task_rank_group_count": scale_up_plan.get("task_rank_group_count"),
         "task_rank_reference_count": scale_up_plan.get("task_rank_reference_count"),
         "rank_id_sum": scale_up_plan.get("rank_id_sum"),
+        "task_dependency_count": dependency_plan.get("task_dependency_count"),
+        "tile_overlap_dependency_count": dependency_plan.get(
+            "tile_overlap_dependency_count"
+        ),
+        "whole_producer_dependency_count": dependency_plan.get(
+            "whole_producer_dependency_count"
+        ),
+        "dependency_scope_code_sum": dependency_plan.get("dependency_scope_code_sum"),
     }
     for key, value in expected.items():
         if summary.get(key) is None or value is None or summary.get(key) != value:

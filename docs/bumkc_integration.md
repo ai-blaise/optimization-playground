@@ -22,9 +22,10 @@ validates:
   engine, simulation, and tensor smoke artifacts,
 - manifest `schema_version == "bumkc.plan.v1"`,
 - manifest `capability_level == "hvm_rooted_runtime_descriptor"`,
-- engine export `schema_version == "bumkc.optimization_playground.v21"`; the
+- engine export `schema_version == "bumkc.optimization_playground.v22"`; the
   loader can still read legacy `v20` artifacts by deriving the engine
-  quantization summary from tensor islands,
+  quantization summary from tensor islands and previous `v21` artifacts by
+  deriving the engine scale-up summary from the runtime descriptor,
 - model-source export `schema_version == "bumkc.source.v11"`,
 - engine-exported manifest schema/capability fields matching `manifest.json`,
 - engine-exported source schema matching `source/model-source.json`,
@@ -87,9 +88,9 @@ bindings. Startup also validates the artifact's default launch context through
 
 `BumkcArtifactSummary.as_log_dict()` includes the accepted manifest schema,
 capability level, source schema, model-source frontend, HVM capture status,
-engine schema, and quantization summary, plus runtime diagnostic and watchdog
-summary fields, so startup logs can audit the exact BUMKC contract that was
-loaded.
+engine schema, scale-up summary, and quantization summary, plus runtime
+diagnostic and watchdog summary fields, so startup logs can audit the exact
+BUMKC contract that was loaded.
 
 When `--enable-bumkc` is active, the validated artifact can supply serving
 hints for existing SGLang controls. NVFP4 weight artifacts default unset

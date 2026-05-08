@@ -102,6 +102,19 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.runtime_summary.diagnostic_blocked_event_slot_count == 8
     assert summary.runtime_summary.watchdog_poll_interval_us == 1000
     assert summary.runtime_summary.watchdog_timeout_us == 30_000_000
+    assert summary.scale_up_summary.compile_gpu_count == 8
+    assert summary.scale_up_summary.runtime_target_gpu_count == 8
+    assert summary.scale_up_summary.runtime_rank_count == 8
+    assert summary.scale_up_summary.target_arch == "sm90"
+    assert summary.scale_up_summary.target_arch_code == 90
+    assert summary.scale_up_summary.worker_count == 64
+    assert summary.scale_up_summary.scheduler_count == 8
+    assert summary.scale_up_summary.task_rank_group_count == 2
+    assert summary.scale_up_summary.task_rank_reference_count == 16
+    assert summary.scale_up_summary.rank_id_sum == 56
+    assert summary.scale_up_summary.collective_task_count == 1
+    assert summary.scale_up_summary.collective_group_size_sum == 8
+    assert summary.scale_up_summary.collective_kind_code_sum == 1
     assert summary.quantization_summary.scheme == "W4A4KV4+IndexerK8"
     assert summary.quantization_summary.scheme_hash != 0
     assert summary.quantization_summary.weight_format == "nv_fp4"
@@ -149,6 +162,8 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert log_dict["engine_schema_version"] == REQUIRED_SCHEMA_VERSION
     assert log_dict["runtime_summary"]["diagnostic_heartbeat_slot_count"] == 72
     assert log_dict["runtime_summary"]["watchdog_timeout_us"] == 30_000_000
+    assert log_dict["scale_up_summary"]["runtime_rank_count"] == 8
+    assert log_dict["scale_up_summary"]["target_arch_code"] == 90
     assert log_dict["quantization_summary"]["indexer_k_bits"] == 8
     assert log_dict["quantization_summary"]["gated_norm"]
     assert log_dict["serving_hints"]["quantization"] == "modelopt_fp4"
@@ -616,6 +631,48 @@ def test_rejects_bumkc_engine_quantization_summary_mismatch(tmp_path):
         match="engine quantization summary mismatch: indexer_k_bits",
     ):
         load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_engine_scale_up_summary_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["scale_up_summary"]["runtime_rank_count"] = 4
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(
+        BumkcArtifactError,
+        match="engine scale-up summary mismatch: runtime_rank_count",
+    ):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_required_bumkc_engine_without_scale_up_summary(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    del engine["scale_up_summary"]
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="scale-up summary is missing"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_accepts_previous_bumkc_engine_without_scale_up_summary(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["schema_version"] = bumkc_artifact.PREVIOUS_SCHEMA_VERSION
+    del engine["scale_up_summary"]
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    summary = load_bumkc_artifact(plan_dir)
+
+    assert summary.engine_schema_version == bumkc_artifact.PREVIOUS_SCHEMA_VERSION
+    assert summary.scale_up_summary.runtime_rank_count == 8
 
 
 def test_accepts_legacy_bumkc_engine_without_quantization_summary(tmp_path):
@@ -1399,6 +1456,21 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "diagnostic_blocked_event_slot_count": 8,
                 "watchdog_poll_interval_us": 1000,
                 "watchdog_timeout_us": 30_000_000,
+            },
+            "scale_up_summary": {
+                "compile_gpu_count": 8,
+                "runtime_target_gpu_count": 8,
+                "runtime_rank_count": 8,
+                "target_arch": "sm90",
+                "target_arch_code": 90,
+                "worker_count": 64,
+                "scheduler_count": 8,
+                "task_rank_group_count": 2,
+                "task_rank_reference_count": 16,
+                "rank_id_sum": 56,
+                "collective_task_count": 1,
+                "collective_group_size_sum": 8,
+                "collective_kind_code_sum": 1,
             },
             "quantization_summary": {
                 "scheme": "W4A4KV4+IndexerK8",

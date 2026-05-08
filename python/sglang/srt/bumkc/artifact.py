@@ -20,8 +20,13 @@ REQUIRED_VALIDATION_MODEL = (
 REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
 REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
 LEGACY_SCHEMA_VERSION = "bumkc.optimization_playground.v20"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v21"
-SUPPORTED_SCHEMA_VERSIONS = (LEGACY_SCHEMA_VERSION, REQUIRED_SCHEMA_VERSION)
+PREVIOUS_SCHEMA_VERSION = "bumkc.optimization_playground.v21"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v22"
+SUPPORTED_SCHEMA_VERSIONS = (
+    LEGACY_SCHEMA_VERSION,
+    PREVIOUS_SCHEMA_VERSION,
+    REQUIRED_SCHEMA_VERSION,
+)
 REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v11"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v13"
@@ -399,6 +404,26 @@ class BumkcRuntimeSummary:
 
 
 @dataclasses.dataclass(frozen=True)
+class BumkcScaleUpSummary:
+    compile_gpu_count: int
+    runtime_target_gpu_count: int
+    runtime_rank_count: int
+    target_arch: str | None
+    target_arch_code: int
+    worker_count: int
+    scheduler_count: int
+    task_rank_group_count: int
+    task_rank_reference_count: int
+    rank_id_sum: int
+    collective_task_count: int
+    collective_group_size_sum: int
+    collective_kind_code_sum: int
+
+    def as_log_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
 class BumkcQuantizationSummary:
     scheme: str | None
     scheme_hash: int
@@ -456,6 +481,7 @@ class BumkcArtifactSummary:
     runtime_entrypoints: tuple[str, ...]
     compiler_summary: BumkcCompilerSummary
     runtime_summary: BumkcRuntimeSummary
+    scale_up_summary: BumkcScaleUpSummary
     quantization_summary: BumkcQuantizationSummary
     serving_hints: BumkcServingHints
     runtime_shape_symbols: tuple[BumkcRuntimeShapeSymbolBinding, ...]
@@ -581,6 +607,7 @@ class BumkcArtifactSummary:
             "runtime_entrypoints": list(self.runtime_entrypoints),
             "compiler_summary": self.compiler_summary.as_log_dict(),
             "runtime_summary": self.runtime_summary.as_log_dict(),
+            "scale_up_summary": self.scale_up_summary.as_log_dict(),
             "quantization_summary": self.quantization_summary.as_log_dict(),
             "serving_hints": self.serving_hints.as_log_dict(),
             "runtime_shape_symbols": [
@@ -692,6 +719,7 @@ def load_bumkc_artifact(
         simulation,
     )
     runtime_summary = _load_runtime_summary(engine, runtime)
+    scale_up_summary = _load_scale_up_summary(engine, runtime)
     _validate_runtime_smoke_plan(
         runtime_smoke,
         runtime,
@@ -725,6 +753,7 @@ def load_bumkc_artifact(
         runtime_entrypoints=entrypoints,
         compiler_summary=compiler_summary,
         runtime_summary=runtime_summary,
+        scale_up_summary=scale_up_summary,
         quantization_summary=quantization_summary,
         serving_hints=_build_serving_hints(quantization_summary),
         runtime_shape_symbols=runtime_shape_symbols,
@@ -1413,6 +1442,83 @@ def _load_runtime_summary(
             raise BumkcArtifactError(f"BUMKC engine runtime summary mismatch: {key}")
 
     return BumkcRuntimeSummary(**{key: int(value) for key, value in expected.items()})
+
+
+def _load_scale_up_summary(
+    engine: dict[str, Any],
+    runtime: dict[str, Any],
+) -> BumkcScaleUpSummary:
+    expected = _expected_scale_up_summary(engine, runtime)
+    summary_record = _read_optional_object(engine, "scale_up_summary")
+    if engine.get("schema_version") == REQUIRED_SCHEMA_VERSION:
+        if summary_record is None:
+            raise BumkcArtifactError("BUMKC engine scale-up summary is missing")
+        summary = _read_scale_up_summary(summary_record)
+        _validate_scale_up_summary(summary, expected)
+        return summary
+    if summary_record is not None:
+        summary = _read_scale_up_summary(summary_record)
+        _validate_scale_up_summary(summary, expected)
+    return expected
+
+
+def _expected_scale_up_summary(
+    engine: dict[str, Any],
+    runtime: dict[str, Any],
+) -> BumkcScaleUpSummary:
+    target_plan = _read_object(runtime, "target_plan")
+    scale_up_plan = _read_object(runtime, "scale_up_plan")
+    communication_plan = _read_object(runtime, "communication_plan")
+    target_arch = _read_optional_str(target_plan, "target_arch")
+    return BumkcScaleUpSummary(
+        compile_gpu_count=_read_int(engine, "gpu_count"),
+        runtime_target_gpu_count=_read_int(target_plan, "gpu_count"),
+        runtime_rank_count=_read_int(scale_up_plan, "rank_count"),
+        target_arch=target_arch,
+        target_arch_code=_target_arch_code(target_arch),
+        worker_count=_read_int(target_plan, "worker_count"),
+        scheduler_count=_read_int(target_plan, "scheduler_count"),
+        task_rank_group_count=_read_int(scale_up_plan, "task_rank_group_count"),
+        task_rank_reference_count=_read_int(scale_up_plan, "task_rank_reference_count"),
+        rank_id_sum=_read_int(scale_up_plan, "rank_id_sum"),
+        collective_task_count=_read_int(communication_plan, "collective_task_count"),
+        collective_group_size_sum=_read_int(
+            communication_plan, "collective_group_size_sum"
+        ),
+        collective_kind_code_sum=_read_int(
+            communication_plan, "collective_kind_code_sum"
+        ),
+    )
+
+
+def _read_scale_up_summary(
+    summary: dict[str, Any],
+) -> BumkcScaleUpSummary:
+    return BumkcScaleUpSummary(
+        compile_gpu_count=_read_int(summary, "compile_gpu_count"),
+        runtime_target_gpu_count=_read_int(summary, "runtime_target_gpu_count"),
+        runtime_rank_count=_read_int(summary, "runtime_rank_count"),
+        target_arch=_read_optional_str(summary, "target_arch"),
+        target_arch_code=_read_int(summary, "target_arch_code"),
+        worker_count=_read_int(summary, "worker_count"),
+        scheduler_count=_read_int(summary, "scheduler_count"),
+        task_rank_group_count=_read_int(summary, "task_rank_group_count"),
+        task_rank_reference_count=_read_int(summary, "task_rank_reference_count"),
+        rank_id_sum=_read_int(summary, "rank_id_sum"),
+        collective_task_count=_read_int(summary, "collective_task_count"),
+        collective_group_size_sum=_read_int(summary, "collective_group_size_sum"),
+        collective_kind_code_sum=_read_int(summary, "collective_kind_code_sum"),
+    )
+
+
+def _validate_scale_up_summary(
+    summary: BumkcScaleUpSummary,
+    expected: BumkcScaleUpSummary,
+) -> None:
+    for field in dataclasses.fields(BumkcScaleUpSummary):
+        name = field.name
+        if getattr(summary, name) != getattr(expected, name):
+            raise BumkcArtifactError(f"BUMKC engine scale-up summary mismatch: {name}")
 
 
 def _validate_dependency_descriptors(descriptors: list[dict[str, Any]]) -> None:
@@ -2116,6 +2222,18 @@ def _dtype_code(parent: dict[str, Any], key: str) -> int:
     if value not in _DTYPE_CODES:
         raise BumkcArtifactError(f"BUMKC dtype is unsupported: {value}")
     return _DTYPE_CODES[value]
+
+
+def _target_arch_code(value: str | None) -> int:
+    if value is None:
+        return 0
+    if value == "sm80":
+        return 80
+    if value == "sm90":
+        return 90
+    if value == "sm100":
+        return 100
+    raise BumkcArtifactError(f"BUMKC target architecture is unsupported: {value}")
 
 
 def _hvm_symbol(prefix: str, value: str) -> str:

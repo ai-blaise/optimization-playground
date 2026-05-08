@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 import dataclasses
 import json
 from pathlib import Path
@@ -14,6 +15,41 @@ REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v7"
 
 class BumkcArtifactError(ValueError):
     pass
+
+
+@dataclasses.dataclass(frozen=True)
+class BumkcRuntimeShapeSymbolBinding:
+    symbol: str
+    min: int
+    max: int
+    bucket: int
+    default_value: int
+
+    def bucketed_value(self, value: int) -> int:
+        return ((value + self.bucket - 1) // self.bucket) * self.bucket
+
+
+@dataclasses.dataclass(frozen=True)
+class BumkcRuntimeServingStateBinding:
+    kind: str
+    symbol: str | None
+    required: bool
+
+    def key(self) -> tuple[str, str | None]:
+        return (self.kind, self.symbol)
+
+
+@dataclasses.dataclass(frozen=True)
+class BumkcRuntimeShapeSymbolValue:
+    symbol: str
+    value: int
+    bucketed_value: int
+
+
+@dataclasses.dataclass(frozen=True)
+class BumkcRuntimeLaunchPlan:
+    shape_symbols: tuple[BumkcRuntimeShapeSymbolValue, ...]
+    serving_state: tuple[BumkcRuntimeServingStateBinding, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,9 +130,81 @@ class BumkcArtifactSummary:
     runtime_executable: bool
     runtime_entrypoints: tuple[str, ...]
     runtime_summary: BumkcRuntimeSummary
+    runtime_shape_symbols: tuple[BumkcRuntimeShapeSymbolBinding, ...]
+    runtime_serving_state: tuple[BumkcRuntimeServingStateBinding, ...]
     task_count: int
     tensor_smoke_enabled: bool
     required_validation_model: str
+
+    def validate_runtime_launch(
+        self,
+        *,
+        shape_symbols: Mapping[str, int],
+        serving_state: Iterable[tuple[str, str | None]],
+    ) -> BumkcRuntimeLaunchPlan:
+        expected_symbols = {binding.symbol for binding in self.runtime_shape_symbols}
+        extra_symbols = sorted(set(shape_symbols) - expected_symbols)
+        if extra_symbols:
+            raise BumkcArtifactError(
+                f"unknown BUMKC runtime shape symbol: {extra_symbols[0]}"
+            )
+
+        validated_shape_symbols = []
+        for binding in self.runtime_shape_symbols:
+            if binding.symbol not in shape_symbols:
+                raise BumkcArtifactError(
+                    f"missing BUMKC runtime shape symbol: {binding.symbol}"
+                )
+            value = shape_symbols[binding.symbol]
+            if not _is_strict_int(value):
+                raise BumkcArtifactError(
+                    f"BUMKC runtime shape symbol {binding.symbol} is not an integer"
+                )
+            if value < binding.min or value > binding.max:
+                raise BumkcArtifactError(
+                    "BUMKC runtime shape symbol "
+                    f"{binding.symbol}={value} is outside "
+                    f"{binding.min}..={binding.max}"
+                )
+            bucketed_value = binding.bucketed_value(value)
+            if bucketed_value > binding.max:
+                raise BumkcArtifactError(
+                    "BUMKC runtime shape symbol "
+                    f"{binding.symbol}={value} buckets to "
+                    f"{bucketed_value} beyond max {binding.max}"
+                )
+            validated_shape_symbols.append(
+                BumkcRuntimeShapeSymbolValue(
+                    symbol=binding.symbol,
+                    value=value,
+                    bucketed_value=bucketed_value,
+                )
+            )
+
+        provided_serving_state = _normalize_serving_state(serving_state)
+        expected_serving_state = {
+            binding.key() for binding in self.runtime_serving_state
+        }
+        extra_serving_state = sorted(
+            provided_serving_state - expected_serving_state,
+            key=lambda item: (item[0], "" if item[1] is None else item[1]),
+        )
+        if extra_serving_state:
+            kind, symbol = extra_serving_state[0]
+            raise BumkcArtifactError(
+                f"unknown BUMKC serving-state binding: {kind}:{symbol}"
+            )
+        for binding in self.runtime_serving_state:
+            if binding.required and binding.key() not in provided_serving_state:
+                raise BumkcArtifactError(
+                    "missing BUMKC serving-state binding: "
+                    f"{binding.kind}:{binding.symbol}"
+                )
+
+        return BumkcRuntimeLaunchPlan(
+            shape_symbols=tuple(validated_shape_symbols),
+            serving_state=tuple(self.runtime_serving_state),
+        )
 
     def as_log_dict(self) -> dict[str, Any]:
         return {
@@ -110,6 +218,13 @@ class BumkcArtifactSummary:
             "runtime_executable": self.runtime_executable,
             "runtime_entrypoints": list(self.runtime_entrypoints),
             "runtime_summary": self.runtime_summary.as_log_dict(),
+            "runtime_shape_symbols": [
+                dataclasses.asdict(binding)
+                for binding in self.runtime_shape_symbols
+            ],
+            "runtime_serving_state": [
+                dataclasses.asdict(binding) for binding in self.runtime_serving_state
+            ],
             "task_count": self.task_count,
             "tensor_smoke_enabled": self.tensor_smoke_enabled,
             "required_validation_model": self.required_validation_model,
@@ -146,6 +261,8 @@ def load_bumkc_artifact(
         raise BumkcArtifactError("BUMKC artifact is not executable")
 
     runtime_summary = _load_runtime_summary(engine, runtime)
+    runtime_shape_symbols = _load_shape_symbol_bindings(runtime)
+    runtime_serving_state = _load_serving_state_bindings(runtime)
     entrypoints = tuple(
         entrypoint.get("name", "") for entrypoint in runtime.get("entrypoints", [])
     )
@@ -160,6 +277,8 @@ def load_bumkc_artifact(
         runtime_executable=bool(runtime["executable"]),
         runtime_entrypoints=entrypoints,
         runtime_summary=runtime_summary,
+        runtime_shape_symbols=runtime_shape_symbols,
+        runtime_serving_state=runtime_serving_state,
         task_count=runtime_summary.task_count,
         tensor_smoke_enabled=bool(tensor_smoke["enabled"]),
         required_validation_model=engine["required_validation_model"],
@@ -268,6 +387,63 @@ def _load_runtime_summary(
     return BumkcRuntimeSummary(**{key: int(value) for key, value in expected.items()})
 
 
+def _load_shape_symbol_bindings(
+    runtime: dict[str, Any],
+) -> tuple[BumkcRuntimeShapeSymbolBinding, ...]:
+    substitution_plan = _read_object(runtime, "substitution_plan")
+    bindings = []
+    seen_symbols = set()
+    for entry in _read_list(substitution_plan, "shape_symbols"):
+        binding = BumkcRuntimeShapeSymbolBinding(
+            symbol=_read_str(entry, "symbol"),
+            min=_read_int(entry, "min"),
+            max=_read_int(entry, "max"),
+            bucket=_read_int(entry, "bucket"),
+            default_value=_read_int(entry, "default_value"),
+        )
+        if binding.min < 1 or binding.max < binding.min:
+            raise BumkcArtifactError(
+                f"BUMKC runtime shape symbol {binding.symbol} has invalid bounds"
+            )
+        if binding.bucket < 1 or binding.bucket > binding.max:
+            raise BumkcArtifactError(
+                f"BUMKC runtime shape symbol {binding.symbol} has invalid bucket"
+            )
+        if binding.default_value < binding.min or binding.default_value > binding.max:
+            raise BumkcArtifactError(
+                f"BUMKC runtime shape symbol {binding.symbol} has invalid default"
+            )
+        if binding.symbol in seen_symbols:
+            raise BumkcArtifactError(
+                f"BUMKC runtime shape symbol {binding.symbol} is duplicated"
+            )
+        seen_symbols.add(binding.symbol)
+        bindings.append(binding)
+    return tuple(bindings)
+
+
+def _load_serving_state_bindings(
+    runtime: dict[str, Any],
+) -> tuple[BumkcRuntimeServingStateBinding, ...]:
+    substitution_plan = _read_object(runtime, "substitution_plan")
+    bindings = []
+    seen_bindings = set()
+    for entry in _read_list(substitution_plan, "serving_state"):
+        binding = BumkcRuntimeServingStateBinding(
+            kind=_read_str(entry, "kind"),
+            symbol=_read_optional_str(entry, "symbol"),
+            required=_read_bool(entry, "required"),
+        )
+        if binding.key() in seen_bindings:
+            raise BumkcArtifactError(
+                "BUMKC runtime serving-state binding "
+                f"{binding.kind}:{binding.symbol} is duplicated"
+            )
+        seen_bindings.add(binding.key())
+        bindings.append(binding)
+    return tuple(bindings)
+
+
 def _read_object(parent: dict[str, Any], key: str) -> dict[str, Any]:
     value = parent.get(key)
     if not isinstance(value, dict):
@@ -286,6 +462,54 @@ def _read_list(parent: dict[str, Any], key: str) -> list[dict[str, Any]]:
 
 def _read_int(parent: dict[str, Any], key: str) -> int:
     value = parent.get(key)
-    if not isinstance(value, int):
+    if not _is_strict_int(value):
         raise BumkcArtifactError(f"BUMKC runtime {key} integer is missing")
     return value
+
+
+def _read_str(parent: dict[str, Any], key: str) -> str:
+    value = parent.get(key)
+    if not isinstance(value, str) or not value:
+        raise BumkcArtifactError(f"BUMKC runtime {key} string is missing")
+    return value
+
+
+def _read_optional_str(parent: dict[str, Any], key: str) -> str | None:
+    value = parent.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise BumkcArtifactError(f"BUMKC runtime {key} string is invalid")
+    return value
+
+
+def _read_bool(parent: dict[str, Any], key: str) -> bool:
+    value = parent.get(key)
+    if not isinstance(value, bool):
+        raise BumkcArtifactError(f"BUMKC runtime {key} boolean is missing")
+    return value
+
+
+def _is_strict_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _normalize_serving_state(
+    serving_state: Iterable[tuple[str, str | None]],
+) -> set[tuple[str, str | None]]:
+    normalized = set()
+    for entry in serving_state:
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            raise BumkcArtifactError("BUMKC serving-state binding is malformed")
+        kind, symbol = entry
+        if not isinstance(kind, str) or not kind:
+            raise BumkcArtifactError("BUMKC serving-state kind is malformed")
+        if symbol is not None and (not isinstance(symbol, str) or not symbol):
+            raise BumkcArtifactError("BUMKC serving-state symbol is malformed")
+        key = (kind, symbol)
+        if key in normalized:
+            raise BumkcArtifactError(
+                f"BUMKC serving-state binding is duplicated: {kind}:{symbol}"
+            )
+        normalized.add(key)
+    return normalized

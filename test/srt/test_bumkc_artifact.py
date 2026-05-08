@@ -42,10 +42,18 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.runtime_summary.substitution_serving_binding_count == 2
     assert summary.runtime_summary.substitution_symbol_max_sum == 4096
     assert summary.runtime_summary.substitution_symbol_bucket_sum == 16
+    assert summary.runtime_shape_symbols[0].symbol == "sequence"
+    assert summary.runtime_serving_state[0].key() == ("sequence", "sequence")
     assert summary.target_arch == "sm90"
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
     assert summary.fallback_mode == "checked"
+
+    launch_plan = summary.validate_runtime_launch(
+        shape_symbols={"sequence": 17},
+        serving_state=[("sequence", "sequence"), ("decode_step", None)],
+    )
+    assert launch_plan.shape_symbols[0].bucketed_value == 32
 
 
 def test_rejects_required_non_executable_bumkc_artifact(tmp_path):
@@ -130,6 +138,62 @@ def test_rejects_bumkc_substitution_summary_mismatch(tmp_path):
 
     with pytest.raises(BumkcArtifactError, match="runtime summary mismatch"):
         load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_runtime_launch_shape_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    summary = load_bumkc_artifact(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="outside"):
+        summary.validate_runtime_launch(
+            shape_symbols={"sequence": 8192},
+            serving_state=[("sequence", "sequence"), ("decode_step", None)],
+        )
+
+
+def test_rejects_bumkc_runtime_launch_bucket_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["substitution_plan"]["shape_symbols"][0]["max"] = 4097
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["runtime_summary"]["substitution_symbol_max_sum"] = 4097
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    summary = load_bumkc_artifact(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="buckets"):
+        summary.validate_runtime_launch(
+            shape_symbols={"sequence": 4097},
+            serving_state=[("sequence", "sequence"), ("decode_step", None)],
+        )
+
+
+def test_rejects_bumkc_runtime_launch_serving_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    summary = load_bumkc_artifact(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="missing BUMKC serving-state"):
+        summary.validate_runtime_launch(
+            shape_symbols={"sequence": 17},
+            serving_state=[("sequence", "sequence")],
+        )
+
+
+def test_rejects_bumkc_runtime_launch_duplicate_serving_state(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    summary = load_bumkc_artifact(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="duplicated"):
+        summary.validate_runtime_launch(
+            shape_symbols={"sequence": 17},
+            serving_state=[
+                ("sequence", "sequence"),
+                ("sequence", "sequence"),
+                ("decode_step", None),
+            ],
+        )
 
 
 def write_bumkc_artifact(tmp_path, *, executable):

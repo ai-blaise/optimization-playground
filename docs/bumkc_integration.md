@@ -31,6 +31,12 @@ validates:
   runtime substitution bounds,
 - and the required REAP validation model contract.
 
+Before invoking any BUMKC runtime entrypoint, the serving path must call
+`BumkcArtifactSummary.validate_runtime_launch()` with concrete dynamic shape
+values and serving-state keys. The guard rejects missing, unknown,
+out-of-range, or out-of-bucket shape substitutions and missing or unknown
+serving-state bindings.
+
 Add `--bumkc-require-executable` when startup must fail unless the runtime
 descriptor is executable. Without that flag, non-executable BUMKC artifacts are
 accepted only as checked fallback metadata.

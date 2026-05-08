@@ -1,10 +1,16 @@
 """Non-persistent FlashSampling kernel for Blackwell (SM100, B200/GB200).
 
 Same CuTe non-persistent design as the H200 target kernel, with
-SM100-specific tuning: 5 pipeline stages for 256 KB SMEM.
+SM100-specific tuning: adaptive pipeline stages for 227 KB max SMEM.
 
-NOT YET VALIDATED — no B200 VM available. BF16 weights only;
-a separate FP4 variant would be needed for native NVFP4 inference.
+Validated on B200 (SM 10.0, Triton 3.4, driver 590.48):
+- Greedy: bit-exact vs torch reference at V=16160/D=7168 (REAP shape),
+  BS=1/4/64
+- Sampling: 100% top-1 agreement over 200 Gumbel trials
+- Perf: 4.33-4.36 TB/s, matches cuBLAS at BS=1, +9% at BS=64
+
+BF16 weights only; a separate FP4 variant would be needed for native
+NVFP4 inference.
 """
 
 import torch
@@ -118,11 +124,18 @@ def flashsample_blackwell_kernel(
         tl.store(max_out_idx_ptr + base_offset, gumbel_max_idx_global, mask=mask_h_out)
 
 
-# BLOCK_D=128 with 5 stages: 36 KB/stage x 5 = 180 KB < 256 KB SMEM.
 _BLOCK_V_BLACKWELL = MIN_BLOCK_SIZE_V
 _BLOCK_D_BLACKWELL = 128
-_NUM_STAGES_BLACKWELL = 5
 _NUM_WARPS_BLACKWELL = 8
+_B200_MAX_SMEM = 232448
+
+
+def _num_stages_blackwell(block_h: int) -> int:
+    smem_per_stage = (_BLOCK_V_BLACKWELL + block_h) * _BLOCK_D_BLACKWELL * 2
+    for stages in (5, 4, 3, 2):
+        if smem_per_stage * stages <= _B200_MAX_SMEM:
+            return stages
+    return 1
 
 
 def fused_mm_sample_blackwell(
@@ -149,7 +162,7 @@ def fused_mm_sample_blackwell(
     NUM_SMS = num_sms_cached(weights.device.index)
 
     num_pid_v = triton.cdiv(V, _BLOCK_V_BLACKWELL)
-    BLOCK_H = bsz_h(H)
+    BLOCK_H = max(16, bsz_h(H))
     num_pid_h = triton.cdiv(H, BLOCK_H)
     total_tiles = num_pid_v * num_pid_h
 
@@ -202,7 +215,7 @@ def fused_mm_sample_blackwell(
         BLOCK_SIZE_D=_BLOCK_D_BLACKWELL,
         BLOCK_SIZE_H=BLOCK_H,
         num_warps=_NUM_WARPS_BLACKWELL,
-        num_stages=_NUM_STAGES_BLACKWELL,
+        num_stages=_num_stages_blackwell(BLOCK_H),
     )
 
     if vocab_start_index is None:

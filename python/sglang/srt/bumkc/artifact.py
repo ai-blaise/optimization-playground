@@ -20,7 +20,7 @@ REQUIRED_VALIDATION_MODEL = (
 )
 REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
 REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v13"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v14"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v11"
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
@@ -479,6 +479,10 @@ def load_bumkc_artifact(
         raise BumkcArtifactError("BUMKC artifact capability is unsupported")
     if engine.get("schema_version") != REQUIRED_SCHEMA_VERSION:
         raise BumkcArtifactError("BUMKC artifact uses an unsupported engine schema")
+    if engine.get("manifest_schema_version") != manifest.get("schema_version"):
+        raise BumkcArtifactError("BUMKC engine manifest schema does not match manifest")
+    if engine.get("manifest_capability_level") != manifest.get("capability_level"):
+        raise BumkcArtifactError("BUMKC engine manifest capability does not match manifest")
     if engine.get("engine") != "sglang":
         raise BumkcArtifactError("BUMKC artifact is not targeted at the SGLang engine")
     if engine.get("engine_profile") != "optimization_playground":

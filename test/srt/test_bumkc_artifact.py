@@ -182,6 +182,30 @@ def test_rejects_unsupported_bumkc_capability(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_engine_manifest_schema_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["manifest_schema_version"] = "bumkc.plan.v0"
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="manifest schema"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_engine_manifest_capability_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["manifest_capability_level"] = "scaffold"
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="manifest capability"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_bumkc_target_arch_mismatch(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     engine_path = plan_dir / "engine" / "optimization-playground.json"
@@ -679,6 +703,8 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "integration_branch": "bumkc/serving-integration",
             "plan_id": plan_id,
             "program_id": program_id,
+            "manifest_schema_version": REQUIRED_PLAN_SCHEMA_VERSION,
+            "manifest_capability_level": REQUIRED_CAPABILITY_LEVEL,
             "model": "matmul-chain",
             "gpu_count": 8,
             "target_arch": "sm90",

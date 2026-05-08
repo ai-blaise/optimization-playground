@@ -2402,13 +2402,74 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def kernel_warmup(self):
         """
         Warmup and tune kernels before cuda graph capture.
-        Currently only doing FlashInfer autotune.
         """
         if self.device != "cuda":
             return
 
+        self._flashsampling_warmup()
+
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+
+    def _flashsampling_warmup(self):
+        if not self.server_args.enable_flashsampling:
+            return
+
+        batch_sizes = self.server_args.flashsampling_warmup_batch_sizes
+        if not batch_sizes:
+            return
+
+        lm_head = getattr(self.model, "lm_head", None)
+        if lm_head is None:
+            return
+
+        from sglang.srt.layers.flashsampling.core import fused_mm_sample_triton
+        from sglang.srt.layers.flashsampling.runtime import (
+            get_flashsampling_lm_head_metadata,
+        )
+
+        metadata = get_flashsampling_lm_head_metadata(lm_head)
+        if metadata is None:
+            return
+        weight, vocab_start_index, valid_vocab_size = metadata
+        if weight.device.type != "cuda":
+            return
+
+        hidden_size = weight.shape[1]
+        temperature = torch.tensor(0.6, dtype=torch.float32, device=weight.device)
+        logger.info("Running FlashSampling warmup for batch sizes: %s", batch_sizes)
+
+        self.forward_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.forward_stream), torch.inference_mode():
+            for batch_size in batch_sizes:
+                hidden_states = torch.empty(
+                    (batch_size, hidden_size),
+                    dtype=weight.dtype,
+                    device=weight.device,
+                )
+                hidden_states.normal_()
+                fused_mm_sample_triton(
+                    weights=weight,
+                    hidden_states=hidden_states,
+                    num_samples=1,
+                    temperature=temperature,
+                    seed=batch_size,
+                    valid_vocab_size=valid_vocab_size,
+                    vocab_start_index=vocab_start_index,
+                )
+                fused_mm_sample_triton(
+                    weights=weight,
+                    hidden_states=hidden_states,
+                    num_samples=1,
+                    temperature=temperature,
+                    seed=batch_size,
+                    greedy_sampling=True,
+                    return_scores=True,
+                    valid_vocab_size=valid_vocab_size,
+                    vocab_start_index=vocab_start_index,
+                )
+        torch.cuda.current_stream().wait_stream(self.forward_stream)
+        logger.info("FlashSampling warmup completed.")
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
@@ -3416,6 +3477,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
     ):
+        if logits_output.next_token_logits is None:
+            return
+
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
 

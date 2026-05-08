@@ -10,6 +10,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.flashsampling import FlashSamplingRuntime
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
@@ -60,6 +61,11 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
+        self.flashsampling_runtime = (
+            FlashSamplingRuntime()
+            if get_global_server_args().enable_flashsampling
+            else None
+        )
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -103,6 +109,16 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
+        if logits_output.flashsampling_info is not None:
+            assert self.flashsampling_runtime is not None
+            assert not return_logprob
+            batch_next_token_ids = self.flashsampling_runtime.sample(
+                logits_output.flashsampling_info,
+                sampling_info,
+            )
+            self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+            return batch_next_token_ids
+
         logits = logits_output.next_token_logits
 
         # Preprocess logits (custom processors and NaN handling)

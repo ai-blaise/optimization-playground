@@ -110,6 +110,88 @@ class TestSMCDisaggregationArgs(unittest.TestCase):
             )
 
 
+class TestFlashSamplingArgs(unittest.TestCase):
+    def test_flashsampling_dp_attention_uses_dp_lm_head(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_flashsampling=True,
+            enable_dp_attention=True,
+            dp_size=2,
+            tp_size=2,
+        )
+
+        server_args._handle_flashsampling()
+
+        self.assertTrue(server_args.enable_dp_lm_head)
+
+    def test_flashsampling_normalizes_auto_provider(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_flashsampling=True,
+            flashsampling_provider="auto",
+        )
+
+        server_args._handle_flashsampling()
+
+        self.assertEqual(server_args.flashsampling_provider, "triton")
+
+    def test_flashsampling_uses_default_warmup_buckets(self):
+        server_args = ServerArgs(model_path="dummy", enable_flashsampling=True)
+
+        server_args._handle_flashsampling()
+
+        self.assertEqual(server_args.flashsampling_warmup_batch_sizes, [1, 32, 64])
+
+    def test_flashsampling_uses_h200_safe_min_batch_default(self):
+        server_args = ServerArgs(model_path="dummy", enable_flashsampling=True)
+
+        server_args._handle_flashsampling()
+
+        self.assertEqual(server_args.flashsampling_min_batch_size, 128)
+
+    def test_flashsampling_accepts_empty_warmup(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_flashsampling=True,
+            flashsampling_warmup_batch_sizes=[],
+        )
+
+        server_args._handle_flashsampling()
+
+        self.assertEqual(server_args.flashsampling_warmup_batch_sizes, [])
+
+    def test_flashsampling_rejects_invalid_warmup_batch_size(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_flashsampling=True,
+            flashsampling_warmup_batch_sizes=[0],
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            server_args._handle_flashsampling()
+
+    def test_flashsampling_rejects_invalid_min_batch_size(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_flashsampling=True,
+            flashsampling_min_batch_size=0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            server_args._handle_flashsampling()
+
+    def test_flashsampling_rejects_invalid_max_batch_size(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_flashsampling=True,
+            flashsampling_min_batch_size=128,
+            flashsampling_max_batch_size=64,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be at least"):
+            server_args._handle_flashsampling()
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

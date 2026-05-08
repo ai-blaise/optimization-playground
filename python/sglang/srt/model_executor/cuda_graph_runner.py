@@ -22,7 +22,7 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
@@ -52,6 +52,9 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.flashsampling.runtime import (
+    is_flashsampling_sampling_info_supported,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import (
@@ -71,6 +74,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -754,6 +759,62 @@ class CudaGraphRunner:
             return "lora"
         return "nolora"
 
+    def _make_flashsampling_capture_sampling_info(
+        self, bs: int, device: torch.device
+    ) -> SamplingBatchInfo:
+        return SamplingBatchInfo(
+            temperatures=torch.ones((bs, 1), dtype=torch.float32, device=device),
+            top_ps=torch.ones((bs,), dtype=torch.float32, device=device),
+            top_ks=torch.full((bs,), TOP_K_ALL, dtype=torch.int32, device=device),
+            min_ps=torch.zeros((bs,), dtype=torch.float32, device=device),
+            temperature_value=1.0,
+            temperature_is_uniform=True,
+            is_all_greedy=False,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=self.model_runner.model_config.vocab_size,
+            device=str(device),
+        )
+
+    def _flashsampling_variant_label(self, variant_label: Optional[str]) -> str:
+        if variant_label is None:
+            return "flashsampling"
+        return f"{variant_label}_flashsampling"
+
+    def _should_capture_flashsampling_graph(self, bs: int) -> bool:
+        if not self.model_runner.server_args.enable_flashsampling:
+            return False
+        if not self.capture_forward_mode.is_decode():
+            return False
+        server_args = self.model_runner.server_args
+        if bs < server_args.flashsampling_min_batch_size:
+            return False
+        return (
+            server_args.flashsampling_max_batch_size is None
+            or bs <= server_args.flashsampling_max_batch_size
+        )
+
+    def _should_use_flashsampling_graph(self, forward_batch: ForwardBatch) -> bool:
+        if not self.model_runner.server_args.enable_flashsampling:
+            return False
+        if not forward_batch.forward_mode.is_decode():
+            return False
+        server_args = self.model_runner.server_args
+        if forward_batch.batch_size < server_args.flashsampling_min_batch_size:
+            return False
+        if (
+            server_args.flashsampling_max_batch_size is not None
+            and forward_batch.batch_size > server_args.flashsampling_max_batch_size
+        ):
+            return False
+        if forward_batch.return_logprob:
+            return False
+        sampling_info = forward_batch.sampling_info
+        return sampling_info is not None and is_flashsampling_sampling_info_supported(
+            sampling_info
+        )
+
     def can_run(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -771,6 +832,8 @@ class CudaGraphRunner:
             cuda_graph_bs = forward_batch.batch_size
 
         variant_label = self._resolve_lora_variant(forward_batch)
+        if self._should_use_flashsampling_graph(forward_batch):
+            variant_label = self._flashsampling_variant_label(variant_label)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         graph_key = self._make_graph_key(cuda_graph_bs, stream_idx, variant_label)
 
@@ -893,13 +956,32 @@ class CudaGraphRunner:
                         num_tokens=bs * self.num_tokens_per_bs,
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
-                        (
-                            graph,
-                            output_buffers,
-                        ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                        key = _default_make_graph_key(bs, stream_idx, variant_label)
-                        self.graphs[key] = graph
-                        self.output_buffers[key] = output_buffers
+                        capture_variants = [(variant_label, False)]
+                        if self._should_capture_flashsampling_graph(bs):
+                            capture_variants.append(
+                                (
+                                    self._flashsampling_variant_label(variant_label),
+                                    True,
+                                )
+                            )
+                        for (
+                            graph_variant_label,
+                            enable_flashsampling_capture,
+                        ) in capture_variants:
+                            (
+                                graph,
+                                output_buffers,
+                            ) = self.capture_one_batch_size(
+                                bs,
+                                forward,
+                                stream_idx,
+                                enable_flashsampling_capture,
+                            )
+                            key = _default_make_graph_key(
+                                bs, stream_idx, graph_variant_label
+                            )
+                            self.graphs[key] = graph
+                            self.output_buffers[key] = output_buffers
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -965,7 +1047,11 @@ class CudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(
-        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+        self,
+        bs: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        enable_flashsampling_capture: bool = False,
     ):
         buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
@@ -1104,6 +1190,10 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
+        if enable_flashsampling_capture:
+            forward_batch.sampling_info = self._make_flashsampling_capture_sampling_info(
+                bs, input_ids.device
+            )
 
         # HiSparse: set coordinator so the hisparse code path is captured into the graph
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
@@ -1300,6 +1390,9 @@ class CudaGraphRunner:
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        self.use_flashsampling_graph = self._should_use_flashsampling_graph(
+            forward_batch
+        )
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
@@ -1329,6 +1422,8 @@ class CudaGraphRunner:
 
         # Replay
         variant_label = self._resolve_lora_variant(forward_batch)
+        if self.use_flashsampling_graph:
+            variant_label = self._flashsampling_variant_label(variant_label)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         graph_key = self._make_graph_key(self.bs, stream_idx, variant_label)
         ctx = (
@@ -1359,6 +1454,14 @@ class CudaGraphRunner:
                     if output.next_token_logits is not None
                     else None
                 )
+            flashsampling_info = None
+            if output.flashsampling_info is not None:
+                flashsampling_info = replace(
+                    output.flashsampling_info,
+                    hidden_states=output.flashsampling_info.hidden_states[
+                        : self.raw_num_token
+                    ],
+                )
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
@@ -1369,6 +1472,7 @@ class CudaGraphRunner:
                     else None
                 ),
                 customized_info=output.customized_info,
+                flashsampling_info=flashsampling_info,
             )
         else:
             assert isinstance(output, PPProxyTensors)

@@ -545,6 +545,13 @@ class ServerArgs:
     turboquant_mla_decode_num_splits: int = 16
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
+    enable_flashsampling: bool = False
+    flashsampling_provider: str = "triton"
+    flashsampling_fallback: str = "auto"
+    flashsampling_tp_reduction: str = "small_allgather"
+    flashsampling_warmup_batch_sizes: Optional[List[int]] = None
+    flashsampling_min_batch_size: int = 128
+    flashsampling_max_batch_size: Optional[int] = None
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -925,6 +932,9 @@ class ServerArgs:
 
         # Handle data parallelism.
         self._handle_data_parallelism()
+
+        # Handle FlashSampling after data-parallel defaults are resolved.
+        self._handle_flashsampling()
 
         # Handle context parallelism.
         self._handle_context_parallelism()
@@ -3105,6 +3115,37 @@ class ServerArgs:
             assert (
                 self.enable_dp_attention
             ), "Please enable dp attention when setting enable_dp_lm_head. "
+
+    def _handle_flashsampling(self):
+        if not self.enable_flashsampling:
+            return
+
+        if self.flashsampling_provider == "auto":
+            self.flashsampling_provider = "triton"
+
+        if self.flashsampling_warmup_batch_sizes is None:
+            self.flashsampling_warmup_batch_sizes = [1, 32, 64]
+        elif any(bs <= 0 for bs in self.flashsampling_warmup_batch_sizes):
+            raise ValueError("--flashsampling-warmup-batch-sizes must be positive")
+
+        if self.flashsampling_min_batch_size <= 0:
+            raise ValueError("--flashsampling-min-batch-size must be positive")
+        if self.flashsampling_max_batch_size is not None:
+            if self.flashsampling_max_batch_size <= 0:
+                raise ValueError("--flashsampling-max-batch-size must be positive")
+            if self.flashsampling_max_batch_size < self.flashsampling_min_batch_size:
+                raise ValueError(
+                    "--flashsampling-max-batch-size must be at least "
+                    "--flashsampling-min-batch-size"
+                )
+
+        if self.enable_dp_attention and self.dp_size > 1 and not self.enable_dp_lm_head:
+            self.enable_dp_lm_head = True
+            logger.warning(
+                "FlashSampling with DP attention enables DP lm_head sharding so "
+                "sampling can run over the attention tensor-parallel group without "
+                "materializing or scattering full logits."
+            )
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
@@ -5557,6 +5598,62 @@ class ServerArgs:
             choices=SAMPLING_BACKEND_CHOICES,
             default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
+        )
+        parser.add_argument(
+            "--enable-flashsampling",
+            action="store_true",
+            default=ServerArgs.enable_flashsampling,
+            help="Enable the FlashSampling pre-logits decode sampler for eligible temperature-only or greedy batches.",
+        )
+        parser.add_argument(
+            "--flashsampling-provider",
+            type=str,
+            choices=["triton", "auto"],
+            default=ServerArgs.flashsampling_provider,
+            help="FlashSampling kernel provider. 'auto' currently selects the Triton fused matmul-sampling kernel.",
+        )
+        parser.add_argument(
+            "--flashsampling-fallback",
+            type=str,
+            choices=["auto", "error"],
+            default=ServerArgs.flashsampling_fallback,
+            help="FlashSampling fallback behavior for unsupported batches.",
+        )
+        parser.add_argument(
+            "--flashsampling-tp-reduction",
+            type=str,
+            choices=["small_allgather"],
+            default=ServerArgs.flashsampling_tp_reduction,
+            help="Tensor-parallel FlashSampling reduction method.",
+        )
+        parser.add_argument(
+            "--flashsampling-warmup-batch-sizes",
+            type=int,
+            nargs="*",
+            default=ServerArgs.flashsampling_warmup_batch_sizes,
+            help=(
+                "FlashSampling batch sizes to prewarm before graph capture. "
+                "Omit the flag to warm up the three Triton BLOCK_SIZE_H buckets "
+                "(1, 32, 64); pass the flag with no values to disable warmup."
+            ),
+        )
+        parser.add_argument(
+            "--flashsampling-min-batch-size",
+            type=int,
+            default=ServerArgs.flashsampling_min_batch_size,
+            help=(
+                "Minimum decode batch size eligible for FlashSampling. Smaller "
+                "batches use the normal logits path. The default is 128."
+            ),
+        )
+        parser.add_argument(
+            "--flashsampling-max-batch-size",
+            type=int,
+            default=ServerArgs.flashsampling_max_batch_size,
+            help=(
+                "Maximum decode batch size eligible for FlashSampling. Larger "
+                "batches use the normal logits path. Omit for no upper bound."
+            ),
         )
         parser.add_argument(
             "--grammar-backend",

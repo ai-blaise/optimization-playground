@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.flashsampling import FlashSamplingInfo, get_flashsampling_info
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     compute_temp_top_p_normalized_logprobs,
@@ -106,6 +107,9 @@ class LogitsProcessorOutput:
     customized_info: Optional[Dict[str, List[Any]]] = None
 
     mm_input_embeds: Optional[torch.Tensor] = None
+
+    ## Part 6: FlashSampling fast path.
+    flashsampling_info: Optional[FlashSamplingInfo] = None
 
 
 @dataclasses.dataclass
@@ -293,8 +297,10 @@ class LogitsProcessor(nn.Module):
     ) -> LogitsProcessorOutput:
         # Extract MIS indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
+        sampling_info = None
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
+            sampling_info = logits_metadata.sampling_info
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
@@ -339,6 +345,29 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            flashsampling_info = get_flashsampling_info(
+                hidden_states=pruned_states,
+                lm_head=lm_head,
+                sampling_info=sampling_info,
+                server_args=get_global_server_args(),
+                forward_mode=logits_metadata.forward_mode,
+                extend_return_logprob=logits_metadata.extend_return_logprob,
+                final_logit_softcapping=self.final_logit_softcapping,
+                logit_scale=self.logit_scale,
+                use_fp32_lm_head=self.use_fp32_lm_head,
+                use_attn_tp_group=self.use_attn_tp_group,
+                do_dp_attention_lm_head_gather=(
+                    self.do_tensor_parallel_all_gather_dp_attn
+                ),
+            )
+            if flashsampling_info is not None:
+                return LogitsProcessorOutput(
+                    next_token_logits=None,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                    flashsampling_info=flashsampling_info,
+                )
+
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (

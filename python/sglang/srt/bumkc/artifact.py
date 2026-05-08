@@ -18,7 +18,7 @@ REQUIRED_CLI_FLAGS = (
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v10"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v11"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v10"
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
 _CONTRACT_HASH_PRIME = 0x00000100000001B3
@@ -87,6 +87,12 @@ _SCHEDULING_POLICY_CODES = {
     "static_aot": 0,
     "dynamic_jit": 1,
 }
+_DEPENDENCY_SCOPE_CODES = {
+    "tile_overlap": 1,
+    "whole_producer": 2,
+}
+_DEPENDENCY_HASH_OFFSET = 14695981039346656037
+_DEPENDENCY_HASH_PRIME = 1099511628211
 
 
 def _contract_hash_str(value: str) -> int:
@@ -110,6 +116,49 @@ def _mix_contract_u64(hash_value: int, value: int) -> int:
 
 def _mix_contract_byte(hash_value: int, byte: int) -> int:
     return ((hash_value ^ byte) * _CONTRACT_HASH_PRIME) & _U64_MASK
+
+
+def _dependency_descriptor_hash(descriptors: list[dict[str, Any]]) -> int:
+    hash_value = _DEPENDENCY_HASH_OFFSET
+    for descriptor in descriptors:
+        hash_value = _mix_dependency_hash_str(
+            hash_value, _read_str(descriptor, "task")
+        )
+        hash_value = _mix_dependency_hash_str(
+            hash_value, _read_str(descriptor, "consumer_event")
+        )
+        hash_value = _mix_dependency_hash_str(
+            hash_value, _read_str(descriptor, "predecessor_event")
+        )
+        hash_value = _mix_dependency_hash_u64(
+            hash_value, _read_int(descriptor, "dependency_ordinal")
+        )
+        scope = _read_str(descriptor, "scope")
+        if scope not in _DEPENDENCY_SCOPE_CODES:
+            raise BumkcArtifactError(
+                f"BUMKC dependency scope is unsupported: {scope}"
+            )
+        hash_value = _mix_dependency_hash_u64(
+            hash_value, _DEPENDENCY_SCOPE_CODES[scope]
+        )
+        hash_value = _mix_dependency_hash_str(
+            hash_value, _read_str(descriptor, "wait_expression")
+        )
+    return hash_value
+
+
+def _mix_dependency_hash_str(hash_value: int, value: str) -> int:
+    encoded = value.encode("utf-8")
+    hash_value = _mix_dependency_hash_u64(hash_value, len(encoded))
+    for byte in encoded:
+        hash_value = _mix_dependency_hash_u64(hash_value, byte)
+    return hash_value
+
+
+def _mix_dependency_hash_u64(hash_value: int, value: int) -> int:
+    if value < 0 or value > _U64_MASK:
+        raise BumkcArtifactError("BUMKC dependency descriptor value is out of range")
+    return ((hash_value * _DEPENDENCY_HASH_PRIME) + value) & _U64_MASK
 
 
 class BumkcArtifactError(ValueError):
@@ -197,6 +246,8 @@ class BumkcRuntimeSummary:
     tile_overlap_dependency_count: int
     whole_producer_dependency_count: int
     dependency_scope_code_sum: int
+    dependency_descriptor_count: int
+    dependency_descriptor_hash: int
     collective_task_count: int
     collective_group_size_sum: int
     collective_kind_code_sum: int
@@ -231,6 +282,8 @@ class BumkcRuntimeSummary:
             "tile_overlap_dependency_count": self.tile_overlap_dependency_count,
             "whole_producer_dependency_count": self.whole_producer_dependency_count,
             "dependency_scope_code_sum": self.dependency_scope_code_sum,
+            "dependency_descriptor_count": self.dependency_descriptor_count,
+            "dependency_descriptor_hash": self.dependency_descriptor_hash,
             "collective_task_count": self.collective_task_count,
             "collective_group_size_sum": self.collective_group_size_sum,
             "collective_kind_code_sum": self.collective_kind_code_sum,
@@ -637,6 +690,25 @@ def _load_runtime_summary(
     substitution_shape_symbols = _read_list(substitution_plan, "shape_symbols")
     substitution_serving_state = _read_list(substitution_plan, "serving_state")
     dependency_plan = _read_object(runtime, "dependency_plan")
+    dependency_descriptors = _read_list(
+        dependency_plan, "dependency_descriptors"
+    )
+    dependency_descriptor_hash = _dependency_descriptor_hash(
+        dependency_descriptors
+    )
+    if _read_int(dependency_plan, "dependency_descriptor_count") != len(
+        dependency_descriptors
+    ):
+        raise BumkcArtifactError(
+            "BUMKC runtime dependency descriptor count mismatch"
+        )
+    if (
+        _read_int(dependency_plan, "dependency_descriptor_hash")
+        != dependency_descriptor_hash
+    ):
+        raise BumkcArtifactError(
+            "BUMKC runtime dependency descriptor hash mismatch"
+        )
     expected = {
         "task_count": runtime.get("task_count"),
         "conventional_launch_count": execution_model.get("conventional_launch_count"),
@@ -659,6 +731,8 @@ def _load_runtime_summary(
             "whole_producer_dependency_count"
         ),
         "dependency_scope_code_sum": dependency_plan.get("dependency_scope_code_sum"),
+        "dependency_descriptor_count": len(dependency_descriptors),
+        "dependency_descriptor_hash": dependency_descriptor_hash,
         "collective_task_count": communication_plan.get("collective_task_count"),
         "collective_group_size_sum": communication_plan.get(
             "collective_group_size_sum"

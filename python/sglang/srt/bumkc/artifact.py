@@ -19,8 +19,8 @@ REQUIRED_VALIDATION_MODEL = (
 )
 REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
 REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v19"
-REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v9"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v20"
+REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v10"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v12"
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
@@ -114,6 +114,22 @@ _QUANTIZATION_FORMAT_CODES = {
     "fp8_e4m3": 2,
     "fp8_e5m2": 3,
     "int4": 4,
+}
+_QUANTIZATION_SCALE_LAYOUT_CODES = {
+    "tensor": 1,
+    "tensor_group": 2,
+    "channel": 3,
+}
+_DTYPE_CODES = {
+    "bool": 1,
+    "i32": 2,
+    "i64": 3,
+    "f16": 4,
+    "bf16": 5,
+    "f32": 6,
+    "fp8_e4m3": 7,
+    "fp8_e5m2": 8,
+    "nv_fp4": 9,
 }
 _DEPENDENCY_HASH_OFFSET = 14695981039346656037
 _DEPENDENCY_HASH_PRIME = 1099511628211
@@ -828,6 +844,18 @@ def _validate_source_artifact(
             quantization, "weight_format"
         ),
         "quantization_weight_bits": _read_optional_int(quantization, "weight_bits"),
+        "quantization_weight_scale_layout_code": _quantization_scale_layout_code(
+            quantization, "weight_scale_layout"
+        ),
+        "quantization_weight_group_size": _read_optional_int(
+            quantization, "weight_group_size"
+        ),
+        "quantization_weight_scale_dtype_code": _dtype_code(
+            quantization, "weight_scale_dtype"
+        ),
+        "quantization_weight_symmetric_code": _optional_bool_code(
+            quantization, "weight_symmetric"
+        ),
         "quantization_activation_bits": _read_optional_int(
             quantization, "activation_bits"
         ),
@@ -853,6 +881,13 @@ def _validate_source_artifact(
             quantization, key.removesuffix("_enabled")
         ):
             raise BumkcArtifactError(f"BUMKC model source summary mismatch: {key}")
+    if _read_bool(model_source, "quantization_weight_zero_point_enabled") != _read_bool(
+        quantization, "weight_zero_point"
+    ):
+        raise BumkcArtifactError(
+            "BUMKC model source summary mismatch: "
+            "quantization_weight_zero_point_enabled"
+        )
 
 
 def _artifact_file_paths(root: Path) -> list[str]:
@@ -1652,6 +1687,35 @@ def _quantization_format_code(parent: dict[str, Any], key: str) -> int:
     if value not in _QUANTIZATION_FORMAT_CODES:
         raise BumkcArtifactError(f"BUMKC quantization format is unsupported: {value}")
     return _QUANTIZATION_FORMAT_CODES[value]
+
+
+def _quantization_scale_layout_code(parent: dict[str, Any], key: str) -> int:
+    value = _read_optional_str(parent, key)
+    if value is None:
+        return 0
+    if value not in _QUANTIZATION_SCALE_LAYOUT_CODES:
+        raise BumkcArtifactError(
+            f"BUMKC quantization scale layout is unsupported: {value}"
+        )
+    return _QUANTIZATION_SCALE_LAYOUT_CODES[value]
+
+
+def _dtype_code(parent: dict[str, Any], key: str) -> int:
+    value = _read_optional_str(parent, key)
+    if value is None:
+        return 0
+    if value not in _DTYPE_CODES:
+        raise BumkcArtifactError(f"BUMKC dtype is unsupported: {value}")
+    return _DTYPE_CODES[value]
+
+
+def _optional_bool_code(parent: dict[str, Any], key: str) -> int:
+    value = parent.get(key)
+    if value is None:
+        return 0
+    if not isinstance(value, bool):
+        raise BumkcArtifactError(f"BUMKC runtime {key} boolean is invalid")
+    return 1 if value else 2
 
 
 def _event_dependency_tensor_count(events: list[dict[str, Any]]) -> int:

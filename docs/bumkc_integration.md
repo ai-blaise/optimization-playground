@@ -33,6 +33,7 @@ validates:
 - engine-exported source schema matching `source/model-source.json`,
 - `runtime_abi_version == "bumkc.runtime.v1"`,
 - runtime smoke schema `bumkc.cuda_smoke.v13`,
+- manifest runtime mode in `{debug, trace, profile, production}`,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
 - exported serving CLI flags,
@@ -55,6 +56,7 @@ validates:
 - `--bumkc-fallback-mode checked` when BUMKC is enabled,
 - preservation of custom optimizations,
 - matching engine/runtime executable flags,
+- production runtime mode only with executable artifacts,
 - compiler summary fields against the HVM tensor island, block pipeline, Event
   Tensor, and simulation artifacts, including native/fallback coverage,
   fallback bridges, MoE dispatch counts across tensor islands, block ops, and
@@ -110,7 +112,8 @@ unquant`, are preserved.
 
 Add `--bumkc-require-executable` when startup must fail unless the runtime
 descriptor is executable. Without that flag, non-executable BUMKC artifacts are
-accepted only as checked fallback metadata.
+accepted only as checked fallback metadata outside production runtime mode.
+Production-mode artifacts are always required to be executable.
 
 The current integration is intentionally narrow. It validates artifacts, applies
 only the serving hints above when the corresponding user controls are unset,

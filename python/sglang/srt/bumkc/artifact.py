@@ -35,6 +35,7 @@ SUPPORTED_SCHEMA_VERSIONS = (
 REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v11"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v13"
+SUPPORTED_RUNTIME_MODES = ("debug", "trace", "profile", "production")
 RUNTIME_SMOKE_BENCHMARK_ITERATIONS = 8
 RUNTIME_SMOKE_BENCHMARK_LAUNCH_CAP = 128
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
@@ -500,6 +501,7 @@ class BumkcArtifactSummary:
     hvm_capture_status: str
     engine_schema_version: str
     fallback_mode: str
+    runtime_mode: str
     runtime_executable: bool
     runtime_entrypoints: tuple[str, ...]
     compiler_summary: BumkcCompilerSummary
@@ -634,6 +636,7 @@ class BumkcArtifactSummary:
             "hvm_capture_status": self.hvm_capture_status,
             "engine_schema_version": self.engine_schema_version,
             "fallback_mode": self.fallback_mode,
+            "runtime_mode": self.runtime_mode,
             "runtime_executable": self.runtime_executable,
             "runtime_entrypoints": list(self.runtime_entrypoints),
             "compiler_summary": self.compiler_summary.as_log_dict(),
@@ -724,6 +727,9 @@ def load_bumkc_artifact(
         )
     if engine.get("fallback_mode") != "checked":
         raise BumkcArtifactError("BUMKC artifact must use checked fallback mode")
+    runtime_mode = _read_str(manifest, "runtime_mode")
+    if runtime_mode not in SUPPORTED_RUNTIME_MODES:
+        raise BumkcArtifactError("BUMKC artifact runtime mode is unsupported")
     if not engine.get("preserve_custom_optimizations"):
         raise BumkcArtifactError(
             "BUMKC artifact does not preserve custom optimizations"
@@ -740,6 +746,10 @@ def load_bumkc_artifact(
         raise BumkcArtifactError("BUMKC engine and runtime executable flags disagree")
     if runtime.get("runtime_abi_version") != REQUIRED_RUNTIME_ABI_VERSION:
         raise BumkcArtifactError("BUMKC artifact uses an unsupported runtime ABI")
+    if runtime_mode == "production" and not runtime.get("executable"):
+        raise BumkcArtifactError(
+            "BUMKC production runtime mode requires executable artifact"
+        )
     if require_executable and not runtime.get("executable"):
         raise BumkcArtifactError("BUMKC artifact is not executable")
 
@@ -782,6 +792,7 @@ def load_bumkc_artifact(
         hvm_capture_status=_read_str(model_source, "hvm_capture_status"),
         engine_schema_version=engine["schema_version"],
         fallback_mode=engine["fallback_mode"],
+        runtime_mode=runtime_mode,
         runtime_executable=bool(runtime["executable"]),
         runtime_entrypoints=entrypoints,
         compiler_summary=compiler_summary,

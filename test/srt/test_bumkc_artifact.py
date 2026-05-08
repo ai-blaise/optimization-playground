@@ -162,6 +162,7 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.model_source_frontend == "internal_test"
     assert summary.hvm_capture_status == "native_eligible"
     assert summary.engine_schema_version == REQUIRED_SCHEMA_VERSION
+    assert summary.runtime_mode == "debug"
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
     assert summary.artifact_digest_count == 16
@@ -173,6 +174,7 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert log_dict["model_source_frontend"] == "internal_test"
     assert log_dict["hvm_capture_status"] == "native_eligible"
     assert log_dict["engine_schema_version"] == REQUIRED_SCHEMA_VERSION
+    assert log_dict["runtime_mode"] == "debug"
     assert log_dict["runtime_summary"]["diagnostic_heartbeat_slot_count"] == 72
     assert log_dict["runtime_summary"]["watchdog_timeout_us"] == 30_000_000
     assert log_dict["scale_up_summary"]["runtime_rank_count"] == 8
@@ -199,6 +201,32 @@ def test_rejects_required_non_executable_bumkc_artifact(tmp_path):
 
     with pytest.raises(BumkcArtifactError, match="not executable"):
         load_bumkc_artifact(tmp_path, require_executable=True)
+
+
+def test_loads_executable_production_bumkc_artifact(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    set_bumkc_runtime_mode(plan_dir, "production")
+
+    summary = load_bumkc_artifact(plan_dir)
+
+    assert summary.runtime_mode == "production"
+    assert summary.runtime_executable
+
+
+def test_rejects_production_non_executable_bumkc_artifact(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=False)
+    set_bumkc_runtime_mode(plan_dir, "production")
+
+    with pytest.raises(BumkcArtifactError, match="production runtime mode"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_unknown_bumkc_runtime_mode(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    set_bumkc_runtime_mode(plan_dir, "minimum_viable")
+
+    with pytest.raises(BumkcArtifactError, match="runtime mode"):
+        load_bumkc_artifact(plan_dir)
 
 
 def test_rejects_bumkc_serving_gpu_count_mismatch(tmp_path):
@@ -1803,6 +1831,17 @@ def write_text(path, value):
 
 def write_json(path, value):
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def set_bumkc_runtime_mode(plan_dir, runtime_mode):
+    for path in (
+        plan_dir / "manifest.json",
+        plan_dir / "source" / "model-source.json",
+    ):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["runtime_mode"] = runtime_mode
+        write_json(path, data)
+    refresh_bumkc_digests(plan_dir)
 
 
 def populate_runtime_smoke_contracts(smoke):

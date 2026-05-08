@@ -101,6 +101,18 @@ def test_rejects_bumkc_artifact_with_unchecked_fallback(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_cli_flag_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["cli_flags"] = ["--enable-bumkc"]
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="CLI flags"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_unsupported_bumkc_schema(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     engine_path = plan_dir / "engine" / "optimization-playground.json"
@@ -333,6 +345,11 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "target_arch": "sm90",
             "fallback_mode": "checked",
             "runtime_executable": executable,
+            "cli_flags": [
+                "--enable-bumkc",
+                "--bumkc-plan-path <artifact-root>/<plan-id>",
+                "--bumkc-fallback-mode checked",
+            ],
             "runtime_summary": {
                 "task_count": 2,
                 "conventional_launch_count": 2,

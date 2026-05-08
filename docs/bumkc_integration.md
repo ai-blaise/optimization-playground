@@ -23,6 +23,7 @@ validates:
 - `schema_version == "bumkc.optimization_playground.v8"`,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
+- exported serving CLI flags,
 - `reports/artifact-digests.json` byte counts and SHA-256 hashes before
   runtime metadata is trusted,
 - matching target architecture between manifest and engine export,

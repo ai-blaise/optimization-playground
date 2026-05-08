@@ -10,6 +10,11 @@ from typing import Any
 
 ARTIFACT_DIGEST_PATH = Path("reports/artifact-digests.json")
 REQUIRED_DIGEST_SCHEMA_VERSION = "bumkc.artifact_digests.v0"
+REQUIRED_CLI_FLAGS = (
+    "--enable-bumkc",
+    "--bumkc-plan-path <artifact-root>/<plan-id>",
+    "--bumkc-fallback-mode checked",
+)
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
@@ -265,6 +270,8 @@ def load_bumkc_artifact(
         raise BumkcArtifactError("BUMKC artifact is not targeted at the SGLang engine")
     if engine.get("engine_profile") != "optimization_playground":
         raise BumkcArtifactError("BUMKC artifact is not for optimization-playground")
+    if tuple(engine.get("cli_flags", ())) != REQUIRED_CLI_FLAGS:
+        raise BumkcArtifactError("BUMKC artifact serving CLI flags are unsupported")
     artifact_paths = _read_object(engine, "artifact_paths")
     if artifact_paths.get("artifact_digests") != ARTIFACT_DIGEST_PATH.as_posix():
         raise BumkcArtifactError("BUMKC artifact digest path is not canonical")

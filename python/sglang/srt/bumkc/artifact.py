@@ -22,7 +22,9 @@ REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
 REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v20"
 REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v10"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
-REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v12"
+REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v13"
+RUNTIME_SMOKE_BENCHMARK_ITERATIONS = 8
+RUNTIME_SMOKE_BENCHMARK_LAUNCH_CAP = 128
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
 _CONTRACT_HASH_PRIME = 0x00000100000001B3
 _U64_MASK = (1 << 64) - 1
@@ -33,6 +35,12 @@ _SOURCE_CONTRACT_KEYS = (
     "expected_conventional_launch_count",
     "expected_persistent_launch_count",
     "expected_launch_reduction_per_mille",
+    "benchmark_enabled",
+    "benchmark_iterations",
+    "benchmark_conventional_launch_count",
+    "benchmark_persistent_launch_count",
+    "benchmark_total_conventional_launches",
+    "benchmark_total_persistent_launches",
     "expected_jit_task_count",
     "expected_aot_task_count",
     "expected_queue_capacity",
@@ -1173,6 +1181,18 @@ def _validate_runtime_smoke_plan(
         raise BumkcArtifactError("BUMKC runtime smoke binary name is not canonical")
 
     execution_model = _read_object(runtime, "execution_model")
+    benchmark_conventional_launch_count = min(
+        runtime_summary.conventional_launch_count,
+        RUNTIME_SMOKE_BENCHMARK_LAUNCH_CAP,
+    )
+    benchmark_persistent_launch_count = runtime_summary.persistent_launch_count
+    benchmark_enabled = (
+        benchmark_conventional_launch_count != 0
+        and benchmark_persistent_launch_count != 0
+    )
+    benchmark_iterations = (
+        RUNTIME_SMOKE_BENCHMARK_ITERATIONS if benchmark_enabled else 0
+    )
     expected = {
         "expected_task_count": runtime_summary.task_count,
         "expected_conventional_launch_count": (
@@ -1181,6 +1201,16 @@ def _validate_runtime_smoke_plan(
         "expected_persistent_launch_count": runtime_summary.persistent_launch_count,
         "expected_launch_reduction_per_mille": _read_int(
             execution_model, "launch_reduction_per_mille"
+        ),
+        "benchmark_enabled": int(benchmark_enabled),
+        "benchmark_iterations": benchmark_iterations,
+        "benchmark_conventional_launch_count": benchmark_conventional_launch_count,
+        "benchmark_persistent_launch_count": benchmark_persistent_launch_count,
+        "benchmark_total_conventional_launches": (
+            benchmark_iterations * benchmark_conventional_launch_count
+        ),
+        "benchmark_total_persistent_launches": (
+            benchmark_iterations * benchmark_persistent_launch_count
         ),
         "expected_jit_task_count": runtime_summary.jit_task_count,
         "expected_aot_task_count": runtime_summary.aot_task_count,

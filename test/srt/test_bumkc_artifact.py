@@ -445,6 +445,18 @@ def test_rejects_bumkc_runtime_smoke_mismatch(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_runtime_smoke_benchmark_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    smoke_path = plan_dir / "generated" / "runtime-smoke.json"
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["benchmark_iterations"] = 7
+    smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="runtime smoke mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_bumkc_runtime_smoke_descriptor_mismatch(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     smoke_path = plan_dir / "generated" / "runtime-smoke.json"
@@ -1044,6 +1056,12 @@ def write_bumkc_artifact(tmp_path, *, executable):
         "expected_conventional_launch_count": 2,
         "expected_persistent_launch_count": 1,
         "expected_launch_reduction_per_mille": 2000,
+        "benchmark_enabled": 1,
+        "benchmark_iterations": 8,
+        "benchmark_conventional_launch_count": 2,
+        "benchmark_persistent_launch_count": 1,
+        "benchmark_total_conventional_launches": 16,
+        "benchmark_total_persistent_launches": 8,
         "expected_jit_task_count": 0,
         "expected_aot_task_count": 2,
         "expected_queue_capacity": 64,

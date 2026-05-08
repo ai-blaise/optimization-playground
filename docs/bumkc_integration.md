@@ -27,7 +27,7 @@ validates:
 - engine-exported manifest schema/capability fields matching `manifest.json`,
 - engine-exported source schema matching `source/model-source.json`,
 - `runtime_abi_version == "bumkc.runtime.v1"`,
-- runtime smoke schema `bumkc.cuda_smoke.v12`,
+- runtime smoke schema `bumkc.cuda_smoke.v13`,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
 - exported serving CLI flags,
@@ -60,8 +60,8 @@ validates:
   descriptors, and Event Tensor descriptors, including descriptor-row
   aggregate recomputation for task, dependency, dependency tensor,
   launch-domain, side-effect, serving-state, communication, and rank-topology
-  fields, runtime diagnostic fields, schema, runtime ABI, plan, program,
-  descriptor-table, and source contract hashes,
+  fields, runtime diagnostic fields, launch-benchmark metadata, schema, runtime
+  ABI, plan, program, descriptor-table, and source contract hashes,
 - and the required REAP validation model contract.
 
 Before invoking any BUMKC runtime entrypoint, the serving path must call

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 MODULE_PATH = Path(__file__).parents[2] / "python/sglang/srt/bumkc/artifact.py"
+SERVER_ARGS_PATH = Path(__file__).parents[2] / "python/sglang/srt/server_args.py"
 SPEC = importlib.util.spec_from_file_location("bumkc_artifact_under_test", MODULE_PATH)
 bumkc_artifact = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = bumkc_artifact
@@ -15,6 +16,15 @@ REQUIRED_VALIDATION_MODEL = bumkc_artifact.REQUIRED_VALIDATION_MODEL
 REQUIRED_SCHEMA_VERSION = bumkc_artifact.REQUIRED_SCHEMA_VERSION
 BumkcArtifactError = bumkc_artifact.BumkcArtifactError
 load_bumkc_artifact = bumkc_artifact.load_bumkc_artifact
+
+
+def test_server_args_exposes_checked_bumkc_fallback_mode():
+    source = SERVER_ARGS_PATH.read_text(encoding="utf-8")
+
+    assert 'bumkc_fallback_mode: str = "checked"' in source
+    assert '"--bumkc-fallback-mode"' in source
+    assert 'choices=["checked"]' in source
+    assert '"--bumkc-fallback-mode must be checked"' in source
 
 
 def test_loads_executable_bumkc_artifact(tmp_path):

@@ -545,6 +545,7 @@ class ServerArgs:
     turboquant_mla_decode_num_splits: int = 16
     enable_bumkc: bool = False
     bumkc_plan_path: Optional[str] = None
+    bumkc_fallback_mode: str = "checked"
     bumkc_require_executable: bool = False
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
@@ -4106,9 +4107,13 @@ class ServerArgs:
         if not self.enable_bumkc:
             if self.bumkc_plan_path is not None:
                 raise ValueError("--bumkc-plan-path requires --enable-bumkc")
+            if self.bumkc_require_executable:
+                raise ValueError("--bumkc-require-executable requires --enable-bumkc")
             return
         if self.bumkc_plan_path is None:
             raise ValueError("--enable-bumkc requires --bumkc-plan-path")
+        if self.bumkc_fallback_mode != "checked":
+            raise ValueError("--bumkc-fallback-mode must be checked")
 
         from sglang.srt.bumkc.artifact import load_bumkc_artifact
 
@@ -5815,6 +5820,13 @@ class ServerArgs:
             default=ServerArgs.bumkc_require_executable,
             action="store_true",
             help="Fail startup unless the BUMKC runtime descriptor is executable.",
+        )
+        parser.add_argument(
+            "--bumkc-fallback-mode",
+            default=ServerArgs.bumkc_fallback_mode,
+            type=str,
+            choices=["checked"],
+            help="BUMKC fallback policy. Only checked fallback is currently supported.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",

@@ -10,7 +10,8 @@ Use:
 python -m sglang.launch_server \
   --model-path <model> \
   --enable-bumkc \
-  --bumkc-plan-path <artifact-root-or-plan-dir>
+  --bumkc-plan-path <artifact-root-or-plan-dir> \
+  --bumkc-fallback-mode checked
 ```
 
 The loader accepts either a concrete BUMKC plan directory containing
@@ -24,6 +25,7 @@ validates:
 - `engine_profile == "optimization_playground"`,
 - matching target architecture between manifest and engine export,
 - checked fallback mode,
+- `--bumkc-fallback-mode checked` when BUMKC is enabled,
 - preservation of custom optimizations,
 - matching engine/runtime executable flags,
 - runtime summary fields against the runtime descriptor, including

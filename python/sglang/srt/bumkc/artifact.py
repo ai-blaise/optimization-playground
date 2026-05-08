@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 ARTIFACT_DIGEST_PATH = Path("reports/artifact-digests.json")
-REQUIRED_DIGEST_SCHEMA_VERSION = "bumkc.artifact_digests.v0"
+VERIFY_REPORT_PATH = Path("reports/verify.json")
+REQUIRED_DIGEST_SCHEMA_VERSION = "bumkc.artifact_digests.v1"
 REQUIRED_CLI_FLAGS = (
     "--enable-bumkc",
     "--bumkc-plan-path <artifact-root>/<plan-id>",
@@ -854,6 +855,10 @@ def _validate_artifact_digests(root: Path, manifest: dict[str, Any]) -> int:
         relative_path = _read_digest_path(entry, "path")
         if relative_path == ARTIFACT_DIGEST_PATH.as_posix():
             raise BumkcArtifactError("BUMKC artifact digest cannot contain itself")
+        if relative_path == VERIFY_REPORT_PATH.as_posix():
+            raise BumkcArtifactError(
+                "BUMKC artifact digest cannot contain the writer verify report"
+            )
         expected_paths.append(relative_path)
     if len(set(expected_paths)) != len(expected_paths):
         raise BumkcArtifactError("BUMKC artifact digest contains duplicate paths")
@@ -1339,7 +1344,10 @@ def _artifact_file_paths(root: Path) -> list[str]:
         if path.is_symlink():
             raise BumkcArtifactError("BUMKC artifact digest rejects symlinks")
         relative_path = path.relative_to(root).as_posix()
-        if relative_path != ARTIFACT_DIGEST_PATH.as_posix():
+        if relative_path not in (
+            ARTIFACT_DIGEST_PATH.as_posix(),
+            VERIFY_REPORT_PATH.as_posix(),
+        ):
             paths.append(relative_path)
     return sorted(paths)
 

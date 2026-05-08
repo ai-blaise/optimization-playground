@@ -941,6 +941,16 @@ def test_rejects_bumkc_digest_mismatch(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_ignores_bumkc_writer_verify_report_drift(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    verify_path = plan_dir / "reports" / "verify.json"
+    write_json(verify_path, {"passed": False})
+
+    summary = load_bumkc_artifact(plan_dir)
+
+    assert summary.plan_id == "plan_test"
+
+
 def test_rejects_bumkc_runtime_launch_shape_mismatch(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     summary = load_bumkc_artifact(plan_dir)
@@ -1822,8 +1832,9 @@ def populate_runtime_smoke_contracts(smoke):
 def refresh_bumkc_digests(plan_dir):
     files = []
     digest_path = plan_dir / "reports" / "artifact-digests.json"
+    verify_path = plan_dir / "reports" / "verify.json"
     for path in sorted(plan_dir.rglob("*")):
-        if path.is_dir() or path == digest_path:
+        if path.is_dir() or path in (digest_path, verify_path):
             continue
         contents = path.read_bytes()
         files.append(
@@ -1836,7 +1847,7 @@ def refresh_bumkc_digests(plan_dir):
     write_json(
         digest_path,
         {
-            "schema_version": "bumkc.artifact_digests.v0",
+            "schema_version": "bumkc.artifact_digests.v1",
             "plan_id": "plan_test",
             "files": files,
         },

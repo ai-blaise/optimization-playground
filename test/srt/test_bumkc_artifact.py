@@ -31,6 +31,7 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.runtime_summary.task_rank_reference_count == 16
     assert summary.runtime_summary.task_dependency_count == 1
     assert summary.runtime_summary.dependency_scope_code_sum == 1
+    assert summary.target_arch == "sm90"
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
     assert summary.fallback_mode == "checked"
@@ -76,6 +77,17 @@ def test_rejects_unsupported_bumkc_schema(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_target_arch_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["target_arch"] = "sm80"
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+
+    with pytest.raises(BumkcArtifactError, match="target architecture"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_bumkc_runtime_summary_mismatch(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     engine_path = plan_dir / "engine" / "optimization-playground.json"
@@ -100,6 +112,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
         {
             "plan_id": plan_id,
             "program_id": program_id,
+            "target_arch": "sm90",
         },
     )
     write_json(
@@ -153,6 +166,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "program_id": program_id,
             "model": "matmul-chain",
             "gpu_count": 8,
+            "target_arch": "sm90",
             "fallback_mode": "checked",
             "runtime_executable": executable,
             "runtime_summary": {

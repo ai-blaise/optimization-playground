@@ -9,7 +9,7 @@ from typing import Any
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v3"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v4"
 
 
 class BumkcArtifactError(ValueError):
@@ -65,6 +65,7 @@ class BumkcArtifactSummary:
     program_id: str
     model: str
     gpu_count: int
+    target_arch: str | None
     fallback_mode: str
     runtime_executable: bool
     runtime_entrypoints: tuple[str, ...]
@@ -80,6 +81,7 @@ class BumkcArtifactSummary:
             "program_id": self.program_id,
             "model": self.model,
             "gpu_count": self.gpu_count,
+            "target_arch": self.target_arch,
             "fallback_mode": self.fallback_mode,
             "runtime_executable": self.runtime_executable,
             "runtime_entrypoints": list(self.runtime_entrypoints),
@@ -106,6 +108,8 @@ def load_bumkc_artifact(
         raise BumkcArtifactError("BUMKC artifact is not targeted at the SGLang engine")
     if engine.get("engine_profile") != "optimization_playground":
         raise BumkcArtifactError("BUMKC artifact is not for optimization-playground")
+    if engine.get("target_arch") != manifest.get("target_arch"):
+        raise BumkcArtifactError("BUMKC engine target architecture does not match manifest")
     if engine.get("fallback_mode") != "checked":
         raise BumkcArtifactError("BUMKC artifact must use checked fallback mode")
     if not engine.get("preserve_custom_optimizations"):
@@ -127,6 +131,7 @@ def load_bumkc_artifact(
         program_id=engine["program_id"],
         model=engine["model"],
         gpu_count=int(engine["gpu_count"]),
+        target_arch=engine.get("target_arch"),
         fallback_mode=engine["fallback_mode"],
         runtime_executable=bool(runtime["executable"]),
         runtime_entrypoints=entrypoints,

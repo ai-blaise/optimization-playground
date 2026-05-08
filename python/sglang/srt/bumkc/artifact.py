@@ -19,8 +19,8 @@ REQUIRED_VALIDATION_MODEL = (
 )
 REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
 REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v18"
-REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v8"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v19"
+REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v9"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v12"
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
@@ -109,6 +109,12 @@ _SERVING_STATE_KIND_CODES = {
     "token_ids": 4,
     "kv_cache_pages": 5,
 }
+_QUANTIZATION_FORMAT_CODES = {
+    "nv_fp4": 1,
+    "fp8_e4m3": 2,
+    "fp8_e5m2": 3,
+    "int4": 4,
+}
 _DEPENDENCY_HASH_OFFSET = 14695981039346656037
 _DEPENDENCY_HASH_PRIME = 1099511628211
 
@@ -181,6 +187,15 @@ def _mix_dependency_hash_u64(hash_value: int, value: int) -> int:
     if value < 0 or value > _U64_MASK:
         raise BumkcArtifactError("BUMKC dependency descriptor value is out of range")
     return ((hash_value * _DEPENDENCY_HASH_PRIME) + value) & _U64_MASK
+
+
+def _stable_name_hash(value: str | None) -> int:
+    if value is None:
+        return 0
+    hash_value = _DEPENDENCY_HASH_OFFSET
+    for byte in value.encode("utf-8"):
+        hash_value = ((hash_value ^ byte) * _DEPENDENCY_HASH_PRIME) & _U64_MASK
+    return hash_value
 
 
 class BumkcArtifactError(ValueError):
@@ -758,6 +773,7 @@ def _validate_source_artifact(
     islands = _read_list(tensor_islands, "islands")
     fallback_bridges = _read_list(tensor_islands, "fallback_bridges")
     shape_symbols = _read_list(tensor_islands, "shape_symbols")
+    quantization = _read_object(tensor_islands, "quantization")
     island_side_effects = [
         _read_side_effect_list(island, "side_effects") for island in islands
     ]
@@ -805,9 +821,37 @@ def _validate_source_artifact(
         "shape_symbol_bucket_sum": sum(
             _read_int(symbol, "bucket") for symbol in shape_symbols
         ),
+        "quantization_scheme_hash": _stable_name_hash(
+            _read_optional_str(quantization, "scheme")
+        ),
+        "quantization_weight_format_code": _quantization_format_code(
+            quantization, "weight_format"
+        ),
+        "quantization_weight_bits": _read_optional_int(quantization, "weight_bits"),
+        "quantization_activation_bits": _read_optional_int(
+            quantization, "activation_bits"
+        ),
+        "quantization_kv_bits": _read_optional_int(quantization, "kv_bits"),
+        "quantization_kv_format_code": _quantization_format_code(
+            quantization, "kv_format"
+        ),
+        "quantization_indexer_k_bits": _read_optional_int(
+            quantization, "indexer_k_bits"
+        ),
+        "quantization_indexer_k_format_code": _quantization_format_code(
+            quantization, "indexer_k_format"
+        ),
+        "quantization_ignored_module_count": _read_int(
+            quantization, "ignored_module_count"
+        ),
     }
     for key, value in expected.items():
         if _read_int(model_source, key) != value:
+            raise BumkcArtifactError(f"BUMKC model source summary mismatch: {key}")
+    for key in ("gated_norm_enabled", "spinquant_enabled"):
+        if _read_bool(model_source, key) != _read_bool(
+            quantization, key.removesuffix("_enabled")
+        ):
             raise BumkcArtifactError(f"BUMKC model source summary mismatch: {key}")
 
 
@@ -1601,6 +1645,15 @@ def _serving_state_kind_code_sum(
     return code_sum
 
 
+def _quantization_format_code(parent: dict[str, Any], key: str) -> int:
+    value = _read_optional_str(parent, key)
+    if value is None:
+        return 0
+    if value not in _QUANTIZATION_FORMAT_CODES:
+        raise BumkcArtifactError(f"BUMKC quantization format is unsupported: {value}")
+    return _QUANTIZATION_FORMAT_CODES[value]
+
+
 def _event_dependency_tensor_count(events: list[dict[str, Any]]) -> int:
     count = 0
     for event in events:
@@ -1629,6 +1682,15 @@ def _read_int(parent: dict[str, Any], key: str) -> int:
     value = parent.get(key)
     if not _is_strict_int(value):
         raise BumkcArtifactError(f"BUMKC runtime {key} integer is missing")
+    return value
+
+
+def _read_optional_int(parent: dict[str, Any], key: str) -> int:
+    value = parent.get(key)
+    if value is None:
+        return 0
+    if not _is_strict_int(value):
+        raise BumkcArtifactError(f"BUMKC runtime {key} integer is invalid")
     return value
 
 

@@ -373,6 +373,18 @@ def test_rejects_bumkc_model_source_summary_mismatch(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_quantization_summary_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    tensor_path = plan_dir / "ir" / "hvm-tensor-islands.json"
+    tensor_islands = json.loads(tensor_path.read_text(encoding="utf-8"))
+    tensor_islands["quantization"]["indexer_k_bits"] = 4
+    tensor_path.write_text(json.dumps(tensor_islands), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="quantization_indexer_k_bits"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_bumkc_compiler_summary_non_integer(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     engine_path = plan_dir / "engine" / "optimization-playground.json"
@@ -590,6 +602,20 @@ def write_bumkc_artifact(tmp_path, *, executable):
     dependency_descriptor_hash = bumkc_artifact._dependency_descriptor_hash(
         dependency_descriptors
     )
+    quantization = {
+        "scheme": "W4A4KV4+IndexerK8",
+        "weight_format": "nv_fp4",
+        "weight_bits": 4,
+        "activation_bits": 4,
+        "kv_bits": 4,
+        "kv_format": "nv_fp4",
+        "indexer_k_bits": 8,
+        "indexer_k_format": "fp8_e4m3",
+        "gated_norm": True,
+        "spinquant": True,
+        "ignored_module_count": 2,
+    }
+    quantization_scheme_hash = bumkc_artifact._stable_name_hash(quantization["scheme"])
 
     write_json(
         plan_dir / "manifest.json",
@@ -615,6 +641,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
         {
             "plan_id": plan_id,
             "program_id": program_id,
+            "quantization": quantization,
             "shape_symbols": [
                 {
                     "id": "sequence",
@@ -700,6 +727,17 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "shape_symbol_count": 1,
             "shape_symbol_max_sum": 4096,
             "shape_symbol_bucket_sum": 16,
+            "quantization_scheme_hash": quantization_scheme_hash,
+            "quantization_weight_format_code": 1,
+            "quantization_weight_bits": 4,
+            "quantization_activation_bits": 4,
+            "quantization_kv_bits": 4,
+            "quantization_kv_format_code": 1,
+            "quantization_indexer_k_bits": 8,
+            "quantization_indexer_k_format_code": 2,
+            "gated_norm_enabled": True,
+            "spinquant_enabled": True,
+            "quantization_ignored_module_count": 2,
         },
     )
     write_json(

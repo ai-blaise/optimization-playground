@@ -232,6 +232,18 @@ def test_rejects_bumkc_runtime_smoke_mismatch(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_runtime_smoke_descriptor_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    smoke_path = plan_dir / "generated" / "runtime-smoke.json"
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["task_descriptors"][1]["side_effect_code_sum"] = 4
+    smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="runtime smoke descriptor mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_unknown_bumkc_tensor_island_coverage(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     island_path = plan_dir / "ir" / "hvm-tensor-islands.json"
@@ -629,8 +641,12 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "expected_aot_task_count": 2,
             "expected_queue_capacity": 64,
             "expected_task_instance_capacity": 2,
+            "expected_predecessor_event_count_sum": 1,
             "expected_dependency_edge_count": 1,
             "expected_dependency_scope_code_sum": 1,
+            "expected_launch_domain_rank_sum": 4,
+            "expected_launch_domain_element_sum": 2,
+            "expected_operator_code_sum": 10,
             "expected_kv_cache_binding_count": 1,
             "expected_communication_task_count": 1,
             "expected_communication_group_size_sum": 8,
@@ -654,11 +670,72 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "expected_event_notification_count": 1,
             "expected_event_execution_count": 2,
             "expected_event_simulation_violation_count": 0,
-            "event_descriptors": [{}, {}],
-            "task_descriptors": [{}, {}],
+            "event_descriptors": [
+                {
+                    "ordinal": 0,
+                    "event_id": "event_first",
+                    "predecessor_event_count": 0,
+                    "successor_event_count": 1,
+                },
+                {
+                    "ordinal": 1,
+                    "event_id": "event_second",
+                    "predecessor_event_count": 1,
+                    "successor_event_count": 0,
+                },
+            ],
+            "task_descriptors": [
+                {
+                    "ordinal": 0,
+                    "task_id": "task_first",
+                    "source_event_tensor": "event_first",
+                    "operator": "matmul",
+                    "scheduling_policy": "static_aot",
+                    "predecessor_event_count": 0,
+                    "dependency_edge_count": 0,
+                    "dependency_scope_code_sum": 0,
+                    "launch_domain_rank": 2,
+                    "launch_domain_elements": 1,
+                    "kv_cache_binding_count": 0,
+                    "communication_kind_code": 0,
+                    "communication_group_size": 0,
+                    "side_effect_count": 0,
+                    "side_effect_code_sum": 0,
+                    "serving_dependency_count": 0,
+                    "serving_kind_code_sum": 0,
+                    "serving_symbol_count": 0,
+                    "rank_group_size": 8,
+                    "rank_id_sum": 28,
+                },
+                {
+                    "ordinal": 1,
+                    "task_id": "task_second",
+                    "source_event_tensor": "event_second",
+                    "operator": "collective",
+                    "scheduling_policy": "static_aot",
+                    "predecessor_event_count": 1,
+                    "dependency_edge_count": 1,
+                    "dependency_scope_code_sum": 1,
+                    "launch_domain_rank": 2,
+                    "launch_domain_elements": 1,
+                    "kv_cache_binding_count": 1,
+                    "communication_kind_code": 1,
+                    "communication_group_size": 8,
+                    "side_effect_count": 1,
+                    "side_effect_code_sum": 3,
+                    "serving_dependency_count": 2,
+                    "serving_kind_code_sum": 5,
+                    "serving_symbol_count": 1,
+                    "rank_group_size": 8,
+                    "rank_id_sum": 28,
+                },
+            ],
         },
     )
-    write_text(plan_dir / "generated" / "runtime_smoke.cu", "int main() { return 0; }\n")
+    write_text(
+        plan_dir / "generated" / "runtime_smoke.cu",
+        "int main() { return 0; }\n",
+    )
     write_json(
         plan_dir / "generated" / "tensor-smoke.json",
         {

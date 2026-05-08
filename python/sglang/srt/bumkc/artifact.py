@@ -27,6 +27,22 @@ _SIDE_EFFECT_CODES = {
     "host_visible_output": 4,
     "profiling_write": 5,
 }
+_OPERATOR_CODES = {
+    "matmul": 1,
+    "attention": 2,
+    "rms_norm": 3,
+    "rope": 4,
+    "mlp": 5,
+    "moe_dispatch": 6,
+    "kv_cache_read": 7,
+    "kv_cache_write": 8,
+    "collective": 9,
+    "unknown": 0,
+}
+_SCHEDULING_POLICY_CODES = {
+    "static_aot": 0,
+    "dynamic_jit": 1,
+}
 
 
 class BumkcArtifactError(ValueError):
@@ -336,13 +352,19 @@ def load_bumkc_artifact(
         raise BumkcArtifactError("BUMKC artifact digest path is not canonical")
     artifact_digest_count = _validate_artifact_digests(root, manifest)
     if engine.get("target_arch") != manifest.get("target_arch"):
-        raise BumkcArtifactError("BUMKC engine target architecture does not match manifest")
+        raise BumkcArtifactError(
+            "BUMKC engine target architecture does not match manifest"
+        )
     if engine.get("fallback_mode") != "checked":
         raise BumkcArtifactError("BUMKC artifact must use checked fallback mode")
     if not engine.get("preserve_custom_optimizations"):
-        raise BumkcArtifactError("BUMKC artifact does not preserve custom optimizations")
+        raise BumkcArtifactError(
+            "BUMKC artifact does not preserve custom optimizations"
+        )
     if engine.get("required_validation_model") != REQUIRED_VALIDATION_MODEL:
-        raise BumkcArtifactError("BUMKC artifact validation model is not the REAP target")
+        raise BumkcArtifactError(
+            "BUMKC artifact validation model is not the REAP target"
+        )
     if engine.get("runtime_executable") != runtime.get("executable"):
         raise BumkcArtifactError("BUMKC engine and runtime executable flags disagree")
     if require_executable and not runtime.get("executable"):
@@ -780,9 +802,144 @@ def _validate_runtime_smoke_plan(
     event_descriptors = _read_list(runtime_smoke, "event_descriptors")
     task_descriptors = _read_list(runtime_smoke, "task_descriptors")
     if len(event_descriptors) != compiler_summary.event_tensor_count:
-        raise BumkcArtifactError("BUMKC runtime smoke event descriptor count mismatches")
+        raise BumkcArtifactError(
+            "BUMKC runtime smoke event descriptor count mismatches"
+        )
     if len(task_descriptors) != runtime_summary.task_count:
         raise BumkcArtifactError("BUMKC runtime smoke task descriptor count mismatches")
+    _validate_runtime_smoke_event_descriptors(
+        runtime_smoke,
+        event_descriptors,
+    )
+    _validate_runtime_smoke_task_descriptors(
+        runtime_smoke,
+        task_descriptors,
+    )
+
+
+def _validate_runtime_smoke_event_descriptors(
+    runtime_smoke: dict[str, Any],
+    event_descriptors: list[dict[str, Any]],
+) -> None:
+    expected = {
+        "expected_event_predecessor_edge_count": 0,
+        "expected_event_successor_edge_count": 0,
+    }
+    for ordinal, event in enumerate(event_descriptors):
+        if _read_int(event, "ordinal") != ordinal:
+            raise BumkcArtifactError("BUMKC runtime smoke event ordinal mismatch")
+        _read_str(event, "event_id")
+        expected["expected_event_predecessor_edge_count"] += _read_int(
+            event, "predecessor_event_count"
+        )
+        expected["expected_event_successor_edge_count"] += _read_int(
+            event, "successor_event_count"
+        )
+    for key, value in expected.items():
+        if _read_int(runtime_smoke, key) != value:
+            raise BumkcArtifactError(f"BUMKC runtime smoke descriptor mismatch: {key}")
+
+
+def _validate_runtime_smoke_task_descriptors(
+    runtime_smoke: dict[str, Any],
+    task_descriptors: list[dict[str, Any]],
+) -> None:
+    expected = {
+        "expected_jit_task_count": 0,
+        "expected_aot_task_count": 0,
+        "expected_task_instance_capacity": 0,
+        "expected_predecessor_event_count_sum": 0,
+        "expected_dependency_edge_count": 0,
+        "expected_dependency_scope_code_sum": 0,
+        "expected_launch_domain_rank_sum": 0,
+        "expected_launch_domain_element_sum": 0,
+        "expected_operator_code_sum": 0,
+        "expected_kv_cache_binding_count": 0,
+        "expected_communication_task_count": 0,
+        "expected_communication_group_size_sum": 0,
+        "expected_communication_kind_code_sum": 0,
+        "expected_side_effecting_task_count": 0,
+        "expected_task_side_effect_count": 0,
+        "expected_task_side_effect_code_sum": 0,
+        "expected_serving_task_count": 0,
+        "expected_serving_dependency_count": 0,
+        "expected_serving_kind_code_sum": 0,
+        "expected_serving_symbol_count": 0,
+        "expected_rank_group_size_sum": 0,
+        "expected_rank_id_sum": 0,
+    }
+    for ordinal, task in enumerate(task_descriptors):
+        if _read_int(task, "ordinal") != ordinal:
+            raise BumkcArtifactError("BUMKC runtime smoke task ordinal mismatch")
+        _read_str(task, "task_id")
+        _read_str(task, "source_event_tensor")
+        policy = _read_str(task, "scheduling_policy")
+        if policy not in _SCHEDULING_POLICY_CODES:
+            raise BumkcArtifactError(
+                f"BUMKC runtime smoke scheduling policy is unsupported: {policy}"
+            )
+        expected["expected_jit_task_count"] += int(policy == "dynamic_jit")
+        expected["expected_aot_task_count"] += int(policy == "static_aot")
+
+        operator = _read_str(task, "operator")
+        if operator not in _OPERATOR_CODES:
+            raise BumkcArtifactError(
+                f"BUMKC runtime smoke operator is unsupported: {operator}"
+            )
+        expected["expected_operator_code_sum"] += _OPERATOR_CODES[operator]
+
+        expected["expected_predecessor_event_count_sum"] += _read_int(
+            task, "predecessor_event_count"
+        )
+        expected["expected_dependency_edge_count"] += _read_int(
+            task, "dependency_edge_count"
+        )
+        expected["expected_dependency_scope_code_sum"] += _read_int(
+            task, "dependency_scope_code_sum"
+        )
+        expected["expected_launch_domain_rank_sum"] += _read_int(
+            task, "launch_domain_rank"
+        )
+        launch_domain_elements = _read_int(task, "launch_domain_elements")
+        expected["expected_launch_domain_element_sum"] += launch_domain_elements
+        expected["expected_task_instance_capacity"] += launch_domain_elements
+        expected["expected_kv_cache_binding_count"] += _read_int(
+            task, "kv_cache_binding_count"
+        )
+        communication_kind_code = _read_int(task, "communication_kind_code")
+        expected["expected_communication_task_count"] += int(
+            communication_kind_code != 0
+        )
+        expected["expected_communication_group_size_sum"] += _read_int(
+            task, "communication_group_size"
+        )
+        expected["expected_communication_kind_code_sum"] += communication_kind_code
+        side_effect_count = _read_int(task, "side_effect_count")
+        expected["expected_side_effecting_task_count"] += int(
+            side_effect_count != 0
+        )
+        expected["expected_task_side_effect_count"] += side_effect_count
+        expected["expected_task_side_effect_code_sum"] += _read_int(
+            task, "side_effect_code_sum"
+        )
+        serving_dependency_count = _read_int(task, "serving_dependency_count")
+        expected["expected_serving_task_count"] += int(
+            serving_dependency_count != 0
+        )
+        expected["expected_serving_dependency_count"] += serving_dependency_count
+        expected["expected_serving_kind_code_sum"] += _read_int(
+            task, "serving_kind_code_sum"
+        )
+        expected["expected_serving_symbol_count"] += _read_int(
+            task, "serving_symbol_count"
+        )
+        expected["expected_rank_group_size_sum"] += _read_int(
+            task, "rank_group_size"
+        )
+        expected["expected_rank_id_sum"] += _read_int(task, "rank_id_sum")
+    for key, value in expected.items():
+        if _read_int(runtime_smoke, key) != value:
+            raise BumkcArtifactError(f"BUMKC runtime smoke descriptor mismatch: {key}")
 
 
 def _load_shape_symbol_bindings(

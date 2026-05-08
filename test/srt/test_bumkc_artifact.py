@@ -230,6 +230,18 @@ def test_rejects_bumkc_hvm_core_book_unknown_tensor_island(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_hvm_core_summary_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    source_path = plan_dir / "source" / "model-source.json"
+    model_source = json.loads(source_path.read_text(encoding="utf-8"))
+    model_source["hvm_node_count"] = 3
+    source_path.write_text(json.dumps(model_source), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="hvm_node_count"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_unsupported_bumkc_plan_schema(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     manifest_path = plan_dir / "manifest.json"
@@ -795,6 +807,11 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "runtime_mode": "debug",
             "hvm_core_book_source_path": "source/hvm-core-book.hvm",
             "hvm_capture_status": "native_eligible",
+            "hvm_region_count": 1,
+            "hvm_node_count": 4,
+            "hvm_model_entry_node_count": 1,
+            "hvm_tensor_island_node_count": 3,
+            "hvm_fallback_boundary_node_count": 0,
             "tensor_island_count": 3,
             "native_eligible_island_count": 2,
             "fallback_island_count": 1,

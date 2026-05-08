@@ -20,7 +20,7 @@ REQUIRED_VALIDATION_MODEL = (
 REQUIRED_PLAN_SCHEMA_VERSION = "bumkc.plan.v1"
 REQUIRED_CAPABILITY_LEVEL = "hvm_rooted_runtime_descriptor"
 REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v20"
-REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v10"
+REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v11"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v13"
 RUNTIME_SMOKE_BENCHMARK_ITERATIONS = 8
@@ -610,7 +610,9 @@ def load_bumkc_artifact(
         raise BumkcArtifactError(
             "BUMKC artifact validation model is not the REAP target"
         )
-    _validate_source_artifact(model_source, manifest, engine, tensor_islands)
+    _validate_source_artifact(
+        model_source, manifest, engine, hvm_core_book, tensor_islands
+    )
     if engine.get("runtime_executable") != runtime.get("executable"):
         raise BumkcArtifactError("BUMKC engine and runtime executable flags disagree")
     if runtime.get("runtime_abi_version") != REQUIRED_RUNTIME_ABI_VERSION:
@@ -778,10 +780,44 @@ def _validate_artifact_paths(root: Path, artifact_paths: dict[str, Any]) -> None
             raise BumkcArtifactError(f"BUMKC artifact path is missing: {key}")
 
 
+def _hvm_core_book_counts(hvm_core_book: dict[str, Any]) -> dict[str, int]:
+    region_count = 0
+    node_count = 0
+    model_entry_node_count = 0
+    tensor_island_node_count = 0
+    fallback_boundary_node_count = 0
+    for region in _read_list(hvm_core_book, "regions"):
+        region_count += 1
+        for node in _read_list(region, "nodes"):
+            node_count += 1
+            kind = _read_object(node, "kind")
+            if len(kind) != 1:
+                raise BumkcArtifactError("BUMKC HVM Core node kind is malformed")
+            tag = next(iter(kind))
+            if tag == "model_entry":
+                model_entry_node_count += 1
+            elif tag == "tensor_island":
+                tensor_island_node_count += 1
+            elif tag == "fallback_boundary":
+                fallback_boundary_node_count += 1
+            else:
+                raise BumkcArtifactError(
+                    f"BUMKC HVM Core node kind is unsupported: {tag}"
+                )
+    return {
+        "region_count": region_count,
+        "node_count": node_count,
+        "model_entry_node_count": model_entry_node_count,
+        "tensor_island_node_count": tensor_island_node_count,
+        "fallback_boundary_node_count": fallback_boundary_node_count,
+    }
+
+
 def _validate_source_artifact(
     model_source: dict[str, Any],
     manifest: dict[str, Any],
     engine: dict[str, Any],
+    hvm_core_book: dict[str, Any],
     tensor_islands: dict[str, Any],
 ) -> None:
     if model_source.get("schema_version") != REQUIRED_SOURCE_SCHEMA_VERSION:
@@ -825,7 +861,13 @@ def _validate_source_artifact(
     coverage_statuses = [
         _source_coverage_status(island, "coverage_status") for island in islands
     ]
+    hvm_counts = _hvm_core_book_counts(hvm_core_book)
     expected = {
+        "hvm_region_count": hvm_counts["region_count"],
+        "hvm_node_count": hvm_counts["node_count"],
+        "hvm_model_entry_node_count": hvm_counts["model_entry_node_count"],
+        "hvm_tensor_island_node_count": hvm_counts["tensor_island_node_count"],
+        "hvm_fallback_boundary_node_count": hvm_counts["fallback_boundary_node_count"],
         "tensor_island_count": len(islands),
         "native_eligible_island_count": sum(
             1 for status in coverage_statuses if status == "native_eligible"

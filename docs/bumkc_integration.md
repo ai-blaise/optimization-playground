@@ -23,7 +23,7 @@ validates:
 - manifest `schema_version == "bumkc.plan.v1"`,
 - manifest `capability_level == "hvm_rooted_runtime_descriptor"`,
 - engine export `schema_version == "bumkc.optimization_playground.v20"`,
-- model-source export `schema_version == "bumkc.source.v10"`,
+- model-source export `schema_version == "bumkc.source.v11"`,
 - engine-exported manifest schema/capability fields matching `manifest.json`,
 - engine-exported source schema matching `source/model-source.json`,
 - `runtime_abi_version == "bumkc.runtime.v1"`,
@@ -40,6 +40,8 @@ validates:
   required BUMKC HVM references, HVM tensor-island/source counts, HVM shape
   symbols, fallback bridges, root region, model entry, and tensor-island node
   ownership,
+- HVM Core structural summaries in `source/model-source.json` against
+  `ir/hvm-core-book.json`,
 - model-source provenance, quantization metadata including scale layout, and
   summary fields against the manifest, engine export, and HVM tensor island
   artifact,

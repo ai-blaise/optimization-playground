@@ -9,7 +9,7 @@ from typing import Any
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v4"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v5"
 
 
 class BumkcArtifactError(ValueError):
@@ -35,6 +35,9 @@ class BumkcRuntimeSummary:
     tile_overlap_dependency_count: int
     whole_producer_dependency_count: int
     dependency_scope_code_sum: int
+    collective_task_count: int
+    collective_group_size_sum: int
+    collective_kind_code_sum: int
 
     def as_log_dict(self) -> dict[str, int]:
         return {
@@ -55,6 +58,9 @@ class BumkcRuntimeSummary:
             "tile_overlap_dependency_count": self.tile_overlap_dependency_count,
             "whole_producer_dependency_count": self.whole_producer_dependency_count,
             "dependency_scope_code_sum": self.dependency_scope_code_sum,
+            "collective_task_count": self.collective_task_count,
+            "collective_group_size_sum": self.collective_group_size_sum,
+            "collective_kind_code_sum": self.collective_kind_code_sum,
         }
 
 
@@ -187,6 +193,7 @@ def _load_runtime_summary(
     queue_plan = _read_object(runtime, "queue_plan")
     memory_plan = _read_object(runtime, "memory_plan")
     scale_up_plan = _read_object(runtime, "scale_up_plan")
+    communication_plan = _read_object(runtime, "communication_plan")
     dependency_plan = _read_object(runtime, "dependency_plan")
     expected = {
         "task_count": runtime.get("task_count"),
@@ -210,6 +217,13 @@ def _load_runtime_summary(
             "whole_producer_dependency_count"
         ),
         "dependency_scope_code_sum": dependency_plan.get("dependency_scope_code_sum"),
+        "collective_task_count": communication_plan.get("collective_task_count"),
+        "collective_group_size_sum": communication_plan.get(
+            "collective_group_size_sum"
+        ),
+        "collective_kind_code_sum": communication_plan.get(
+            "collective_kind_code_sum"
+        ),
     }
     for key, value in expected.items():
         if summary.get(key) is None or value is None or summary.get(key) != value:

@@ -19,14 +19,15 @@ validates:
 
 - matching plan and program IDs across manifest, runtime, engine, and tensor
   smoke artifacts,
-- `schema_version == "bumkc.optimization_playground.v4"`,
+- `schema_version == "bumkc.optimization_playground.v5"`,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
 - matching target architecture between manifest and engine export,
 - checked fallback mode,
 - preservation of custom optimizations,
 - matching engine/runtime executable flags,
-- runtime summary fields against the runtime descriptor,
+- runtime summary fields against the runtime descriptor, including
+  communication-plan collective counts,
 - and the required REAP validation model contract.
 
 Add `--bumkc-require-executable` when startup must fail unless the runtime

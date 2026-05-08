@@ -31,6 +31,9 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.runtime_summary.task_rank_reference_count == 16
     assert summary.runtime_summary.task_dependency_count == 1
     assert summary.runtime_summary.dependency_scope_code_sum == 1
+    assert summary.runtime_summary.collective_task_count == 1
+    assert summary.runtime_summary.collective_group_size_sum == 8
+    assert summary.runtime_summary.collective_kind_code_sum == 1
     assert summary.target_arch == "sm90"
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
@@ -70,7 +73,7 @@ def test_rejects_unsupported_bumkc_schema(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     engine_path = plan_dir / "engine" / "optimization-playground.json"
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
-    engine["schema_version"] = "bumkc.optimization_playground.v2"
+    engine["schema_version"] = "bumkc.optimization_playground.v4"
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
 
     with pytest.raises(BumkcArtifactError, match="unsupported engine schema"):
@@ -153,6 +156,11 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "whole_producer_dependency_count": 0,
                 "dependency_scope_code_sum": 1,
             },
+            "communication_plan": {
+                "collective_task_count": 1,
+                "collective_group_size_sum": 8,
+                "collective_kind_code_sum": 1,
+            },
         },
     )
     write_json(
@@ -187,6 +195,9 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "tile_overlap_dependency_count": 1,
                 "whole_producer_dependency_count": 0,
                 "dependency_scope_code_sum": 1,
+                "collective_task_count": 1,
+                "collective_group_size_sum": 8,
+                "collective_kind_code_sum": 1,
             },
             "preserve_custom_optimizations": True,
             "required_validation_model": REQUIRED_VALIDATION_MODEL,

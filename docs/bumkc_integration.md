@@ -78,11 +78,12 @@ Before invoking any BUMKC runtime entrypoint, the serving path must call
 `BumkcArtifactSummary.validate_scale_up_domain()` and
 `BumkcArtifactSummary.validate_runtime_launch()`. The scale-up guard rejects
 artifacts whose compiled GPU count does not match the serving domain
-(`tp_size * pp_size`). The runtime-launch guard rejects missing, unknown,
-out-of-range, or out-of-bucket shape substitutions and missing or unknown
-serving-state bindings. Startup also validates the artifact's default launch
-context through `validate_default_runtime_launch()` when `--enable-bumkc` loads
-the artifact.
+(`tp_size * pp_size`). Loading also rejects artifacts whose runtime target GPU
+count, scale-up rank count, or target architecture disagree with the engine
+contract. The runtime-launch guard rejects missing, unknown, out-of-range, or
+out-of-bucket shape substitutions and missing or unknown serving-state
+bindings. Startup also validates the artifact's default launch context through
+`validate_default_runtime_launch()` when `--enable-bumkc` loads the artifact.
 
 `BumkcArtifactSummary.as_log_dict()` includes the accepted manifest schema,
 capability level, source schema, model-source frontend, HVM capture status,

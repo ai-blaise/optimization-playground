@@ -473,6 +473,11 @@ class BumkcArtifactSummary:
                 "BUMKC artifact GPU count does not match serving domain: "
                 f"artifact={self.gpu_count}, serving={gpu_count}"
             )
+        if gpu_count != self.runtime_summary.rank_count:
+            raise BumkcArtifactError(
+                "BUMKC runtime rank count does not match serving domain: "
+                f"rank_count={self.runtime_summary.rank_count}, serving={gpu_count}"
+            )
 
     def validate_runtime_launch(
         self,
@@ -1288,6 +1293,17 @@ def _load_runtime_summary(
     diagnostics_plan = _read_object(runtime, "diagnostics_plan")
     worker_count = _read_int(target_plan, "worker_count")
     scheduler_count = _read_int(target_plan, "scheduler_count")
+    engine_gpu_count = _read_int(engine, "gpu_count")
+    runtime_gpu_count = _read_int(target_plan, "gpu_count")
+    rank_count = _read_int(scale_up_plan, "rank_count")
+    if runtime_gpu_count != engine_gpu_count:
+        raise BumkcArtifactError("BUMKC runtime target GPU count mismatches engine")
+    if rank_count != engine_gpu_count:
+        raise BumkcArtifactError("BUMKC runtime scale-up rank count mismatches engine")
+    if target_plan.get("target_arch") != engine.get("target_arch"):
+        raise BumkcArtifactError(
+            "BUMKC runtime target architecture mismatches engine"
+        )
     if _read_int(diagnostics_plan, "heartbeat_slot_count") != (
         worker_count + scheduler_count
     ):
@@ -1341,7 +1357,7 @@ def _load_runtime_summary(
         "task_instance_capacity": queue_plan.get("task_instance_capacity"),
         "device_global_binding_count": memory_plan.get("device_global_binding_count"),
         "kv_cache_binding_count": memory_plan.get("kv_cache_binding_count"),
-        "rank_count": scale_up_plan.get("rank_count"),
+        "rank_count": rank_count,
         "task_rank_group_count": scale_up_plan.get("task_rank_group_count"),
         "task_rank_reference_count": scale_up_plan.get("task_rank_reference_count"),
         "rank_id_sum": scale_up_plan.get("rank_id_sum"),

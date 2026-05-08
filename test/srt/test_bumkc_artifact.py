@@ -431,6 +431,42 @@ def test_rejects_bumkc_target_arch_mismatch(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_runtime_target_gpu_count_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["target_plan"]["gpu_count"] = 4
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="target GPU count"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_runtime_scale_up_rank_count_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["scale_up_plan"]["rank_count"] = 4
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="scale-up rank count"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_runtime_target_arch_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["target_plan"]["target_arch"] = "sm80"
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="target architecture"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_bumkc_runtime_summary_mismatch(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     engine_path = plan_dir / "engine" / "optimization-playground.json"

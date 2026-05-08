@@ -22,18 +22,20 @@ validates:
   engine, simulation, and tensor smoke artifacts,
 - manifest `schema_version == "bumkc.plan.v1"`,
 - manifest `capability_level == "hvm_rooted_runtime_descriptor"`,
-- engine export `schema_version == "bumkc.optimization_playground.v24"`; the
+- engine export `schema_version == "bumkc.optimization_playground.v25"`; the
   loader can still read legacy `v20` artifacts by deriving the engine
   quantization summary from tensor islands and previous `v21` artifacts by
   deriving the engine scale-up summary from the runtime descriptor, while `v22`
   artifacts derive serving hints from quantization metadata and `v23`
-  artifacts derive the launch summary from the runtime substitution plan,
+  artifacts derive the launch summary from the runtime substitution plan; `v24`
+  artifacts derive runtime mode from the manifest/model-source contract,
 - model-source export `schema_version == "bumkc.source.v11"`,
 - engine-exported manifest schema/capability fields matching `manifest.json`,
 - engine-exported source schema matching `source/model-source.json`,
 - `runtime_abi_version == "bumkc.runtime.v1"`,
 - runtime smoke schema `bumkc.cuda_smoke.v13`,
 - manifest runtime mode in `{debug, trace, profile, production}`,
+- engine-exported runtime mode matching the manifest for `v25` artifacts,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
 - exported serving CLI flags,

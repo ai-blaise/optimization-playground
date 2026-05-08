@@ -498,6 +498,18 @@ def test_rejects_bumkc_target_arch_mismatch(tmp_path):
         load_bumkc_artifact(plan_dir)
 
 
+def test_rejects_bumkc_engine_runtime_mode_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    engine_path = plan_dir / "engine" / "optimization-playground.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    engine["runtime_mode"] = "production"
+    engine_path.write_text(json.dumps(engine), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="runtime mode"):
+        load_bumkc_artifact(plan_dir)
+
+
 def test_rejects_bumkc_runtime_target_gpu_count_mismatch(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     runtime_path = plan_dir / "runtime" / "plan.json"
@@ -1532,6 +1544,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "gpu_count": 8,
             "target_arch": "sm90",
             "fallback_mode": "checked",
+            "runtime_mode": "debug",
             "runtime_executable": executable,
             "cli_flags": [
                 "--enable-bumkc",
@@ -1837,6 +1850,7 @@ def set_bumkc_runtime_mode(plan_dir, runtime_mode):
     for path in (
         plan_dir / "manifest.json",
         plan_dir / "source" / "model-source.json",
+        plan_dir / "engine" / "optimization-playground.json",
     ):
         data = json.loads(path.read_text(encoding="utf-8"))
         data["runtime_mode"] = runtime_mode

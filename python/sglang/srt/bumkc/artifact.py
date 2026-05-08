@@ -24,12 +24,14 @@ LEGACY_SCHEMA_VERSION = "bumkc.optimization_playground.v20"
 PREVIOUS_SCHEMA_VERSION = "bumkc.optimization_playground.v21"
 SCALE_UP_SCHEMA_VERSION = "bumkc.optimization_playground.v22"
 SERVING_HINTS_SCHEMA_VERSION = "bumkc.optimization_playground.v23"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v24"
+LAUNCH_SCHEMA_VERSION = "bumkc.optimization_playground.v24"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v25"
 SUPPORTED_SCHEMA_VERSIONS = (
     LEGACY_SCHEMA_VERSION,
     PREVIOUS_SCHEMA_VERSION,
     SCALE_UP_SCHEMA_VERSION,
     SERVING_HINTS_SCHEMA_VERSION,
+    LAUNCH_SCHEMA_VERSION,
     REQUIRED_SCHEMA_VERSION,
 )
 REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v11"
@@ -730,6 +732,13 @@ def load_bumkc_artifact(
     runtime_mode = _read_str(manifest, "runtime_mode")
     if runtime_mode not in SUPPORTED_RUNTIME_MODES:
         raise BumkcArtifactError("BUMKC artifact runtime mode is unsupported")
+    if engine.get("schema_version") == REQUIRED_SCHEMA_VERSION:
+        if engine.get("runtime_mode") != runtime_mode:
+            raise BumkcArtifactError(
+                "BUMKC engine runtime mode does not match manifest"
+            )
+    elif "runtime_mode" in engine and engine.get("runtime_mode") != runtime_mode:
+        raise BumkcArtifactError("BUMKC engine runtime mode does not match manifest")
     if not engine.get("preserve_custom_optimizations"):
         raise BumkcArtifactError(
             "BUMKC artifact does not preserve custom optimizations"

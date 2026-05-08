@@ -68,6 +68,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def layersplit_active_rows_hint(self):
         return self._layersplit_active_rows_hint
 
+    @property
+    def size_full(self):
+        return self.size
+
     def debug_print(self) -> str:
         return ""
 

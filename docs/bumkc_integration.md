@@ -20,7 +20,7 @@ validates:
 
 - matching plan and program IDs across manifest, HVM compiler, runtime,
   engine, simulation, and tensor smoke artifacts,
-- `schema_version == "bumkc.optimization_playground.v9"`,
+- `schema_version == "bumkc.optimization_playground.v10"`,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
 - exported serving CLI flags,
@@ -36,11 +36,11 @@ validates:
 - matching engine/runtime executable flags,
 - compiler summary fields against the HVM tensor island, block pipeline, Event
   Tensor, and simulation artifacts, including native/fallback coverage,
-  fallback bridges, Event Tensor edge counts, notifications, execution count,
-  and violation count,
+  fallback bridges, side-effect counts and code sums, Event Tensor edge counts,
+  notifications, execution count, and violation count,
 - runtime summary fields against the runtime descriptor, including
-  communication-plan collective counts, serving-state dependency counts, and
-  runtime substitution bounds,
+  communication-plan collective counts, side-effect counts and code sums,
+  serving-state dependency counts, and runtime substitution bounds,
 - generated CUDA runtime-smoke metadata against the runtime summary, compiler
   summary, runtime ABI, expected source path, expected binary name, task
   descriptors, and Event Tensor descriptors,

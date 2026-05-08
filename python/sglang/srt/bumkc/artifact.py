@@ -18,8 +18,15 @@ REQUIRED_CLI_FLAGS = (
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v9"
-REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v8"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v10"
+REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v9"
+_SIDE_EFFECT_CODES = {
+    "kv_cache_read": 1,
+    "kv_cache_write": 2,
+    "collective": 3,
+    "host_visible_output": 4,
+    "profiling_write": 5,
+}
 
 
 class BumkcArtifactError(ValueError):
@@ -66,9 +73,18 @@ class BumkcCompilerSummary:
     tensor_island_count: int
     native_tensor_island_count: int
     fallback_tensor_island_count: int
+    side_effecting_tensor_island_count: int
+    tensor_island_side_effect_count: int
+    tensor_island_side_effect_code_sum: int
     fallback_bridge_count: int
     block_op_count: int
+    side_effecting_block_op_count: int
+    block_side_effect_count: int
+    block_side_effect_code_sum: int
     event_tensor_count: int
+    side_effecting_event_tensor_count: int
+    event_side_effect_count: int
+    event_side_effect_code_sum: int
     event_predecessor_edge_count: int
     event_successor_edge_count: int
     event_notification_count: int
@@ -101,6 +117,9 @@ class BumkcRuntimeSummary:
     collective_task_count: int
     collective_group_size_sum: int
     collective_kind_code_sum: int
+    side_effecting_task_count: int
+    task_side_effect_count: int
+    task_side_effect_code_sum: int
     serving_task_count: int
     serving_dependency_count: int
     serving_kind_code_sum: int
@@ -132,6 +151,9 @@ class BumkcRuntimeSummary:
             "collective_task_count": self.collective_task_count,
             "collective_group_size_sum": self.collective_group_size_sum,
             "collective_kind_code_sum": self.collective_kind_code_sum,
+            "side_effecting_task_count": self.side_effecting_task_count,
+            "task_side_effect_count": self.task_side_effect_count,
+            "task_side_effect_code_sum": self.task_side_effect_code_sum,
             "serving_task_count": self.serving_task_count,
             "serving_dependency_count": self.serving_dependency_count,
             "serving_kind_code_sum": self.serving_kind_code_sum,
@@ -520,6 +542,7 @@ def _load_runtime_summary(
     memory_plan = _read_object(runtime, "memory_plan")
     scale_up_plan = _read_object(runtime, "scale_up_plan")
     communication_plan = _read_object(runtime, "communication_plan")
+    side_effect_plan = _read_object(runtime, "side_effect_plan")
     serving_state_plan = _read_object(runtime, "serving_state_plan")
     substitution_plan = _read_object(runtime, "substitution_plan")
     substitution_shape_symbols = _read_list(substitution_plan, "shape_symbols")
@@ -553,6 +576,13 @@ def _load_runtime_summary(
         ),
         "collective_kind_code_sum": communication_plan.get(
             "collective_kind_code_sum"
+        ),
+        "side_effecting_task_count": side_effect_plan.get(
+            "side_effecting_task_count"
+        ),
+        "task_side_effect_count": side_effect_plan.get("task_side_effect_count"),
+        "task_side_effect_code_sum": side_effect_plan.get(
+            "task_side_effect_code_sum"
         ),
         "serving_task_count": serving_state_plan.get("serving_task_count"),
         "serving_dependency_count": serving_state_plan.get(
@@ -593,6 +623,15 @@ def _load_compiler_summary(
     events = _read_list(event_tensors, "event_tensors")
     execution_order = _read_any_list(simulation, "execution_order")
     violations = _read_list(simulation, "violations")
+    island_side_effects = [
+        _read_side_effect_list(island, "side_effects") for island in islands
+    ]
+    block_side_effects = [
+        _read_side_effect_list(block, "side_effects") for block in block_ops
+    ]
+    event_side_effects = [
+        _read_side_effect_list(event, "side_effects") for event in events
+    ]
     native_island_count = 0
     fallback_island_count = 0
     for island in islands:
@@ -610,9 +649,32 @@ def _load_compiler_summary(
         "tensor_island_count": len(islands),
         "native_tensor_island_count": native_island_count,
         "fallback_tensor_island_count": fallback_island_count,
+        "side_effecting_tensor_island_count": sum(
+            1 for side_effects in island_side_effects if side_effects
+        ),
+        "tensor_island_side_effect_count": sum(
+            len(side_effects) for side_effects in island_side_effects
+        ),
+        "tensor_island_side_effect_code_sum": _side_effect_code_sum(
+            island_side_effects
+        ),
         "fallback_bridge_count": len(fallback_bridges),
         "block_op_count": len(block_ops),
+        "side_effecting_block_op_count": sum(
+            1 for side_effects in block_side_effects if side_effects
+        ),
+        "block_side_effect_count": sum(
+            len(side_effects) for side_effects in block_side_effects
+        ),
+        "block_side_effect_code_sum": _side_effect_code_sum(block_side_effects),
         "event_tensor_count": len(events),
+        "side_effecting_event_tensor_count": sum(
+            1 for side_effects in event_side_effects if side_effects
+        ),
+        "event_side_effect_count": sum(
+            len(side_effects) for side_effects in event_side_effects
+        ),
+        "event_side_effect_code_sum": _side_effect_code_sum(event_side_effects),
         "event_predecessor_edge_count": sum(
             len(_read_any_list(event, "predecessor_events")) for event in events
         ),
@@ -670,6 +732,13 @@ def _validate_runtime_smoke_plan(
         ),
         "expected_communication_kind_code_sum": (
             runtime_summary.collective_kind_code_sum
+        ),
+        "expected_side_effecting_task_count": (
+            runtime_summary.side_effecting_task_count
+        ),
+        "expected_task_side_effect_count": runtime_summary.task_side_effect_count,
+        "expected_task_side_effect_code_sum": (
+            runtime_summary.task_side_effect_code_sum
         ),
         "expected_serving_task_count": runtime_summary.serving_task_count,
         "expected_serving_dependency_count": runtime_summary.serving_dependency_count,
@@ -794,6 +863,24 @@ def _read_any_list(parent: dict[str, Any], key: str) -> list[Any]:
     if not isinstance(value, list):
         raise BumkcArtifactError(f"BUMKC runtime {key} list is missing")
     return value
+
+
+def _read_side_effect_list(parent: dict[str, Any], key: str) -> list[str]:
+    values = _read_any_list(parent, key)
+    for value in values:
+        if value not in _SIDE_EFFECT_CODES:
+            raise BumkcArtifactError(
+                f"BUMKC side-effect marker is unsupported: {value}"
+            )
+    return values
+
+
+def _side_effect_code_sum(side_effect_lists: Iterable[list[str]]) -> int:
+    return sum(
+        _SIDE_EFFECT_CODES[side_effect]
+        for side_effects in side_effect_lists
+        for side_effect in side_effects
+    )
 
 
 def _read_summary_int(parent: dict[str, Any], key: str) -> int:

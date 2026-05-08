@@ -39,9 +39,18 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.compiler_summary.tensor_island_count == 3
     assert summary.compiler_summary.native_tensor_island_count == 2
     assert summary.compiler_summary.fallback_tensor_island_count == 1
+    assert summary.compiler_summary.side_effecting_tensor_island_count == 1
+    assert summary.compiler_summary.tensor_island_side_effect_count == 1
+    assert summary.compiler_summary.tensor_island_side_effect_code_sum == 3
     assert summary.compiler_summary.fallback_bridge_count == 1
     assert summary.compiler_summary.block_op_count == 2
+    assert summary.compiler_summary.side_effecting_block_op_count == 1
+    assert summary.compiler_summary.block_side_effect_count == 1
+    assert summary.compiler_summary.block_side_effect_code_sum == 3
     assert summary.compiler_summary.event_tensor_count == 2
+    assert summary.compiler_summary.side_effecting_event_tensor_count == 1
+    assert summary.compiler_summary.event_side_effect_count == 1
+    assert summary.compiler_summary.event_side_effect_code_sum == 3
     assert summary.compiler_summary.event_predecessor_edge_count == 1
     assert summary.compiler_summary.event_successor_edge_count == 1
     assert summary.compiler_summary.event_notification_count == 1
@@ -56,6 +65,9 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.runtime_summary.collective_task_count == 1
     assert summary.runtime_summary.collective_group_size_sum == 8
     assert summary.runtime_summary.collective_kind_code_sum == 1
+    assert summary.runtime_summary.side_effecting_task_count == 1
+    assert summary.runtime_summary.task_side_effect_count == 1
+    assert summary.runtime_summary.task_side_effect_code_sum == 3
     assert summary.runtime_summary.serving_task_count == 1
     assert summary.runtime_summary.serving_dependency_count == 2
     assert summary.runtime_summary.serving_kind_code_sum == 5
@@ -181,6 +193,30 @@ def test_rejects_bumkc_compiler_summary_non_integer(tmp_path):
     refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="engine summary"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_side_effect_summary_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    event_path = plan_dir / "ir" / "hvm-event-tensors.json"
+    events = json.loads(event_path.read_text(encoding="utf-8"))
+    events["event_tensors"][1]["side_effects"] = ["kv_cache_write"]
+    event_path.write_text(json.dumps(events), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="compiler summary mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_unknown_side_effect(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    island_path = plan_dir / "ir" / "hvm-tensor-islands.json"
+    islands = json.loads(island_path.read_text(encoding="utf-8"))
+    islands["islands"][1]["side_effects"] = ["eventual_consistency"]
+    island_path.write_text(json.dumps(islands), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="side-effect marker"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -329,9 +365,9 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "plan_id": plan_id,
             "program_id": program_id,
             "islands": [
-                {"coverage_status": "native_eligible"},
-                {"coverage_status": "native_eligible"},
-                {"coverage_status": "fallback_only"},
+                {"coverage_status": "native_eligible", "side_effects": []},
+                {"coverage_status": "native_eligible", "side_effects": ["collective"]},
+                {"coverage_status": "fallback_only", "side_effects": []},
             ],
             "fallback_bridges": [
                 {
@@ -356,7 +392,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
         {
             "plan_id": plan_id,
             "program_id": program_id,
-            "block_ops": [{}, {}],
+            "block_ops": [{"side_effects": []}, {"side_effects": ["collective"]}],
         },
     )
     write_json(
@@ -366,10 +402,12 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "program_id": program_id,
             "event_tensors": [
                 {
+                    "side_effects": [],
                     "predecessor_events": [],
                     "successor_events": ["event_second"],
                 },
                 {
+                    "side_effects": ["collective"],
                     "predecessor_events": ["event_first"],
                     "successor_events": [],
                 },
@@ -445,6 +483,11 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "collective_group_size_sum": 8,
                 "collective_kind_code_sum": 1,
             },
+            "side_effect_plan": {
+                "side_effecting_task_count": 1,
+                "task_side_effect_count": 1,
+                "task_side_effect_code_sum": 3,
+            },
             "serving_state_plan": {
                 "serving_task_count": 1,
                 "serving_dependency_count": 2,
@@ -498,9 +541,18 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "tensor_island_count": 3,
                 "native_tensor_island_count": 2,
                 "fallback_tensor_island_count": 1,
+                "side_effecting_tensor_island_count": 1,
+                "tensor_island_side_effect_count": 1,
+                "tensor_island_side_effect_code_sum": 3,
                 "fallback_bridge_count": 1,
                 "block_op_count": 2,
+                "side_effecting_block_op_count": 1,
+                "block_side_effect_count": 1,
+                "block_side_effect_code_sum": 3,
                 "event_tensor_count": 2,
+                "side_effecting_event_tensor_count": 1,
+                "event_side_effect_count": 1,
+                "event_side_effect_code_sum": 3,
                 "event_predecessor_edge_count": 1,
                 "event_successor_edge_count": 1,
                 "event_notification_count": 1,
@@ -528,6 +580,9 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "collective_task_count": 1,
                 "collective_group_size_sum": 8,
                 "collective_kind_code_sum": 1,
+                "side_effecting_task_count": 1,
+                "task_side_effect_count": 1,
+                "task_side_effect_code_sum": 3,
                 "serving_task_count": 1,
                 "serving_dependency_count": 2,
                 "serving_kind_code_sum": 5,
@@ -560,7 +615,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
     write_json(
         plan_dir / "generated" / "runtime-smoke.json",
         {
-            "schema_version": "bumkc.cuda_smoke.v8",
+            "schema_version": "bumkc.cuda_smoke.v9",
             "plan_id": plan_id,
             "program_id": program_id,
             "runtime_abi_version": "bumkc.runtime.v0",
@@ -580,6 +635,9 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "expected_communication_task_count": 1,
             "expected_communication_group_size_sum": 8,
             "expected_communication_kind_code_sum": 1,
+            "expected_side_effecting_task_count": 1,
+            "expected_task_side_effect_count": 1,
+            "expected_task_side_effect_code_sum": 3,
             "expected_serving_task_count": 1,
             "expected_serving_dependency_count": 2,
             "expected_serving_kind_code_sum": 5,

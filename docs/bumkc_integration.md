@@ -21,6 +21,8 @@ validates:
 - matching plan and program IDs across manifest, HVM compiler, runtime,
   engine, simulation, and tensor smoke artifacts,
 - `schema_version == "bumkc.optimization_playground.v11"`,
+- `runtime_abi_version == "bumkc.runtime.v1"`,
+- runtime smoke schema `bumkc.cuda_smoke.v11`,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
 - exported serving CLI flags,
@@ -40,14 +42,15 @@ validates:
   notifications, execution count, and violation count,
 - runtime summary fields against the runtime descriptor, including
   communication-plan collective counts, side-effect counts and code sums,
-  serving-state dependency counts, dependency descriptor count/hash, and runtime
-  substitution bounds,
+  serving-state dependency counts, dependency descriptor count/hash including
+  dependency tensor IDs, and runtime substitution bounds,
 - generated CUDA runtime-smoke metadata against the runtime summary, compiler
   summary, runtime ABI, expected source path, expected binary name, task
   descriptors, and Event Tensor descriptors, including descriptor-row
-  aggregate recomputation for task, dependency, launch-domain, side-effect,
-  serving-state, communication, and rank-topology fields plus schema, runtime
-  ABI, plan, program, descriptor-table, and source contract hashes,
+  aggregate recomputation for task, dependency, dependency tensor,
+  launch-domain, side-effect, serving-state, communication, and rank-topology
+  fields plus schema, runtime ABI, plan, program, descriptor-table, and source
+  contract hashes,
 - and the required REAP validation model contract.
 
 Before invoking any BUMKC runtime entrypoint, the serving path must call

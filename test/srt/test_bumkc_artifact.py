@@ -15,6 +15,10 @@ SPEC.loader.exec_module(bumkc_artifact)
 
 REQUIRED_VALIDATION_MODEL = bumkc_artifact.REQUIRED_VALIDATION_MODEL
 REQUIRED_SCHEMA_VERSION = bumkc_artifact.REQUIRED_SCHEMA_VERSION
+REQUIRED_RUNTIME_ABI_VERSION = bumkc_artifact.REQUIRED_RUNTIME_ABI_VERSION
+REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = (
+    bumkc_artifact.REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION
+)
 BumkcArtifactError = bumkc_artifact.BumkcArtifactError
 load_bumkc_artifact = bumkc_artifact.load_bumkc_artifact
 
@@ -185,6 +189,37 @@ def test_rejects_bumkc_runtime_dependency_descriptor_mismatch(tmp_path):
     refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="dependency descriptor hash"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_runtime_dependency_tensor_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    smoke_path = plan_dir / "generated" / "runtime-smoke.json"
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["task_descriptors"][1]["dependency_tensor_count"] = 0
+    smoke["expected_dependency_tensor_count"] = 0
+    populate_runtime_smoke_contracts(smoke)
+    smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="runtime smoke mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_runtime_abi_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["runtime_abi_version"] = "bumkc.runtime.v0"
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    smoke_path = plan_dir / "generated" / "runtime-smoke.json"
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["runtime_abi_version"] = "bumkc.runtime.v0"
+    populate_runtime_smoke_contracts(smoke)
+    smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="runtime ABI"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -397,6 +432,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
             "consumer_event": "event_second",
             "predecessor_event": "event_first",
             "dependency_ordinal": 0,
+            "tensors": ["tensor_hidden"],
             "scope": "tile_overlap",
             "wait_expression": "same_logical_tile_ready",
         }
@@ -497,7 +533,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
         {
             "plan_id": plan_id,
             "program_id": program_id,
-            "runtime_abi_version": "bumkc.runtime.v0",
+            "runtime_abi_version": REQUIRED_RUNTIME_ABI_VERSION,
             "executable": executable,
             "entrypoints": (
                 [{"name": "cuda_tensor_smoke", "symbol": "bumkc_tensor_smoke"}]
@@ -672,10 +708,10 @@ def write_bumkc_artifact(tmp_path, *, executable):
         },
     )
     runtime_smoke = {
-        "schema_version": "bumkc.cuda_smoke.v10",
+        "schema_version": REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION,
         "plan_id": plan_id,
         "program_id": program_id,
-        "runtime_abi_version": "bumkc.runtime.v0",
+        "runtime_abi_version": REQUIRED_RUNTIME_ABI_VERSION,
         "source_path": "generated/runtime_smoke.cu",
         "binary_name": "runtime_smoke",
         "expected_task_count": 2,
@@ -688,6 +724,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
         "expected_task_instance_capacity": 2,
         "expected_predecessor_event_count_sum": 1,
         "expected_dependency_edge_count": 1,
+        "expected_dependency_tensor_count": 1,
         "expected_dependency_scope_code_sum": 1,
         "expected_launch_domain_rank_sum": 4,
         "expected_launch_domain_element_sum": 2,
@@ -738,6 +775,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "scheduling_policy": "static_aot",
                 "predecessor_event_count": 0,
                 "dependency_edge_count": 0,
+                "dependency_tensor_count": 0,
                 "dependency_scope_code_sum": 0,
                 "launch_domain_rank": 2,
                 "launch_domain_elements": 1,
@@ -760,6 +798,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "scheduling_policy": "static_aot",
                 "predecessor_event_count": 1,
                 "dependency_edge_count": 1,
+                "dependency_tensor_count": 1,
                 "dependency_scope_code_sum": 1,
                 "launch_domain_rank": 2,
                 "launch_domain_elements": 1,

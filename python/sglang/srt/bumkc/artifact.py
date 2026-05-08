@@ -19,7 +19,8 @@ REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
 REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v11"
-REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v10"
+REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
+REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v11"
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
 _CONTRACT_HASH_PRIME = 0x00000100000001B3
 _U64_MASK = (1 << 64) - 1
@@ -36,6 +37,7 @@ _SOURCE_CONTRACT_KEYS = (
     "expected_task_instance_capacity",
     "expected_predecessor_event_count_sum",
     "expected_dependency_edge_count",
+    "expected_dependency_tensor_count",
     "expected_dependency_scope_code_sum",
     "expected_launch_domain_rank_sum",
     "expected_launch_domain_element_sum",
@@ -133,6 +135,14 @@ def _dependency_descriptor_hash(descriptors: list[dict[str, Any]]) -> int:
         hash_value = _mix_dependency_hash_u64(
             hash_value, _read_int(descriptor, "dependency_ordinal")
         )
+        tensors = _read_any_list(descriptor, "tensors")
+        hash_value = _mix_dependency_hash_u64(hash_value, len(tensors))
+        for tensor in tensors:
+            if not isinstance(tensor, str) or not tensor:
+                raise BumkcArtifactError(
+                    "BUMKC dependency descriptor tensor is malformed"
+                )
+            hash_value = _mix_dependency_hash_str(hash_value, tensor)
         scope = _read_str(descriptor, "scope")
         if scope not in _DEPENDENCY_SCOPE_CODES:
             raise BumkcArtifactError(
@@ -487,6 +497,8 @@ def load_bumkc_artifact(
         )
     if engine.get("runtime_executable") != runtime.get("executable"):
         raise BumkcArtifactError("BUMKC engine and runtime executable flags disagree")
+    if runtime.get("runtime_abi_version") != REQUIRED_RUNTIME_ABI_VERSION:
+        raise BumkcArtifactError("BUMKC artifact uses an unsupported runtime ABI")
     if require_executable and not runtime.get("executable"):
         raise BumkcArtifactError("BUMKC artifact is not executable")
 
@@ -871,6 +883,7 @@ def _validate_runtime_smoke_plan(
         raise BumkcArtifactError("BUMKC runtime smoke binary name is not canonical")
 
     execution_model = _read_object(runtime, "execution_model")
+    dependency_plan = _read_object(runtime, "dependency_plan")
     expected = {
         "expected_task_count": runtime_summary.task_count,
         "expected_conventional_launch_count": (
@@ -885,6 +898,9 @@ def _validate_runtime_smoke_plan(
         "expected_queue_capacity": runtime_summary.queue_capacity,
         "expected_task_instance_capacity": runtime_summary.task_instance_capacity,
         "expected_dependency_edge_count": runtime_summary.task_dependency_count,
+        "expected_dependency_tensor_count": _runtime_dependency_tensor_count(
+            dependency_plan
+        ),
         "expected_dependency_scope_code_sum": (
             runtime_summary.dependency_scope_code_sum
         ),
@@ -996,6 +1012,7 @@ def _validate_runtime_smoke_task_descriptors(
         "expected_task_instance_capacity": 0,
         "expected_predecessor_event_count_sum": 0,
         "expected_dependency_edge_count": 0,
+        "expected_dependency_tensor_count": 0,
         "expected_dependency_scope_code_sum": 0,
         "expected_launch_domain_rank_sum": 0,
         "expected_launch_domain_element_sum": 0,
@@ -1039,6 +1056,9 @@ def _validate_runtime_smoke_task_descriptors(
         )
         expected["expected_dependency_edge_count"] += _read_int(
             task, "dependency_edge_count"
+        )
+        expected["expected_dependency_tensor_count"] += _read_int(
+            task, "dependency_tensor_count"
         )
         expected["expected_dependency_scope_code_sum"] += _read_int(
             task, "dependency_scope_code_sum"
@@ -1154,6 +1174,10 @@ def _runtime_smoke_descriptor_contract_hash(
         )
         hash_value = _mix_contract_u64(
             hash_value,
+            _read_int(task, "dependency_tensor_count"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
             _read_int(task, "dependency_scope_code_sum"),
         )
         hash_value = _mix_contract_u64(
@@ -1258,6 +1282,13 @@ def _load_shape_symbol_bindings(
         seen_symbols.add(binding.symbol)
         bindings.append(binding)
     return tuple(bindings)
+
+
+def _runtime_dependency_tensor_count(dependency_plan: dict[str, Any]) -> int:
+    return sum(
+        len(_read_any_list(descriptor, "tensors"))
+        for descriptor in _read_list(dependency_plan, "dependency_descriptors")
+    )
 
 
 def _load_serving_state_bindings(

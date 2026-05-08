@@ -65,6 +65,7 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.runtime_summary.rank_count == 8
     assert summary.runtime_summary.task_rank_reference_count == 16
     assert summary.runtime_summary.task_dependency_count == 1
+    assert summary.runtime_summary.dependency_tensor_count == 1
     assert summary.runtime_summary.dependency_scope_code_sum == 1
     assert summary.runtime_summary.dependency_descriptor_count == 1
     assert summary.runtime_summary.dependency_descriptor_hash != 0
@@ -189,6 +190,18 @@ def test_rejects_bumkc_runtime_dependency_descriptor_mismatch(tmp_path):
     refresh_bumkc_digests(plan_dir)
 
     with pytest.raises(BumkcArtifactError, match="dependency descriptor hash"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_runtime_dependency_tensor_summary_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    runtime_path = plan_dir / "runtime" / "plan.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["dependency_plan"]["dependency_tensor_count"] = 0
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="dependency tensor count"):
         load_bumkc_artifact(plan_dir)
 
 
@@ -564,6 +577,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
             },
             "dependency_plan": {
                 "task_dependency_count": 1,
+                "dependency_tensor_count": 1,
                 "tile_overlap_dependency_count": 1,
                 "whole_producer_dependency_count": 0,
                 "dependency_scope_code_sum": 1,
@@ -667,6 +681,7 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "task_rank_reference_count": 16,
                 "rank_id_sum": 56,
                 "task_dependency_count": 1,
+                "dependency_tensor_count": 1,
                 "tile_overlap_dependency_count": 1,
                 "whole_producer_dependency_count": 0,
                 "dependency_scope_code_sum": 1,

@@ -20,7 +20,7 @@ validates:
 
 - matching plan and program IDs across manifest, HVM compiler, runtime,
   engine, simulation, and tensor smoke artifacts,
-- `schema_version == "bumkc.optimization_playground.v11"`,
+- `schema_version == "bumkc.optimization_playground.v12"`,
 - `runtime_abi_version == "bumkc.runtime.v1"`,
 - runtime smoke schema `bumkc.cuda_smoke.v11`,
 - `engine == "sglang"`,
@@ -42,8 +42,9 @@ validates:
   notifications, execution count, and violation count,
 - runtime summary fields against the runtime descriptor, including
   communication-plan collective counts, side-effect counts and code sums,
-  serving-state dependency counts, dependency descriptor count/hash including
-  dependency tensor IDs, and runtime substitution bounds,
+  serving-state dependency counts, dependency tensor count, dependency
+  descriptor count/hash including dependency tensor IDs, and runtime
+  substitution bounds,
 - generated CUDA runtime-smoke metadata against the runtime summary, compiler
   summary, runtime ABI, expected source path, expected binary name, task
   descriptors, and Event Tensor descriptors, including descriptor-row

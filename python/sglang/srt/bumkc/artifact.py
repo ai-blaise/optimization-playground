@@ -18,7 +18,7 @@ REQUIRED_CLI_FLAGS = (
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v11"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v12"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
 REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v11"
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
@@ -255,6 +255,7 @@ class BumkcRuntimeSummary:
     task_dependency_count: int
     tile_overlap_dependency_count: int
     whole_producer_dependency_count: int
+    dependency_tensor_count: int
     dependency_scope_code_sum: int
     dependency_descriptor_count: int
     dependency_descriptor_hash: int
@@ -291,6 +292,7 @@ class BumkcRuntimeSummary:
             "task_dependency_count": self.task_dependency_count,
             "tile_overlap_dependency_count": self.tile_overlap_dependency_count,
             "whole_producer_dependency_count": self.whole_producer_dependency_count,
+            "dependency_tensor_count": self.dependency_tensor_count,
             "dependency_scope_code_sum": self.dependency_scope_code_sum,
             "dependency_descriptor_count": self.dependency_descriptor_count,
             "dependency_descriptor_hash": self.dependency_descriptor_hash,
@@ -721,6 +723,15 @@ def _load_runtime_summary(
         raise BumkcArtifactError(
             "BUMKC runtime dependency descriptor hash mismatch"
         )
+    dependency_tensor_count = sum(
+        len(_read_any_list(descriptor, "tensors"))
+        for descriptor in dependency_descriptors
+    )
+    if (
+        _read_int(dependency_plan, "dependency_tensor_count")
+        != dependency_tensor_count
+    ):
+        raise BumkcArtifactError("BUMKC runtime dependency tensor count mismatch")
     expected = {
         "task_count": runtime.get("task_count"),
         "conventional_launch_count": execution_model.get("conventional_launch_count"),
@@ -742,6 +753,7 @@ def _load_runtime_summary(
         "whole_producer_dependency_count": dependency_plan.get(
             "whole_producer_dependency_count"
         ),
+        "dependency_tensor_count": dependency_tensor_count,
         "dependency_scope_code_sum": dependency_plan.get("dependency_scope_code_sum"),
         "dependency_descriptor_count": len(dependency_descriptors),
         "dependency_descriptor_hash": dependency_descriptor_hash,
@@ -883,7 +895,6 @@ def _validate_runtime_smoke_plan(
         raise BumkcArtifactError("BUMKC runtime smoke binary name is not canonical")
 
     execution_model = _read_object(runtime, "execution_model")
-    dependency_plan = _read_object(runtime, "dependency_plan")
     expected = {
         "expected_task_count": runtime_summary.task_count,
         "expected_conventional_launch_count": (
@@ -898,9 +909,7 @@ def _validate_runtime_smoke_plan(
         "expected_queue_capacity": runtime_summary.queue_capacity,
         "expected_task_instance_capacity": runtime_summary.task_instance_capacity,
         "expected_dependency_edge_count": runtime_summary.task_dependency_count,
-        "expected_dependency_tensor_count": _runtime_dependency_tensor_count(
-            dependency_plan
-        ),
+        "expected_dependency_tensor_count": runtime_summary.dependency_tensor_count,
         "expected_dependency_scope_code_sum": (
             runtime_summary.dependency_scope_code_sum
         ),
@@ -1282,13 +1291,6 @@ def _load_shape_symbol_bindings(
         seen_symbols.add(binding.symbol)
         bindings.append(binding)
     return tuple(bindings)
-
-
-def _runtime_dependency_tensor_count(dependency_plan: dict[str, Any]) -> int:
-    return sum(
-        len(_read_any_list(descriptor, "tensors"))
-        for descriptor in _read_list(dependency_plan, "dependency_descriptors")
-    )
 
 
 def _load_serving_state_bindings(

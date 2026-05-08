@@ -34,6 +34,8 @@ def test_server_args_exposes_checked_bumkc_fallback_mode():
     assert 'choices=["checked"]' in source
     assert '"--bumkc-fallback-mode must be checked"' in source
     assert "self._bumkc_artifact_summary.serving_hints" in source
+    assert "validate_scale_up_domain" in source
+    assert "gpu_count=self.tp_size * self.pp_size" in source
     assert "self.quantization = serving_hints.quantization" in source
     assert "self.moe_runner_backend = serving_hints.moe_runner_backend" in source
 
@@ -151,6 +153,7 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert log_dict["quantization_summary"]["gated_norm"]
     assert log_dict["serving_hints"]["quantization"] == "modelopt_fp4"
     assert log_dict["serving_hints"]["moe_runner_backend"] == "flashinfer_trtllm"
+    summary.validate_scale_up_domain(gpu_count=8)
 
     launch_plan = summary.validate_runtime_launch(
         shape_symbols={"sequence": 17},
@@ -166,6 +169,22 @@ def test_rejects_required_non_executable_bumkc_artifact(tmp_path):
 
     with pytest.raises(BumkcArtifactError, match="not executable"):
         load_bumkc_artifact(tmp_path, require_executable=True)
+
+
+def test_rejects_bumkc_serving_gpu_count_mismatch(tmp_path):
+    write_bumkc_artifact(tmp_path, executable=True)
+    summary = load_bumkc_artifact(tmp_path)
+
+    with pytest.raises(BumkcArtifactError, match="GPU count"):
+        summary.validate_scale_up_domain(gpu_count=4)
+
+
+def test_rejects_invalid_bumkc_serving_gpu_count(tmp_path):
+    write_bumkc_artifact(tmp_path, executable=True)
+    summary = load_bumkc_artifact(tmp_path)
+
+    with pytest.raises(BumkcArtifactError, match="GPU count is invalid"):
+        summary.validate_scale_up_domain(gpu_count=0)
 
 
 def test_derives_bumkc_fp8_serving_hints():

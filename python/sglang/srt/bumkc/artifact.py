@@ -465,6 +465,15 @@ class BumkcArtifactSummary:
     artifact_digest_count: int
     required_validation_model: str
 
+    def validate_scale_up_domain(self, *, gpu_count: int) -> None:
+        if not _is_strict_int(gpu_count) or gpu_count < 1:
+            raise BumkcArtifactError("BUMKC serving GPU count is invalid")
+        if gpu_count != self.gpu_count:
+            raise BumkcArtifactError(
+                "BUMKC artifact GPU count does not match serving domain: "
+                f"artifact={self.gpu_count}, serving={gpu_count}"
+            )
+
     def validate_runtime_launch(
         self,
         *,

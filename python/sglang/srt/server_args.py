@@ -4121,6 +4121,9 @@ class ServerArgs:
             self.bumkc_plan_path,
             require_executable=self.bumkc_require_executable,
         )
+        self._bumkc_artifact_summary.validate_scale_up_domain(
+            gpu_count=self.tp_size * self.pp_size,
+        )
         self._bumkc_default_launch_plan = (
             self._bumkc_artifact_summary.validate_default_runtime_launch()
         )

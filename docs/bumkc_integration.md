@@ -75,8 +75,10 @@ validates:
 - and the required REAP validation model contract.
 
 Before invoking any BUMKC runtime entrypoint, the serving path must call
-`BumkcArtifactSummary.validate_runtime_launch()` with concrete dynamic shape
-values and serving-state keys. The guard rejects missing, unknown,
+`BumkcArtifactSummary.validate_scale_up_domain()` and
+`BumkcArtifactSummary.validate_runtime_launch()`. The scale-up guard rejects
+artifacts whose compiled GPU count does not match the serving domain
+(`tp_size * pp_size`). The runtime-launch guard rejects missing, unknown,
 out-of-range, or out-of-bucket shape substitutions and missing or unknown
 serving-state bindings. Startup also validates the artifact's default launch
 context through `validate_default_runtime_launch()` when `--enable-bumkc` loads

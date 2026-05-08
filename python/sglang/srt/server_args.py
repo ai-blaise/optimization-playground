@@ -4124,6 +4124,14 @@ class ServerArgs:
         self._bumkc_default_launch_plan = (
             self._bumkc_artifact_summary.validate_default_runtime_launch()
         )
+        serving_hints = self._bumkc_artifact_summary.serving_hints
+        if self.quantization is None and serving_hints.quantization is not None:
+            self.quantization = serving_hints.quantization
+        if (
+            self.moe_runner_backend == "auto"
+            and serving_hints.moe_runner_backend is not None
+        ):
+            self.moe_runner_backend = serving_hints.moe_runner_backend
         logger.info(
             "Loaded BUMKC artifact: %s",
             self._bumkc_artifact_summary.as_log_dict(),

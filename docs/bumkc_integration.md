@@ -88,10 +88,19 @@ engine schema, and quantization summary, plus runtime diagnostic and watchdog
 summary fields, so startup logs can audit the exact BUMKC contract that was
 loaded.
 
+When `--enable-bumkc` is active, the validated artifact can supply serving
+hints for existing SGLang controls. NVFP4 weight artifacts default unset
+`--quantization` to `modelopt_fp4`, and FP8 weight artifacts default it to
+`fp8`. If the MoE runner backend is still `auto`, those quantized paths default
+to `flashinfer_trtllm`. Explicit user settings, including `--quantization
+unquant`, are preserved.
+
 Add `--bumkc-require-executable` when startup must fail unless the runtime
 descriptor is executable. Without that flag, non-executable BUMKC artifacts are
 accepted only as checked fallback metadata.
 
-The current integration is intentionally a narrow contract reader. It does not
-alter scheduling, kernel selection, KV-cache policy, or custom optimization
-defaults unless a later runtime path consumes the validated artifact summary.
+The current integration is intentionally narrow. It validates artifacts, applies
+only the serving hints above when the corresponding user controls are unset,
+and otherwise does not alter scheduling, KV-cache policy, or custom
+optimization defaults unless a later runtime path consumes the validated
+artifact summary.

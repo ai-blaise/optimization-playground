@@ -33,6 +33,9 @@ def test_server_args_exposes_checked_bumkc_fallback_mode():
     assert '"--bumkc-fallback-mode"' in source
     assert 'choices=["checked"]' in source
     assert '"--bumkc-fallback-mode must be checked"' in source
+    assert "self._bumkc_artifact_summary.serving_hints" in source
+    assert "self.quantization = serving_hints.quantization" in source
+    assert "self.moe_runner_backend = serving_hints.moe_runner_backend" in source
 
 
 def test_loads_executable_bumkc_artifact(tmp_path):
@@ -120,6 +123,8 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.quantization_summary.gated_norm is True
     assert summary.quantization_summary.spinquant is True
     assert summary.quantization_summary.ignored_module_count == 2
+    assert summary.serving_hints.quantization == "modelopt_fp4"
+    assert summary.serving_hints.moe_runner_backend == "flashinfer_trtllm"
     assert summary.runtime_shape_symbols[0].symbol == "sequence"
     assert summary.runtime_serving_state[0].key() == ("sequence", "sequence")
     assert summary.target_arch == "sm90"
@@ -144,6 +149,8 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert log_dict["runtime_summary"]["watchdog_timeout_us"] == 30_000_000
     assert log_dict["quantization_summary"]["indexer_k_bits"] == 8
     assert log_dict["quantization_summary"]["gated_norm"]
+    assert log_dict["serving_hints"]["quantization"] == "modelopt_fp4"
+    assert log_dict["serving_hints"]["moe_runner_backend"] == "flashinfer_trtllm"
 
     launch_plan = summary.validate_runtime_launch(
         shape_symbols={"sequence": 17},

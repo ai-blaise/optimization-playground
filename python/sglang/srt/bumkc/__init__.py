@@ -6,6 +6,7 @@ from sglang.srt.bumkc.artifact import (
     BumkcRuntimeServingStateBinding,
     BumkcRuntimeShapeSymbolBinding,
     BumkcRuntimeShapeSymbolValue,
+    BumkcServingHints,
     load_bumkc_artifact,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "BumkcRuntimeServingStateBinding",
     "BumkcRuntimeShapeSymbolBinding",
     "BumkcRuntimeShapeSymbolValue",
+    "BumkcServingHints",
     "load_bumkc_artifact",
 ]

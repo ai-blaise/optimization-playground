@@ -429,6 +429,15 @@ class BumkcQuantizationSummary:
 
 
 @dataclasses.dataclass(frozen=True)
+class BumkcServingHints:
+    quantization: str | None
+    moe_runner_backend: str | None
+
+    def as_log_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
 class BumkcArtifactSummary:
     root: Path
     plan_id: str
@@ -448,6 +457,7 @@ class BumkcArtifactSummary:
     compiler_summary: BumkcCompilerSummary
     runtime_summary: BumkcRuntimeSummary
     quantization_summary: BumkcQuantizationSummary
+    serving_hints: BumkcServingHints
     runtime_shape_symbols: tuple[BumkcRuntimeShapeSymbolBinding, ...]
     runtime_serving_state: tuple[BumkcRuntimeServingStateBinding, ...]
     task_count: int
@@ -558,6 +568,7 @@ class BumkcArtifactSummary:
             "compiler_summary": self.compiler_summary.as_log_dict(),
             "runtime_summary": self.runtime_summary.as_log_dict(),
             "quantization_summary": self.quantization_summary.as_log_dict(),
+            "serving_hints": self.serving_hints.as_log_dict(),
             "runtime_shape_symbols": [
                 dataclasses.asdict(binding) for binding in self.runtime_shape_symbols
             ],
@@ -701,6 +712,7 @@ def load_bumkc_artifact(
         compiler_summary=compiler_summary,
         runtime_summary=runtime_summary,
         quantization_summary=quantization_summary,
+        serving_hints=_build_serving_hints(quantization_summary),
         runtime_shape_symbols=runtime_shape_symbols,
         runtime_serving_state=runtime_serving_state,
         task_count=runtime_summary.task_count,
@@ -1096,6 +1108,25 @@ def _read_quantization_summary(
         gated_norm=_read_bool(summary, "gated_norm"),
         spinquant=_read_bool(summary, "spinquant"),
         ignored_module_count=_read_int(summary, "ignored_module_count"),
+    )
+
+
+def _build_serving_hints(
+    quantization: BumkcQuantizationSummary,
+) -> BumkcServingHints:
+    quantization_method = None
+    if quantization.weight_format == "nv_fp4":
+        quantization_method = "modelopt_fp4"
+    elif quantization.weight_format in ("fp8_e4m3", "fp8_e5m2"):
+        quantization_method = "fp8"
+
+    moe_runner_backend = None
+    if quantization_method in ("fp8", "modelopt_fp4"):
+        moe_runner_backend = "flashinfer_trtllm"
+
+    return BumkcServingHints(
+        quantization=quantization_method,
+        moe_runner_backend=moe_runner_backend,
     )
 
 

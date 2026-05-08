@@ -19,7 +19,7 @@ validates:
 
 - matching plan and program IDs across manifest, runtime, engine, and tensor
   smoke artifacts,
-- `schema_version == "bumkc.optimization_playground.v1"`,
+- `schema_version == "bumkc.optimization_playground.v2"`,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
 - checked fallback mode,

@@ -27,6 +27,8 @@ def test_loads_executable_bumkc_artifact(tmp_path):
     assert summary.runtime_entrypoints == ("cuda_tensor_smoke",)
     assert summary.runtime_summary.task_instance_capacity == 2
     assert summary.runtime_summary.kv_cache_binding_count == 1
+    assert summary.runtime_summary.rank_count == 8
+    assert summary.runtime_summary.task_rank_reference_count == 16
     assert summary.task_count == summary.runtime_summary.task_count
     assert summary.tensor_smoke_enabled
     assert summary.fallback_mode == "checked"
@@ -65,7 +67,7 @@ def test_rejects_unsupported_bumkc_schema(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     engine_path = plan_dir / "engine" / "optimization-playground.json"
     engine = json.loads(engine_path.read_text(encoding="utf-8"))
-    engine["schema_version"] = "bumkc.optimization_playground.v0"
+    engine["schema_version"] = "bumkc.optimization_playground.v1"
     engine_path.write_text(json.dumps(engine), encoding="utf-8")
 
     with pytest.raises(BumkcArtifactError, match="unsupported engine schema"):
@@ -124,6 +126,12 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "device_global_binding_count": 4,
                 "kv_cache_binding_count": 1,
             },
+            "scale_up_plan": {
+                "rank_count": 8,
+                "task_rank_group_count": 2,
+                "task_rank_reference_count": 16,
+                "rank_id_sum": 56,
+            },
         },
     )
     write_json(
@@ -149,6 +157,10 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "task_instance_capacity": 2,
                 "device_global_binding_count": 4,
                 "kv_cache_binding_count": 1,
+                "rank_count": 8,
+                "task_rank_group_count": 2,
+                "task_rank_reference_count": 16,
+                "rank_id_sum": 56,
             },
             "preserve_custom_optimizations": True,
             "required_validation_model": REQUIRED_VALIDATION_MODEL,

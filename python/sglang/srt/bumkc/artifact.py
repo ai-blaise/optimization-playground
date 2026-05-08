@@ -9,7 +9,7 @@ from typing import Any
 REQUIRED_VALIDATION_MODEL = (
     "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
 )
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v1"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v2"
 
 
 class BumkcArtifactError(ValueError):
@@ -27,6 +27,10 @@ class BumkcRuntimeSummary:
     task_instance_capacity: int
     device_global_binding_count: int
     kv_cache_binding_count: int
+    rank_count: int
+    task_rank_group_count: int
+    task_rank_reference_count: int
+    rank_id_sum: int
 
     def as_log_dict(self) -> dict[str, int]:
         return {
@@ -39,6 +43,10 @@ class BumkcRuntimeSummary:
             "task_instance_capacity": self.task_instance_capacity,
             "device_global_binding_count": self.device_global_binding_count,
             "kv_cache_binding_count": self.kv_cache_binding_count,
+            "rank_count": self.rank_count,
+            "task_rank_group_count": self.task_rank_group_count,
+            "task_rank_reference_count": self.task_rank_reference_count,
+            "rank_id_sum": self.rank_id_sum,
         }
 
 
@@ -165,6 +173,7 @@ def _load_runtime_summary(
     execution_model = _read_object(runtime, "execution_model")
     queue_plan = _read_object(runtime, "queue_plan")
     memory_plan = _read_object(runtime, "memory_plan")
+    scale_up_plan = _read_object(runtime, "scale_up_plan")
     expected = {
         "task_count": runtime.get("task_count"),
         "conventional_launch_count": execution_model.get("conventional_launch_count"),
@@ -175,6 +184,10 @@ def _load_runtime_summary(
         "task_instance_capacity": queue_plan.get("task_instance_capacity"),
         "device_global_binding_count": memory_plan.get("device_global_binding_count"),
         "kv_cache_binding_count": memory_plan.get("kv_cache_binding_count"),
+        "rank_count": scale_up_plan.get("rank_count"),
+        "task_rank_group_count": scale_up_plan.get("task_rank_group_count"),
+        "task_rank_reference_count": scale_up_plan.get("task_rank_reference_count"),
+        "rank_id_sum": scale_up_plan.get("rank_id_sum"),
     }
     for key, value in expected.items():
         if summary.get(key) is None or value is None or summary.get(key) != value:

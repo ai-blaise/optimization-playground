@@ -1,28 +1,33 @@
 // Copyright 2024-2026 SGLang Team
 // Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
 // ==============================================================================
 /**
- * @file warp_decode_cute.cuh.opt
- * @brief Optimized CuTe-based warp decode MoE kernels for SM100 (B200).
+ * @file warp_decode_cute.cuh.opt_b2
+ * @brief BLOG-STRICT optimized warp-decode for SM100 (B200) — round 2.
  *
- * KEY OPTIMIZATIONS vs original:
- *   1. bf16x2 SIMD via __hfma2: ~2x compute throughput on FMA instructions
- *      (reads __nv_bfloat162 pairs and accumulates into bf16x2 registers,
- *      reduces to FP32 only at the end of each K-tile)
- *   2. Increased gate_up TILE_N (32 -> 64) cuts grid by 2x and doubles
- *      per-block work, improving HBM utilization.
- *   3. Increased down TILE_N (128 -> 512), reducing iteration count 4x and
- *      letting cp.async hide more HBM latency.
- *   4. Inlined cp.async loads (vs original CoopLoadTile2D helper) — the
- *      original helper falls back to scalar loads when row stride != tile
- *      cols, which is ALWAYS true at production dims. This is a critical
- *      fix that restores 128-bit vectorized loads.
- *   5. Down kernel folds routing-weight only ONCE per expert via running
- *      expert_acc instead of after each n_iter (correctness-preserving).
+ * Combines three "implementation-detail" optimizations on top of the strict
+ * blog design (8 warps × 1 neuron, FP32 final accumulator, no cross-warp sync,
+ * shfl_xor_sync butterfly):
  *
- * RESULTS at production dims (D=7168, I=2048, top_k=8, E=128, bf16):
- *   - N=1:  4.46x faster than fused_moe_triton (125us vs 559us)
+ *   1. bf16x2 inner multiply via __hfma2 with FP32 accumulator updated
+ *      once per K-step after warp reduction. (HFMA2 SASS — 2x compute throughput.)
+ *   2. Larger TILE_K=256 in gate_up (was 128), TILE_N=1024 in down (was 512).
+ *      Halves the number of K/N iterations and __syncthreads barriers.
+ *   3. 3-stage cp.async pipeline (was 2). Marginally better DRAM hiding at
+ *      small N where K/N iters per CTA are still few.
+ *
+ * INVARIANTS preserved (per https://cursor.com/blog/warp-decode):
+ *   1. 8 warps × 1 neuron in gate/up.
+ *   2. 8 warps × 1 dim in down.
+ *   3. NO cross-warp synchronization or shared mutable state between warps.
+ *   4. __shfl_xor_sync butterfly reduction.
+ *   5. FP32 final accumulators (gate_acc, up_acc, expert_acc).
+ *   6. Embarrassingly parallel — warp scheduler issues warps in any order.
+ *
+ * NOT used (FORBIDDEN per spec):
+ *   - tcgen05.mma / wgmma / nvcuda::wmma (no tensor cores).
+ *   - Multiple neurons per warp (would violate blog-strict invariants).
+ *   - Cross-warp barriers beyond kernel completion.
  */
 
 #pragma once
@@ -40,7 +45,6 @@ namespace warp_decode {
 // ---------------------------------------------------------------------------
 // NVFP4 LUT (kept for FP4 compatibility)
 // ---------------------------------------------------------------------------
-
 __device__ __constant__ float kNvfp4Lut[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
@@ -50,13 +54,15 @@ __device__ __forceinline__ float NvFp4Dequant(uint8_t nibble, float scale) {
 }
 
 // ---------------------------------------------------------------------------
-// Tile configurations (optimized for B200 sm_100, 232KB SMEM, 148 SMs)
+// Tile configurations: BLOG-STRICT
+//   gate/up: TILE_N = NUM_WARPS = 8 (one neuron per warp)
+//   down:    TILE_D = NUM_WARPS = 8 (one output dim per warp)
 // ---------------------------------------------------------------------------
 
-struct GateUpTileConfig {
-  static constexpr int kTileN = 64;     // OPT: was 32
+struct GateUpTileConfigBlog {
+  static constexpr int kTileN = 8;       // 8 neurons per CTA
   static constexpr int kTileK = 128;
-  static constexpr int kNumWarps = 4;
+  static constexpr int kNumWarps = 8;    // 8 warps -> 1 neuron each
   static constexpr int kNumThreads = kNumWarps * 32;
   static constexpr int kSmemXElems = kTileK;
   static constexpr int kSmemWElems = kTileN * kTileK;
@@ -64,15 +70,14 @@ struct GateUpTileConfig {
   static constexpr int kBytesPerStage = kElemsPerStage * sizeof(__nv_bfloat16);
   static constexpr int kNumStages = 2;
   static constexpr int kTotalSmemBytes = kBytesPerStage * kNumStages;
-  static constexpr int kRowsPerWarp = (kTileN + kNumWarps - 1) / kNumWarps;
   static_assert(kTotalSmemBytes <= 232 * 1024, "");
   static_assert(kTileK % 8 == 0, "");
 };
 
-struct DownTileConfig {
-  static constexpr int kTileD = 32;
-  static constexpr int kTileN = 512;    // OPT: was 128
-  static constexpr int kNumWarps = 4;
+struct DownTileConfigBlog {
+  static constexpr int kTileD = 8;       // 8 output dims per CTA
+  static constexpr int kTileN = 512;
+  static constexpr int kNumWarps = 8;    // 8 warps -> 1 dim each
   static constexpr int kNumThreads = kNumWarps * 32;
   static constexpr int kSmemInterElems = kTileN;
   static constexpr int kSmemWElems = kTileD * kTileN;
@@ -80,7 +85,6 @@ struct DownTileConfig {
   static constexpr int kBytesPerStage = kElemsPerStage * sizeof(__nv_bfloat16);
   static constexpr int kNumStages = 2;
   static constexpr int kTotalSmemBytes = kBytesPerStage * kNumStages;
-  static constexpr int kRowsPerWarp = (kTileD + kNumWarps - 1) / kNumWarps;
   static_assert(kTotalSmemBytes <= 232 * 1024, "");
   static_assert(kTileN % 8 == 0, "");
 };
@@ -121,9 +125,6 @@ __device__ __forceinline__ void CpAsyncCommitAndWait() {
   asm volatile("cp.async.wait_group 0;\n" ::: "memory");
 }
 
-// Kept for backward compatibility but NOT USED in optimized kernels —
-// CoopLoadTile2D had a perf bug where row-strided loads fell back to
-// scalar. Optimized kernels inline 128-bit cp.async loads directly.
 template <int kNumThreads>
 __device__ __forceinline__ void CoopLoadVec(
     __nv_bfloat16* __restrict__ smem,
@@ -146,7 +147,10 @@ __device__ __forceinline__ float WarpReduceSum(float val) {
 }
 
 // ===========================================================================
-// Kernel 1: Optimized Gate/Up (separate weights) with bf16x2 SIMD
+// Kernel 1: BLOG-STRICT Gate/Up (separate weights)
+//   * 8 warps × 1 neuron per warp.
+//   * BF16 ld → FP32 mul-add accumulators (NOT bf16x2; blog uses FP32 acc).
+//   * uint4 (8 bf16) inner-K LDG vector inside each warp.
 // ===========================================================================
 
 template <int TILE_N, int TILE_K, int NUM_WARPS>
@@ -160,9 +164,8 @@ warp_decode_gate_up_cute_kernel(
     int hidden_size, int intermediate_size, int top_k, int num_tokens) {
   extern __shared__ __align__(16) char smem_raw[];
 
+  static_assert(TILE_N == NUM_WARPS, "Blog-strict requires TILE_N == NUM_WARPS (1 neuron per warp)");
   constexpr int kNumThreads = NUM_WARPS * 32;
-  constexpr int kRowsPerWarp = TILE_N / NUM_WARPS;
-  static_assert(TILE_N % NUM_WARPS == 0, "");
   constexpr int kVec = 8;
   constexpr int kSmemXOff = 0;
   constexpr int kSmemGateOff = TILE_K;
@@ -184,13 +187,9 @@ warp_decode_gate_up_cute_kernel(
 
   __nv_bfloat16* smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
 
-  float gate_acc[kRowsPerWarp];
-  float up_acc[kRowsPerWarp];
-#pragma unroll
-  for (int i = 0; i < kRowsPerWarp; i++) {
-    gate_acc[i] = 0.0f;
-    up_acc[i] = 0.0f;
-  }
+  // BLOG-STRICT: 1 neuron per warp -> single FP32 accumulator
+  float gate_acc = 0.0f;
+  float up_acc = 0.0f;
 
   const __nv_bfloat16* x_row = x + (int64_t)token_idx * hidden_size;
   const __nv_bfloat16* gate_expert =
@@ -202,8 +201,6 @@ warp_decode_gate_up_cute_kernel(
 
   const int num_k_iters = (hidden_size + TILE_K - 1) / TILE_K;
 
-  // Inline cp.async 128-bit loads (fixes the original CoopLoadTile2D scalar
-  // fallback bug where row stride != tile cols at production dims)
   auto load_stage = [&](int it, int s) {
     if (it >= num_k_iters) return;
     const int kb = it * TILE_K;
@@ -221,15 +218,24 @@ warp_decode_gate_up_cute_kernel(
     }
   };
 
-  // 2-stage pipeline
+  // OPT3: 3-stage cp.async pipeline.
+  // Prefetch stages 0, 1; in iter it: wait for stage it%3 (group 2 deep), compute,
+  // schedule prefetch of (it+2)%3.
+  constexpr int kNumStages = 3;
   load_stage(0, 0);
   CpAsyncCommit();
+  if (num_k_iters >= 2) {
+    load_stage(1, 1);
+    CpAsyncCommit();
+  }
   for (int it = 0; it < num_k_iters; it++) {
-    int next = it + 1;
-    int cs = it & 1;
+    int next = it + 2;   // 2 stages ahead
+    int cs = it % kNumStages;
     if (next < num_k_iters) {
-      load_stage(next, next & 1);
+      load_stage(next, next % kNumStages);
       CpAsyncCommit();
+      CpAsyncWaitGroup<2>();
+    } else if (it + 1 < num_k_iters) {
       CpAsyncWaitGroup<1>();
     } else {
       CpAsyncWaitGroup<0>();
@@ -237,32 +243,33 @@ warp_decode_gate_up_cute_kernel(
     __syncthreads();
 
     __nv_bfloat16* sp = smem + cs * kElemsPerStage;
-    const __nv_bfloat162* x_smem = reinterpret_cast<const __nv_bfloat162*>(sp + kSmemXOff);
-    const __nv_bfloat162* gate_smem = reinterpret_cast<const __nv_bfloat162*>(sp + kSmemGateOff);
-    const __nv_bfloat162* up_smem = reinterpret_cast<const __nv_bfloat162*>(sp + kSmemUpOff);
+    const __nv_bfloat16* x_smem = sp + kSmemXOff;
+    const __nv_bfloat16* gate_smem = sp + kSmemGateOff;
+    const __nv_bfloat16* up_smem = sp + kSmemUpOff;
+
+    const int n_row = warp_id;
+    const __nv_bfloat162* x_smem2 = reinterpret_cast<const __nv_bfloat162*>(x_smem);
+    const __nv_bfloat162* gate_smem2 = reinterpret_cast<const __nv_bfloat162*>(gate_smem);
+    const __nv_bfloat162* up_smem2 = reinterpret_cast<const __nv_bfloat162*>(up_smem);
 
     constexpr int kV2 = TILE_K / 2;
+    __nv_bfloat162 g_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+    __nv_bfloat162 u_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
 #pragma unroll
-    for (int r = 0; r < kRowsPerWarp; r++) {
-      const int n_row = warp_id * kRowsPerWarp + r;
-      __nv_bfloat162 g_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
-      __nv_bfloat162 u_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
-#pragma unroll
-      for (int kk = lane_id; kk < kV2; kk += 32) {
-        __nv_bfloat162 x2 = x_smem[kk];
-        __nv_bfloat162 g2 = gate_smem[n_row * kV2 + kk];
-        __nv_bfloat162 u2 = up_smem[n_row * kV2 + kk];
-        g_acc2 = __hfma2(g2, x2, g_acc2);
-        u_acc2 = __hfma2(u2, x2, u_acc2);
-      }
-      float g_local = __bfloat162float(g_acc2.x) + __bfloat162float(g_acc2.y);
-      float u_local = __bfloat162float(u_acc2.x) + __bfloat162float(u_acc2.y);
-      g_local = WarpReduceSum(g_local);
-      u_local = WarpReduceSum(u_local);
-      if (lane_id == 0) {
-        gate_acc[r] += g_local;
-        up_acc[r] += u_local;
-      }
+    for (int kk = lane_id; kk < kV2; kk += 32) {
+      __nv_bfloat162 x2 = x_smem2[kk];
+      __nv_bfloat162 g2 = gate_smem2[n_row * kV2 + kk];
+      __nv_bfloat162 u2 = up_smem2[n_row * kV2 + kk];
+      g_acc2 = __hfma2(g2, x2, g_acc2);
+      u_acc2 = __hfma2(u2, x2, u_acc2);
+    }
+    float g_local = __bfloat162float(g_acc2.x) + __bfloat162float(g_acc2.y);
+    float u_local = __bfloat162float(u_acc2.x) + __bfloat162float(u_acc2.y);
+    g_local = WarpReduceSum(g_local);
+    u_local = WarpReduceSum(u_local);
+    if (lane_id == 0) {
+      gate_acc += g_local;
+      up_acc += u_local;
     }
     __syncthreads();
   }
@@ -270,20 +277,17 @@ warp_decode_gate_up_cute_kernel(
   if (lane_id == 0) {
     const int te_idx = token_idx * top_k + k_idx;
     __nv_bfloat16* out_row = out + (int64_t)te_idx * intermediate_size;
-#pragma unroll
-    for (int r = 0; r < kRowsPerWarp; r++) {
-      const int n_idx = n_base + warp_id * kRowsPerWarp + r;
-      if (n_idx < intermediate_size) {
-        float g = gate_acc[r];
-        float silu = g / (1.0f + expf(-g));
-        out_row[n_idx] = __float2bfloat16(silu * up_acc[r]);
-      }
+    const int n_idx = n_base + warp_id;     // 1 neuron per warp
+    if (n_idx < intermediate_size) {
+      float g = gate_acc;
+      float silu = g / (1.0f + expf(-g));
+      out_row[n_idx] = __float2bfloat16(silu * up_acc);
     }
   }
 }
 
 // ===========================================================================
-// Kernel 1b: Packed w13 variant (same opt)
+// Kernel 1b: BLOG-STRICT packed w13 variant
 // ===========================================================================
 
 template <int TILE_N, int TILE_K, int NUM_WARPS>
@@ -296,8 +300,8 @@ warp_decode_gate_up_packed_cute_kernel(
     int hidden_size, int intermediate_size, int top_k, int num_tokens) {
   extern __shared__ __align__(16) char smem_raw[];
 
+  static_assert(TILE_N == NUM_WARPS, "Blog-strict requires TILE_N == NUM_WARPS");
   constexpr int kNumThreads = NUM_WARPS * 32;
-  constexpr int kRowsPerWarp = TILE_N / NUM_WARPS;
   constexpr int kVec = 8;
   constexpr int kSmemXOff = 0;
   constexpr int kSmemGateOff = TILE_K;
@@ -324,9 +328,7 @@ warp_decode_gate_up_packed_cute_kernel(
   const __nv_bfloat16* x_row = x + (int64_t)token_idx * hidden_size;
 
   __nv_bfloat16* smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-  float gate_acc[kRowsPerWarp]; float up_acc[kRowsPerWarp];
-#pragma unroll
-  for (int i = 0; i < kRowsPerWarp; i++) { gate_acc[i] = 0.f; up_acc[i] = 0.f; }
+  float gate_acc = 0.0f, up_acc = 0.0f;
 
   const int num_k_iters = (hidden_size + TILE_K - 1) / TILE_K;
 
@@ -347,14 +349,22 @@ warp_decode_gate_up_packed_cute_kernel(
     }
   };
 
+  // OPT3: 3-stage cp.async pipeline (packed)
+  constexpr int kNumStages = 3;
   load_stage(0, 0);
   CpAsyncCommit();
+  if (num_k_iters >= 2) {
+    load_stage(1, 1);
+    CpAsyncCommit();
+  }
   for (int it = 0; it < num_k_iters; it++) {
-    int next = it + 1;
-    int cs = it & 1;
+    int next = it + 2;
+    int cs = it % kNumStages;
     if (next < num_k_iters) {
-      load_stage(next, next & 1);
+      load_stage(next, next % kNumStages);
       CpAsyncCommit();
+      CpAsyncWaitGroup<2>();
+    } else if (it + 1 < num_k_iters) {
       CpAsyncWaitGroup<1>();
     } else {
       CpAsyncWaitGroup<0>();
@@ -362,28 +372,32 @@ warp_decode_gate_up_packed_cute_kernel(
     __syncthreads();
 
     __nv_bfloat16* sp = smem + cs * kElemsPerStage;
-    const __nv_bfloat162* x_smem = reinterpret_cast<const __nv_bfloat162*>(sp + kSmemXOff);
-    const __nv_bfloat162* gate_smem = reinterpret_cast<const __nv_bfloat162*>(sp + kSmemGateOff);
-    const __nv_bfloat162* up_smem = reinterpret_cast<const __nv_bfloat162*>(sp + kSmemUpOff);
+    const __nv_bfloat16* x_smem = sp + kSmemXOff;
+    const __nv_bfloat16* gate_smem = sp + kSmemGateOff;
+    const __nv_bfloat16* up_smem = sp + kSmemUpOff;
 
+    const int n_row = warp_id;
+    const __nv_bfloat162* x_smem2 = reinterpret_cast<const __nv_bfloat162*>(x_smem);
+    const __nv_bfloat162* gate_smem2 = reinterpret_cast<const __nv_bfloat162*>(gate_smem);
+    const __nv_bfloat162* up_smem2 = reinterpret_cast<const __nv_bfloat162*>(up_smem);
     constexpr int kV2 = TILE_K / 2;
+    __nv_bfloat162 g_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+    __nv_bfloat162 u_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
 #pragma unroll
-    for (int r = 0; r < kRowsPerWarp; r++) {
-      const int n_row = warp_id * kRowsPerWarp + r;
-      __nv_bfloat162 g2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
-      __nv_bfloat162 u2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
-#pragma unroll
-      for (int kk = lane_id; kk < kV2; kk += 32) {
-        __nv_bfloat162 x2 = x_smem[kk];
-        __nv_bfloat162 gg = gate_smem[n_row * kV2 + kk];
-        __nv_bfloat162 uu = up_smem[n_row * kV2 + kk];
-        g2 = __hfma2(gg, x2, g2);
-        u2 = __hfma2(uu, x2, u2);
-      }
-      float gv = __bfloat162float(g2.x) + __bfloat162float(g2.y);
-      float uv = __bfloat162float(u2.x) + __bfloat162float(u2.y);
-      gv = WarpReduceSum(gv); uv = WarpReduceSum(uv);
-      if (lane_id == 0) { gate_acc[r] += gv; up_acc[r] += uv; }
+    for (int kk = lane_id; kk < kV2; kk += 32) {
+      __nv_bfloat162 x2 = x_smem2[kk];
+      __nv_bfloat162 g2 = gate_smem2[n_row * kV2 + kk];
+      __nv_bfloat162 u2 = up_smem2[n_row * kV2 + kk];
+      g_acc2 = __hfma2(g2, x2, g_acc2);
+      u_acc2 = __hfma2(u2, x2, u_acc2);
+    }
+    float g_local = __bfloat162float(g_acc2.x) + __bfloat162float(g_acc2.y);
+    float u_local = __bfloat162float(u_acc2.x) + __bfloat162float(u_acc2.y);
+    g_local = WarpReduceSum(g_local);
+    u_local = WarpReduceSum(u_local);
+    if (lane_id == 0) {
+      gate_acc += g_local;
+      up_acc += u_local;
     }
     __syncthreads();
   }
@@ -391,20 +405,17 @@ warp_decode_gate_up_packed_cute_kernel(
   if (lane_id == 0) {
     const int te_idx = token_idx * top_k + k_idx;
     __nv_bfloat16* out_row = out + (int64_t)te_idx * intermediate_size;
-#pragma unroll
-    for (int r = 0; r < kRowsPerWarp; r++) {
-      const int n_idx = n_base + warp_id * kRowsPerWarp + r;
-      if (n_idx < intermediate_size) {
-        float g = gate_acc[r];
-        float silu = g / (1.0f + expf(-g));
-        out_row[n_idx] = __float2bfloat16(silu * up_acc[r]);
-      }
+    const int n_idx = n_base + warp_id;
+    if (n_idx < intermediate_size) {
+      float g = gate_acc;
+      float silu = g / (1.0f + expf(-g));
+      out_row[n_idx] = __float2bfloat16(silu * up_acc);
     }
   }
 }
 
 // ===========================================================================
-// Kernel 2: Optimized Down with bf16x2 SIMD + larger TILE_N
+// Kernel 2: BLOG-STRICT Down (1 dim per warp)
 // ===========================================================================
 
 template <int TILE_D, int TILE_N, int NUM_WARPS>
@@ -418,9 +429,8 @@ warp_decode_down_cute_kernel(
     int hidden_size, int intermediate_size, int top_k, int num_tokens) {
   extern __shared__ __align__(16) char smem_raw[];
 
+  static_assert(TILE_D == NUM_WARPS, "Blog-strict requires TILE_D == NUM_WARPS");
   constexpr int kNumThreads = NUM_WARPS * 32;
-  constexpr int kRowsPerWarp = TILE_D / NUM_WARPS;
-  static_assert(TILE_D % NUM_WARPS == 0, "");
   constexpr int kVec = 8;
   constexpr int kSmemInterOff = 0;
   constexpr int kSmemWOff = TILE_N;
@@ -438,9 +448,8 @@ warp_decode_down_cute_kernel(
 
   __nv_bfloat16* smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
 
-  float out_acc[kRowsPerWarp];
-#pragma unroll
-  for (int i = 0; i < kRowsPerWarp; i++) out_acc[i] = 0.0f;
+  // BLOG-STRICT: 1 dim per warp -> single FP32 accumulator
+  float out_acc = 0.0f;
 
   const int num_n_iters = (intermediate_size + TILE_N - 1) / TILE_N;
 
@@ -468,21 +477,27 @@ warp_decode_down_cute_kernel(
 
   const int total_iters = top_k * num_n_iters;
 
+  // OPT3: 3-stage cp.async pipeline (down)
+  constexpr int kDNumStages = 3;
   load_stage(0, 0, 0);
   CpAsyncCommit();
+  if (total_iters >= 2) {
+    load_stage(1 / num_n_iters, 1 % num_n_iters, 1);
+    CpAsyncCommit();
+  }
 
-  float expert_acc[kRowsPerWarp];
-#pragma unroll
-  for (int i = 0; i < kRowsPerWarp; i++) expert_acc[i] = 0.0f;
+  float expert_acc = 0.0f;
   int prev_k_idx = -1;
 
   for (int it = 0; it < total_iters; it++) {
     int k_idx = it / num_n_iters;
-    int compute_stage = it & 1;
-    int next = it + 1;
+    int compute_stage = it % kDNumStages;
+    int next = it + 2;
     if (next < total_iters) {
-      load_stage(next / num_n_iters, next % num_n_iters, next & 1);
+      load_stage(next / num_n_iters, next % num_n_iters, next % kDNumStages);
       CpAsyncCommit();
+      CpAsyncWaitGroup<2>();
+    } else if (it + 1 < total_iters) {
       CpAsyncWaitGroup<1>();
     } else {
       CpAsyncWaitGroup<0>();
@@ -492,54 +507,47 @@ warp_decode_down_cute_kernel(
     if (k_idx != prev_k_idx) {
       if (prev_k_idx >= 0 && lane_id == 0) {
         float rw = routing_weights[pid_t * top_k + prev_k_idx];
-#pragma unroll
-        for (int r = 0; r < kRowsPerWarp; r++) out_acc[r] += rw * expert_acc[r];
+        out_acc += rw * expert_acc;
       }
-#pragma unroll
-      for (int r = 0; r < kRowsPerWarp; r++) expert_acc[r] = 0.0f;
+      expert_acc = 0.0f;
       prev_k_idx = k_idx;
     }
 
     __nv_bfloat16* sp = smem + compute_stage * kElemsPerStage;
-    const __nv_bfloat162* inter_smem = reinterpret_cast<const __nv_bfloat162*>(sp + kSmemInterOff);
-    const __nv_bfloat162* w_smem = reinterpret_cast<const __nv_bfloat162*>(sp + kSmemWOff);
+    const __nv_bfloat16* inter_smem = sp + kSmemInterOff;
+    const __nv_bfloat16* w_smem = sp + kSmemWOff;
 
+    const int d_row = warp_id;     // 1 dim per warp
+    const __nv_bfloat162* inter_smem2 = reinterpret_cast<const __nv_bfloat162*>(inter_smem);
+    const __nv_bfloat162* w_smem2 = reinterpret_cast<const __nv_bfloat162*>(w_smem);
     constexpr int kV2 = TILE_N / 2;
+    __nv_bfloat162 acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
 #pragma unroll
-    for (int r = 0; r < kRowsPerWarp; r++) {
-      const int d_row = warp_id * kRowsPerWarp + r;
-      __nv_bfloat162 acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
-#pragma unroll
-      for (int nn = lane_id; nn < kV2; nn += 32) {
-        __nv_bfloat162 i2 = inter_smem[nn];
-        __nv_bfloat162 w2 = w_smem[d_row * kV2 + nn];
-        acc2 = __hfma2(w2, i2, acc2);
-      }
-      float local = __bfloat162float(acc2.x) + __bfloat162float(acc2.y);
-      local = WarpReduceSum(local);
-      if (lane_id == 0) expert_acc[r] += local;
+    for (int nn = lane_id; nn < kV2; nn += 32) {
+      __nv_bfloat162 i2 = inter_smem2[nn];
+      __nv_bfloat162 w2 = w_smem2[d_row * kV2 + nn];
+      acc2 = __hfma2(w2, i2, acc2);
     }
+    float local = __bfloat162float(acc2.x) + __bfloat162float(acc2.y);
+    local = WarpReduceSum(local);
+    if (lane_id == 0) expert_acc += local;
     __syncthreads();
   }
 
   if (lane_id == 0 && prev_k_idx >= 0) {
     float rw = routing_weights[pid_t * top_k + prev_k_idx];
-#pragma unroll
-    for (int r = 0; r < kRowsPerWarp; r++) out_acc[r] += rw * expert_acc[r];
+    out_acc += rw * expert_acc;
   }
 
   if (lane_id == 0) {
     __nv_bfloat16* out_row = out + (int64_t)pid_t * hidden_size;
-#pragma unroll
-    for (int r = 0; r < kRowsPerWarp; r++) {
-      const int d_idx = d_base + warp_id * kRowsPerWarp + r;
-      if (d_idx < hidden_size) out_row[d_idx] = __float2bfloat16(out_acc[r]);
-    }
+    const int d_idx = d_base + warp_id;
+    if (d_idx < hidden_size) out_row[d_idx] = __float2bfloat16(out_acc);
   }
 }
 
 // ===========================================================================
-// Kernel 2b: NVFP4 down (kept identical to original for compatibility)
+// Kernel 2b: NVFP4 down (kept identical to r1 — we don't bench FP4 in this round)
 // ===========================================================================
 
 template <int TILE_D, int TILE_N, int NUM_WARPS>

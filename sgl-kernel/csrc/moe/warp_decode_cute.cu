@@ -1,9 +1,9 @@
 // Copyright 2024-2026 SGLang Team
 // Licensed under the Apache License, Version 2.0.
 // ==============================================================================
-// Optimized warp_decode_cute dispatch — uses new tile sizes from .cuh.opt:
-//   - Gate/Up: TILE_N=64 (was 32), TILE_K=128, NUM_WARPS=4
-//   - Down:    TILE_D=32, TILE_N=512 (was 128), NUM_WARPS=4
+// BLOG-STRICT warp_decode_cute dispatch:
+//   - Gate/Up: TILE_N=8 (one neuron per warp), TILE_K=128, NUM_WARPS=8
+//   - Down:    TILE_D=8 (one dim per warp),    TILE_N=512, NUM_WARPS=8
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -14,22 +14,24 @@
 namespace sglang {
 namespace warp_decode {
 
-constexpr int kGateUpTileN = 64;
-constexpr int kGateUpTileK = 128;
-constexpr int kGateUpNumWarps = 4;
+// OPT3: opt2 large tiles + 3-stage cp.async pipeline.
+constexpr int kGateUpTileN = 8;
+constexpr int kGateUpTileK = 256;
+constexpr int kGateUpNumWarps = 8;
 constexpr int kGateUpNumThreads = kGateUpNumWarps * 32;
 
-constexpr int kDownTileD = 32;
-constexpr int kDownTileN = 512;
-constexpr int kDownNumWarps = 4;
+constexpr int kDownTileD = 8;
+constexpr int kDownTileN = 1024;
+constexpr int kDownNumWarps = 8;
 constexpr int kDownNumThreads = kDownNumWarps * 32;
 
+// 3 stages instead of 2 — deeper pipeline to better hide DRAM latency.
 constexpr int kGateUpSmemBytes =
-    2 * (kGateUpTileK + 2 * kGateUpTileN * kGateUpTileK) *
+    3 * (kGateUpTileK + 2 * kGateUpTileN * kGateUpTileK) *
     static_cast<int>(sizeof(__nv_bfloat16));
 
 constexpr int kDownSmemBytes =
-    2 * (kDownTileN + kDownTileD * kDownTileN) *
+    3 * (kDownTileN + kDownTileD * kDownTileN) *
     static_cast<int>(sizeof(__nv_bfloat16));
 
 template <typename KernelFunc>
@@ -122,7 +124,6 @@ void warp_decode_cute_down_fp4(
     torch::Tensor& out,
     int hidden_size, int intermediate_size, int top_k, int num_tokens, int group_size) {
   if (num_tokens == 0) return;
-  // FP4 path uses smaller TILE_N (128) to keep SMEM in budget
   constexpr int FP4_TILE_D = 32;
   constexpr int FP4_TILE_N = 128;
   constexpr int FP4_NUM_WARPS = 4;

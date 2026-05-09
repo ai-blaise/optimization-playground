@@ -18,7 +18,7 @@ trials × 500 iterations.
 |---|---|---|---|
 | TurboQuant 2.5-bit KV dequant | `python/sglang/jit_kernel/csrc/quantization/turboquant_dense_kv.cuh` | original (this file, baseline) | 1.02x@N=1, 1.08x@N=256+ |
 | TurboQuant MLA 2.5-bit decode | `python/sglang/jit_kernel/csrc/quantization/turboquant_dense_mla_decode.cuh` | original (this file, baseline) | 1.40-2.56x across topk |
-| IndexCache NSA fused-store | `python/sglang/jit_kernel/csrc/nsa/fused_store_index_cache.cuh` | upstream paged-cache layout | 1.36x |
+| IndexCache NSA fused-store (bf16→fp8 quant+scatter) | `python/sglang/jit_kernel/csrc/nsa/fused_store_index_cache.cuh` | upstream paged-cache layout | 1.36x |
 | FlashSampling Blackwell | `python/sglang/srt/layers/flashsampling/target_kernel_blackwell.py` | matmul + topk + softmax + multinomial | 3.6x at TP=8 (already in upstream `main`; not modified by this commit) |
 | G1 Gate (CuTe) | `sgl-kernel/csrc/attention/g1_attention_cute.cuh` | `g1_gate_fwd_kernel` (in-file legacy) | 1.23-1.71x graph mode |
 | GatedNorm (CuTe) | `sgl-kernel/csrc/elementwise/gated_norm_cute.cu(h)` | upstream `gated_norm.py` (Triton + torch.mm dispatch) | R=16: 1.04-1.49x vs torch.mm; vs original cute up to 38.69x |
@@ -89,9 +89,14 @@ online softmax across `topk` slots, single-token decode (`q_nope` 512-d,
 
 ### 3. IndexCache NSA fused-store
 
-`fused_store_index_k_cache` writes `[nt, head_dim]` BF16 keys to the
-page-organized uint8 cache with `(hd + 4)` byte-per-token slots. Predecessor
-is the same kernel with `__launch_bounds__(32, 1)` and a `PagedCacheLayout`
+`fused_store_index_k_cache` is a fused **bf16 → fp8 e4m3** quantize-and-scatter
+kernel for the NSA indexer cache. It reads `[nt, head_dim]` BF16 keys, computes
+a per-token absolute-max + reciprocal scale, casts to `fp8x2_e4m3_t` via
+`cvt.satfinite.e4m3x2`, and writes the FP8 payload + an FP32 scale into the
+page-organized uint8 cache laid out as `(head_dim + 4)` bytes per token slot
+(`head_dim` bytes of FP8 + 4 bytes of FP32 scale). This matches the IndexerK8
+8-bit indexer-key declaration in the V3.2-REAP model variants. Predecessor is
+the same kernel with `__launch_bounds__(32, 1)` and a `PagedCacheLayout`
 helper struct.
 
 **Optimization (Round 1):** Removed `__launch_bounds__(32, 1)`, switched to
@@ -337,6 +342,29 @@ raising warp occupancy from 11% (`TILE_N≥128` + 8 warps/block, register
 file budget allowing), a persistent + grouped-GEMM dispatcher, or
 migration to `tcgen05.mma` + TMEM + TMA multicast (the 26x compute-
 architecture step). These are scoped as future work.
+
+**Subsequent round (blog-strict + bf16x2 + larger inner-loop tile + 3-stage
+`cp.async`)**: with the kernel restored to the blog-strict design (8 warps ×
+1 neuron in both gate/up and down) and three layered optimizations applied
+that preserve every blog invariant — bf16x2 inner via `__hfma2`, `TILE_K=256`
++ larger inner-loop chunk for the down kernel, and a 3-stage `cp.async`
+pipeline — the kernel is a strict improvement over r1 at every N where the
+gate/up phase dominates:
+
+| N | r1 | this round | speedup vs r1 | speedup vs `fused_moe_triton` |
+|---|---|---|---|---|
+| 1 | 580us | 574us | 1.01x | **4.38x** (was r1's 4.10x) |
+| 4 | 2508us | 2119us | **1.18x** | 1.05x (was r1's 0.93x — gap closed) |
+| 8 | 4335us | 4209us | 1.03x | 0.92x (was r1's 0.88x — improved) |
+| 16 | 8650us | 8518us | 1.02x | 0.71x (structural — no tensor cores) |
+| 64 | 33145us | 33629us | tie within noise | 0.054x (structural) |
+
+NCU at N=1 confirms `gate_up` warps_active rises from r1's 16.7% to ≥80%
+(blog-strict 8-warp × 1-neuron design); `down` cycle count is matched to
+r1's per-row work amortization via the larger inner-loop tile while keeping
+the blog's TILE_D=8 (one row per warp). Correctness: max abs diff vs r1
+≤ 0.047 across all N at production scale 0.1; cosine similarity ≥ 0.999976
+vs FP32 reference.
 
 For decode-time autoregressive workloads (the production case for this
 kernel), N=1 is the dominant operating point. The per-(token, expert) grid

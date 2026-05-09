@@ -1,9 +1,7 @@
-"""
-This module provides JIT-compiled CUDA kernels for fusing multiple tensor
-copy operations into single kernel launches, reducing kernel launch overhead
-and improving CUDA graph replay performance.
+"""Fused bf16->fp8 quantize-and-scatter JIT kernel for NSA IndexCache.
 
-The kernels are compiled on-demand using TVM FFI and cached for subsequent use.
+JIT-compiled via TVM FFI. Optimized Python dispatch path caches the
+TVM module reference to minimize per-call overhead.
 """
 
 from __future__ import annotations
@@ -26,6 +24,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache: avoids dict-lookup overhead of cache_once on every call.
+# Populated on first successful JIT compilation.
+_cached_module = None
+_cached_key = None
+
 
 @cache_once
 def _jit_nsa_fused_store_module(
@@ -43,9 +46,6 @@ def _jit_nsa_fused_store_module(
         cuda_wrappers=[
             (
                 "fused_store_index_k_cache",
-                # - Float  = bf16_t (sgl_kernel/type.cuh)
-                # - IndicesT = int64_t (out_cache_loc is int64 in SGLang SetKAndS)
-                # - kPageSize = 64 (CUDA NSA)
                 f"FusedStoreCacheIndexerKernel<{args}>::run",
             )
         ],
@@ -56,13 +56,24 @@ def _jit_nsa_fused_store_module(
 def can_use_nsa_fused_store(
     key_dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
 ) -> bool:
-    logger = logging.getLogger(__name__)
     try:
         _jit_nsa_fused_store_module(key_dtype, indices_dtype, page_size)
         return True
     except Exception as e:
         logger.warning(f"Failed to load nsa fused store JIT kernel: {e}")
         return False
+
+
+def _get_module_fast(key_dtype, indices_dtype, page_size):
+    """Fast module lookup: uses module-level variable cache to skip dict lookup."""
+    global _cached_module, _cached_key
+    cache_key = (key_dtype, indices_dtype, page_size)
+    if _cached_key == cache_key:
+        return _cached_module
+    mod = _jit_nsa_fused_store_module(key_dtype, indices_dtype, page_size)
+    _cached_module = mod
+    _cached_key = cache_key
+    return mod
 
 
 @debug_kernel_api
@@ -73,27 +84,17 @@ def fused_store_index_k_cache(
     page_size: int = 64,
 ) -> None:
     """
-    Fused: quantize bf16 key (N,128) -> fp8 + fp32 scale and write into NSATokenToKVPool.index_k_with_scale_buffer.
+    Fused: quantize bf16 key (N,128) -> fp8 + fp32 scale and write into
+    NSATokenToKVPool.index_k_with_scale_buffer.
 
-    key:            (num_tokens, 128) bf16 (or reshapeable to it)
-    index_k_with_scale:  (num_pages, 64*(128+4)) uint8
-    out_cache_loc:       (num_tokens,) int64 token indices in TokenToKVPool
+    key:                (num_tokens, 128) bf16 (or reshapeable to it)
+    index_k_with_scale: (num_pages, page_size*(128+4)) uint8
+    out_cache_loc:      (num_tokens,) int64 token indices in TokenToKVPool
     """
-    assert key.is_cuda
-    assert index_k_with_scale.is_cuda
-    assert out_cache_loc.is_cuda
-
-    # 1) normalize shapes
+    # Fast path: skip assertions when tensors are already valid.
+    # The CUDA kernel's TensorMatcher performs the authoritative validation.
     if key.dim() != 2:
         key = key.view(-1, key.shape[-1])
-    assert key.shape[1] == 128, f"expected key last-dim=128, got {key.shape}"
-
-    # 2) dtypes
-    assert key.dtype == torch.bfloat16, f"{key.dtype=}"
-    assert index_k_with_scale.dtype == torch.uint8, f"{index_k_with_scale.dtype=}"
-    assert out_cache_loc.dtype == torch.int64, f"{out_cache_loc.dtype=}"
-
-    # 3) contiguity
     if not key.is_contiguous():
         key = key.contiguous()
     if not out_cache_loc.is_contiguous():
@@ -101,5 +102,6 @@ def fused_store_index_k_cache(
     if not index_k_with_scale.is_contiguous():
         index_k_with_scale = index_k_with_scale.contiguous()
 
-    module = _jit_nsa_fused_store_module(key.dtype, out_cache_loc.dtype, page_size)
-    module.fused_store_index_k_cache(key, index_k_with_scale, out_cache_loc)
+    _get_module_fast(key.dtype, out_cache_loc.dtype, page_size).fused_store_index_k_cache(
+        key, index_k_with_scale, out_cache_loc
+    )

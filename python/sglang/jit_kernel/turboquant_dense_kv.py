@@ -16,30 +16,31 @@ def _jit_turboquant_dense_kv_module() -> Module:
     return load_jit(
         "turboquant_dense_kv_dequant_4bit",
         cuda_files=["quantization/turboquant_dense_kv.cuh"],
+        extra_dependencies=["cutlass"],
         cuda_wrappers=[
             (
                 "dequantize_selected_4bit",
-                "TurboQuantDenseKVDequant4BitKernel::run",
+                "turboquant_detail::TurboQuantDenseKVDequant4BitKernel::run",
             ),
             (
                 "dequantize_selected_2p5",
-                "TurboQuantDenseKVDequant2p5BitKernel::run",
+                "turboquant_detail::TurboQuantDenseKVDequant2p5BitKernel::run",
             ),
             (
                 "dequantize_page_table_selected_2p5",
-                "TurboQuantDenseKVDequantPageTable2p5BitKernel::run",
+                "turboquant_detail::TurboQuantDenseKVDequantPageTable2p5BitKernel::run",
             ),
             (
                 "dequantize_page_table_selected_2p5_fp8",
-                "TurboQuantDenseKVDequantPageTable2p5BitFP8Kernel::run",
+                "turboquant_detail::TurboQuantDenseKVDequantPageTable2p5BitFP8Kernel::run",
             ),
             (
                 "dequantize_page_table_selected_2p5_fp8_reuse",
-                "TurboQuantDenseKVDequantPageTable2p5BitFP8ReuseKernel::run",
+                "turboquant_detail::TurboQuantDenseKVDequantPageTable2p5BitFP8ReuseKernel::run",
             ),
             (
                 "store_2p5",
-                "TurboQuantDenseKVStore2p5BitKernel::run",
+                "turboquant_detail::TurboQuantDenseKVStore2p5BitKernel::run",
             ),
         ],
     )

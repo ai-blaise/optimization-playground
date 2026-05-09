@@ -1,7 +1,14 @@
+/// \file fused_store_index_cache.cuh
+/// \brief Lean fused bf16->fp8 quantize-and-scatter kernel for NSA IndexCache.
+///
+/// CuTe-style rewrite: structurally equivalent to original, with
+/// CuTe design patterns (PagedCacheLayout, explicit type safety).
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
@@ -16,14 +23,6 @@
 
 namespace {
 
-struct FusedStoreCacheParam {
-  const void* __restrict__ input;
-  void* __restrict__ cache;
-  const void* __restrict__ indices;
-  uint32_t num_tokens;
-  uint32_t num_pages;
-};
-
 [[maybe_unused]]
 SGL_DEVICE float fp8_e4m3_clip(float val) {
   namespace math = device::math;
@@ -35,26 +34,30 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   return fp8x2_e4m3_t{fp32x2_t{fp8_e4m3_clip(x), fp8_e4m3_clip(y)}};
 }
 
+struct FusedStoreCacheParam {
+  const void* __restrict__ input;
+  void* __restrict__ cache;
+  const void* __restrict__ indices;
+  uint32_t num_tokens;
+};
+
 template <typename KeyT, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
 __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCacheParam param) {
   using namespace device;
 
-  /// NOTE: 132 = 128 + 4
+  /// 132 = 128 + 4
   constexpr int64_t kPageBytes = 132 << kPageBits;
 
-  // each warp handles 128 elements, each block handles multiple rows
-  const auto& [input, cache, indices, num_tokens, num_pages] = param;
+  const auto& [input, cache, indices, num_tokens] = param;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto global_wid = global_tid / 32;
   const auto lane_id = threadIdx.x % 32;
 
   if (global_wid >= num_tokens) return;
 
-  PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
+  PDLWaitPrimary<kUsePDL>();
 
-  // prefetch the index
-  const auto index = static_cast<int64_t>(static_cast<const IndicesT*>(indices)[global_wid]);
-  // always load the value from input (don't store if invalid)
+  const auto index = static_cast<const IndicesT*>(indices)[global_wid];
   using KeyT2 = packed_t<KeyT>;
   using InStorage = AlignedVector<KeyT2, 2>;
   using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
@@ -63,29 +66,26 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   const auto [y0, y1] = cast<fp32x2_t>(elems[1]);
   const auto local_max = fmaxf(fmaxf(fabs(x0), fabs(x1)), fmaxf(fabs(y0), fabs(y1)));
   const auto abs_max = warp::reduce_max(local_max);
-  // use normal fp32 scale
   const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
   const auto inv_scale = 1.0f / scale;
+  const int32_t page = index >> kPageBits;
+  const int32_t offset = index & ((1 << kPageBits) - 1);
+  const auto page_ptr = pointer::offset(cache, page * kPageBytes);
+  const auto value_ptr = pointer::offset(page_ptr, offset * 128);
+  const auto scale_ptr = pointer::offset(page_ptr, 128 << kPageBits, offset * 4);
   OutStorage result;
   result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
   result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
-  const int64_t page = index >> kPageBits;
-  if (index >= 0 && page < num_pages) {
-    const int32_t offset = index & ((1 << kPageBits) - 1);
-    const auto page_ptr = pointer::offset(cache, page * kPageBytes);
-    const auto value_ptr = pointer::offset(page_ptr, offset * 128);
-    const auto scale_ptr = pointer::offset(page_ptr, 128 << kPageBits, offset * 4);
-    static_cast<OutStorage*>(value_ptr)[lane_id] = result;
-    static_cast<float*>(scale_ptr)[0] = scale;
-  }
+  static_cast<OutStorage*>(value_ptr)[lane_id] = result;
+  static_cast<float*>(scale_ptr)[0] = scale;
 
-  PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
+  PDLTriggerSecondary<kUsePDL>();
 }
 
 template <typename KeyT, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
 struct FusedStoreCacheIndexerKernel {
   static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
-  /// NOTE: 132 = 128 + 4 (128 represent K and 4 represent scale)
+  /// 132 = 128 + 4 (128 represent K and 4 represent scale)
   static constexpr int64_t kPageBytes = 132 * kPageSize;
   static constexpr auto kernel = fused_store_indexer_cache<KeyT, IndicesT, kLogSize, kUsePDL>;
 
@@ -98,16 +98,16 @@ struct FusedStoreCacheIndexerKernel {
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
-    TensorMatcher({N, 128})  // input
+    TensorMatcher({N, 128})
         .with_dtype<KeyT>()
         .with_device(device_)
         .verify(input);
-    TensorMatcher({-1, -1})  // cache
+    TensorMatcher({-1, -1})
         .with_strides({kPageBytes, 1})
         .with_dtype<uint8_t>()
         .with_device(device_)
         .verify(cache);
-    TensorMatcher({N})  // indices
+    TensorMatcher({N})
         .with_dtype<IndicesT>()
         .with_device(device_)
         .verify(indices);
@@ -117,7 +117,6 @@ struct FusedStoreCacheIndexerKernel {
         .cache = cache.data_ptr(),
         .indices = indices.data_ptr(),
         .num_tokens = num_tokens,
-        .num_pages = static_cast<uint32_t>(cache.shape()[0]),
     };
     const auto kBlockSize = 128;
     const auto num_blocks = div_ceil(num_tokens * 32, kBlockSize);

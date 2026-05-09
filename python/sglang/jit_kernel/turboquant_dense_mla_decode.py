@@ -16,22 +16,23 @@ def _jit_turboquant_dense_mla_decode_module() -> Module:
     return load_jit(
         "turboquant_dense_mla_decode",
         cuda_files=["quantization/turboquant_dense_mla_decode.cuh"],
+        extra_dependencies=["cutlass"],
         cuda_wrappers=[
             (
                 "decode_2p5",
-                "TurboQuantDenseMLADecode2p5Kernel::run",
+                "turboquant_mla_detail::TurboQuantDenseMLADecode2p5Kernel::run",
             ),
             (
                 "decode_2p5_split",
-                "TurboQuantDenseMLADecode2p5SplitKernel::run",
+                "turboquant_mla_detail::TurboQuantDenseMLADecode2p5SplitKernel::run",
             ),
             (
                 "rotate_query",
-                "TurboQuantDenseMLARotateQueryKernel::run",
+                "turboquant_mla_detail::TurboQuantDenseMLARotateQueryKernel::run",
             ),
             (
                 "decode_2p5_split_rotated",
-                "TurboQuantDenseMLADecode2p5SplitRotatedKernel::run",
+                "turboquant_mla_detail::TurboQuantDenseMLADecode2p5SplitRotatedKernel::run",
             ),
         ],
     )

@@ -9,7 +9,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-namespace {
+namespace turboquant_mla_detail {
 
 constexpr int kLatentDim = 512;
 constexpr int kRopeDim = 64;
@@ -67,7 +67,57 @@ __device__ __forceinline__ float block_reduce_sum_128(float value, float* __rest
   return warp_sums[0];
 }
 
-__global__ void turboquant_dense_mla_decode_2p5_kernel(
+
+// Warp-shuffle FWHT for levels 0-4 (len=1,2,4,8,16 fit within a warp)
+__device__ __forceinline__ void fwht_warp_levels(float* __restrict__ smem, int tid) {
+  float val = smem[tid];
+#pragma unroll
+  for (int stride = 1; stride <= 16; stride <<= 1) {
+    float other = __shfl_xor_sync(0xffffffff, val, stride);
+    val = (tid & stride) ? (other - val) : (val + other);
+  }
+  smem[tid] = val;
+}
+
+// FWHT_4 across one thread's 4 register values (covers FWHT levels with
+// len=128 and len=256 of the 512-pt transform).
+__device__ __forceinline__ void fwht_register_top2(float& v0, float& v1, float& v2, float& v3) {
+  const float a = v0 + v1;
+  const float b = v0 - v1;
+  const float c = v2 + v3;
+  const float d = v2 - v3;
+  v0 = a + c;
+  v2 = a - c;
+  v1 = b + d;
+  v3 = b - d;
+}
+
+// Intra-warp FWHT_32 via shuffle (levels 0..4).
+__device__ __forceinline__ float fwht_lane_levels_under32(float val, int lane) {
+#pragma unroll
+  for (int stride = 1; stride <= 16; stride <<= 1) {
+    float other = __shfl_xor_sync(0xffffffff, val, stride);
+    val = (lane & stride) ? (other - val) : (val + other);
+  }
+  return val;
+}
+
+// 128-element FWHT (levels 0..6 of the 512-pt transform): warp-shuffle for
+// levels 0..4, smem exchange for levels 5..6.
+__device__ __forceinline__ float fwht_128elem(float val, int tid, float* __restrict__ smem128) {
+  val = fwht_lane_levels_under32(val, tid & 31);
+  smem128[tid] = val;
+  __syncthreads();
+  val = (tid & 32) ? (smem128[tid ^ 32] - val) : (val + smem128[tid ^ 32]);
+  __syncthreads();
+  smem128[tid] = val;
+  __syncthreads();
+  val = (tid & 64) ? (smem128[tid ^ 64] - val) : (val + smem128[tid ^ 64]);
+  return val;
+}
+
+__global__ void __launch_bounds__(128, 8)
+turboquant_dense_mla_decode_2p5_kernel(
     const bf16_t* __restrict__ q_nope,
     const bf16_t* __restrict__ q_rope,
     const uint8_t* __restrict__ compressed,
@@ -94,79 +144,98 @@ __global__ void turboquant_dense_mla_decode_2p5_kernel(
   const int tid = threadIdx.x;
   if (row >= num_rows || head >= num_heads) return;
 
-  __shared__ float q_rot[kLatentDim];
-  __shared__ float acc[kLatentDim];
-  __shared__ float score_latent[kLatentDim];
-  __shared__ float score_rope[kLatentDim];
-  __shared__ float softmax_state[4];
-
+  // Each thread owns 4 latent dims at indices g*128 + tid for g in 0..3.
   const bf16_t* q_nope_row = q_nope + row * q_nope_stride_0 + head * q_nope_stride_1;
-  q_rot[tid] = bf16_to_float(q_nope_row[tid]) * signs1[tid];
-  acc[tid] = 0.0f;
+  float v0 = bf16_to_float(q_nope_row[0 * 128 + tid]) * __ldg(&signs1[0 * 128 + tid]);
+  float v1 = bf16_to_float(q_nope_row[1 * 128 + tid]) * __ldg(&signs1[1 * 128 + tid]);
+  float v2 = bf16_to_float(q_nope_row[2 * 128 + tid]) * __ldg(&signs1[2 * 128 + tid]);
+  float v3 = bf16_to_float(q_nope_row[3 * 128 + tid]) * __ldg(&signs1[3 * 128 + tid]);
+
+  __shared__ float smem128[128];
+
+  // Forward FWHT_512 = FWHT_128 per group (cooperative) then FWHT_4 across groups.
+  v0 = fwht_128elem(v0, tid, smem128);
+  __syncthreads();
+  v1 = fwht_128elem(v1, tid, smem128);
+  __syncthreads();
+  v2 = fwht_128elem(v2, tid, smem128);
+  __syncthreads();
+  v3 = fwht_128elem(v3, tid, smem128);
+  __syncthreads();
+  fwht_register_top2(v0, v1, v2, v3);
+
+  const float s2_0 = __ldg(&signs2[0 * 128 + tid]);
+  const float s2_1 = __ldg(&signs2[1 * 128 + tid]);
+  const float s2_2 = __ldg(&signs2[2 * 128 + tid]);
+  const float s2_3 = __ldg(&signs2[3 * 128 + tid]);
+  v0 *= kInvSqrtLatentDim * s2_0;
+  v1 *= kInvSqrtLatentDim * s2_1;
+  v2 *= kInvSqrtLatentDim * s2_2;
+  v3 *= kInvSqrtLatentDim * s2_3;
+
+  float cent_high[8];
+  float cent_low[4];
+#pragma unroll
+  for (int i = 0; i < 8; i++) cent_high[i] = __ldg(&centroids_high[i]);
+#pragma unroll
+  for (int i = 0; i < 4; i++) cent_low[i] = __ldg(&centroids_low[i]);
+
+  const bf16_t* q_rope_row = q_rope + row * q_rope_stride_0 + head * q_rope_stride_1;
+  float q_rope_val = (tid < kRopeDim) ? bf16_to_float(q_rope_row[tid]) : 0.0f;
+
+  const int32_t* pages = page_table + row * page_table_stride_0;
+
+  __shared__ float softmax_state[4];
   if (tid == 0) {
     softmax_state[0] = kNegInf;
     softmax_state[1] = 0.0f;
   }
-  __syncthreads();
 
-#pragma unroll
-  for (int len = 1; len < kLatentDim; len <<= 1) {
-    const int wht_group = tid / (len << 1);
-    const int pos = tid & ((len << 1) - 1);
-    const int a = wht_group * (len << 1) + (pos & (len - 1));
-    const int b = a + len;
-    const float x = q_rot[a];
-    const float y = q_rot[b];
-    __syncthreads();
-    if (pos < len) {
-      q_rot[a] = x + y;
-      q_rot[b] = x - y;
-    }
-    __syncthreads();
-  }
-  q_rot[tid] = q_rot[tid] * kInvSqrtLatentDim * signs2[tid];
+  float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
   __syncthreads();
-
-  const bf16_t* q_rope_row = q_rope + row * q_rope_stride_0 + head * q_rope_stride_1;
-  const int32_t* pages = page_table + row * page_table_stride_0;
 
   for (int col = 0; col < topk; ++col) {
-    const int32_t page = pages[col];
+    const int32_t page = __ldg(&pages[col]);
     const bool valid = page >= 0;
     const uint8_t* slot = compressed + (valid ? static_cast<int64_t>(page) : 0) * compressed_stride_0;
 
-    const int group = tid >> 7;
-    const int channel = tid & 127;
-    const uint8_t* group_ptr = slot + group * 36;
-    float centroid;
-    if (channel < 32) {
-      centroid = centroids_high[unpack_3bit(group_ptr, channel)];
+    const uint8_t* g0p = slot;
+    const uint8_t* g1p = slot + 36;
+    const uint8_t* g2p = slot + 72;
+    const uint8_t* g3p = slot + 108;
+
+    float c0, c1, c2, c3;
+    if (tid < 32) {
+      c0 = cent_high[unpack_3bit(g0p, tid)];
+      c1 = cent_high[unpack_3bit(g1p, tid)];
+      c2 = cent_high[unpack_3bit(g2p, tid)];
+      c3 = cent_high[unpack_3bit(g3p, tid)];
     } else {
-      centroid = centroids_low[unpack_2bit(group_ptr + 12, channel - 32)];
+      c0 = cent_low[unpack_2bit(g0p + 12, tid - 32)];
+      c1 = cent_low[unpack_2bit(g1p + 12, tid - 32)];
+      c2 = cent_low[unpack_2bit(g2p + 12, tid - 32)];
+      c3 = cent_low[unpack_2bit(g3p + 12, tid - 32)];
     }
 
     const half norm_half = *reinterpret_cast<const half*>(slot + kPackedBytes2p5);
     const float norm = __half2float(norm_half);
-    score_latent[tid] = valid ? q_rot[tid] * centroid : 0.0f;
+
+    // Combined latent + rope dot product, one block reduction.
+    float val = valid ? (v0 * c0 + v1 * c1 + v2 * c2 + v3 * c3) * norm : 0.0f;
     if (tid < kRopeDim && valid) {
       const bf16_t* rope = reinterpret_cast<const bf16_t*>(slot + kPackedBytes2p5 + kNormBytes);
-      score_rope[tid] = bf16_to_float(q_rope_row[tid]) * bf16_to_float(rope[tid]);
-    } else {
-      score_rope[tid] = 0.0f;
+      val += q_rope_val * bf16_to_float(rope[tid]);
     }
+
+    float warp_sum = warp_reduce_sum(val);
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    __shared__ float warp_partials[4];
+    if (lane == 0) warp_partials[warp_id] = warp_sum;
     __syncthreads();
-
-#pragma unroll
-    for (int stride = 256; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        score_latent[tid] += score_latent[tid + stride];
-        score_rope[tid] += score_rope[tid + stride];
-      }
-      __syncthreads();
-    }
-
     if (tid == 0) {
-      const float score = valid ? (norm * score_latent[0] + score_rope[0]) * sm_scale : kNegInf;
+      float total = warp_partials[0] + warp_partials[1] + warp_partials[2] + warp_partials[3];
+      const float score = valid ? total * sm_scale : kNegInf;
       const float old_m = softmax_state[0];
       const float old_l = softmax_state[1];
       const float new_m = fmaxf(old_m, score);
@@ -179,32 +248,41 @@ __global__ void turboquant_dense_mla_decode_2p5_kernel(
     }
     __syncthreads();
 
-    acc[tid] = acc[tid] * softmax_state[2] + softmax_state[3] * norm * centroid;
-    __syncthreads();
+    const float alpha = softmax_state[2];
+    const float beta_norm = softmax_state[3] * norm;
+    acc0 = acc0 * alpha + beta_norm * c0;
+    acc1 = acc1 * alpha + beta_norm * c1;
+    acc2 = acc2 * alpha + beta_norm * c2;
+    acc3 = acc3 * alpha + beta_norm * c3;
   }
 
+  // NaN-safe rescue: match r2's pattern of denom>0?expr:0 applied to whole expression.
+  // This protects against any path that leaves acc{0..3} or denom as NaN/Inf
+  // (e.g. when input compressed bytes contain bf16 NaN encodings).
   const float denom = softmax_state[1];
-  q_rot[tid] = denom > 0.0f ? (acc[tid] / denom) * signs2[tid] : 0.0f;
+  const bool denom_ok = denom > 0.0f;
+  v0 = denom_ok ? (acc0 / denom) * s2_0 : 0.0f;
+  v1 = denom_ok ? (acc1 / denom) * s2_1 : 0.0f;
+  v2 = denom_ok ? (acc2 / denom) * s2_2 : 0.0f;
+  v3 = denom_ok ? (acc3 / denom) * s2_3 : 0.0f;
+
+  // Inverse FWHT_512 (FWHT is self-inverse up to scale; same factorization).
+  fwht_register_top2(v0, v1, v2, v3);
+  __syncthreads();
+  v0 = fwht_128elem(v0, tid, smem128);
+  __syncthreads();
+  v1 = fwht_128elem(v1, tid, smem128);
+  __syncthreads();
+  v2 = fwht_128elem(v2, tid, smem128);
+  __syncthreads();
+  v3 = fwht_128elem(v3, tid, smem128);
   __syncthreads();
 
-#pragma unroll
-  for (int len = 1; len < kLatentDim; len <<= 1) {
-    const int wht_group = tid / (len << 1);
-    const int pos = tid & ((len << 1) - 1);
-    const int a = wht_group * (len << 1) + (pos & (len - 1));
-    const int b = a + len;
-    const float x = q_rot[a];
-    const float y = q_rot[b];
-    __syncthreads();
-    if (pos < len) {
-      q_rot[a] = x + y;
-      q_rot[b] = x - y;
-    }
-    __syncthreads();
-  }
-
   bf16_t* out_row = out + row * out_stride_0 + head * out_stride_1;
-  out_row[tid] = __float2bfloat16(q_rot[tid] * kInvSqrtLatentDim * signs1[tid]);
+  out_row[0 * 128 + tid] = __float2bfloat16(v0 * kInvSqrtLatentDim * __ldg(&signs1[0 * 128 + tid]));
+  out_row[1 * 128 + tid] = __float2bfloat16(v1 * kInvSqrtLatentDim * __ldg(&signs1[1 * 128 + tid]));
+  out_row[2 * 128 + tid] = __float2bfloat16(v2 * kInvSqrtLatentDim * __ldg(&signs1[2 * 128 + tid]));
+  out_row[3 * 128 + tid] = __float2bfloat16(v3 * kInvSqrtLatentDim * __ldg(&signs1[3 * 128 + tid]));
 }
 
 __global__ void turboquant_dense_mla_decode_2p5_stage1_kernel(
@@ -243,8 +321,12 @@ __global__ void turboquant_dense_mla_decode_2p5_stage1_kernel(
   __shared__ float score_rope[kLatentDim];
   __shared__ float softmax_state[4];
 
+  const int lane = tid & 31;
+  const int warp_id = tid >> 5;
+
   const bf16_t* q_nope_row = q_nope + row * q_nope_stride_0 + head * q_nope_stride_1;
-  q_rot[tid] = bf16_to_float(q_nope_row[tid]) * signs1[tid];
+  const float s1_val = __ldg(&signs1[tid]);
+  q_rot[tid] = bf16_to_float(q_nope_row[tid]) * s1_val;
   acc[tid] = 0.0f;
   if (tid == 0) {
     softmax_state[0] = kNegInf;
@@ -252,8 +334,11 @@ __global__ void turboquant_dense_mla_decode_2p5_stage1_kernel(
   }
   __syncthreads();
 
+  fwht_warp_levels(q_rot, tid);
+  __syncthreads();
+
 #pragma unroll
-  for (int len = 1; len < kLatentDim; len <<= 1) {
+  for (int len = 32; len < kLatentDim; len <<= 1) {
     const int wht_group = tid / (len << 1);
     const int pos = tid & ((len << 1) - 1);
     const int a = wht_group * (len << 1) + (pos & (len - 1));
@@ -267,7 +352,7 @@ __global__ void turboquant_dense_mla_decode_2p5_stage1_kernel(
     }
     __syncthreads();
   }
-  q_rot[tid] = q_rot[tid] * kInvSqrtLatentDim * signs2[tid];
+  q_rot[tid] = q_rot[tid] * kInvSqrtLatentDim * __ldg(&signs2[tid]);
   __syncthreads();
 
   const int64_t chunk = (topk + num_splits - 1) / num_splits;
@@ -276,8 +361,20 @@ __global__ void turboquant_dense_mla_decode_2p5_stage1_kernel(
   const bf16_t* q_rope_row = q_rope + row * q_rope_stride_0 + head * q_rope_stride_1;
   const int32_t* pages = page_table + row * page_table_stride_0;
 
+  float cent_high[8];
+  float cent_low[4];
+#pragma unroll
+  for (int i = 0; i < 8; i++) cent_high[i] = __ldg(&centroids_high[i]);
+#pragma unroll
+  for (int i = 0; i < 4; i++) cent_low[i] = __ldg(&centroids_low[i]);
+
+  float q_rope_val = 0.0f;
+  if (tid < kRopeDim) {
+    q_rope_val = bf16_to_float(q_rope_row[tid]);
+  }
+
   for (int64_t col = begin; col < end; ++col) {
-    const int32_t page = pages[col];
+    const int32_t page = __ldg(&pages[col]);
     const bool valid = page >= 0;
     const uint8_t* slot = compressed + (valid ? static_cast<int64_t>(page) : 0) * compressed_stride_0;
 
@@ -286,33 +383,33 @@ __global__ void turboquant_dense_mla_decode_2p5_stage1_kernel(
     const uint8_t* group_ptr = slot + group * 36;
     float centroid;
     if (channel < 32) {
-      centroid = centroids_high[unpack_3bit(group_ptr, channel)];
+      centroid = cent_high[unpack_3bit(group_ptr, channel)];
     } else {
-      centroid = centroids_low[unpack_2bit(group_ptr + 12, channel - 32)];
+      centroid = cent_low[unpack_2bit(group_ptr + 12, channel - 32)];
     }
 
     const half norm_half = *reinterpret_cast<const half*>(slot + kPackedBytes2p5);
     const float norm = __half2float(norm_half);
-    score_latent[tid] = valid ? q_rot[tid] * centroid : 0.0f;
+
+    float val = valid ? norm * q_rot[tid] * centroid : 0.0f;
     if (tid < kRopeDim && valid) {
       const bf16_t* rope = reinterpret_cast<const bf16_t*>(slot + kPackedBytes2p5 + kNormBytes);
-      score_rope[tid] = bf16_to_float(q_rope_row[tid]) * bf16_to_float(rope[tid]);
-    } else {
-      score_rope[tid] = 0.0f;
+      val += q_rope_val * bf16_to_float(rope[tid]);
+    }
+
+    float warp_sum = warp_reduce_sum(val);
+    if (lane == 0) {
+      score_latent[warp_id] = warp_sum;
     }
     __syncthreads();
 
-#pragma unroll
-    for (int stride = 256; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        score_latent[tid] += score_latent[tid + stride];
-        score_rope[tid] += score_rope[tid + stride];
-      }
-      __syncthreads();
-    }
-
     if (tid == 0) {
-      const float score = valid ? (norm * score_latent[0] + score_rope[0]) * sm_scale : kNegInf;
+      float total = 0.0f;
+#pragma unroll
+      for (int w = 0; w < 16; w++) {
+        total += score_latent[w];
+      }
+      const float score = valid ? total * sm_scale : kNegInf;
       const float old_m = softmax_state[0];
       const float old_l = softmax_state[1];
       const float new_m = fmaxf(old_m, score);
@@ -326,7 +423,6 @@ __global__ void turboquant_dense_mla_decode_2p5_stage1_kernel(
     __syncthreads();
 
     acc[tid] = acc[tid] * softmax_state[2] + softmax_state[3] * norm * centroid;
-    __syncthreads();
   }
 
   float* mid_row = mid + row * mid_stride_0 + head * mid_stride_1 + split * mid_stride_2;
@@ -355,11 +451,14 @@ __global__ void turboquant_dense_mla_rotate_query_kernel(
 
   __shared__ float q_rot[kLatentDim];
   const bf16_t* q_nope_row = q_nope + row * q_nope_stride_0 + head * q_nope_stride_1;
-  q_rot[tid] = bf16_to_float(q_nope_row[tid]) * signs1[tid];
+  q_rot[tid] = bf16_to_float(q_nope_row[tid]) * __ldg(&signs1[tid]);
+  __syncthreads();
+
+  fwht_warp_levels(q_rot, tid);
   __syncthreads();
 
 #pragma unroll
-  for (int len = 1; len < kLatentDim; len <<= 1) {
+  for (int len = 32; len < kLatentDim; len <<= 1) {
     const int wht_group = tid / (len << 1);
     const int pos = tid & ((len << 1) - 1);
     const int a = wht_group * (len << 1) + (pos & (len - 1));
@@ -375,7 +474,7 @@ __global__ void turboquant_dense_mla_rotate_query_kernel(
   }
 
   float* out_row = q_rot_out + row * q_rot_stride_0 + head * q_rot_stride_1;
-  out_row[tid] = q_rot[tid] * kInvSqrtLatentDim * signs2[tid];
+  out_row[tid] = q_rot[tid] * kInvSqrtLatentDim * __ldg(&signs2[tid]);
 }
 
 __global__ void turboquant_dense_mla_decode_2p5_stage1_rotated_kernel(
@@ -425,8 +524,23 @@ __global__ void turboquant_dense_mla_decode_2p5_stage1_rotated_kernel(
   const bf16_t* q_rope_row = q_rope + row * q_rope_stride_0 + head * q_rope_stride_1;
   const int32_t* pages = page_table + row * page_table_stride_0;
 
+  const int lane = tid & 31;
+  const int warp_id = tid >> 5;
+
+  float cent_high[8];
+  float cent_low[4];
+#pragma unroll
+  for (int i = 0; i < 8; i++) cent_high[i] = __ldg(&centroids_high[i]);
+#pragma unroll
+  for (int i = 0; i < 4; i++) cent_low[i] = __ldg(&centroids_low[i]);
+
+  float q_rope_val = 0.0f;
+  if (tid < kRopeDim) {
+    q_rope_val = bf16_to_float(q_rope_row[tid]);
+  }
+
   for (int64_t col = begin; col < end; ++col) {
-    const int32_t page = pages[col];
+    const int32_t page = __ldg(&pages[col]);
     const bool valid = page >= 0;
     const uint8_t* slot = compressed + (valid ? static_cast<int64_t>(page) : 0) * compressed_stride_0;
 
@@ -435,33 +549,33 @@ __global__ void turboquant_dense_mla_decode_2p5_stage1_rotated_kernel(
     const uint8_t* group_ptr = slot + group * 36;
     float centroid;
     if (channel < 32) {
-      centroid = centroids_high[unpack_3bit(group_ptr, channel)];
+      centroid = cent_high[unpack_3bit(group_ptr, channel)];
     } else {
-      centroid = centroids_low[unpack_2bit(group_ptr + 12, channel - 32)];
+      centroid = cent_low[unpack_2bit(group_ptr + 12, channel - 32)];
     }
 
     const half norm_half = *reinterpret_cast<const half*>(slot + kPackedBytes2p5);
     const float norm = __half2float(norm_half);
-    score_latent[tid] = valid ? q_rot_row[tid] * centroid : 0.0f;
+
+    float val = valid ? norm * q_rot_row[tid] * centroid : 0.0f;
     if (tid < kRopeDim && valid) {
       const bf16_t* rope = reinterpret_cast<const bf16_t*>(slot + kPackedBytes2p5 + kNormBytes);
-      score_rope[tid] = bf16_to_float(q_rope_row[tid]) * bf16_to_float(rope[tid]);
-    } else {
-      score_rope[tid] = 0.0f;
+      val += q_rope_val * bf16_to_float(rope[tid]);
+    }
+
+    float warp_sum = warp_reduce_sum(val);
+    if (lane == 0) {
+      score_latent[warp_id] = warp_sum;
     }
     __syncthreads();
 
-#pragma unroll
-    for (int stride = 256; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        score_latent[tid] += score_latent[tid + stride];
-        score_rope[tid] += score_rope[tid + stride];
-      }
-      __syncthreads();
-    }
-
     if (tid == 0) {
-      const float score = valid ? (norm * score_latent[0] + score_rope[0]) * sm_scale : kNegInf;
+      float total = 0.0f;
+#pragma unroll
+      for (int w = 0; w < 16; w++) {
+        total += score_latent[w];
+      }
+      const float score = valid ? total * sm_scale : kNegInf;
       const float old_m = softmax_state[0];
       const float old_l = softmax_state[1];
       const float new_m = fmaxf(old_m, score);
@@ -475,7 +589,6 @@ __global__ void turboquant_dense_mla_decode_2p5_stage1_rotated_kernel(
     __syncthreads();
 
     acc[tid] = acc[tid] * softmax_state[2] + softmax_state[3] * norm * centroid;
-    __syncthreads();
   }
 
   float* mid_row = mid + row * mid_stride_0 + head * mid_stride_1 + split * mid_stride_2;
@@ -657,11 +770,11 @@ __global__ void turboquant_dense_mla_decode_2p5_stage2_kernel(
   }
   __syncthreads();
 
-  buf[tid] = state[0] > 0.0f ? (value / state[0]) * signs2[tid] : 0.0f;
+  buf[tid] = state[0] > 0.0f ? (value / state[0]) * __ldg(&signs2[tid]) : 0.0f;
   __syncthreads();
 
 #pragma unroll
-  for (int len = 1; len < kLatentDim; len <<= 1) {
+  for (int len = 32; len < kLatentDim; len <<= 1) {
     const int wht_group = tid / (len << 1);
     const int pos = tid & ((len << 1) - 1);
     const int a = wht_group * (len << 1) + (pos & (len - 1));
@@ -676,8 +789,11 @@ __global__ void turboquant_dense_mla_decode_2p5_stage2_kernel(
     __syncthreads();
   }
 
+  fwht_warp_levels(buf, tid);
+  __syncthreads();
+
   bf16_t* out_row = out + row * out_stride_0 + head * out_stride_1;
-  out_row[tid] = __float2bfloat16(buf[tid] * kInvSqrtLatentDim * signs1[tid]);
+  out_row[tid] = __float2bfloat16(buf[tid] * kInvSqrtLatentDim * __ldg(&signs1[tid]));
 }
 
 struct TurboQuantDenseMLADecode2p5Kernel {
@@ -742,7 +858,7 @@ struct TurboQuantDenseMLADecode2p5Kernel {
     if (R.unwrap() == 0 || H.unwrap() == 0 || K.unwrap() == 0) return;
 
     dim3 grid(R.unwrap(), H.unwrap());
-    LaunchKernel(grid, kLatentDim, device.unwrap())(
+    LaunchKernel(grid, 128, device.unwrap())(
         turboquant_dense_mla_decode_2p5_kernel,
         static_cast<const bf16_t*>(q_nope.data_ptr()),
         static_cast<const bf16_t*>(q_rope.data_ptr()),
@@ -1041,4 +1157,4 @@ struct TurboQuantDenseMLADecode2p5SplitRotatedKernel {
   }
 };
 
-}  // namespace
+}  // namespace turboquant_mla_detail

@@ -153,6 +153,63 @@ class WarpDecodeRunnerCore(MoeRunnerCore):
     def runner_backend(self) -> MoeRunnerBackend:
         return MoeRunnerBackend.WARP_DECODE
 
+    def run_from_dispatch(
+        self,
+        dispatch_output: Any,
+        quant_info: MoeQuantInfo,
+        config: MoeRunnerConfig,
+        hooks: Optional[Any] = None,
+    ) -> Any:
+        """Direct dispatch path — bypasses pre/post permute.
+
+        Warp decode doesn't need token scatter/gather because each
+        program owns one output scalar. This method lets the MoeRunner
+        skip the permute pipeline entirely.
+        """
+        from sglang.srt.layers.moe.warp_decode.kernels import warp_decode_moe_packed
+
+        hidden_states = dispatch_output.hidden_states
+        topk_ids = dispatch_output.topk_output.topk_ids
+        topk_weights = dispatch_output.topk_output.topk_weights
+        num_tokens = hidden_states.shape[0]
+
+        if num_tokens > self._max_batch and self.fallback_runner is not None:
+            return None
+
+        if not hasattr(self, "_quant_w13"):
+            self._quant_w13 = getattr(quant_info, "w13_weight", None)
+            self._quant_w2 = getattr(quant_info, "w2_weight", None)
+            self._intermediate = getattr(
+                quant_info, "intermediate_size_per_partition",
+                config.intermediate_size_per_partition,
+            )
+
+        w13 = self._quant_w13 or getattr(quant_info, "w13_weight", None)
+        w2 = self._quant_w2 or getattr(quant_info, "w2_weight", None)
+        intermediate = self._intermediate or config.intermediate_size_per_partition
+
+        if w13 is None or w2 is None:
+            if self.fallback_runner is not None:
+                return None
+            raise RuntimeError("Warp decode requires w13/w2 weights in quant_info")
+
+        output = warp_decode_moe_packed(
+            hidden_states=hidden_states,
+            w13=w13,
+            w2=w2,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            intermediate_size=intermediate,
+            inplace=False,
+        )
+
+        from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
+        return CombineInput(
+            hidden_states=output,
+            topk_output=dispatch_output.topk_output,
+            format=dispatch_output.format,
+        )
+
     def run(
         self,
         runner_input: RunnerInput,
@@ -168,7 +225,6 @@ class WarpDecodeRunnerCore(MoeRunnerCore):
         from sglang.srt.layers.moe.warp_decode.kernels import warp_decode_moe_packed
 
         if not isinstance(runner_input, WarpDecodeRunnerInput):
-            # Fallback for non-warp-decode inputs
             if self.fallback_runner is not None:
                 return self.fallback_runner.run(
                     runner_input, quant_info, running_state, hooks
@@ -181,15 +237,11 @@ class WarpDecodeRunnerCore(MoeRunnerCore):
 
         num_tokens = runner_input.hidden_states.shape[0]
 
-        # Fall back for large batches
         if num_tokens > self._max_batch and self.fallback_runner is not None:
             return self.fallback_runner.run(
                 runner_input, quant_info, running_state, hooks
             )
 
-        # Adjust expert IDs for expert parallelism
-        # When EP is active, expert IDs are global but weights are local.
-        # We need to offset the expert IDs by local_expert_offset.
         topk_ids = runner_input.topk_ids
         if quant_info.local_expert_offset > 0:
             topk_ids = topk_ids - quant_info.local_expert_offset

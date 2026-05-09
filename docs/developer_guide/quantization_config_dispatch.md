@@ -69,23 +69,55 @@ checkpoint expects the IndexerK8 FP8 fused-store path:
 
 Effect on `server_args`:
 
-| Field                 | Mutation                                              |
-|-----------------------|-------------------------------------------------------|
-| `quant_method`        | If `"fp8_e4m3"`, the dict is recorded on `server_args.indexer_quantization_declared`. |
+| Field            | Mutation                                              |
+|------------------|-------------------------------------------------------|
+| `quant_method`   | If `"fp8_e4m3"` or `"disabled"`, the dict is recorded on `server_args.indexer_quantization_declared`. |
 
-The runtime fused-store dispatch in
-`python/sglang/srt/layers/attention/nsa/nsa_indexer.py` selects the FP8
-path based on the indexer key tensor dtype. The
-`indexer_quantization_declared` attribute is a declarative metadata
-record: it documents that the model intends FP8 indexer keys and is
-available to startup checks and logging without forcing a kernel
-override.
+Effect at runtime: the fused-store dispatch in
+`python/sglang/srt/layers/attention/nsa/nsa_indexer.py` calls
+`should_use_nsa_fused_store(server_args, key.dtype, indices.dtype,
+page_size, ...)`. That helper consults
+`server_args.indexer_quantization_declared` and:
 
-Other `quant_method` values (e.g. `"int4"`) are ignored.
+* `quant_method == "fp8_e4m3"` forces the FP8 fused-store path. If the
+  kernel's compatibility check fails for the runtime tensor shapes the
+  helper raises `RuntimeError` rather than silently falling back, so
+  the mismatch surfaces loudly.
+* `quant_method == "disabled"` forces the fallback path even if the
+  dtypes are compatible. Useful for A/B comparisons or for disabling
+  the fused store on a specific deployment without rebuilding the
+  checkpoint.
+* Field absent (`indexer_quantization_declared is None`): the helper
+  falls through to the historical platform/dtype auto-detection
+  (`_is_cuda and not _is_fp8_fnuz and can_use_nsa_fused_store(...)`).
+  Backward-compatible — zero behavior change for stock checkpoints.
+
+Other `quant_method` values (e.g. `"int4"`) are ignored at config-load
+time.
+
+#### How to force-disable IndexCache FP8
+
+Add to the model's `config.json`:
+
+```json
+{
+  "quantization_config": {
+    "indexer_quantization": {
+      "quant_method": "disabled"
+    }
+  }
+}
+```
+
+The runtime always takes the fallback `act_quant` path even if every
+other auto-detection signal is positive.
 
 ## Precedence
 
-CLI flags always take precedence:
+CLI flags always take precedence; `quantization_config` fields fill in
+when no CLI override is supplied.
+
+For TurboQuant 2.5-bit dense KV:
 
 1. If the operator passes `--enable-turboquant-dense-kv-cache`, the flag
    is already `True` before the dispatcher runs and the dispatcher's
@@ -96,6 +128,14 @@ CLI flags always take precedence:
    dispatcher does not overwrite it.
 3. Absent CLI flags, the config field promotes the corresponding
    `server_args` value.
+
+For the IndexCache FP8 fused-store dispatch (high to low):
+
+1. CLI flag (none today; reserved for a future
+   `--nsa-fused-store-mode={force,disable,auto}` knob).
+2. `quantization_config.indexer_quantization.quant_method`:
+   `"fp8_e4m3"` → force fused-store; `"disabled"` → force fallback.
+3. Auto-detection by platform and `can_use_nsa_fused_store(...)`.
 
 This matches the precedence pattern used elsewhere in `server_args.py`
 (e.g. `nsa_prefill_backend`, `nsa_decode_backend`).
@@ -134,6 +174,14 @@ runtime kernel dispatch).
   back cleanly.
 - The two fields compose (a config with both set in the same
   `quantization_config`).
+- `should_use_nsa_fused_store`:
+  - With no declaration, behavior matches the auto-detect path
+    (regression guard for backward compatibility).
+  - Declared `fp8_e4m3` + compatible runtime shapes → forces the
+    fused-store path.
+  - Declared `fp8_e4m3` + incompatible shapes → raises `RuntimeError`.
+  - Declared `disabled` + compatible shapes → forces the fallback.
+  - Unrecognized declared method → falls through to auto-detection.
 
 ## Adding a new dispatch field
 

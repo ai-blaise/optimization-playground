@@ -222,6 +222,178 @@ def test_both_fields_compose():
     }
 
 
+def test_indexer_quantization_disabled_records_declaration():
+    """A ``disabled`` declaration is recorded (used to force the fallback)."""
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "indexer_quantization": {"quant_method": "disabled"},
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.indexer_quantization_declared == {"quant_method": "disabled"}
+
+
+# ---------------------------------------------------------------------------
+# Tests for ``should_use_nsa_fused_store`` — the runtime gate that the
+# fused-store dispatch site in ``nsa_indexer.py`` consults.
+# ---------------------------------------------------------------------------
+
+
+class _FakeDtype:
+    """Stand-in for ``torch.dtype`` so the helper tests don't need torch."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __repr__(self) -> str:
+        return f"FakeDtype({self.name!r})"
+
+
+def _always_compatible(*_args, **_kwargs) -> bool:
+    return True
+
+
+def _never_compatible(*_args, **_kwargs) -> bool:
+    return False
+
+
+def test_should_use_fused_store_no_declaration_matches_auto_detect():
+    """No declaration → behavior is identical to current auto-detect (regression guard)."""
+    server_args = FakeServerArgs()  # indexer_quantization_declared is None
+
+    # Auto-detect says yes AND platform OK → use fused store.
+    assert (
+        dispatcher.should_use_nsa_fused_store(
+            server_args,
+            _FakeDtype("bfloat16"),
+            _FakeDtype("int64"),
+            page_size=64,
+            auto_compat_check=_always_compatible,
+            auto_platform_ok=True,
+        )
+        is True
+    )
+
+    # Auto-detect says yes BUT platform not OK → fallback.
+    assert (
+        dispatcher.should_use_nsa_fused_store(
+            server_args,
+            _FakeDtype("bfloat16"),
+            _FakeDtype("int64"),
+            page_size=64,
+            auto_compat_check=_always_compatible,
+            auto_platform_ok=False,
+        )
+        is False
+    )
+
+    # Auto-detect says no → fallback.
+    assert (
+        dispatcher.should_use_nsa_fused_store(
+            server_args,
+            _FakeDtype("bfloat16"),
+            _FakeDtype("int64"),
+            page_size=64,
+            auto_compat_check=_never_compatible,
+            auto_platform_ok=True,
+        )
+        is False
+    )
+
+
+def test_should_use_fused_store_declared_fp8_compatible_forces_path():
+    server_args = FakeServerArgs(
+        indexer_quantization_declared={"quant_method": "fp8_e4m3"}
+    )
+    # Even if platform auto-flag is False, declaration forces FP8 path
+    # provided the kernel compat check accepts the runtime shapes.
+    assert (
+        dispatcher.should_use_nsa_fused_store(
+            server_args,
+            _FakeDtype("bfloat16"),
+            _FakeDtype("int64"),
+            page_size=64,
+            auto_compat_check=_always_compatible,
+            auto_platform_ok=False,
+        )
+        is True
+    )
+
+
+def test_should_use_fused_store_declared_fp8_incompatible_raises():
+    server_args = FakeServerArgs(
+        indexer_quantization_declared={"quant_method": "fp8_e4m3"}
+    )
+    try:
+        dispatcher.should_use_nsa_fused_store(
+            server_args,
+            _FakeDtype("float32"),
+            _FakeDtype("int64"),
+            page_size=128,
+            auto_compat_check=_never_compatible,
+            auto_platform_ok=True,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "fp8_e4m3" in message
+        assert "FakeDtype('float32')" in message
+        assert "page_size=128" in message
+    else:
+        raise AssertionError(
+            "should_use_nsa_fused_store should raise when declared fp8_e4m3 is "
+            "incompatible with the runtime tensor shapes."
+        )
+
+
+def test_should_use_fused_store_declared_disabled_forces_fallback():
+    server_args = FakeServerArgs(
+        indexer_quantization_declared={"quant_method": "disabled"}
+    )
+    # Even if auto-detect would happily pick the fused path, the
+    # declaration forces fallback.
+    assert (
+        dispatcher.should_use_nsa_fused_store(
+            server_args,
+            _FakeDtype("bfloat16"),
+            _FakeDtype("int64"),
+            page_size=64,
+            auto_compat_check=_always_compatible,
+            auto_platform_ok=True,
+        )
+        is False
+    )
+
+
+def test_should_use_fused_store_unknown_declared_method_falls_through():
+    """An unrecognized declared method falls back to auto-detection."""
+    server_args = FakeServerArgs(
+        indexer_quantization_declared={"quant_method": "future_kernel_v2"}
+    )
+    assert (
+        dispatcher.should_use_nsa_fused_store(
+            server_args,
+            _FakeDtype("bfloat16"),
+            _FakeDtype("int64"),
+            page_size=64,
+            auto_compat_check=_always_compatible,
+            auto_platform_ok=True,
+        )
+        is True
+    )
+    assert (
+        dispatcher.should_use_nsa_fused_store(
+            server_args,
+            _FakeDtype("bfloat16"),
+            _FakeDtype("int64"),
+            page_size=64,
+            auto_compat_check=_never_compatible,
+            auto_platform_ok=True,
+        )
+        is False
+    )
+
+
 if __name__ == "__main__":
     import pytest
 

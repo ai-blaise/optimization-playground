@@ -15,9 +15,10 @@ Two fields are recognized:
 
 2. ``indexer_quantization``: a new top-level dict; when
    ``quant_method == "fp8_e4m3"``, the declaration is recorded on
-   ``server_args.indexer_quantization_declared`` so downstream code can
-   assert that the FP8 fused-store dispatch in ``nsa_indexer.py`` is
-   actually selected at runtime.
+   ``server_args.indexer_quantization_declared``. The runtime fused-store
+   dispatch in ``nsa_indexer.py`` consults this attribute via
+   ``should_use_nsa_fused_store`` so the field actively gates the FP8
+   path rather than only documenting intent.
 
 CLI flags take precedence: if the operator already passed
 ``--enable-turboquant-dense-kv-cache`` (i.e. the flag is ``True``) the
@@ -32,7 +33,7 @@ that an unfamiliar checkpoint loads cleanly on a stock SGLang build.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from sglang.srt.layers.quantization.turboquant_dense_kv import (
     TURBOQUANT_DENSE_KV_PRESETS,
@@ -41,6 +42,7 @@ from sglang.srt.layers.quantization.turboquant_dense_kv import (
 logger = logging.getLogger(__name__)
 
 INDEXER_FP8_QUANT_METHOD = "fp8_e4m3"
+INDEXER_DISABLED_QUANT_METHOD = "disabled"
 TURBOQUANT_DENSE_QUANT_METHOD = "turboquant_dense"
 DEFAULT_TURBOQUANT_DENSE_KV_PRESET = "latent_2p5bit_nc"
 
@@ -103,19 +105,21 @@ def _maybe_apply_indexer_quantization(
     indexer_quant = _coerce_dict(quant_cfg.get("indexer_quantization"))
     if indexer_quant is None:
         return
-    if indexer_quant.get("quant_method") != INDEXER_FP8_QUANT_METHOD:
+    method = indexer_quant.get("quant_method")
+    if method not in (INDEXER_FP8_QUANT_METHOD, INDEXER_DISABLED_QUANT_METHOD):
         logger.info(
             "quantization_config.indexer_quantization.quant_method=%r is "
             "not supported by the IndexerK8 FP8 fused-store path; "
             "ignoring config-side dispatch.",
-            indexer_quant.get("quant_method"),
+            method,
         )
         return
 
     server_args.indexer_quantization_declared = dict(indexer_quant)
     logger.info(
-        "Recording IndexerK8 FP8 declaration from quantization_config "
-        "(indexer_quantization.quant_method=fp8_e4m3)."
+        "Recording indexer_quantization declaration from quantization_config "
+        "(indexer_quantization.quant_method=%s).",
+        method,
     )
 
 
@@ -132,3 +136,59 @@ def apply_quantization_config_dispatch(
         return
     _maybe_apply_turboquant_dense(server_args, quant_cfg)
     _maybe_apply_indexer_quantization(server_args, quant_cfg)
+
+
+def should_use_nsa_fused_store(
+    server_args: Any,
+    key_dtype: Any,
+    indices_dtype: Any,
+    page_size: int,
+    *,
+    auto_compat_check: Callable[..., bool],
+    auto_platform_ok: bool = True,
+) -> bool:
+    """Decide whether to dispatch to the NSA IndexCache FP8 fused-store kernel.
+
+    Precedence (high to low):
+
+    1. ``server_args.indexer_quantization_declared`` (set by
+       ``apply_quantization_config_dispatch`` from
+       ``quantization_config.indexer_quantization``):
+
+       * ``quant_method == "fp8_e4m3"`` forces the fused-store path. If
+         the kernel compatibility check (``auto_compat_check``) reports
+         the dtypes/page_size cannot be served, this raises
+         ``RuntimeError`` rather than silently falling back, so the
+         mismatch surfaces loudly.
+       * ``quant_method == "disabled"`` forces the fallback path even if
+         the dtypes are compatible.
+       * Any other recorded value is left to auto-detection (the
+         dispatcher already filters unsupported methods at config-load
+         time).
+
+    2. Auto-detection: ``auto_platform_ok and auto_compat_check(...)``.
+       This preserves the historical behavior when no declaration is
+       present (backward-compatible, zero behavioral change).
+
+    A future CLI flag for force-enable/disable would slot above (1)
+    here without disturbing the rest of the precedence chain.
+    """
+    declared = getattr(server_args, "indexer_quantization_declared", None)
+    if isinstance(declared, dict):
+        method = declared.get("quant_method")
+        if method == INDEXER_FP8_QUANT_METHOD:
+            if not auto_compat_check(key_dtype, indices_dtype, page_size):
+                raise RuntimeError(
+                    "quantization_config.indexer_quantization declared "
+                    f"quant_method={INDEXER_FP8_QUANT_METHOD!r} but the NSA "
+                    "fused-store kernel rejected the runtime tensor shapes "
+                    f"(key_dtype={key_dtype}, indices_dtype={indices_dtype}, "
+                    f"page_size={page_size}). Either remove the declaration "
+                    "or fix the tensor layout."
+                )
+            return True
+        if method == INDEXER_DISABLED_QUANT_METHOD:
+            return False
+    return auto_platform_ok and auto_compat_check(
+        key_dtype, indices_dtype, page_size
+    )

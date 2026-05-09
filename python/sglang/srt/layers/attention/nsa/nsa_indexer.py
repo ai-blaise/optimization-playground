@@ -19,6 +19,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.layers.quantization.quantization_config_dispatch import (
+    should_use_nsa_fused_store,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -1531,15 +1534,17 @@ class Indexer(MultiPlatformOp):
             pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return
 
-        # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
-        if (
-            _is_cuda
-            and (not _is_fp8_fnuz)
-            and can_use_nsa_fused_store(
-                key.dtype,
-                forward_batch.out_cache_loc.dtype,
-                forward_batch.token_to_kv_pool.page_size,
-            )
+        # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz).
+        # Gated by ``quantization_config.indexer_quantization`` when the
+        # checkpoint declares one (see should_use_nsa_fused_store);
+        # otherwise falls back to the historical platform/dtype auto-detect.
+        if should_use_nsa_fused_store(
+            get_global_server_args(),
+            key.dtype,
+            forward_batch.out_cache_loc.dtype,
+            forward_batch.token_to_kv_pool.page_size,
+            auto_compat_check=can_use_nsa_fused_store,
+            auto_platform_ok=_is_cuda and (not _is_fp8_fnuz),
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
             buf = pool.get_local_index_k_with_scale_buffer(layer_id=layer_id)

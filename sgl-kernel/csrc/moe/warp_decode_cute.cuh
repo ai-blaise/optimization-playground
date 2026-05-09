@@ -75,6 +75,11 @@ struct GateUpTileConfig {
   static constexpr int SMEM_PER_STAGE = SMEM_X_BYTES + 2 * SMEM_W_BYTES;
   static constexpr int NUM_STAGES = 2;  // double-buffer
   static constexpr int TOTAL_SMEM = SMEM_PER_STAGE * NUM_STAGES;
+
+  // Verify SMEM fits within B200's 232 KB budget (237568 bytes).
+  // Gate/Up: 2 * (128 + 2*32*128) * 2 = 2 * 8320 * 2 = 33280 bytes
+  static_assert(TOTAL_SMEM <= 232 * 1024,
+      "GateUpTileConfig SMEM exceeds B200 232KB budget");
 };
 
 // Down kernel tile sizes
@@ -95,6 +100,10 @@ struct DownTileConfig {
   static constexpr int SMEM_PER_STAGE = SMEM_INTER_BYTES + SMEM_W_BYTES;
   static constexpr int NUM_STAGES = 2;
   static constexpr int TOTAL_SMEM = SMEM_PER_STAGE * NUM_STAGES;
+
+  // Down: 2 * (128 + 32*128) * 2 = 2 * 4224 * 2 = 16896 bytes
+  static_assert(TOTAL_SMEM <= 232 * 1024,
+      "DownTileConfig SMEM exceeds B200 232KB budget");
 };
 
 // NVFP4 dequantization helpers
@@ -271,13 +280,16 @@ warp_decode_gate_up_cute_kernel(
         u_local += uv * xv;
       }
 
-      // Warp-level reduction
+      // Warp-level butterfly reduction (shfl_xor is the canonical
+      // butterfly pattern and compiles to PTX shfl.sync.bfly)
       #pragma unroll
       for (int offset = 16; offset > 0; offset >>= 1) {
-        g_local += __shfl_down_sync(0xFFFFFFFF, g_local, offset);
-        u_local += __shfl_down_sync(0xFFFFFFFF, u_local, offset);
+        g_local += __shfl_xor_sync(0xFFFFFFFF, g_local, offset);
+        u_local += __shfl_xor_sync(0xFFFFFFFF, u_local, offset);
       }
 
+      // After butterfly reduction every lane holds the full sum,
+      // but only lane 0 accumulates to avoid redundant work.
       if (lane_id == 0) {
         gate_acc[r] += g_local;
         up_acc[r] += u_local;
@@ -438,10 +450,11 @@ warp_decode_gate_up_packed_cute_kernel(
         u_local += uv * xv;
       }
 
+      // Butterfly reduction (shfl_xor compiles to PTX shfl.sync.bfly)
       #pragma unroll
       for (int offset = 16; offset > 0; offset >>= 1) {
-        g_local += __shfl_down_sync(0xFFFFFFFF, g_local, offset);
-        u_local += __shfl_down_sync(0xFFFFFFFF, u_local, offset);
+        g_local += __shfl_xor_sync(0xFFFFFFFF, g_local, offset);
+        u_local += __shfl_xor_sync(0xFFFFFFFF, u_local, offset);
       }
 
       if (lane_id == 0) {
@@ -590,10 +603,10 @@ warp_decode_down_cute_kernel(
           local_sum += wv * iv;
         }
 
-        // Warp reduction
+        // Butterfly reduction (shfl_xor -> PTX shfl.sync.bfly)
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-          local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+          local_sum += __shfl_xor_sync(0xFFFFFFFF, local_sum, offset);
         }
 
         if (lane_id == 0) {
@@ -795,10 +808,10 @@ warp_decode_down_fp4_cute_kernel(
           local_sum += wv * iv;
         }
 
-        // Warp reduction
+        // Butterfly reduction (shfl_xor -> PTX shfl.sync.bfly)
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-          local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+          local_sum += __shfl_xor_sync(0xFFFFFFFF, local_sum, offset);
         }
 
         if (lane_id == 0) {

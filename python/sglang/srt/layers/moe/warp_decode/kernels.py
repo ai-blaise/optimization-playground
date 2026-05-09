@@ -513,10 +513,12 @@ def _warp_decode_down_fp4_kernel(
                 other=0.0,
             ).to(tl.float32)
 
-            # For NVFP4: packed bytes at intermediate_size // 2 columns
-            # Each byte = 2 FP4 values. We load the byte and unpack.
-            # For simplicity in BF16 path, we just load BF16 weights directly.
-            # The FP4 dequant path would go here for NVFP4 models.
+            # NVFP4 dequantization stub -- the Triton FP4 kernel is not yet
+            # implemented.  The CuTe CUDA path in warp_decode_cute.cuh
+            # provides full NVFP4 support via the nvfp4_dequant LUT.
+            # For now, fall through to the BF16 weight load path so the
+            # kernel at least works when called with bf16-cast weights.
+            # TODO(warp-decode): implement Triton NVFP4 unpack/dequant
             w_down_vals = tl.load(
                 w_down_ptr
                 + expert_id * w_down_stride_e
@@ -636,6 +638,21 @@ def warp_decode_moe(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
+    # Input validation
+    assert hidden_states.ndim == 2, f"hidden_states must be 2D, got {hidden_states.ndim}D"
+    assert hidden_states.is_cuda, "hidden_states must be on CUDA"
+    assert hidden_states.dtype == torch.bfloat16, (
+        f"hidden_states must be bfloat16, got {hidden_states.dtype}"
+    )
+
+    num_tokens, hidden_size = hidden_states.shape
+
+    # Edge case: zero tokens returns empty output
+    if num_tokens == 0:
+        if inplace:
+            return hidden_states
+        return torch.empty_like(hidden_states)
+
     # CuTe dispatch
     if _should_use_cute():
         return sgl_kernel.warp_decode_cute_moe_forward(
@@ -643,16 +660,9 @@ def warp_decode_moe(
             topk_ids, topk_weights, inplace,
         )
 
-    # Input validation
-    assert hidden_states.ndim == 2, f"hidden_states must be 2D, got {hidden_states.ndim}D"
-    assert hidden_states.dtype == torch.bfloat16, (
-        f"hidden_states must be bfloat16, got {hidden_states.dtype}"
-    )
     assert w_gate.dtype == torch.bfloat16, f"w_gate must be bfloat16, got {w_gate.dtype}"
     assert w_up.dtype == torch.bfloat16, f"w_up must be bfloat16, got {w_up.dtype}"
     assert w_down.dtype == torch.bfloat16, f"w_down must be bfloat16, got {w_down.dtype}"
-
-    num_tokens, hidden_size = hidden_states.shape
     num_experts, intermediate_size, w_k = w_gate.shape
     top_k = topk_ids.shape[1]
 
@@ -787,6 +797,21 @@ def warp_decode_moe_packed(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
+    # Input validation
+    assert hidden_states.ndim == 2, f"hidden_states must be 2D, got {hidden_states.ndim}D"
+    assert hidden_states.is_cuda, "hidden_states must be on CUDA"
+    assert hidden_states.dtype == torch.bfloat16, (
+        f"hidden_states must be bfloat16, got {hidden_states.dtype}"
+    )
+
+    num_tokens, hidden_size = hidden_states.shape
+
+    # Edge case: zero tokens returns empty output
+    if num_tokens == 0:
+        if inplace:
+            return hidden_states
+        return torch.empty_like(hidden_states)
+
     # CuTe dispatch
     if _should_use_cute():
         isize = intermediate_size if intermediate_size is not None else (w13.shape[1] // 2)
@@ -796,15 +821,9 @@ def warp_decode_moe_packed(
             isize, inplace,
         )
 
-    # Input validation
-    assert hidden_states.ndim == 2, f"hidden_states must be 2D, got {hidden_states.ndim}D"
-    assert hidden_states.dtype == torch.bfloat16, (
-        f"hidden_states must be bfloat16, got {hidden_states.dtype}"
-    )
     assert w13.dtype == torch.bfloat16, f"w13 must be bfloat16, got {w13.dtype}"
     assert w2.dtype == torch.bfloat16, f"w2 must be bfloat16, got {w2.dtype}"
 
-    num_tokens, hidden_size = hidden_states.shape
     if intermediate_size is None:
         intermediate_size = w13.shape[1] // 2
     top_k = topk_ids.shape[1]

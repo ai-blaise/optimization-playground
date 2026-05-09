@@ -98,11 +98,19 @@ def maybe_warp_decode_forward(
     if num_tokens > _WARP_DECODE_MAX_BATCH or num_tokens == 0:
         return None
 
-    # Check topk output format - we need standard topk_ids and topk_weights
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    # Check topk output format -- we need standard topk_ids and topk_weights.
+    # Guard against TopKOutputChecker not existing in older sglang versions.
+    try:
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    if not TopKOutputChecker.format_is_standard(topk_output):
-        return None
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            return None
+    except (ImportError, AttributeError):
+        # Fallback: just check that the attributes exist
+        if not hasattr(topk_output, "topk_ids") or not hasattr(
+            topk_output, "topk_weights"
+        ):
+            return None
 
     topk_ids = topk_output.topk_ids
     topk_weights = topk_output.topk_weights

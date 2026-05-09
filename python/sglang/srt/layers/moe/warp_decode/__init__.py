@@ -34,8 +34,6 @@ For prefill and large batches, fall back to expert-centric execution.
 from sglang.srt.layers.moe.warp_decode.kernels import (
     warp_decode_moe,
     warp_decode_moe_packed,
-    _CUTE_AVAILABLE,
-    _should_use_cute,
 )
 from sglang.srt.layers.moe.warp_decode.runner import WarpDecodeRunnerCore
 
@@ -43,6 +41,4 @@ __all__ = [
     "warp_decode_moe",
     "warp_decode_moe_packed",
     "WarpDecodeRunnerCore",
-    "_CUTE_AVAILABLE",
-    "_should_use_cute",
 ]

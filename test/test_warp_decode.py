@@ -343,6 +343,40 @@ class TestWarpDecodeKernels(unittest.TestCase):
 
         self._check_correctness(output, reference, "normalized_weights")
 
+    def test_zero_tokens(self):
+        """Test that zero-token input returns an empty tensor without error."""
+        from sglang.srt.layers.moe.warp_decode.kernels import warp_decode_moe_packed
+
+        D, N, E, K = 256, 128, 8, 2
+        # Zero batch size
+        hs = torch.empty(0, D, dtype=torch.bfloat16, device="cuda")
+        w13 = torch.randn(E, 2 * N, D, dtype=torch.bfloat16, device="cuda") * 0.02
+        w2 = torch.randn(E, D, N, dtype=torch.bfloat16, device="cuda") * 0.02
+        ids = torch.empty(0, K, dtype=torch.int64, device="cuda")
+        wts = torch.empty(0, K, dtype=torch.float32, device="cuda")
+
+        output = warp_decode_moe_packed(hs, w13, w2, ids, wts, intermediate_size=N)
+        self.assertEqual(output.shape, (0, D))
+
+    def test_non_divisible_dimensions(self):
+        """Test with dimensions not evenly divisible by tile sizes."""
+        from sglang.srt.layers.moe.warp_decode.kernels import warp_decode_moe_packed
+
+        # hidden=100 not divisible by TILE_K=128,
+        # intermediate=50 not divisible by TILE_N=32
+        B, D, N, E, K = 2, 100, 50, 4, 2
+        hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
+
+        w13 = torch.cat([wg, wu], dim=1)
+
+        output = warp_decode_moe_packed(hs, w13, wd, ids, wts, intermediate_size=N)
+        reference = reference_moe_packed_forward(hs, w13, wd, ids, wts, N)
+
+        self._check_correctness(
+            output, reference, "non_divisible_dims",
+            cos_threshold=0.999, abs_threshold=0.05,
+        )
+
 
 class TestWarpDecodeIntegration(unittest.TestCase):
     """Test warp decode integration with the FusedMoE layer."""

@@ -101,10 +101,34 @@ void warp_decode_cute_gate_up(
     int top_k,
     int num_tokens) {
 
+  // Edge case: zero tokens is a no-op
+  if (num_tokens == 0) return;
+
+  // Dtype checks
   TORCH_CHECK(x.dtype() == torch::kBFloat16, "x must be bf16");
   TORCH_CHECK(w_gate.dtype() == torch::kBFloat16, "w_gate must be bf16");
   TORCH_CHECK(w_up.dtype() == torch::kBFloat16, "w_up must be bf16");
   TORCH_CHECK(expert_ids.dtype() == torch::kInt32, "expert_ids must be int32");
+
+  // Device checks
+  TORCH_CHECK(x.is_cuda(), "x must be on CUDA");
+  TORCH_CHECK(w_gate.is_cuda(), "w_gate must be on CUDA");
+  TORCH_CHECK(w_up.is_cuda(), "w_up must be on CUDA");
+  TORCH_CHECK(out.is_cuda(), "out must be on CUDA");
+  TORCH_CHECK(expert_ids.is_cuda(), "expert_ids must be on CUDA");
+
+  // Contiguity checks
+  TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+  TORCH_CHECK(w_gate.is_contiguous(), "w_gate must be contiguous");
+  TORCH_CHECK(w_up.is_contiguous(), "w_up must be contiguous");
+  TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+  TORCH_CHECK(expert_ids.is_contiguous(), "expert_ids must be contiguous");
+
+  // Dimension checks
+  TORCH_CHECK(x.ndim() == 2, "x must be 2D [num_tokens, hidden_size]");
+  TORCH_CHECK(w_gate.ndim() == 3, "w_gate must be 3D [E, N, K]");
+  TORCH_CHECK(w_up.ndim() == 3, "w_up must be 3D [E, N, K]");
+  TORCH_CHECK(expert_ids.ndim() == 2, "expert_ids must be 2D [num_tokens, top_k]");
 
   auto ts = select_tiles(hidden_size, intermediate_size);
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -139,9 +163,15 @@ void warp_decode_cute_gate_up_packed(
     int top_k,
     int num_tokens) {
 
+  if (num_tokens == 0) return;
+
   TORCH_CHECK(x.dtype() == torch::kBFloat16, "x must be bf16");
   TORCH_CHECK(w13.dtype() == torch::kBFloat16, "w13 must be bf16");
   TORCH_CHECK(expert_ids.dtype() == torch::kInt32, "expert_ids must be int32");
+  TORCH_CHECK(x.is_cuda() && w13.is_cuda() && out.is_cuda() && expert_ids.is_cuda(),
+      "all tensors must be on CUDA");
+  TORCH_CHECK(x.is_contiguous() && w13.is_contiguous() && out.is_contiguous()
+      && expert_ids.is_contiguous(), "all tensors must be contiguous");
 
   auto ts = select_tiles(hidden_size, intermediate_size);
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -174,10 +204,17 @@ void warp_decode_cute_down(
     int top_k,
     int num_tokens) {
 
+  if (num_tokens == 0) return;
+
   TORCH_CHECK(intermediate.dtype() == torch::kBFloat16, "intermediate must be bf16");
   TORCH_CHECK(w_down.dtype() == torch::kBFloat16, "w_down must be bf16");
   TORCH_CHECK(routing_weights.dtype() == torch::kFloat32, "routing_weights must be float32");
   TORCH_CHECK(expert_ids.dtype() == torch::kInt32, "expert_ids must be int32");
+  TORCH_CHECK(intermediate.is_cuda() && w_down.is_cuda() && routing_weights.is_cuda()
+      && expert_ids.is_cuda() && out.is_cuda(), "all tensors must be on CUDA");
+  TORCH_CHECK(intermediate.is_contiguous() && w_down.is_contiguous()
+      && routing_weights.is_contiguous() && expert_ids.is_contiguous()
+      && out.is_contiguous(), "all tensors must be contiguous");
 
   auto ts = select_tiles(hidden_size, intermediate_size);
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -214,6 +251,8 @@ void warp_decode_cute_down_fp4(
     int num_tokens,
     int group_size) {
 
+  if (num_tokens == 0) return;
+
   TORCH_CHECK(intermediate.dtype() == torch::kBFloat16, "intermediate must be bf16");
   TORCH_CHECK(w_down_packed.dtype() == torch::kUInt8, "w_down_packed must be uint8");
   TORCH_CHECK(w_down_scales.dtype() == torch::kBFloat16, "w_down_scales must be bf16");
@@ -222,6 +261,8 @@ void warp_decode_cute_down_fp4(
   TORCH_CHECK(expert_ids.dtype() == torch::kInt32, "expert_ids must be int32");
   TORCH_CHECK(group_size > 0 && (group_size & (group_size - 1)) == 0,
               "group_size must be a positive power of 2");
+  TORCH_CHECK(intermediate_size % 2 == 0,
+              "intermediate_size must be even for NVFP4 packing");
 
   auto ts = select_tiles(hidden_size, intermediate_size);
   auto stream = at::cuda::getCurrentCUDAStream();

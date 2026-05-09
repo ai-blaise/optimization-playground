@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import torch
 
@@ -40,14 +40,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerCore,
     RunnerInput,
     RunnerOutput,
-    register_fused_func,
-    register_post_permute,
-    register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +101,7 @@ class WarpDecodeRunnerInput(RunnerInput):
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.TRITON  # Reuse TRITON backend enum
+        return MoeRunnerBackend.WARP_DECODE
 
 
 @dataclass
@@ -118,7 +112,7 @@ class WarpDecodeRunnerOutput(RunnerOutput):
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.TRITON
+        return MoeRunnerBackend.WARP_DECODE
 
 
 class WarpDecodeRunnerCore(MoeRunnerCore):
@@ -126,6 +120,15 @@ class WarpDecodeRunnerCore(MoeRunnerCore):
 
     Falls back to the provided fallback runner for large batches
     or when warp decode is not beneficial.
+
+    Composes with all other custom optimizations (GatedNorm, G1 Gate,
+    IndexCache, TurboQuant, LayerSplit, FlashSampling, HiSparse) because
+    those operate in the attention phase of the decoder layer, not the
+    MoE phase. Warp decode only replaces the expert computation kernel;
+    everything else in the layer forward remains unchanged.
+
+    Enable via: --moe-runner-backend warp_decode
+    Or via env: SGLANG_ENABLE_WARP_DECODE=1 (for the fast-path hook)
     """
 
     def __init__(
@@ -138,15 +141,17 @@ class WarpDecodeRunnerCore(MoeRunnerCore):
         self._max_batch = WARP_DECODE_MAX_BATCH
         logger.info(
             "WarpDecodeRunnerCore initialized: max_batch=%d, "
-            "intermediate_size=%s, hidden_size=%s",
+            "intermediate_size=%s, hidden_size=%s, "
+            "fallback=%s",
             self._max_batch,
             config.intermediate_size_per_partition,
             config.hidden_size,
+            type(fallback_runner).__name__ if fallback_runner else "none",
         )
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.TRITON
+        return MoeRunnerBackend.WARP_DECODE
 
     def run(
         self,

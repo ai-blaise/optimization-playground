@@ -32,13 +32,23 @@ For prefill and large batches, fall back to expert-centric execution.
 """
 
 from sglang.srt.layers.moe.warp_decode.kernels import (
+    _CUTE_AVAILABLE,
+    _should_use_cute,
     warp_decode_moe,
     warp_decode_moe_packed,
 )
-from sglang.srt.layers.moe.warp_decode.runner import WarpDecodeRunnerCore
+from sglang.srt.layers.moe.warp_decode.runner import (
+    WarpDecodeRunnerCore,
+    is_warp_decode_enabled,
+    should_use_warp_decode,
+)
 
 __all__ = [
     "warp_decode_moe",
     "warp_decode_moe_packed",
     "WarpDecodeRunnerCore",
+    "is_warp_decode_enabled",
+    "should_use_warp_decode",
+    "_CUTE_AVAILABLE",
+    "_should_use_cute",
 ]

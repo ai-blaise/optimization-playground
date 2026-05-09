@@ -584,6 +584,7 @@ class ServerArgs:
     turboquant_skip_layers: Optional[str] = None
     turboquant_execution_mode: str = "fused_decode"
     turboquant_mla_decode_num_splits: int = 16
+    indexer_quantization_declared: Optional[Dict[str, Any]] = None
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
     enable_flashsampling: bool = False
@@ -1820,11 +1821,15 @@ class ServerArgs:
             get_mimo_v2_fused_qkv_expected_tp_size,
             is_deepseek_nsa,
         )
+        from sglang.srt.layers.quantization.quantization_config_dispatch import (
+            apply_quantization_config_dispatch,
+        )
 
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
 
         hf_config = self.get_model_config().hf_config
+        apply_quantization_config_dispatch(self, hf_config)
         model_arch = hf_config.architectures[0]
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)

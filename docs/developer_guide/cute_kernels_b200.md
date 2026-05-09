@@ -23,7 +23,7 @@ trials × 500 iterations.
 | G1 Gate (CuTe) | `sgl-kernel/csrc/attention/g1_attention_cute.cuh` | `g1_gate_fwd_kernel` (in-file legacy) | 1.23-1.71x graph mode |
 | GatedNorm (CuTe) | `sgl-kernel/csrc/elementwise/gated_norm_cute.cu(h)` | upstream `gated_norm.py` (Triton + torch.mm dispatch) | R=16: 1.04-1.49x vs torch.mm; vs original cute up to 38.69x |
 | LayerSplit (CuTe) | `sgl-kernel/csrc/kvcacheio/layersplit_cute.cu` | `torch.Tensor.copy_` / sequential copies | 1.21-1.38x single; 1.14-1.34x@low-layers multi |
-| WarpDecode MoE (CuTe) | `sgl-kernel/csrc/moe/warp_decode_cute.cu(h)` | `fused_moe_triton` | 4.08x at N=1 (production decode) |
+| WarpDecode MoE (CuTe) | `sgl-kernel/csrc/moe/warp_decode_cute.cu(h)` | `fused_moe_triton` | 4.08x at N=1 (production decode); 1.02–1.05x further over opt_b2 with `-DWD_PDL_ENABLED=1` |
 
 ## Detailed comparisons
 
@@ -376,6 +376,47 @@ takes over.
 Bit-exact: max abs diff 3.05e-5 vs `fused_moe_triton` and the original CuTe
 baseline.
 
+**Final round (composition: TILE_K=512 + split-FP32 inner accumulator + PDL
+chain).** Two further blog-invariant changes compose with the previous round:
+
+1. `kGateUpTileK` raised from 256 to 512, halving the K-loop iterations from
+   28 to 14 at `D=7168`. The naive doubling regresses cosine similarity
+   (longer in-warp BF16x2 accumulator chain accumulates more rounding error,
+   delta ~6×10⁻⁶), so the inner loop is split into `kFlush=128` chunks with
+   FP32 partial-flush between chunks. This restores opt_b2's BF16
+   accumulation depth exactly while keeping the load/sync amortization win
+   from the wider tile. SMEM at `TILE_K=512 × 3 stages` is 52 KB/CTA, well
+   within B200's 232 KB; +1 register/thread, no spill.
+2. PDL (Programmatic Dependent Launch) chain: `gate/up` ends with
+   `__syncthreads() + __threadfence() + cudaTriggerProgrammaticLaunchCompletion()`,
+   `down` begins with `cudaGridDependencySynchronize()`, and the host-side
+   launch helper switches to `cudaLaunchKernelEx` with the
+   `cudaLaunchAttributeProgrammaticStreamSerialization` attribute. The
+   runtime opportunistically overlaps the down kernel's launch latency with
+   the gate/up kernel's tail. Gated by the `WD_PDL_ENABLED` build flag.
+
+| N | opt_b2 | composition | speedup vs opt_b2 |
+|---|---|---|---|
+| 1 | 121.42us | 119.52us | **1.0159x** |
+| 4 | 439.47us | 428.62us | **1.0253x** |
+| 8 | 875.36us | 843.97us | **1.0372x** |
+| 16 | 1750.27us | 1674.03us | **1.0455x** |
+| 64 | 7028.99us | 6679.82us | **1.0523x** |
+
+Strict improvement at every N. Cosine similarity vs FP32 reference is
+0.9999789–0.9999798 (≥ the 0.999976 acceptance gate, matches opt_b2 to
+the last digit). Blog invariants preserved: 8 warps × 1 neuron in both
+gate/up and down, `__shfl_xor_sync` butterfly, FP32 final accumulators,
+no cross-warp synchronization beyond the PDL grid-dependency edge, no
+tensor cores.
+
+A separate experiment combining 128-bit `uint4` LDS at `TILE_K=512` with
+the same PDL chain (the J+D+F′ composition) was non-additive: PDL gains
+concentrate at small N (launch latency), wider LDS gains concentrate at
+large N (LDS bandwidth), so combining them adds register pressure that
+slightly attenuates each individual gain. Production deployment uses J+D
+only.
+
 ## Build configuration
 
 The CuTe kernels build via `torch.utils.cpp_extension.load()` with:
@@ -392,6 +433,7 @@ CUDA_FLAGS = [
     "-gencode=arch=compute_100,code=sm_100",
     "-DFLASHINFER_ENABLE_BF16",
     "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",
+    "-DWD_PDL_ENABLED=1",                   # WarpDecode PDL chain (B200)
 ]
 ```
 
@@ -405,6 +447,11 @@ Critical build constraints discovered during this work:
    `-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK`.
 3. `cusparse.h` is included transitively by ATen but is not in the standard
    CUDA path on this image; `nvidia-cu13/include` must be added.
+4. `-DWD_PDL_ENABLED=1` activates the WarpDecode `gate/up`→`down` PDL chain.
+   Omitting the flag falls back to the standard triple-chevron launch path
+   (correct, slightly slower: see WarpDecode section). Requires CUDA ≥ 12.3
+   and an SM_90+ device for `cudaTriggerProgrammaticLaunchCompletion` /
+   `cudaGridDependencySynchronize`.
 
 ## Production correctness
 

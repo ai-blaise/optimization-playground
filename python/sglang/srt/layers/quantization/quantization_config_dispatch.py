@@ -149,29 +149,25 @@ def should_use_nsa_fused_store(
 ) -> bool:
     """Decide whether to dispatch to the NSA IndexCache FP8 fused-store kernel.
 
-    Precedence (high to low):
+    Precedence, high to low:
 
-    1. ``server_args.indexer_quantization_declared`` (set by
-       ``apply_quantization_config_dispatch`` from
-       ``quantization_config.indexer_quantization``):
+    1. ``server_args.indexer_quantization_declared`` (populated by
+       ``apply_quantization_config_dispatch``):
 
-       * ``quant_method == "fp8_e4m3"`` forces the fused-store path. If
-         the kernel compatibility check (``auto_compat_check``) reports
-         the dtypes/page_size cannot be served, this raises
-         ``RuntimeError`` rather than silently falling back, so the
-         mismatch surfaces loudly.
-       * ``quant_method == "disabled"`` forces the fallback path even if
-         the dtypes are compatible.
-       * Any other recorded value is left to auto-detection (the
-         dispatcher already filters unsupported methods at config-load
-         time).
+       * ``quant_method == "fp8_e4m3"`` forces the fused-store path; the
+         caller's ``auto_compat_check`` must accept the runtime tensor
+         shapes or this raises ``RuntimeError`` instead of silently
+         falling back.
+       * ``quant_method == "disabled"`` forces the fallback path.
+       * Other recorded values fall through to auto-detection.
 
     2. Auto-detection: ``auto_platform_ok and auto_compat_check(...)``.
-       This preserves the historical behavior when no declaration is
-       present (backward-compatible, zero behavioral change).
+       Preserves the historical behavior when no declaration is present.
 
-    A future CLI flag for force-enable/disable would slot above (1)
-    here without disturbing the rest of the precedence chain.
+    Raises:
+      RuntimeError: when the config declares ``fp8_e4m3`` but
+        ``auto_compat_check`` rejects the runtime ``(key_dtype,
+        indices_dtype, page_size)`` triple.
     """
     declared = getattr(server_args, "indexer_quantization_declared", None)
     if isinstance(declared, dict):

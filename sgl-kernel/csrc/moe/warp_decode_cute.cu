@@ -1,9 +1,10 @@
 // Copyright 2024-2026 SGLang Team
 // Licensed under the Apache License, Version 2.0.
 // ==============================================================================
-// BLOG-STRICT warp_decode_cute dispatch:
-//   - Gate/Up: TILE_N=8 (one neuron per warp), TILE_K=128, NUM_WARPS=8
-//   - Down:    TILE_D=8 (one dim per warp),    TILE_N=512, NUM_WARPS=8
+// Blog-strict warp_decode_cute dispatch (https://cursor.com/blog/warp-decode):
+//   - Gate/Up: TILE_N=8 (one neuron per warp), TILE_K=512, NUM_WARPS=8
+//   - Down:    TILE_D=8 (one dim per warp),    TILE_N=1024, NUM_WARPS=8
+// 3-stage cp.async pipeline; optional gate/up→down PDL chain via WD_PDL_ENABLED.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -14,9 +15,8 @@
 namespace sglang {
 namespace warp_decode {
 
-// OPT3: opt2 large tiles + 3-stage cp.async pipeline.
 constexpr int kGateUpTileN = 8;
-constexpr int kGateUpTileK = 256;
+constexpr int kGateUpTileK = 512;
 constexpr int kGateUpNumWarps = 8;
 constexpr int kGateUpNumThreads = kGateUpNumWarps * 32;
 
@@ -25,7 +25,6 @@ constexpr int kDownTileN = 1024;
 constexpr int kDownNumWarps = 8;
 constexpr int kDownNumThreads = kDownNumWarps * 32;
 
-// 3 stages instead of 2 — deeper pipeline to better hide DRAM latency.
 constexpr int kGateUpSmemBytes =
     3 * (kGateUpTileK + 2 * kGateUpTileN * kGateUpTileK) *
     static_cast<int>(sizeof(__nv_bfloat16));
@@ -42,6 +41,30 @@ void MaybeSetSmemAttribute(KernelFunc kernel, int smem_bytes) {
   }
 }
 
+// Launches the kernel with cudaLaunchAttributeProgrammaticStreamSerialization
+// when WD_PDL_ENABLED is set so the runtime can overlap the launch latency
+// with the prior in-stream kernel's tail. Falls back to triple-chevron
+// otherwise.
+template <typename KernelPtr, typename... Args>
+inline void WdLaunch(KernelPtr kernel, dim3 grid, dim3 block, size_t smem,
+                     cudaStream_t stream, Args&&... args) {
+#if defined(WD_PDL_ENABLED) && WD_PDL_ENABLED
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  cudaLaunchConfig_t config = {};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = smem;
+  config.stream = stream;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+  cudaLaunchKernelEx(&config, kernel, std::forward<Args>(args)...);
+#else
+  kernel<<<grid, block, smem, stream>>>(std::forward<Args>(args)...);
+#endif
+}
+
 void warp_decode_cute_gate_up(
     const torch::Tensor& x, const torch::Tensor& w_gate, const torch::Tensor& w_up,
     torch::Tensor& out, const torch::Tensor& expert_ids,
@@ -53,19 +76,18 @@ void warp_decode_cute_gate_up(
   TORCH_CHECK(out.dtype() == torch::kBFloat16);
   TORCH_CHECK(expert_ids.dtype() == torch::kInt32);
   auto stream = at::cuda::getCurrentCUDAStream();
-  MaybeSetSmemAttribute(
-      warp_decode_gate_up_cute_kernel<kGateUpTileN, kGateUpTileK, kGateUpNumWarps>,
-      kGateUpSmemBytes);
+  auto kernel_fn =
+      warp_decode_gate_up_cute_kernel<kGateUpTileN, kGateUpTileK, kGateUpNumWarps>;
+  MaybeSetSmemAttribute(kernel_fn, kGateUpSmemBytes);
   dim3 grid((intermediate_size + kGateUpTileN - 1) / kGateUpTileN,
             num_tokens * top_k);
   dim3 block(kGateUpNumThreads);
-  warp_decode_gate_up_cute_kernel<kGateUpTileN, kGateUpTileK, kGateUpNumWarps>
-      <<<grid, block, kGateUpSmemBytes, stream>>>(
-          reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(w_gate.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(w_up.data_ptr()),
-          reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-          expert_ids.data_ptr<int>(), hidden_size, intermediate_size, top_k, num_tokens);
+  WdLaunch(kernel_fn, grid, block, kGateUpSmemBytes, stream,
+           reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+           reinterpret_cast<const __nv_bfloat16*>(w_gate.data_ptr()),
+           reinterpret_cast<const __nv_bfloat16*>(w_up.data_ptr()),
+           reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+           expert_ids.data_ptr<int>(), hidden_size, intermediate_size, top_k, num_tokens);
 }
 
 void warp_decode_cute_gate_up_packed(
@@ -78,18 +100,17 @@ void warp_decode_cute_gate_up_packed(
   TORCH_CHECK(out.dtype() == torch::kBFloat16);
   TORCH_CHECK(expert_ids.dtype() == torch::kInt32);
   auto stream = at::cuda::getCurrentCUDAStream();
-  MaybeSetSmemAttribute(
-      warp_decode_gate_up_packed_cute_kernel<kGateUpTileN, kGateUpTileK, kGateUpNumWarps>,
-      kGateUpSmemBytes);
+  auto kernel_fn =
+      warp_decode_gate_up_packed_cute_kernel<kGateUpTileN, kGateUpTileK, kGateUpNumWarps>;
+  MaybeSetSmemAttribute(kernel_fn, kGateUpSmemBytes);
   dim3 grid((intermediate_size + kGateUpTileN - 1) / kGateUpTileN,
             num_tokens * top_k);
   dim3 block(kGateUpNumThreads);
-  warp_decode_gate_up_packed_cute_kernel<kGateUpTileN, kGateUpTileK, kGateUpNumWarps>
-      <<<grid, block, kGateUpSmemBytes, stream>>>(
-          reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(w13.data_ptr()),
-          reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-          expert_ids.data_ptr<int>(), hidden_size, intermediate_size, top_k, num_tokens);
+  WdLaunch(kernel_fn, grid, block, kGateUpSmemBytes, stream,
+           reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+           reinterpret_cast<const __nv_bfloat16*>(w13.data_ptr()),
+           reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+           expert_ids.data_ptr<int>(), hidden_size, intermediate_size, top_k, num_tokens);
 }
 
 void warp_decode_cute_down(
@@ -103,18 +124,17 @@ void warp_decode_cute_down(
   TORCH_CHECK(routing_weights.dtype() == torch::kFloat32);
   TORCH_CHECK(expert_ids.dtype() == torch::kInt32);
   auto stream = at::cuda::getCurrentCUDAStream();
-  MaybeSetSmemAttribute(
-      warp_decode_down_cute_kernel<kDownTileD, kDownTileN, kDownNumWarps>,
-      kDownSmemBytes);
+  auto kernel_fn =
+      warp_decode_down_cute_kernel<kDownTileD, kDownTileN, kDownNumWarps>;
+  MaybeSetSmemAttribute(kernel_fn, kDownSmemBytes);
   dim3 grid((hidden_size + kDownTileD - 1) / kDownTileD, num_tokens);
   dim3 block(kDownNumThreads);
-  warp_decode_down_cute_kernel<kDownTileD, kDownTileN, kDownNumWarps>
-      <<<grid, block, kDownSmemBytes, stream>>>(
-          reinterpret_cast<const __nv_bfloat16*>(intermediate.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(w_down.data_ptr()),
-          routing_weights.data_ptr<float>(), expert_ids.data_ptr<int>(),
-          reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-          hidden_size, intermediate_size, top_k, num_tokens);
+  WdLaunch(kernel_fn, grid, block, kDownSmemBytes, stream,
+           reinterpret_cast<const __nv_bfloat16*>(intermediate.data_ptr()),
+           reinterpret_cast<const __nv_bfloat16*>(w_down.data_ptr()),
+           routing_weights.data_ptr<float>(), expert_ids.data_ptr<int>(),
+           reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+           hidden_size, intermediate_size, top_k, num_tokens);
 }
 
 void warp_decode_cute_down_fp4(

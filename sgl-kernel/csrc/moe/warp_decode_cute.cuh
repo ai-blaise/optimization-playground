@@ -2,31 +2,41 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // ==============================================================================
 /**
- * @file warp_decode_cute.cuh.opt_b2
- * @brief BLOG-STRICT optimized warp-decode for SM100 (B200) — round 2.
+ * @file warp_decode_cute.cuh
+ * @brief Blog-strict warp-decode for SM100 (B200).
  *
- * Combines three "implementation-detail" optimizations on top of the strict
- * blog design (8 warps × 1 neuron, FP32 final accumulator, no cross-warp sync,
- * shfl_xor_sync butterfly):
+ * Implementation-detail optimizations layered on top of the strict blog
+ * design (https://cursor.com/blog/warp-decode):
  *
- *   1. bf16x2 inner multiply via __hfma2 with FP32 accumulator updated
- *      once per K-step after warp reduction. (HFMA2 SASS — 2x compute throughput.)
- *   2. Larger TILE_K=256 in gate_up (was 128), TILE_N=1024 in down (was 512).
- *      Halves the number of K/N iterations and __syncthreads barriers.
- *   3. 3-stage cp.async pipeline (was 2). Marginally better DRAM hiding at
- *      small N where K/N iters per CTA are still few.
+ *   1. bf16x2 inner multiply via __hfma2 with FP32 accumulator updated once
+ *      per K-step after warp reduction (HFMA2 SASS).
+ *   2. TILE_K=512 in gate/up with a kFlush=128 split-FP32 inner accumulator.
+ *      The wider tile halves K-loop iterations from 28 to 14 at D=7168;
+ *      flushing the bf16x2 partial into FP32 every 128 elements preserves
+ *      the same BF16 accumulation depth as a TILE_K=128 baseline so cosine
+ *      similarity does not drift. SMEM 52 KB/CTA × 3 stages fits within
+ *      B200's 232 KB; +1 register/thread, no spill. Down kernel uses
+ *      TILE_N=1024.
+ *   3. 3-stage cp.async pipeline with proper N-1 prologue/epilogue
+ *      (prefetch stages 0,1; wait_group<2> in steady state; wait_group<1>
+ *      then <0> for the last two iterations).
+ *   4. Optional gate/up→down PDL chain (cudaTriggerProgrammaticLaunchCompletion
+ *      + cudaGridDependencySynchronize, host-side cudaLaunchKernelEx with
+ *      cudaLaunchAttributeProgrammaticStreamSerialization). Gated by
+ *      WD_PDL_ENABLED build flag; no-ops out when not defined.
  *
- * INVARIANTS preserved (per https://cursor.com/blog/warp-decode):
+ * Invariants preserved:
  *   1. 8 warps × 1 neuron in gate/up.
  *   2. 8 warps × 1 dim in down.
- *   3. NO cross-warp synchronization or shared mutable state between warps.
+ *   3. No cross-warp synchronization or shared mutable state between warps
+ *      (the PDL trigger is a grid-level dependency edge, not warp sync).
  *   4. __shfl_xor_sync butterfly reduction.
  *   5. FP32 final accumulators (gate_acc, up_acc, expert_acc).
  *   6. Embarrassingly parallel — warp scheduler issues warps in any order.
  *
- * NOT used (FORBIDDEN per spec):
+ * Forbidden (per spec):
  *   - tcgen05.mma / wgmma / nvcuda::wmma (no tensor cores).
- *   - Multiple neurons per warp (would violate blog-strict invariants).
+ *   - Multiple neurons per warp.
  *   - Cross-warp barriers beyond kernel completion.
  */
 
@@ -38,6 +48,17 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+
+// PDL (Programmatic Dependent Launch) — opt-in via WD_PDL_ENABLED build flag.
+// Brings in cudaTriggerProgrammaticLaunchCompletion / cudaGridDependencySynchronize.
+#if defined(WD_PDL_ENABLED) && WD_PDL_ENABLED
+#include <cuda_device_runtime_api.h>
+#define WD_PDL_TRIGGER() ::cudaTriggerProgrammaticLaunchCompletion()
+#define WD_PDL_WAIT()    ::cudaGridDependencySynchronize()
+#else
+#define WD_PDL_TRIGGER() ((void)0)
+#define WD_PDL_WAIT()    ((void)0)
+#endif
 
 namespace sglang {
 namespace warp_decode {
@@ -253,18 +274,28 @@ warp_decode_gate_up_cute_kernel(
     const __nv_bfloat162* up_smem2 = reinterpret_cast<const __nv_bfloat162*>(up_smem);
 
     constexpr int kV2 = TILE_K / 2;
-    __nv_bfloat162 g_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
-    __nv_bfloat162 u_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+    // Flush the bf16x2 partial into FP32 every kFlush=128 elements so the
+    // BF16 accumulation depth stays at 4 hfma2/lane regardless of TILE_K.
+    // For TILE_K <= 256 this collapses to one flush at the end.
+    constexpr int kFlush = (kV2 > 128) ? 128 : kV2;
+    float g_local = 0.f;
+    float u_local = 0.f;
 #pragma unroll
-    for (int kk = lane_id; kk < kV2; kk += 32) {
-      __nv_bfloat162 x2 = x_smem2[kk];
-      __nv_bfloat162 g2 = gate_smem2[n_row * kV2 + kk];
-      __nv_bfloat162 u2 = up_smem2[n_row * kV2 + kk];
-      g_acc2 = __hfma2(g2, x2, g_acc2);
-      u_acc2 = __hfma2(u2, x2, u_acc2);
+    for (int kk_base = 0; kk_base < kV2; kk_base += kFlush) {
+      __nv_bfloat162 g_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+      __nv_bfloat162 u_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+#pragma unroll
+      for (int kk = lane_id; kk < kFlush; kk += 32) {
+        const int gk = kk_base + kk;
+        __nv_bfloat162 x2 = x_smem2[gk];
+        __nv_bfloat162 g2 = gate_smem2[n_row * kV2 + gk];
+        __nv_bfloat162 u2 = up_smem2[n_row * kV2 + gk];
+        g_acc2 = __hfma2(g2, x2, g_acc2);
+        u_acc2 = __hfma2(u2, x2, u_acc2);
+      }
+      g_local += __bfloat162float(g_acc2.x) + __bfloat162float(g_acc2.y);
+      u_local += __bfloat162float(u_acc2.x) + __bfloat162float(u_acc2.y);
     }
-    float g_local = __bfloat162float(g_acc2.x) + __bfloat162float(g_acc2.y);
-    float u_local = __bfloat162float(u_acc2.x) + __bfloat162float(u_acc2.y);
     g_local = WarpReduceSum(g_local);
     u_local = WarpReduceSum(u_local);
     if (lane_id == 0) {
@@ -284,6 +315,12 @@ warp_decode_gate_up_cute_kernel(
       out_row[n_idx] = __float2bfloat16(silu * up_acc);
     }
   }
+  // Signal the dependent down kernel that intermediate is ready. The
+  // threadfence orders the store above before the trigger PTX. No-op when
+  // WD_PDL_ENABLED is unset.
+  __syncthreads();
+  __threadfence();
+  WD_PDL_TRIGGER();
 }
 
 // ===========================================================================
@@ -381,18 +418,26 @@ warp_decode_gate_up_packed_cute_kernel(
     const __nv_bfloat162* gate_smem2 = reinterpret_cast<const __nv_bfloat162*>(gate_smem);
     const __nv_bfloat162* up_smem2 = reinterpret_cast<const __nv_bfloat162*>(up_smem);
     constexpr int kV2 = TILE_K / 2;
-    __nv_bfloat162 g_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
-    __nv_bfloat162 u_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+    // See split-FP32 accumulator note in the non-packed variant.
+    constexpr int kFlush = (kV2 > 128) ? 128 : kV2;
+    float g_local = 0.f;
+    float u_local = 0.f;
 #pragma unroll
-    for (int kk = lane_id; kk < kV2; kk += 32) {
-      __nv_bfloat162 x2 = x_smem2[kk];
-      __nv_bfloat162 g2 = gate_smem2[n_row * kV2 + kk];
-      __nv_bfloat162 u2 = up_smem2[n_row * kV2 + kk];
-      g_acc2 = __hfma2(g2, x2, g_acc2);
-      u_acc2 = __hfma2(u2, x2, u_acc2);
+    for (int kk_base = 0; kk_base < kV2; kk_base += kFlush) {
+      __nv_bfloat162 g_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+      __nv_bfloat162 u_acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+#pragma unroll
+      for (int kk = lane_id; kk < kFlush; kk += 32) {
+        const int gk = kk_base + kk;
+        __nv_bfloat162 x2 = x_smem2[gk];
+        __nv_bfloat162 g2 = gate_smem2[n_row * kV2 + gk];
+        __nv_bfloat162 u2 = up_smem2[n_row * kV2 + gk];
+        g_acc2 = __hfma2(g2, x2, g_acc2);
+        u_acc2 = __hfma2(u2, x2, u_acc2);
+      }
+      g_local += __bfloat162float(g_acc2.x) + __bfloat162float(g_acc2.y);
+      u_local += __bfloat162float(u_acc2.x) + __bfloat162float(u_acc2.y);
     }
-    float g_local = __bfloat162float(g_acc2.x) + __bfloat162float(g_acc2.y);
-    float u_local = __bfloat162float(u_acc2.x) + __bfloat162float(u_acc2.y);
     g_local = WarpReduceSum(g_local);
     u_local = WarpReduceSum(u_local);
     if (lane_id == 0) {
@@ -412,6 +457,10 @@ warp_decode_gate_up_packed_cute_kernel(
       out_row[n_idx] = __float2bfloat16(silu * up_acc);
     }
   }
+  // PDL trigger — signal dependent (down) kernel that intermediate is ready.
+  __syncthreads();
+  __threadfence();
+  WD_PDL_TRIGGER();
 }
 
 // ===========================================================================
@@ -450,6 +499,10 @@ warp_decode_down_cute_kernel(
 
   // BLOG-STRICT: 1 dim per warp -> single FP32 accumulator
   float out_acc = 0.0f;
+
+  // Block until the prior gate/up grid signals (griddepcontrol.launch_dependents)
+  // before any cp.async reads of `intermediate`. No-op when WD_PDL_ENABLED is unset.
+  WD_PDL_WAIT();
 
   const int num_n_iters = (intermediate_size + TILE_N - 1) / TILE_N;
 

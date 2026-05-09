@@ -294,13 +294,11 @@ topk_weights, inplace)` — single-token MoE decode at production dims
   true at production dims (`hidden_size=7168 != TILE_K=128`). This was the
   largest single contributor.
 
-**Round 2 attempt (sparse expert grid + nvcuda::wmma)** beat round 1 at
-N=32/64 (1.07x and 1.36x) but lost at N=1 (within noise). Per-token-expert
-grid is a fundamental 26x compute-architecture gap vs `fused_moe_triton`'s
-wgmma path (warp_decode scalar ~83 TFLOPS bf16 peak vs Hopper wgmma
-~2.2 PFLOPS at the same precision). Closing this gap requires migration
-to Blackwell `tcgen05.mma` + `TMEM` + TMA multicast — a CUTLASS-scale
-rewrite scoped as future work.
+**Round 2 attempt (sparse expert grid + nvcuda::wmma)** initially appeared
+to win at N=32/64 (1.07x/1.36x) but the gain did not reproduce in
+subsequent isolated A/B testing (round-B verification with strict gates
+saw 0.98x at N=64 and 0.73x at N=4 — the original numbers were measurement
+noise driven by thermal variance). Round-2 was not shipped.
 
 | N | wd_orig | Round 1 | fused_moe_triton | Round 1 vs Triton |
 |---|---|---|---|---|
@@ -309,6 +307,36 @@ rewrite scoped as future work.
 | 8 | 9493us | 845us | 740us | 0.88x |
 | 16 | 18205us | 4038us | 3530us | 0.87x |
 | 64 | 66838us | 13542us | 4063us | 0.30x |
+
+**Round-A and Round-B follow-up (cycle-level evidence)**: three further
+rounds of optimization were attempted with strict bit-exact + perf gates.
+All returned definitive negative results:
+
+* Round-A surgical micro-opts (bf16x4 inner loop, 3-stage `cp.async`,
+  `TILE_K=256`) regressed by 0-67% across N. NCU shows `gate_up` is at
+  `sm__inst_executed_pipe_fma = 16.84% of peak` and `sm__warps_active =
+  10.99% of peak`. The kernel is **occupancy-bound, not FMA-bound** —
+  FMA-targeting changes can't help. `bf16x4` halves effective lane
+  participation when `TILE_K=128` (only 16 of 32 lanes active per row);
+  `cp.async` 3-stage costs 50% more SMEM at no gain because memory
+  latency is already hidden at this occupancy; combining bf16x4 with
+  `TILE_K=256` compounds register pressure and reduces occupancy further.
+
+* Round-B adaptive dispatch (use round-1 at N=1, route N≥4 to a
+  token-permuted active-expert grid with weight-reuse) was bit-exact
+  (max abs diff 0 across all N) but at N=4 gave 0.727x (regression), at
+  N=64 gave 0.98x (round-2's claimed +1.36x did not reproduce). r1 is
+  bandwidth-bound for N≥12 (linear scaling 10.7ms → 33ms from N=12 to
+  N=64; weight reads dominate); the sort/permute setup overhead dominates
+  any weight-reuse savings at production batch sizes.
+
+The combined evidence is conclusive: **r1 is at the practical
+kernel-level floor for the warp-decode design.** Closing the N≥4 gap
+to `fused_moe_triton` genuinely requires architectural changes — either
+raising warp occupancy from 11% (`TILE_N≥128` + 8 warps/block, register
+file budget allowing), a persistent + grouped-GEMM dispatcher, or
+migration to `tcgen05.mma` + TMEM + TMA multicast (the 26x compute-
+architecture step). These are scoped as future work.
 
 For decode-time autoregressive workloads (the production case for this
 kernel), N=1 is the dominant operating point. The per-(token, expert) grid

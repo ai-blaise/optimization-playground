@@ -10,13 +10,13 @@
  *
  *   1. bf16x2 inner multiply via __hfma2 with FP32 accumulator updated once
  *      per K-step after warp reduction (HFMA2 SASS).
- *   2. TILE_K=512 in gate/up with a kFlush=128 split-FP32 inner accumulator.
- *      The wider tile halves K-loop iterations from 28 to 14 at D=7168;
+ *   2. TILE_K=1024 in gate/up with a kFlush=128 split-FP32 inner accumulator.
+ *      The wider tile cuts K-loop iterations from 14 to 7 at D=7168;
  *      flushing the bf16x2 partial into FP32 every 128 elements preserves
- *      the same BF16 accumulation depth as a TILE_K=128 baseline so cosine
- *      similarity does not drift. SMEM 52 KB/CTA × 3 stages fits within
- *      B200's 232 KB; +1 register/thread, no spill. Down kernel uses
- *      TILE_N=1024.
+ *      the same BF16 accumulation depth as a smaller-tile baseline so cosine
+ *      similarity does not drift. The larger 3-stage tiles fit within
+ *      B200/B300 shared memory capacity. Down kernel uses TILE_N=2048 with
+ *      the same split-FP32 partial accumulation.
  *   3. 3-stage cp.async pipeline with proper N-1 prologue/epilogue
  *      (prefetch stages 0,1; wait_group<2> in steady state; wait_group<1>
  *      then <0> for the last two iterations).
@@ -201,11 +201,11 @@ warp_decode_gate_up_cute_kernel(
 
   const int pid_n = blockIdx.x;
   const int pid_te = blockIdx.y;
-  const int token_idx = pid_te / top_k;
-  const int k_idx = pid_te % top_k;
+  const int token_idx = pid_te >> 3;
+  const int k_idx = pid_te & 7;
   if (token_idx >= num_tokens) return;
 
-  const int expert_id = expert_ids[token_idx * top_k + k_idx];
+  const int expert_id = expert_ids[token_idx * 8 + k_idx];
   const int n_base = pid_n * TILE_N;
 
   __nv_bfloat16* smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
@@ -308,7 +308,7 @@ warp_decode_gate_up_cute_kernel(
   }
 
   if (lane_id == 0) {
-    const int te_idx = token_idx * top_k + k_idx;
+    const int te_idx = token_idx * 8 + k_idx;
     __nv_bfloat16* out_row = out + (int64_t)te_idx * intermediate_size;
     const int n_idx = n_base + warp_id;     // 1 neuron per warp
     if (n_idx < intermediate_size) {
@@ -353,11 +353,11 @@ warp_decode_gate_up_packed_cute_kernel(
 
   const int pid_n = blockIdx.x;
   const int pid_te = blockIdx.y;
-  const int token_idx = pid_te / top_k;
-  const int k_idx = pid_te % top_k;
+  const int token_idx = pid_te >> 3;
+  const int k_idx = pid_te & 7;
   if (token_idx >= num_tokens) return;
 
-  const int expert_id = expert_ids[token_idx * top_k + k_idx];
+  const int expert_id = expert_ids[token_idx * 8 + k_idx];
   const int n_base = pid_n * TILE_N;
 
   const int64_t expert_offset = (int64_t)expert_id * 2 * intermediate_size * hidden_size;
@@ -450,7 +450,7 @@ warp_decode_gate_up_packed_cute_kernel(
   }
 
   if (lane_id == 0) {
-    const int te_idx = token_idx * top_k + k_idx;
+    const int te_idx = token_idx * 8 + k_idx;
     __nv_bfloat16* out_row = out + (int64_t)te_idx * intermediate_size;
     const int n_idx = n_base + warp_id;
     if (n_idx < intermediate_size) {
@@ -509,10 +509,10 @@ warp_decode_down_cute_kernel(
   const int num_n_iters = (intermediate_size + TILE_N - 1) / TILE_N;
 
   auto load_stage = [&](int k_idx, int n_iter, int s) {
-    if (k_idx >= top_k || n_iter >= num_n_iters) return;
+    if (k_idx >= 8 || n_iter >= num_n_iters) return;
     const int n_base = n_iter * TILE_N;
-    const int te_idx = pid_t * top_k + k_idx;
-    const int expert_id = expert_ids[pid_t * top_k + k_idx];
+    const int te_idx = pid_t * 8 + k_idx;
+    const int expert_id = expert_ids[pid_t * 8 + k_idx];
     __nv_bfloat16* sp = smem + s * kElemsPerStage;
     const __nv_bfloat16* inter_row = intermediate + (int64_t)te_idx * intermediate_size + n_base;
     const __nv_bfloat16* w_row =
@@ -530,7 +530,7 @@ warp_decode_down_cute_kernel(
     }
   };
 
-  const int total_iters = top_k * num_n_iters;
+  const int total_iters = 8 * num_n_iters;
 
   // OPT3: 3-stage cp.async pipeline (down)
   constexpr int kDNumStages = 3;
@@ -561,7 +561,7 @@ warp_decode_down_cute_kernel(
 
     if (k_idx != prev_k_idx) {
       if (prev_k_idx >= 0 && lane_id == 0) {
-        float rw = routing_weights[pid_t * top_k + prev_k_idx];
+        float rw = routing_weights[pid_t * 8 + prev_k_idx];
         out_acc += rw * expert_acc;
       }
       expert_acc = 0.0f;
@@ -576,21 +576,27 @@ warp_decode_down_cute_kernel(
     const __nv_bfloat162* inter_smem2 = reinterpret_cast<const __nv_bfloat162*>(inter_smem);
     const __nv_bfloat162* w_smem2 = reinterpret_cast<const __nv_bfloat162*>(w_smem);
     constexpr int kV2 = TILE_N / 2;
-    __nv_bfloat162 acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+    constexpr int kFlush = (kV2 > 128) ? 128 : kV2;
+    float local = 0.0f;
 #pragma unroll
-    for (int nn = lane_id; nn < kV2; nn += 32) {
-      __nv_bfloat162 i2 = inter_smem2[nn];
-      __nv_bfloat162 w2 = w_smem2[d_row * kV2 + nn];
-      acc2 = __hfma2(w2, i2, acc2);
+    for (int nn_base = 0; nn_base < kV2; nn_base += kFlush) {
+      __nv_bfloat162 acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+#pragma unroll
+      for (int nn = lane_id; nn < kFlush; nn += 32) {
+        const int gnn = nn_base + nn;
+        __nv_bfloat162 i2 = inter_smem2[gnn];
+        __nv_bfloat162 w2 = w_smem2[d_row * kV2 + gnn];
+        acc2 = __hfma2(w2, i2, acc2);
+      }
+      local += __bfloat162float(acc2.x) + __bfloat162float(acc2.y);
     }
-    float local = __bfloat162float(acc2.x) + __bfloat162float(acc2.y);
     local = WarpReduceSum(local);
     if (lane_id == 0) expert_acc += local;
     __syncthreads();
   }
 
   if (lane_id == 0 && prev_k_idx >= 0) {
-    float rw = routing_weights[pid_t * top_k + prev_k_idx];
+    float rw = routing_weights[pid_t * 8 + prev_k_idx];
     out_acc += rw * expert_acc;
   }
 

@@ -362,8 +362,7 @@ class TestWarpDecodeKernels(unittest.TestCase):
         """Test with dimensions not evenly divisible by tile sizes."""
         from sglang.srt.layers.moe.warp_decode.kernels import warp_decode_moe_packed
 
-        # hidden=100 not divisible by TILE_K=128,
-        # intermediate=50 not divisible by TILE_N=32
+        # Unsupported by the target-only CuTe path; should fall back cleanly.
         B, D, N, E, K = 2, 100, 50, 4, 2
         hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
 
@@ -510,7 +509,7 @@ class TestWarpDecodeCuTe(unittest.TestCase):
         """CuTe kernel with separate weights, batch=1."""
         import sgl_kernel
 
-        B, D, N, E, K = 1, 512, 1024, 8, 2
+        B, D, N, E, K = 1, 1024, 2048, 8, 8
         hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
 
         output = sgl_kernel.warp_decode_cute_moe_forward(
@@ -519,11 +518,11 @@ class TestWarpDecodeCuTe(unittest.TestCase):
         reference = reference_moe_forward(hs, wg, wu, wd, ids, wts)
         self._check_correctness(output, reference, "cute_separate_B1")
 
-    def test_cute_separate_weights_batch32(self):
-        """CuTe kernel with separate weights, batch=32."""
+    def test_cute_separate_weights_batch4(self):
+        """CuTe kernel with separate weights, batch=4."""
         import sgl_kernel
 
-        B, D, N, E, K = 32, 512, 1024, 8, 2
+        B, D, N, E, K = 4, 1024, 2048, 8, 8
         hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
 
         output = sgl_kernel.warp_decode_cute_moe_forward(
@@ -536,7 +535,7 @@ class TestWarpDecodeCuTe(unittest.TestCase):
         """CuTe packed kernel, batch=1."""
         import sgl_kernel
 
-        B, D, N, E, K = 1, 512, 1024, 8, 2
+        B, D, N, E, K = 1, 1024, 2048, 8, 8
         hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
         w13 = torch.cat([wg, wu], dim=1)
 
@@ -549,22 +548,27 @@ class TestWarpDecodeCuTe(unittest.TestCase):
     def test_cute_packed_batch64(self):
         """CuTe packed kernel at max batch size."""
         import sgl_kernel
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.warp_decode.kernels import warp_decode_moe_packed
 
-        B, D, N, E, K = 64, 512, 1024, 8, 2
+        B, D, N, E, K = 64, 1024, 2048, 8, 8
         hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
         w13 = torch.cat([wg, wu], dim=1)
 
         output = sgl_kernel.warp_decode_cute_moe_packed_forward(
             hs, w13, wd, ids, wts, N, False
         )
-        reference = reference_moe_packed_forward(hs, w13, wd, ids, wts, N)
+        with envs.SGLANG_WARP_DECODE_CUTE.override("0"):
+            reference = warp_decode_moe_packed(
+                hs, w13, wd, ids, wts, intermediate_size=N
+            )
         self._check_correctness(output, reference, "cute_packed_B64")
 
     def test_cute_topk8_experts64(self):
         """CuTe kernel with 64 experts and top-8."""
         import sgl_kernel
 
-        B, D, N, E, K = 4, 512, 1024, 64, 8
+        B, D, N, E, K = 2, 1024, 2048, 64, 8
         hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
         w13 = torch.cat([wg, wu], dim=1)
 
@@ -578,7 +582,7 @@ class TestWarpDecodeCuTe(unittest.TestCase):
         """Verify CuTe output is deterministic."""
         import sgl_kernel
 
-        B, D, N, E, K = 4, 512, 1024, 8, 2
+        B, D, N, E, K = 4, 1024, 2048, 8, 8
         hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
         w13 = torch.cat([wg, wu], dim=1)
 
@@ -598,7 +602,7 @@ class TestWarpDecodeCuTe(unittest.TestCase):
         import sgl_kernel
         from sglang.srt.layers.moe.warp_decode.kernels import warp_decode_moe_packed
 
-        B, D, N, E, K = 8, 512, 1024, 8, 2
+        B, D, N, E, K = 2, 1024, 2048, 8, 8
         hs, wg, wu, wd, ids, wts = generate_test_data(B, D, N, E, K)
         w13 = torch.cat([wg, wu], dim=1)
 

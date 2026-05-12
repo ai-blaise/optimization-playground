@@ -2,8 +2,8 @@
 // Licensed under the Apache License, Version 2.0.
 // ==============================================================================
 // Blog-strict warp_decode_cute dispatch (https://cursor.com/blog/warp-decode):
-//   - Gate/Up: TILE_N=8 (one neuron per warp), TILE_K=512, NUM_WARPS=8
-//   - Down:    TILE_D=8 (one dim per warp),    TILE_N=1024, NUM_WARPS=8
+//   - Gate/Up: TILE_N=8 (one neuron per warp), TILE_K=1024, NUM_WARPS=8
+//   - Down:    TILE_D=8 (one dim per warp),    TILE_N=2048, NUM_WARPS=8
 // 3-stage cp.async pipeline; optional gate/up→down PDL chain via WD_PDL_ENABLED.
 
 #include <ATen/cuda/CUDAContext.h>
@@ -16,22 +16,26 @@ namespace sglang {
 namespace warp_decode {
 
 constexpr int kGateUpTileN = 8;
-constexpr int kGateUpTileK = 512;
+constexpr int kGateUpTileK = 1024;
 constexpr int kGateUpNumWarps = 8;
 constexpr int kGateUpNumThreads = kGateUpNumWarps * 32;
 
 constexpr int kDownTileD = 8;
-constexpr int kDownTileN = 1024;
+constexpr int kDownTileN = 2048;
 constexpr int kDownNumWarps = 8;
 constexpr int kDownNumThreads = kDownNumWarps * 32;
 
-constexpr int kGateUpSmemBytes =
-    3 * (kGateUpTileK + 2 * kGateUpTileN * kGateUpTileK) *
-    static_cast<int>(sizeof(__nv_bfloat16));
+template <int TILE_K>
+constexpr int GateUpSmemBytes() {
+  return 3 * (TILE_K + 2 * kGateUpTileN * TILE_K) *
+      static_cast<int>(sizeof(__nv_bfloat16));
+}
 
-constexpr int kDownSmemBytes =
-    3 * (kDownTileN + kDownTileD * kDownTileN) *
-    static_cast<int>(sizeof(__nv_bfloat16));
+template <int TILE_N>
+constexpr int DownSmemBytes() {
+  return 3 * (TILE_N + kDownTileD * TILE_N) *
+      static_cast<int>(sizeof(__nv_bfloat16));
+}
 
 template <typename KernelFunc>
 void MaybeSetSmemAttribute(KernelFunc kernel, int smem_bytes) {
@@ -80,7 +84,8 @@ inline void WdLaunch(KernelPtr kernel, dim3 grid, dim3 block, size_t smem,
 #endif
 }
 
-void warp_decode_cute_gate_up(
+template <int TILE_K>
+void warp_decode_cute_gate_up_impl(
     const torch::Tensor& x, const torch::Tensor& w_gate, const torch::Tensor& w_up,
     torch::Tensor& out, const torch::Tensor& expert_ids,
     int hidden_size, int intermediate_size, int top_k, int num_tokens) {
@@ -92,12 +97,14 @@ void warp_decode_cute_gate_up(
   TORCH_CHECK(expert_ids.dtype() == torch::kInt32);
   auto stream = at::cuda::getCurrentCUDAStream();
   auto kernel_fn =
-      warp_decode_gate_up_cute_kernel<kGateUpTileN, kGateUpTileK, kGateUpNumWarps>;
-  MaybeSetSmemAttribute(kernel_fn, kGateUpSmemBytes);
+      warp_decode_gate_up_cute_kernel<
+          kGateUpTileN, TILE_K, kGateUpNumWarps>;
+  constexpr int smem_bytes = GateUpSmemBytes<TILE_K>();
+  MaybeSetSmemAttribute(kernel_fn, smem_bytes);
   dim3 grid((intermediate_size + kGateUpTileN - 1) / kGateUpTileN,
             num_tokens * top_k);
   dim3 block(kGateUpNumThreads);
-  WdLaunch(kernel_fn, grid, block, kGateUpSmemBytes, stream,
+  WdLaunch(kernel_fn, grid, block, smem_bytes, stream,
            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
            reinterpret_cast<const __nv_bfloat16*>(w_gate.data_ptr()),
            reinterpret_cast<const __nv_bfloat16*>(w_up.data_ptr()),
@@ -105,7 +112,18 @@ void warp_decode_cute_gate_up(
            expert_ids.data_ptr<int>(), hidden_size, intermediate_size, top_k, num_tokens);
 }
 
-void warp_decode_cute_gate_up_packed(
+void warp_decode_cute_gate_up(
+    const torch::Tensor& x, const torch::Tensor& w_gate, const torch::Tensor& w_up,
+    torch::Tensor& out, const torch::Tensor& expert_ids,
+    int hidden_size, int intermediate_size, int top_k, int num_tokens) {
+  TORCH_CHECK(top_k == 8, "warp_decode_cute requires top_k=8, got ", top_k);
+  warp_decode_cute_gate_up_impl<kGateUpTileK>(
+      x, w_gate, w_up, out, expert_ids, hidden_size, intermediate_size,
+      top_k, num_tokens);
+}
+
+template <int TILE_K>
+void warp_decode_cute_gate_up_packed_impl(
     const torch::Tensor& x, const torch::Tensor& w13,
     torch::Tensor& out, const torch::Tensor& expert_ids,
     int hidden_size, int intermediate_size, int top_k, int num_tokens) {
@@ -116,19 +134,32 @@ void warp_decode_cute_gate_up_packed(
   TORCH_CHECK(expert_ids.dtype() == torch::kInt32);
   auto stream = at::cuda::getCurrentCUDAStream();
   auto kernel_fn =
-      warp_decode_gate_up_packed_cute_kernel<kGateUpTileN, kGateUpTileK, kGateUpNumWarps>;
-  MaybeSetSmemAttribute(kernel_fn, kGateUpSmemBytes);
+      warp_decode_gate_up_packed_cute_kernel<
+          kGateUpTileN, TILE_K, kGateUpNumWarps>;
+  constexpr int smem_bytes = GateUpSmemBytes<TILE_K>();
+  MaybeSetSmemAttribute(kernel_fn, smem_bytes);
   dim3 grid((intermediate_size + kGateUpTileN - 1) / kGateUpTileN,
             num_tokens * top_k);
   dim3 block(kGateUpNumThreads);
-  WdLaunch(kernel_fn, grid, block, kGateUpSmemBytes, stream,
+  WdLaunch(kernel_fn, grid, block, smem_bytes, stream,
            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
            reinterpret_cast<const __nv_bfloat16*>(w13.data_ptr()),
            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
            expert_ids.data_ptr<int>(), hidden_size, intermediate_size, top_k, num_tokens);
 }
 
-void warp_decode_cute_down(
+void warp_decode_cute_gate_up_packed(
+    const torch::Tensor& x, const torch::Tensor& w13,
+    torch::Tensor& out, const torch::Tensor& expert_ids,
+    int hidden_size, int intermediate_size, int top_k, int num_tokens) {
+  TORCH_CHECK(top_k == 8, "warp_decode_cute requires top_k=8, got ", top_k);
+  warp_decode_cute_gate_up_packed_impl<kGateUpTileK>(
+      x, w13, out, expert_ids, hidden_size, intermediate_size, top_k,
+      num_tokens);
+}
+
+template <int TILE_N>
+void warp_decode_cute_down_impl(
     const torch::Tensor& intermediate, const torch::Tensor& w_down,
     const torch::Tensor& routing_weights, const torch::Tensor& expert_ids,
     torch::Tensor& out,
@@ -140,16 +171,29 @@ void warp_decode_cute_down(
   TORCH_CHECK(expert_ids.dtype() == torch::kInt32);
   auto stream = at::cuda::getCurrentCUDAStream();
   auto kernel_fn =
-      warp_decode_down_cute_kernel<kDownTileD, kDownTileN, kDownNumWarps>;
-  MaybeSetSmemAttribute(kernel_fn, kDownSmemBytes);
+      warp_decode_down_cute_kernel<
+          kDownTileD, TILE_N, kDownNumWarps>;
+  constexpr int smem_bytes = DownSmemBytes<TILE_N>();
+  MaybeSetSmemAttribute(kernel_fn, smem_bytes);
   dim3 grid((hidden_size + kDownTileD - 1) / kDownTileD, num_tokens);
   dim3 block(kDownNumThreads);
-  WdLaunch(kernel_fn, grid, block, kDownSmemBytes, stream,
+  WdLaunch(kernel_fn, grid, block, smem_bytes, stream,
            reinterpret_cast<const __nv_bfloat16*>(intermediate.data_ptr()),
            reinterpret_cast<const __nv_bfloat16*>(w_down.data_ptr()),
            routing_weights.data_ptr<float>(), expert_ids.data_ptr<int>(),
            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
            hidden_size, intermediate_size, top_k, num_tokens);
+}
+
+void warp_decode_cute_down(
+    const torch::Tensor& intermediate, const torch::Tensor& w_down,
+    const torch::Tensor& routing_weights, const torch::Tensor& expert_ids,
+    torch::Tensor& out,
+    int hidden_size, int intermediate_size, int top_k, int num_tokens) {
+  TORCH_CHECK(top_k == 8, "warp_decode_cute requires top_k=8, got ", top_k);
+  warp_decode_cute_down_impl<kDownTileN>(
+      intermediate, w_down, routing_weights, expert_ids, out, hidden_size,
+      intermediate_size, top_k, num_tokens);
 }
 
 void warp_decode_cute_down_fp4(

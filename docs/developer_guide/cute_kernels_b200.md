@@ -23,7 +23,7 @@ trials × 500 iterations.
 | G1 Gate (CuTe) | `sgl-kernel/csrc/attention/g1_attention_cute.cuh` | `g1_gate_fwd_kernel` (in-file legacy) | 1.23-1.71x graph mode |
 | GatedNorm (CuTe) | `sgl-kernel/csrc/elementwise/gated_norm_cute.cu(h)` | upstream `gated_norm.py` (Triton + torch.mm dispatch) | R=16: 1.04-1.49x vs torch.mm; vs original cute up to 38.69x |
 | LayerSplit (CuTe) | `sgl-kernel/csrc/kvcacheio/layersplit_cute.cu` | `torch.Tensor.copy_` / sequential copies | 1.21-1.38x single; 1.14-1.34x@low-layers multi |
-| WarpDecode MoE (CuTe) | `sgl-kernel/csrc/moe/warp_decode_cute.cu(h)` | Triton Warp Decode fallback | 11.98-13.41x on B300 at DeepSeek MoE shape |
+| WarpDecode MoE (CuTe) | `sgl-kernel/csrc/moe/warp_decode_cute.cu(h)` | Triton Warp Decode fallback | 12.19-13.48x on B300 at DeepSeek MoE shape |
 
 ## Detailed comparisons
 
@@ -422,87 +422,72 @@ takes over.
 Bit-exact: max abs diff 3.05e-5 vs `fused_moe_triton` and the original CuTe
 baseline.
 
-**Final round (composition: TILE_K=512 + split-FP32 inner accumulator + PDL
-chain).** Two further blog-invariant changes compose with the previous round:
+**Target-model final round (B300, target-only dispatch).** The final Warp
+Decode CuTe path is now specialized for the target DeepSeek MoE shape rather
+than preserving a general CuTe fallback. The Python wrapper only selects this
+kernel when the decode shape is compatible with the target path:
 
-1. `kGateUpTileK` raised from 256 to 512, halving the K-loop iterations from
-   28 to 14 at `D=7168`. The naive doubling regresses cosine similarity
-   (longer in-warp BF16x2 accumulator chain accumulates more rounding error,
-   delta ~6×10⁻⁶), so the inner loop is split into `kFlush=128` chunks with
-   FP32 partial-flush between chunks. This restores opt_b2's BF16
-   accumulation depth exactly while keeping the load/sync amortization win
-   from the wider tile. SMEM at `TILE_K=512 × 3 stages` is 52 KB/CTA, well
-   within B200's 232 KB; +1 register/thread, no spill.
-2. PDL (Programmatic Dependent Launch) chain: `gate/up` ends with
-   `__syncthreads() + __threadfence() + cudaTriggerProgrammaticLaunchCompletion()`,
-   `down` begins with `cudaGridDependencySynchronize()`, and the host-side
-   launch helper switches to `cudaLaunchKernelEx` with the
-   `cudaLaunchAttributeProgrammaticStreamSerialization` attribute. The
-   runtime opportunistically overlaps the down kernel's launch latency with
-   the gate/up kernel's tail. Gated by the `WD_PDL_ENABLED` build flag.
-
-| N | opt_b2 | composition | speedup vs opt_b2 |
-|---|---|---|---|
-| 1 | 121.42us | 119.52us | **1.0159x** |
-| 4 | 439.47us | 428.62us | **1.0253x** |
-| 8 | 875.36us | 843.97us | **1.0372x** |
-| 16 | 1750.27us | 1674.03us | **1.0455x** |
-| 64 | 7028.99us | 6679.82us | **1.0523x** |
-
-Strict improvement at every N. Cosine similarity vs FP32 reference is
-0.9999789–0.9999798 (≥ the 0.999976 acceptance gate, matches opt_b2 to
-the last digit). Blog invariants preserved: 8 warps × 1 neuron in both
-gate/up and down, `__shfl_xor_sync` butterfly, FP32 final accumulators,
-no cross-warp synchronization beyond the PDL grid-dependency edge, no
-tensor cores.
-
-A separate experiment combining 128-bit `uint4` LDS at `TILE_K=512` with
-the same PDL chain (the J+D+F′ composition) was non-additive: PDL gains
-concentrate at small N (launch latency), wider LDS gains concentrate at
-large N (LDS bandwidth), so combining them adds register pressure that
-slightly attenuates each individual gain. Production deployment uses J+D
-only.
-
-**Current production dispatch.** The upstreamed runtime path exposes Warp
-Decode through `--moe-runner-backend warp_decode` and the environment-gated
-`FusedMoE` hook. The CuTe kernel is selected only for aligned Blackwell BF16
-decode shapes:
-
-- `hidden_size % 512 == 0`
+- `top_k == 8`
+- `hidden_size % 1024 == 0`
 - `hidden_size % 8 == 0`
-- `intermediate_size % 1024 == 0`
+- `intermediate_size % 2048 == 0`
 - BF16 hidden states and BF16 expert weights
 
-Unsupported shapes fall back through the Python wrapper and the direct
-`sgl_kernel` op rejects them before launch. This keeps the DeepSeek MoE shape
-(`D=7168`, `I=2048`, `topk=8`, `E=128`) on the optimized path without allowing
-the 512/1024-tile `cp.async` loads to read outside small synthetic tensors.
+For the target model (`D=7168`, `I=2048`, `topk=8`, `E=128`), those predicates
+hold exactly. Other shapes still use the existing Triton Warp Decode path rather
+than an older CuTe tile variant.
+
+The target path keeps the blog-strict execution model: 8 warps per CTA, one
+intermediate neuron per warp in gate/up, one output dimension per warp in down,
+`__shfl_xor_sync` reductions, FP32 final accumulators, and no tensor cores. The
+accepted kernel raises gate/up `TILE_K` from 512 to 1024, raises down `TILE_N`
+from 1024 to 2048, specializes `top_k=8` index math, and keeps split-FP32
+partial accumulation in both gate/up and down so wider tiles do not accumulate a
+long BF16x2 rounding chain.
+
+Rejected candidate evidence is important:
+
+1. `top_k=8` specialization alone was correct but only moved timings within
+   noise.
+2. Down `TILE_N=2048` without split-FP32 partial accumulation was faster but
+   failed the accuracy gate (`cos=0.9999666` vs Triton at target shape).
+3. Down `TILE_N=2048` with split-FP32 restored correctness
+   (`cos=0.9999853`, max abs `0.0014648`) while retaining the throughput gain.
+
+**Current production dispatch.** The runtime path exposes Warp Decode through
+`--moe-runner-backend warp_decode` and the environment-gated `FusedMoE` hook.
 When `SGLANG_ENABLE_WARP_DECODE=false`, `FusedMoE.forward_impl` does not import
-or call the Warp Decode hook.
+or call the Warp Decode hook. When Warp Decode is enabled, `SGLANG_WARP_DECODE_CUTE=auto`
+selects the CuTe target path on Blackwell only for the predicates above;
+otherwise it stays on the Triton Warp Decode implementation.
 
 **B300 validation.** CUDA 13.0, PyTorch 2.11.0+cu130, SM103/SM100
 `sgl-kernel` build:
 
-```
+```bash
 pytest test/test_warp_decode.py -q -s
 # 25 passed
 
 # DeepSeek-shaped CuTe vs Triton fallback:
 # B=1, D=7168, I=2048, E=128, topk=8
-# cosine=0.99997520, max_abs=0.00006104, mean_abs=0.00001310
+# cosine=0.9999853373, max_abs=0.00146484375, mean_abs=0.0002900322
 ```
 
 Target-shape A/B with `benchmark/warp_decode/bench_warp_decode.py`
-(`warmup=10`, `iters=50`, reference disabled):
+(`warmup=20`, `iters=100`, reference disabled):
 
-| Batch | Triton fallback | CuTe | Speedup |
+| Batch | Triton fallback | CuTe target path | Speedup |
 |---:|---:|---:|---:|
-| 1 | 1504.3us | 124.9us | 12.05x |
-| 4 | 5341.4us | 409.9us | 13.03x |
-| 8 | 10423.8us | 789.6us | 13.20x |
-| 16 | 20826.7us | 1556.7us | 13.38x |
-| 32 | 40002.7us | 3097.1us | 12.92x |
-| 64 | 78043.7us | 6198.2us | 12.59x |
+| 1 | 1502.0us | 123.2us | 12.19x |
+| 4 | 5338.7us | 406.8us | 13.12x |
+| 8 | 10428.2us | 785.7us | 13.27x |
+| 16 | 20812.4us | 1543.9us | 13.48x |
+| 32 | 39984.4us | 3062.8us | 13.05x |
+| 64 | 77996.9us | 6144.4us | 12.69x |
+
+The accepted target-only kernel sources were also archived on the B300 at
+`/root/nvfp4-phase/kernel_archive/20260512T160326_warp_decode_target_only`
+before further work.
 
 ## Build configuration
 

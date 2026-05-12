@@ -27,9 +27,10 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 _CUTE_AVAILABLE = False
-_CUTE_GATE_UP_TILE_K = 512
+_CUTE_GATE_UP_TILE_K = 1024
 _CUTE_DOWN_TILE_D = 8
-_CUTE_DOWN_TILE_N = 1024
+_CUTE_DOWN_TILE_N = 2048
+_CUTE_TOP_K = 8
 try:
     import sgl_kernel
 
@@ -56,17 +57,20 @@ def _should_use_cute() -> bool:
     return False
 
 
-def _shape_supports_cute(hidden_size: int, intermediate_size: int) -> bool:
+def _shape_supports_cute(
+    hidden_size: int, intermediate_size: int, top_k: int
+) -> bool:
     return (
-        hidden_size % _CUTE_GATE_UP_TILE_K == 0
+        top_k == _CUTE_TOP_K
+        and hidden_size % _CUTE_GATE_UP_TILE_K == 0
         and hidden_size % _CUTE_DOWN_TILE_D == 0
         and intermediate_size % _CUTE_DOWN_TILE_N == 0
     )
 
 
-def _can_use_cute(hidden_size: int, intermediate_size: int) -> bool:
+def _can_use_cute(hidden_size: int, intermediate_size: int, top_k: int) -> bool:
     return _should_use_cute() and _shape_supports_cute(
-        hidden_size, intermediate_size
+        hidden_size, intermediate_size, top_k
     )
 
 
@@ -452,8 +456,9 @@ def warp_decode_moe(
             return hidden_states
         return torch.empty_like(hidden_states)
 
+    top_k = topk_ids.shape[1]
     # CuTe dispatch
-    if _can_use_cute(hidden_size, w_gate.shape[1]):
+    if _can_use_cute(hidden_size, w_gate.shape[1], top_k):
         return sgl_kernel.warp_decode_cute_moe_forward(
             hidden_states, w_gate, w_up, w_down,
             topk_ids, topk_weights, inplace,
@@ -463,7 +468,6 @@ def warp_decode_moe(
     assert w_up.dtype == torch.bfloat16, f"w_up must be bfloat16, got {w_up.dtype}"
     assert w_down.dtype == torch.bfloat16, f"w_down must be bfloat16, got {w_down.dtype}"
     num_experts, intermediate_size, w_k = w_gate.shape
-    top_k = topk_ids.shape[1]
 
     assert w_k == hidden_size, (
         f"w_gate hidden dim {w_k} != hidden_size {hidden_size}"
@@ -612,8 +616,9 @@ def warp_decode_moe_packed(
         return torch.empty_like(hidden_states)
 
     isize = intermediate_size if intermediate_size is not None else (w13.shape[1] // 2)
+    top_k = topk_ids.shape[1]
     # CuTe dispatch
-    if _can_use_cute(hidden_size, isize):
+    if _can_use_cute(hidden_size, isize, top_k):
         return sgl_kernel.warp_decode_cute_moe_packed_forward(
             hidden_states, w13, w2,
             topk_ids, topk_weights,
@@ -625,7 +630,6 @@ def warp_decode_moe_packed(
 
     if intermediate_size is None:
         intermediate_size = w13.shape[1] // 2
-    top_k = topk_ids.shape[1]
 
     assert w13.shape[2] == hidden_size, (
         f"w13 hidden dim {w13.shape[2]} != hidden_size {hidden_size}"

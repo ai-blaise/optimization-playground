@@ -29,11 +29,14 @@ from typing import List, Tuple
 import torch
 
 
-def cute_shape_supported(hidden_size: int, intermediate_size: int) -> bool:
+def cute_shape_supported(
+    hidden_size: int, intermediate_size: int, top_k: int
+) -> bool:
     return (
-        hidden_size % 512 == 0
+        top_k == 8
+        and hidden_size % 1024 == 0
         and hidden_size % 8 == 0
-        and intermediate_size % 1024 == 0
+        and intermediate_size % 2048 == 0
     )
 
 
@@ -203,7 +206,9 @@ def benchmark_cute_warp_decode(
     Returns:
         Tuple of (mean_latency_us, bandwidth_gb_s), or (-1, -1) if unavailable.
     """
-    if not cute_shape_supported(hidden_states.shape[1], intermediate_size):
+    if not cute_shape_supported(
+        hidden_states.shape[1], intermediate_size, topk_ids.shape[1]
+    ):
         return -1.0, -1.0
     try:
         import sgl_kernel
@@ -258,10 +263,10 @@ def benchmark_cute_warp_decode(
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark warp decode MoE")
-    parser.add_argument("--hidden-size", type=int, default=1024)
-    parser.add_argument("--intermediate-size", type=int, default=1024)
-    parser.add_argument("--num-experts", type=int, default=16)
-    parser.add_argument("--top-k", type=int, default=4)
+    parser.add_argument("--hidden-size", type=int, default=7168)
+    parser.add_argument("--intermediate-size", type=int, default=2048)
+    parser.add_argument("--num-experts", type=int, default=128)
+    parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument(
         "--batch-sizes", type=str, default="1,4,8,16,32,64",
         help="Comma-separated batch sizes to benchmark"
@@ -279,7 +284,9 @@ def main():
         import sgl_kernel
         cute_available = (
             hasattr(sgl_kernel, "warp_decode_cute_moe_packed_forward")
-            and cute_shape_supported(args.hidden_size, args.intermediate_size)
+            and cute_shape_supported(
+                args.hidden_size, args.intermediate_size, args.top_k
+            )
         )
     except ImportError:
         pass

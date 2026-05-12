@@ -46,6 +46,12 @@ SGL_DEVICE float reduce_max_width8(float value) {
   return value;
 }
 
+SGL_DEVICE float reduce_max_width4(float value, uint32_t mask) {
+  value = fmaxf(value, __shfl_xor_sync(mask, value, 2, 4));
+  value = fmaxf(value, __shfl_xor_sync(mask, value, 1, 4));
+  return value;
+}
+
 SGL_DEVICE uint32_t ceil_to_ue8m0_exp(float value) {
   const auto bits = __float_as_uint(fabsf(value));
   auto exp = (bits >> 23) & 0xffu;
@@ -62,6 +68,17 @@ SGL_DEVICE uint32_t pack_scale_word(uint32_t scale_exp) {
   return e0 | (e1 << 8) | (e2 << 16) | (e3 << 24);
 }
 
+SGL_DEVICE uint32_t pack_half_warp_scale_word(
+    uint32_t scale_exp, uint32_t mask) {
+  const auto lane_id = threadIdx.x & 31;
+  const auto row_base = lane_id & 16;
+  const auto e0 = __shfl_sync(mask, scale_exp, row_base);
+  const auto e1 = __shfl_sync(mask, scale_exp, row_base + 4);
+  const auto e2 = __shfl_sync(mask, scale_exp, row_base + 8);
+  const auto e3 = __shfl_sync(mask, scale_exp, row_base + 12);
+  return e0 | (e1 << 8) | (e2 << 16) | (e3 << 24);
+}
+
 SGL_DEVICE uint32_t clear_e2m1_signed_zero(uint32_t packed) {
   const auto magnitude = packed & 0x77777777u;
   const auto nonzero =
@@ -69,7 +86,7 @@ SGL_DEVICE uint32_t clear_e2m1_signed_zero(uint32_t packed) {
   return packed & (0x77777777u | nonzero);
 }
 
-SGL_DEVICE uint32_t pack_even_lane_e2m1(
+SGL_DEVICE uint32_t pack_eight_e2m1(
     float x0, float x1, float y0, float y1, float next_x0,
     float next_x1, float next_y0, float next_y1, float inv_scale) {
   float values[8] = {
@@ -83,6 +100,13 @@ SGL_DEVICE uint32_t pack_even_lane_e2m1(
       next_y1 * inv_scale,
   };
   return clear_e2m1_signed_zero(fp32_vec_to_e2m1(values));
+}
+
+SGL_DEVICE uint32_t pack_even_lane_e2m1(
+    float x0, float x1, float y0, float y1, float next_x0,
+    float next_x1, float next_y0, float next_y1, float inv_scale) {
+  return pack_eight_e2m1(
+      x0, x1, y0, y1, next_x0, next_x1, next_y0, next_y1, inv_scale);
 }
 
 template <typename KeyT>
@@ -125,6 +149,44 @@ SGL_DEVICE uint32_t quantize_indexer_row(
   return scale_word;
 }
 
+template <typename KeyT>
+SGL_DEVICE void quantize_indexer_row_half_warp(
+    const void* __restrict__ input,
+    void* __restrict__ values,
+    void* __restrict__ scales,
+    uint32_t input_row_id,
+    uint32_t output_row_id) {
+  using namespace device;
+  using KeyT2 = packed_t<KeyT>;
+  using InStorage = AlignedVector<KeyT2, 4>;
+
+  const auto lane_id = threadIdx.x & 31;
+  const auto lane_row = lane_id & 15;
+  const auto row_mask = 0x0000ffffu << (lane_id & 16);
+  const auto elems =
+      static_cast<const InStorage*>(input)[input_row_id * 16 + lane_row];
+  const auto [x0, x1] = cast<fp32x2_t>(elems[0]);
+  const auto [y0, y1] = cast<fp32x2_t>(elems[1]);
+  const auto [z0, z1] = cast<fp32x2_t>(elems[2]);
+  const auto [w0, w1] = cast<fp32x2_t>(elems[3]);
+  const auto local_max =
+      fmaxf(fmaxf(fmaxf(fabs(x0), fabs(x1)), fmaxf(fabs(y0), fabs(y1))),
+            fmaxf(fmaxf(fabs(z0), fabs(z1)), fmaxf(fabs(w0), fabs(w1))));
+  const auto group_max = reduce_max_width4(local_max, row_mask);
+  const auto scale_exp =
+      ceil_to_ue8m0_exp(fmaxf(1e-4f, group_max) / kE2M1Max);
+  const auto scale = __uint_as_float(scale_exp << 23);
+  const auto inv_scale = reciprocal_approximate_ftz(scale);
+  const auto packed =
+      pack_eight_e2m1(x0, x1, y0, y1, z0, z1, w0, w1, inv_scale);
+  static_cast<uint32_t*>(values)[output_row_id * 16 + lane_row] = packed;
+
+  const auto scale_word = pack_half_warp_scale_word(scale_exp, row_mask);
+  if (lane_row == 0) {
+    static_cast<uint32_t*>(scales)[output_row_id] = scale_word;
+  }
+}
+
 template <typename KeyT, typename IndicesT, uint32_t kPageBits,
           bool kUsePDL>
 __global__ void fused_store_indexer_cache_nvfp4(
@@ -155,9 +217,10 @@ __global__ void fused_store_indexer_cache_nvfp4(
 template <typename KeyT>
 __global__ void quantize_indexer_q_nvfp4(const __grid_constant__ NVFP4IndexerQuantParam param) {
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const auto global_wid = global_tid / 32;
-  if (global_wid >= param.num_rows) return;
-  quantize_indexer_row<KeyT>(param.input, param.values, param.scales, global_wid, global_wid);
+  const auto global_hwid = global_tid / 16;
+  if (global_hwid >= param.num_rows) return;
+  quantize_indexer_row_half_warp<KeyT>(
+      param.input, param.values, param.scales, global_hwid, global_hwid);
 }
 
 template <typename KeyT, typename IndicesT, uint32_t kPageSize,
@@ -230,7 +293,7 @@ struct NVFP4IndexerQuantKernel {
         .num_rows = num_rows,
     };
     constexpr auto kBlockSize = 256;
-    const auto num_blocks = div_ceil(num_rows * 32, kBlockSize);
+    const auto num_blocks = div_ceil(num_rows * 16, kBlockSize);
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap())(q_kernel, params);
   }
 };

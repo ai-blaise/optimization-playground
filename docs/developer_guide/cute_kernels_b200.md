@@ -19,6 +19,7 @@ trials × 500 iterations.
 | TurboQuant 2.5-bit KV dequant | `python/sglang/jit_kernel/csrc/quantization/turboquant_dense_kv.cuh` | original (this file, baseline) | 1.02x@N=1, 1.08x@N=256+ |
 | TurboQuant MLA 2.5-bit decode | `python/sglang/jit_kernel/csrc/quantization/turboquant_dense_mla_decode.cuh` | original (this file, baseline) | 1.40-2.56x across topk |
 | IndexCache NSA fused-store (bf16→fp8 quant+scatter) | `python/sglang/jit_kernel/csrc/nsa/fused_store_index_cache.cuh` | upstream paged-cache layout | 1.36x |
+| NVFP4 NSA Indexer Q quant | `python/sglang/jit_kernel/csrc/nsa/nvfp4_indexer_quant.cuh` | full-warp NVFP4 Q quant | 1.51x at `8192x64x128` |
 | FlashSampling Blackwell | `python/sglang/srt/layers/flashsampling/target_kernel_blackwell.py` | matmul + topk + softmax + multinomial | 3.6x at TP=8 (already in upstream `main`; not modified by this commit) |
 | G1 Gate (CuTe) | `sgl-kernel/csrc/attention/g1_attention_cute.cuh` | `g1_gate_fwd_kernel` (in-file legacy) | 1.23-1.71x graph mode |
 | GatedNorm (CuTe) | `sgl-kernel/csrc/elementwise/gated_norm_cute.cu(h)` | upstream `gated_norm.py` (Triton + torch.mm dispatch) | R=16: 1.04-1.49x vs torch.mm; vs original cute up to 38.69x |
@@ -144,6 +145,18 @@ the K-store cases. IKP attributed the Q baseline mainly to load, reduction, and
 scale-store regions; DeepGEMM/TileKernels-inspired variants (`pow2_inv`,
 `float2_pack`, `scale_leaders`, `pow2_float2`) were byte-exact but did not
 outperform the baseline beyond noise, so no source change was kept.
+
+The accepted May 2026 Q-only half-warp update keeps the K-store path unchanged
+and remaps `quantize_indexer_q_nvfp4` to two rows per warp. Each half warp owns
+one 128-d row, issues 128-bit loads, performs width-4 scale reductions over each
+32-value UE8M0 group, and writes the same packed E2M1/UE8M0 layout as the
+full-warp reference. Rejected microvariants stayed within noise or regressed;
+the half-warp mapping was the first candidate with IKP-backed load and
+pair-shuffle reduction. B300 validation on the exact committed source reported
+`test_nvfp4_indexer.py -> 2 passed, 1 skipped`, bench correctness count `8`,
+and Q `8192x64x128` median latency `0.049024 ms` versus the same-session
+baseline `0.073952 ms` (33.7% lower). K-store medians remained about `0.007 ms`,
+which is expected because the K-store source path was deliberately untouched.
 
 **Optimization (Round 1):** Removed `__launch_bounds__(32, 1)`, switched to
 4-warp blocks, removed `PagedCacheLayout` helper struct, removed the redundant

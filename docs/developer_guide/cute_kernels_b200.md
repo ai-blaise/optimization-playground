@@ -134,6 +134,17 @@ Validation on a B300 SXM6 node covered the executable JIT path:
   spills; the query quantization kernel used 19 registers and the fused
   K-store kernel used 21 registers.
 
+The May 2026 Blackwell sweep on a 2x B300 SXM6 node revalidated the executable
+path after the Megatron backward integration. `test_nvfp4_indexer.py` reported
+`2 passed, 1 skipped` on SM103; the skip is the expected non-Blackwell guard.
+Byte-exact coverage included Q rows `1, 16, 512, 8192` and K-store rows `8192`
+with contiguous and random indices at page sizes `64` and `128`. Median CUDA
+event timings were `0.073824 ms` for Q `8192x64x128` and about `0.007 ms` for
+the K-store cases. IKP attributed the Q baseline mainly to load, reduction, and
+scale-store regions; DeepGEMM/TileKernels-inspired variants (`pow2_inv`,
+`float2_pack`, `scale_leaders`, `pow2_float2`) were byte-exact but did not
+outperform the baseline beyond noise, so no source change was kept.
+
 **Optimization (Round 1):** Removed `__launch_bounds__(32, 1)`, switched to
 4-warp blocks, removed `PagedCacheLayout` helper struct, removed the redundant
 bounds check in the fast path.

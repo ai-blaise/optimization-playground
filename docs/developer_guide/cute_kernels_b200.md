@@ -477,6 +477,8 @@ Unsupported shapes fall back through the Python wrapper and the direct
 `sgl_kernel` op rejects them before launch. This keeps the DeepSeek MoE shape
 (`D=7168`, `I=2048`, `topk=8`, `E=128`) on the optimized path without allowing
 the 512/1024-tile `cp.async` loads to read outside small synthetic tensors.
+When `SGLANG_ENABLE_WARP_DECODE=false`, `FusedMoE.forward_impl` does not import
+or call the Warp Decode hook.
 
 **B300 validation.** CUDA 13.0, PyTorch 2.11.0+cu130, SM103/SM100
 `sgl-kernel` build:
@@ -491,16 +493,16 @@ pytest test/test_warp_decode.py -q -s
 ```
 
 Target-shape A/B with `benchmark/warp_decode/bench_warp_decode.py`
-(`warmup=3`, `iters=10`, reference disabled):
+(`warmup=10`, `iters=50`, reference disabled):
 
 | Batch | Triton fallback | CuTe | Speedup |
 |---:|---:|---:|---:|
-| 1 | 1506.8us | 125.8us | 11.98x |
-| 4 | 5341.0us | 410.4us | 13.01x |
-| 8 | 10426.7us | 789.7us | 13.20x |
-| 16 | 20787.9us | 1550.1us | 13.41x |
-| 32 | 39960.8us | 3070.4us | 13.02x |
-| 64 | 77969.7us | 6141.2us | 12.70x |
+| 1 | 1504.3us | 124.9us | 12.05x |
+| 4 | 5341.4us | 409.9us | 13.03x |
+| 8 | 10423.8us | 789.6us | 13.20x |
+| 16 | 20826.7us | 1556.7us | 13.38x |
+| 32 | 40002.7us | 3097.1us | 12.92x |
+| 64 | 78043.7us | 6198.2us | 12.59x |
 
 ## Build configuration
 

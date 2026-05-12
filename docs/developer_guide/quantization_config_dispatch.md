@@ -299,12 +299,23 @@ runtime kernel dispatch).
 
 - No-op when `quantization_config` is absent.
 - TurboQuant `kv_cache_scheme` enables the flag and copies the preset.
+- HIGGS `kv_cache_scheme` (`quant_method=higgs_dense_2bit`) enables
+  `enable_higgs_dense_2bit_kv_cache`; a bare declaration with no
+  layout fields still enables; the CLI flag short-circuits a redundant
+  config-side promotion.
+- TurboQuant ↔ HIGGS mutual exclusion is enforced in both directions:
+  a config that declares one path while the CLI already enabled the
+  other raises `ValueError` loudly.
 - The CLI-supplied preset survives a config that asks for a different
   one.
 - Unknown `quant_method`, unknown preset, and missing fields all fall
-  back cleanly.
+  back cleanly. The unknown-method check is a regression guard for
+  both `enable_turboquant_dense_kv_cache` and
+  `enable_higgs_dense_2bit_kv_cache`.
 - The two fields compose (a config with both set in the same
   `quantization_config`).
+- A wrapper object that exposes `to_dict()` is coerced and applied
+  (both TurboQuant and HIGGS paths).
 - `should_use_nsa_fused_store`:
   - With no declaration, behavior matches the auto-detect path
     (regression guard for backward compatibility).

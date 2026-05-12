@@ -589,8 +589,10 @@ class ServerArgs:
     nsa_indexcache_pattern: Optional[str] = None
     hisa_block_size: int = 128
     hisa_block_topk: int = 64
+    hisa_compression_ratio: float = 4.0
     hisa_min_seq_len: int = 65536
     hisa_execution_mode: str = "optimized"
+    enable_nsa_nvfp4_hisa: bool = False
     enable_turboquant_dense_kv_cache: bool = False
     turboquant_dense_kv_preset: str = "latent_2p5bit_nc"
     turboquant_residual_window_size: int = 128
@@ -1225,6 +1227,8 @@ class ServerArgs:
             raise ValueError("--hisa-block-size must be positive.")
         if self.hisa_block_topk <= 0:
             raise ValueError("--hisa-block-topk must be positive.")
+        if self.hisa_compression_ratio < 0:
+            raise ValueError("--hisa-compression-ratio must be non-negative.")
         if self.hisa_min_seq_len <= 0:
             raise ValueError("--hisa-min-seq-len must be positive.")
 
@@ -1232,8 +1236,11 @@ class ServerArgs:
         overrides["nsa_indexer_mode"] = self.nsa_indexer_mode
         overrides["hisa_block_size"] = self.hisa_block_size
         overrides["hisa_block_topk"] = self.hisa_block_topk
+        overrides["hisa_compression_ratio"] = self.hisa_compression_ratio
         overrides["hisa_min_seq_len"] = self.hisa_min_seq_len
         overrides["hisa_execution_mode"] = self.hisa_execution_mode
+        if self.enable_nsa_nvfp4_hisa:
+            overrides["enable_nsa_nvfp4_hisa"] = True
 
         if self.nsa_indexer_mode in ("indexcache", "indexcache-hisa"):
             if self.nsa_indexcache_pattern is not None:
@@ -6024,6 +6031,17 @@ class ServerArgs:
             help="Number of HISA coarse blocks to refine.",
         )
         parser.add_argument(
+            "--hisa-compression-ratio",
+            default=ServerArgs.hisa_compression_ratio,
+            type=float,
+            help=(
+                "Dynamic HISA coarse block compression ratio. A value of 4.0 "
+                "selects ceil(num_blocks / 4) blocks, raised as needed to "
+                "cover index_topk. Set 0 to use --hisa-block-topk as a fixed "
+                "block budget."
+            ),
+        )
+        parser.add_argument(
             "--hisa-min-seq-len",
             default=ServerArgs.hisa_min_seq_len,
             type=int,
@@ -6035,6 +6053,15 @@ class ServerArgs:
             type=str,
             choices=HISA_EXECUTION_MODE_CHOICES,
             help="HISA execution path.",
+        )
+        parser.add_argument(
+            "--enable-nsa-nvfp4-hisa",
+            action="store_true",
+            help=(
+                "Enable the experimental NVFP4 IndexCache HISA indexer path. "
+                "Defaults off and only applies to NVFP4 IndexCache with "
+                "--nsa-indexer-mode=hisa or indexcache-hisa."
+            ),
         )
         parser.add_argument(
             "--enable-turboquant-dense-kv-cache",
@@ -7813,7 +7840,10 @@ class ServerArgs:
                     "--nsa-indexer-mode=indexcache-hisa is not compatible with HiSparse. "
                     "Use --nsa-indexer-mode=indexcache for the HiSparse combined path."
                 )
-            if self.hisa_block_size * self.hisa_block_topk < hf_config.index_topk:
+            if (
+                self.hisa_compression_ratio <= 0
+                and self.hisa_block_size * self.hisa_block_topk < hf_config.index_topk
+            ):
                 raise ValueError(
                     "--hisa-block-size * --hisa-block-topk must be at least index_topk."
                 )

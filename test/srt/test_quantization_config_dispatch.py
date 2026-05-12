@@ -66,7 +66,14 @@ class FakeServerArgs:
     enable_turboquant_dense_kv_cache: bool = False
     turboquant_dense_kv_preset: str = "latent_2p5bit_nc"
     enable_higgs_dense_2bit_kv_cache: bool = False
+    nsa_indexer_mode: str = "vanilla"
     nsa_indexer_quantization: str = "auto"
+    hisa_block_size: int = 128
+    hisa_block_topk: int = 64
+    hisa_compression_ratio: float = 4.0
+    hisa_min_seq_len: int = 65536
+    hisa_execution_mode: str = "optimized"
+    enable_nsa_nvfp4_hisa: bool = False
     indexer_quantization_declared: Optional[Dict[str, Any]] = None
 
 
@@ -80,6 +87,7 @@ def test_no_quantization_config_is_noop():
     dispatcher.apply_quantization_config_dispatch(server_args, FakeHfConfig())
     assert server_args.enable_turboquant_dense_kv_cache is False
     assert server_args.turboquant_dense_kv_preset == "latent_2p5bit_nc"
+    assert server_args.enable_nsa_nvfp4_hisa is False
     assert server_args.indexer_quantization_declared is None
 
 
@@ -288,6 +296,54 @@ def test_indexer_quantization_nvfp4_records_declaration():
         "scale_format": "ue8m0",
         "scale_block_size": 32,
     }
+    assert server_args.enable_nsa_nvfp4_hisa is False
+
+
+def test_indexer_quantization_nvfp4_hisa_enables_config_surface():
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "indexer_quantization": {
+                "quant_method": "nvfp4_e2m1_ue8m0",
+                "hisa": {
+                    "enabled": True,
+                    "block_size": 128,
+                    "compression_ratio": 4.0,
+                    "min_seq_len": 8192,
+                    "execution_mode": "optimized",
+                },
+            },
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.enable_nsa_nvfp4_hisa is True
+    assert server_args.nsa_indexer_mode == "indexcache-hisa"
+    assert server_args.hisa_block_size == 128
+    assert server_args.hisa_block_topk == 64
+    assert server_args.hisa_compression_ratio == 4.0
+    assert server_args.hisa_min_seq_len == 8192
+    assert server_args.hisa_execution_mode == "optimized"
+
+
+def test_indexer_quantization_nvfp4_hisa_preserves_cli_hisa_values():
+    server_args = FakeServerArgs(
+        nsa_indexer_mode="hisa",
+        hisa_compression_ratio=0.0,
+        hisa_min_seq_len=32768,
+    )
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "indexer_quantization": {
+                "quant_method": "nvfp4_e2m1_ue8m0",
+                "hisa": {"enabled": True, "min_seq_len": 8192},
+            },
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.enable_nsa_nvfp4_hisa is True
+    assert server_args.nsa_indexer_mode == "hisa"
+    assert server_args.hisa_compression_ratio == 0.0
+    assert server_args.hisa_min_seq_len == 32768
 
 
 def test_cli_flag_takes_precedence_over_config():

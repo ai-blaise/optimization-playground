@@ -167,6 +167,26 @@ __device__ __forceinline__ float WarpReduceSum(float val) {
   return val;
 }
 
+__device__ __forceinline__ float Ex2ApproxFtz(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+__device__ __forceinline__ float RcpApproxFtz(float x) {
+  float y;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+__device__ __forceinline__ float FastSigmoid(float x) {
+  return RcpApproxFtz(1.0f + Ex2ApproxFtz(-x * 1.4426950408889634f));
+}
+
+__device__ __forceinline__ float FastSilu(float x) {
+  return x * FastSigmoid(x);
+}
+
 // ===========================================================================
 // Kernel 1: BLOG-STRICT Gate/Up (separate weights)
 //   * 8 warps × 1 neuron per warp.
@@ -313,8 +333,7 @@ warp_decode_gate_up_cute_kernel(
     const int n_idx = n_base + warp_id;     // 1 neuron per warp
     if (n_idx < intermediate_size) {
       float g = gate_acc;
-      float silu = g / (1.0f + expf(-g));
-      out_row[n_idx] = __float2bfloat16(silu * up_acc);
+      out_row[n_idx] = __float2bfloat16(FastSilu(g) * up_acc);
     }
   }
   // Signal the dependent down kernel that intermediate is ready. The
@@ -455,8 +474,7 @@ warp_decode_gate_up_packed_cute_kernel(
     const int n_idx = n_base + warp_id;
     if (n_idx < intermediate_size) {
       float g = gate_acc;
-      float silu = g / (1.0f + expf(-g));
-      out_row[n_idx] = __float2bfloat16(silu * up_acc);
+      out_row[n_idx] = __float2bfloat16(FastSilu(g) * up_acc);
     }
   }
   // PDL trigger — signal dependent (down) kernel that intermediate is ready.
@@ -529,6 +547,69 @@ warp_decode_down_cute_kernel(
       CpAsyncLoad128(sp + kSmemWOff + r*TILE_N + c, w_row + r*intermediate_size + c);
     }
   };
+
+  if (num_n_iters == 1) {
+    // Target-shape fast path: top_k=8 and TILE_N covers the full intermediate
+    // row, so each expert contributes one staged dot product.
+    constexpr int kDNumStages = 3;
+    load_stage(0, 0, 0);
+    CpAsyncCommit();
+    load_stage(1, 0, 1);
+    CpAsyncCommit();
+
+#pragma unroll
+    for (int k_idx = 0; k_idx < 8; ++k_idx) {
+      constexpr int kNumTopK = 8;
+      const int compute_stage = k_idx % kDNumStages;
+      const int next = k_idx + 2;
+      if (next < kNumTopK) {
+        load_stage(next, 0, next % kDNumStages);
+        CpAsyncCommit();
+        CpAsyncWaitGroup<2>();
+      } else if (k_idx + 1 < kNumTopK) {
+        CpAsyncWaitGroup<1>();
+      } else {
+        CpAsyncWaitGroup<0>();
+      }
+      __syncthreads();
+
+      __nv_bfloat16* sp = smem + compute_stage * kElemsPerStage;
+      const __nv_bfloat16* inter_smem = sp + kSmemInterOff;
+      const __nv_bfloat16* w_smem = sp + kSmemWOff;
+
+      const int d_row = warp_id;
+      const __nv_bfloat162* inter_smem2 = reinterpret_cast<const __nv_bfloat162*>(inter_smem);
+      const __nv_bfloat162* w_smem2 = reinterpret_cast<const __nv_bfloat162*>(w_smem);
+      constexpr int kV2 = TILE_N / 2;
+      constexpr int kFlush = (kV2 > 128) ? 128 : kV2;
+      float local = 0.0f;
+#pragma unroll
+      for (int nn_base = 0; nn_base < kV2; nn_base += kFlush) {
+        __nv_bfloat162 acc2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+#pragma unroll
+        for (int nn = lane_id; nn < kFlush; nn += 32) {
+          const int gnn = nn_base + nn;
+          __nv_bfloat162 i2 = inter_smem2[gnn];
+          __nv_bfloat162 w2 = w_smem2[d_row * kV2 + gnn];
+          acc2 = __hfma2(w2, i2, acc2);
+        }
+        local += __bfloat162float(acc2.x) + __bfloat162float(acc2.y);
+      }
+      local = WarpReduceSum(local);
+      if (lane_id == 0) {
+        float rw = routing_weights[pid_t * 8 + k_idx];
+        out_acc += rw * local;
+      }
+      __syncthreads();
+    }
+
+    if (lane_id == 0) {
+      __nv_bfloat16* out_row = out + (int64_t)pid_t * hidden_size;
+      const int d_idx = d_base + warp_id;
+      if (d_idx < hidden_size) out_row[d_idx] = __float2bfloat16(out_acc);
+    }
+    return;
+  }
 
   const int total_iters = 8 * num_n_iters;
 

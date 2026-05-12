@@ -179,6 +179,49 @@ def _maybe_apply_indexer_quantization(
         method,
     )
 
+    hisa_cfg = _coerce_dict(indexer_quant.get("hisa"))
+    if method != INDEXER_NVFP4_QUANT_METHOD or hisa_cfg is None:
+        return
+    if not bool(hisa_cfg.get("enabled", False)):
+        return
+
+    server_args.enable_nsa_nvfp4_hisa = True
+    mode = str(hisa_cfg.get("mode", "indexcache-hisa"))
+    if mode not in ("hisa", "indexcache-hisa"):
+        logger.info(
+            "quantization_config.indexer_quantization.hisa.mode=%r is not "
+            "supported; keeping the existing NSA indexer mode.",
+            mode,
+        )
+    elif getattr(server_args, "nsa_indexer_mode", "vanilla") == "vanilla":
+        server_args.nsa_indexer_mode = mode
+    if (
+        "block_size" in hisa_cfg
+        and getattr(server_args, "hisa_block_size", 128) == 128
+    ):
+        server_args.hisa_block_size = int(hisa_cfg["block_size"])
+    if "block_topk" in hisa_cfg and getattr(server_args, "hisa_block_topk", 64) == 64:
+        server_args.hisa_block_topk = int(hisa_cfg["block_topk"])
+    if (
+        "compression_ratio" in hisa_cfg
+        and getattr(server_args, "hisa_compression_ratio", 4.0) == 4.0
+    ):
+        server_args.hisa_compression_ratio = float(hisa_cfg["compression_ratio"])
+    if (
+        "min_seq_len" in hisa_cfg
+        and getattr(server_args, "hisa_min_seq_len", 65536) == 65536
+    ):
+        server_args.hisa_min_seq_len = int(hisa_cfg["min_seq_len"])
+    if (
+        "execution_mode" in hisa_cfg
+        and getattr(server_args, "hisa_execution_mode", "optimized") == "optimized"
+    ):
+        server_args.hisa_execution_mode = str(hisa_cfg["execution_mode"])
+    logger.info(
+        "Enabling NVFP4 HISA IndexCache indexer from "
+        "quantization_config.indexer_quantization.hisa."
+    )
+
 
 def apply_quantization_config_dispatch(
     server_args: Any, hf_config: Any

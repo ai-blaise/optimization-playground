@@ -1467,6 +1467,7 @@ class DeepseekV2AttentionMLA(
                 ),
                 hisa_block_size=getattr(config, "hisa_block_size", 128),
                 hisa_block_topk=getattr(config, "hisa_block_topk", 64),
+                hisa_compression_ratio=getattr(config, "hisa_compression_ratio", 4.0),
                 hisa_min_seq_len=getattr(config, "hisa_min_seq_len", 65536),
                 hisa_execution_mode=getattr(
                     config, "hisa_execution_mode", "optimized"

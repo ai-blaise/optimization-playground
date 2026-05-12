@@ -502,6 +502,43 @@ The accepted target-only kernel sources were also archived on the B300 at
 `/root/nvfp4-phase/kernel_archive/20260512T160326_warp_decode_target_only`
 before further work.
 
+**B200 stop-point follow-up.** A B200-only pass used the direct Warp Decode
+extension harness on the target shape (`D=7168`, `I=2048`, `E=128`, `topk=8`)
+to avoid rebuilding unrelated kernels while preserving the production source
+path. It first accepted a down-kernel `num_n_iters == 1` fast path for the
+target `I=2048` tile. The change keeps the 3-stage `cp.async` pipeline and
+split-FP32 accumulation but removes runtime `it / num_n_iters`, previous-expert
+bookkeeping, and delayed routing folding when the tile covers the full
+intermediate row.
+
+The final stop-point candidate replaced the gate/up SiLU activation with the
+same inline approximate sigmoid form used by the Blackwell G1 kernel:
+`ex2.approx.ftz.f32` plus `rcp.approx.ftz.f32`. Correctness against the PyTorch
+reference remained within the established BF16 gate on B200:
+
+| Batch | Cosine | Max abs | Mean abs |
+|---:|---:|---:|---:|
+| 1 | 0.9999859333 | 0.0024414062 | 0.0004682836 |
+| 64 | 0.9999855757 | 0.0029296875 | 0.0003488629 |
+
+Direct-extension timings (`warmup=20`, `iters=100`) after the fast-SiLU
+candidate were:
+
+| Batch | Down fast path | Fast-SiLU final | Delta |
+|---:|---:|---:|---:|
+| 1 | 118.6us | 118.1us | 0.4% faster |
+| 4 | 399.5us | 397.1us | 0.6% faster |
+| 8 | 776.0us | 770.8us | 0.7% faster |
+| 16 | 1529.8us | 1524.0us | 0.4% faster |
+| 32 | 3086.8us | 3055.2us | 1.0% faster |
+| 64 | 6133.2us | 6076.3us | 0.9% faster |
+
+The B64 final number uses a dedicated `warmup=30`, `iters=200` rerun
+(`6076.3us` mean, `6074.9us` median) to avoid one all-batch outlier. Rejected
+B200 down-tile variants remain rejected: `TILE_N=1024` regressed at every target
+batch, and `TILE_N=1536` violates the target `I=2048` shape guard without
+tail-safe vector loads.
+
 ## Build configuration
 
 The CuTe kernels build via `torch.utils.cpp_extension.load()` with:

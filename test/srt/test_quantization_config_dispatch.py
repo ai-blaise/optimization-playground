@@ -65,6 +65,7 @@ dispatcher = _load_module(
 class FakeServerArgs:
     enable_turboquant_dense_kv_cache: bool = False
     turboquant_dense_kv_preset: str = "latent_2p5bit_nc"
+    enable_higgs_dense_2bit_kv_cache: bool = False
     nsa_indexer_quantization: str = "auto"
     indexer_quantization_declared: Optional[Dict[str, Any]] = None
 
@@ -115,6 +116,138 @@ def test_turboquant_dense_default_preset_keeps_default():
     dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
     assert server_args.enable_turboquant_dense_kv_cache is True
     assert server_args.turboquant_dense_kv_preset == "latent_2p5bit_nc"
+
+
+# ---------------------------------------------------------------------------
+# HIGGS 2-bit dense MLA KV (alternative to TurboQuant 2.5-bit). Mirrors the
+# TurboQuant dispatcher tests above; the two paths are mutually exclusive.
+# ---------------------------------------------------------------------------
+
+
+def test_higgs_dense_kv_cache_scheme_enables_flag():
+    """``quant_method=higgs_dense_2bit`` sets the corresponding bool."""
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "kv_cache_scheme": {
+                "quant_method": "higgs_dense_2bit",
+                "preset": "eden2_16",
+                "slot_bytes": 258,
+                "packed_bits": 2,
+                "kv_dim": 576,
+                "latent_dim": 512,
+                "rope_dim": 64,
+                "hadamard_groupsize": 512,
+                "codebook": "eden2_16",
+            },
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.enable_higgs_dense_2bit_kv_cache is True
+    # The TurboQuant flag must remain off — the two paths are mutually exclusive.
+    assert server_args.enable_turboquant_dense_kv_cache is False
+
+
+def test_higgs_dense_minimal_scheme_enables_flag():
+    """A bare ``quant_method=higgs_dense_2bit`` (no layout fields) still enables."""
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "kv_cache_scheme": {"quant_method": "higgs_dense_2bit"},
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.enable_higgs_dense_2bit_kv_cache is True
+    assert server_args.enable_turboquant_dense_kv_cache is False
+
+
+def test_higgs_cli_flag_already_set_is_noop():
+    """When ``--enable-higgs-dense-2bit-kv-cache`` is already True, dispatcher no-ops."""
+    server_args = FakeServerArgs(enable_higgs_dense_2bit_kv_cache=True)
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "kv_cache_scheme": {"quant_method": "higgs_dense_2bit"},
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.enable_higgs_dense_2bit_kv_cache is True
+
+
+def test_higgs_unknown_kv_cache_scheme_method_is_ignored():
+    """An unrecognized ``quant_method`` leaves both KV bools off."""
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "kv_cache_scheme": {"quant_method": "future_kv_v3"},
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.enable_higgs_dense_2bit_kv_cache is False
+    assert server_args.enable_turboquant_dense_kv_cache is False
+
+
+def test_higgs_quantization_config_object_with_to_dict():
+    """A wrapper with a ``to_dict()`` method is coerced and applied."""
+
+    class WrappedQuantConfig:
+        def to_dict(self):
+            return {
+                "kv_cache_scheme": {
+                    "quant_method": "higgs_dense_2bit",
+                    "slot_bytes": 258,
+                },
+            }
+
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(quantization_config=WrappedQuantConfig())
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.enable_higgs_dense_2bit_kv_cache is True
+    assert server_args.enable_turboquant_dense_kv_cache is False
+
+
+def test_higgs_declared_blocks_turboquant_cli():
+    """Config declares HIGGS while CLI already enabled TurboQuant → ``ValueError``."""
+    server_args = FakeServerArgs(enable_turboquant_dense_kv_cache=True)
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "kv_cache_scheme": {"quant_method": "higgs_dense_2bit"},
+        }
+    )
+    try:
+        dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    except ValueError as exc:
+        message = str(exc)
+        assert "higgs_dense_2bit" in message
+        assert "turboquant" in message.lower()
+    else:
+        raise AssertionError(
+            "Declaring higgs_dense_2bit while TurboQuant is enabled on the CLI "
+            "must raise ValueError; the two paths are mutually exclusive."
+        )
+
+
+def test_turboquant_declared_blocks_higgs_cli():
+    """Config declares TurboQuant while CLI already enabled HIGGS → ``ValueError``."""
+    server_args = FakeServerArgs(enable_higgs_dense_2bit_kv_cache=True)
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "kv_cache_scheme": {
+                "quant_method": "turboquant_dense",
+                "preset": "latent_2p5bit_nc",
+            },
+        }
+    )
+    try:
+        dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    except ValueError as exc:
+        message = str(exc)
+        assert "turboquant_dense" in message
+        assert "higgs" in message.lower()
+    else:
+        raise AssertionError(
+            "Declaring turboquant_dense while HIGGS is enabled on the CLI must "
+            "raise ValueError; the two paths are mutually exclusive."
+        )
 
 
 def test_indexer_quantization_fp8_records_declaration():
@@ -185,6 +318,7 @@ def test_unknown_kv_cache_scheme_method_is_ignored():
     )
     dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
     assert server_args.enable_turboquant_dense_kv_cache is False
+    assert server_args.enable_higgs_dense_2bit_kv_cache is False
     assert server_args.indexer_quantization_declared is None
 
 

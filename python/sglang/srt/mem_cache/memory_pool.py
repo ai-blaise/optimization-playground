@@ -49,6 +49,16 @@ from sglang.jit_kernel.turboquant_dense_mla_decode import (
     turboquant_dense_mla_decode_2p5_split_rotated,
     turboquant_dense_mla_rotate_query,
 )
+from sglang.jit_kernel.higgs_dense_2bit import (
+    dequantize_higgs_dense_2bit,
+    dequantize_higgs_dense_2bit_page_table,
+    store_higgs_dense_2bit,
+)
+from sglang.jit_kernel.higgs_dense_2bit_mla_decode import (
+    higgs_dense_2bit_mla_decode,
+    higgs_dense_2bit_mla_decode_split,
+    higgs_dense_2bit_mla_rotate_query,
+)
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -65,6 +75,10 @@ from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.quantization.turboquant_dense_kv import (
     TurboQuantDenseKVCodec,
     TurboQuantDenseKVConfig,
+)
+from sglang.srt.layers.quantization.higgs_dense_2bit_kv import (
+    HiggsDense2BitCodec,
+    HiggsDense2BitConfig,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
@@ -3113,6 +3127,396 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
 
         dst_dtype = dst_dtype or self.dtype
         kv = self.turboquant_codec.decompress(
+            self._get_layersplit_kv_buffer(layer_id)[loc], dst_dtype
+        )
+        return kv[..., : self.kv_lora_rank], kv[..., self.kv_lora_rank :]
+
+
+class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
+    """NSA KV pool with 2-bit HIGGS compressed dense MLA storage.
+
+    Mirrors :class:`TurboQuantNSATokenToKVPool` 1:1 but stores 258 B/token/layer
+    instead of TurboQuant's 274 B/token/layer (-5.84%) using EDEN2-16 lattice
+    quantization (Pletka et al. arXiv 2501.19392 + AquaKV reference).
+
+    Two-attribute compatibility shim with the TurboQuant dispatch:
+      * ``turboquant_execution_mode`` mirrors as ``"fused_decode"`` so the
+        existing decode-dispatch gate at ``nsa_backend.py`` recognizes this
+        pool as a compressed-dense pool through a single field, while the
+        ``higgs_execution_mode`` field provides the dedicated HIGGS view.
+    """
+
+    def __init__(
+        self,
+        *args,
+        higgs_execution_mode: str = "fused_decode",
+        higgs_skip_layers: Optional[set[int]] = None,
+        higgs_mla_decode_num_splits: int = 16,
+        **kwargs,
+    ):
+        self.higgs_execution_mode = higgs_execution_mode
+        # Compatibility alias: backends gate on `turboquant_execution_mode`
+        # to decide "this pool stores compressed-dense KV"; we surface the
+        # same field so any future backend that checks the alias works
+        # uniformly. The actual dispatch in `nsa_backend.py` also checks
+        # the pool type / `higgs_dense_2bit_preset` to disambiguate paths.
+        self.turboquant_execution_mode = higgs_execution_mode
+        self.higgs_dense_2bit_preset = "eden2_16"
+        self.higgs_skip_layers = higgs_skip_layers or set()
+        self.higgs_mla_decode_num_splits = int(higgs_mla_decode_num_splits)
+        if self.higgs_mla_decode_num_splits < 1:
+            raise ValueError(
+                "higgs_mla_decode_num_splits must be >= 1; "
+                f"got {self.higgs_mla_decode_num_splits}."
+            )
+        # Lazily-allocated scratch buffers for the split-K decode path.
+        # Shapes depend on (batch, heads, num_splits) and the BF16 query;
+        # we allocate on first call and only reallocate when shapes
+        # change. Matches TurboQuant's pattern at line 2973 above.
+        self._higgs_mla_decode_mid: Optional[torch.Tensor] = None
+        self._higgs_mla_q_rotated: Optional[torch.Tensor] = None
+        super().__init__(*args, **kwargs)
+
+    def _create_buffers(self):
+        self.store_dtype = torch.uint8
+        self.higgs_codec = HiggsDense2BitCodec(
+            HiggsDense2BitConfig(
+                latent_dim=self.kv_lora_rank,
+                rope_dim=self.qk_rope_head_dim,
+            ),
+            torch.device(self.device),
+        )
+        self.higgs_slot_bytes = self.higgs_codec.slot_bytes
+        dtype_bytes = torch.tensor([], dtype=self.dtype).element_size()
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                self.kv_buffer = []
+                for local_layer_idx in range(self.layer_num):
+                    layer_id = self.start_layer + local_layer_idx
+                    rows = (
+                        m
+                        if self.layersplit_owns_layer(layer_id)
+                        else self.page_size
+                    )
+                    if layer_id in self.higgs_skip_layers:
+                        self.kv_buffer.append(
+                            torch.zeros(
+                                (rows, 1, self.kv_cache_dim),
+                                dtype=self.dtype,
+                                device=self.device,
+                            )
+                        )
+                    else:
+                        self.kv_buffer.append(
+                            torch.zeros(
+                                (rows, 1, self.higgs_slot_bytes),
+                                dtype=torch.uint8,
+                                device=self.device,
+                            )
+                        )
+                if self.layersplit_policy is not None:
+                    self.layersplit_kv_buffer = torch.zeros(
+                        (m, 1, self.higgs_slot_bytes),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+
+        self._higgs_selected_buffer: Optional[torch.Tensor] = None
+        self._higgs_compact_page_table: Optional[torch.Tensor] = None
+        fp16_bytes = (self.kv_lora_rank + self.qk_rope_head_dim) * dtype_bytes
+        logger.info(
+            "HIGGS dense 2-bit MLA KV cache enabled: %d bytes/token "
+            "(baseline dense=%d bytes/token, savings=%.2f%%)",
+            self.higgs_slot_bytes,
+            fp16_bytes,
+            100.0 * (fp16_bytes - self.higgs_slot_bytes) / fp16_bytes,
+        )
+
+    def _clear_buffers(self):
+        self._wait_layersplit_kv_prefetch()
+        del self.kv_buffer
+        if self.layersplit_kv_buffer is not None:
+            del self.layersplit_kv_buffer
+
+    def _uses_higgs_layer(self, layer_id: int) -> bool:
+        return layer_id not in self.higgs_skip_layers
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        if not self._uses_higgs_layer(layer_id):
+            return self._get_layersplit_kv_buffer(layer_id)
+
+        # HIGGS fused_decode does NOT materialize the full dense KV cache.
+        # Callers that need the dense view should go through
+        # ``get_mla_kv_buffer`` (single-loc decompress) or
+        # ``get_higgs_selected_kv_buffer`` (page-table decompress).
+        raise RuntimeError(
+            "HIGGS dense 2-bit fused_decode does not materialize the full "
+            "dense KV cache; use get_higgs_selected_kv_buffer or "
+            "get_mla_kv_buffer."
+        )
+
+    def get_value_buffer(self, layer_id: int):
+        key_buf = self.get_key_buffer(layer_id)
+        return key_buf[..., : self.kv_lora_rank]
+
+    def get_kv_buffer(self, layer_id: int):
+        key_buf = self.get_key_buffer(layer_id)
+        return key_buf, key_buf[..., : self.kv_lora_rank]
+
+    def get_higgs_selected_kv_buffer(
+        self,
+        layer_id: int,
+        page_table: torch.Tensor,
+        fp8_layout: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Materialize the latent+rope view for a page_table-indexed selection.
+
+        Returns ``(kv_cache, compact_page_table)``. Output is BF16 latent+rope
+        of width ``kv_lora_rank + qk_rope_head_dim`` (i.e. ``kv_cache_dim``).
+        ``fp8_layout`` is accepted for API symmetry with TurboQuant but is
+        not yet supported on the HIGGS path — falls through to the BF16
+        path. This matches the early-stage rollout: HIGGS is targeting
+        ``flashmla_sparse`` / ``tilelang`` first; ``flashmla_kv`` FP8 will
+        come once the codec is proven in production.
+        """
+        if not self._uses_higgs_layer(layer_id):
+            layer_buffer = self._get_layersplit_kv_buffer(layer_id)
+            return layer_buffer, page_table
+        layer_buffer = self._get_layersplit_kv_buffer(layer_id)
+
+        if (
+            self.dtype == torch.bfloat16
+            and page_table.is_cuda
+            and page_table.dtype == torch.int32
+            and page_table.is_contiguous()
+        ):
+            if (
+                self._higgs_selected_buffer is None
+                or self._higgs_selected_buffer.shape[0] < page_table.numel()
+            ):
+                self._higgs_selected_buffer = torch.empty(
+                    (page_table.numel(), 1, self.kv_cache_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            if (
+                self._higgs_compact_page_table is None
+                or self._higgs_compact_page_table.shape != page_table.shape
+            ):
+                self._higgs_compact_page_table = torch.empty_like(page_table)
+            kv_cache = self._higgs_selected_buffer[: page_table.numel()]
+            dequantize_higgs_dense_2bit_page_table(
+                layer_buffer,
+                page_table,
+                kv_cache,
+                self._higgs_compact_page_table,
+                self.higgs_codec.codebook,
+            )
+            return kv_cache, self._higgs_compact_page_table
+
+        # Fallback: eager codec path for non-standard layouts (e.g. CPU).
+        mask = page_table >= 0
+        flat_loc = page_table.clamp_min(0).reshape(-1).long()
+        kv_cache = self.higgs_codec.decompress(
+            layer_buffer[flat_loc],
+            self.dtype,
+        )
+        compact_page_table = torch.arange(
+            page_table.numel(),
+            dtype=page_table.dtype,
+            device=page_table.device,
+        ).reshape(page_table.shape)
+        compact_page_table = compact_page_table.masked_fill(~mask, -1)
+        return kv_cache, compact_page_table
+
+    def forward_higgs_dense_2bit_mla_decode(
+        self,
+        layer_id: int,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        page_table: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """Fused dense MLA decode on the 2-bit HIGGS packed slots.
+
+        Mirrors :meth:`TurboQuantNSATokenToKVPool.forward_turboquant_dense_mla_decode`.
+        When ``higgs_mla_decode_num_splits > 1`` the split-K path runs:
+        FWHT_512 of ``q_nope`` into a ``q_rotated`` scratch, then the
+        topk loop is sharded across ``num_splits`` blocks per
+        ``(row, head)`` with a merge-and-inverse-FWHT stage. This
+        mirrors TurboQuant's ``decode_2p5_split_rotated`` two-stage
+        pipeline and recovers small-batch throughput on H200.
+        Setting ``num_splits == 1`` selects the original single-pass
+        kernel, useful when ``num_rows * num_heads`` already saturates
+        the GPU.
+        """
+        layer_buffer = self._get_layersplit_kv_buffer(layer_id)
+        out = torch.empty(
+            (q_nope.shape[0], q_nope.shape[1], self.kv_lora_rank),
+            dtype=self.dtype,
+            device=q_nope.device,
+        )
+        num_splits = self.higgs_mla_decode_num_splits
+        if num_splits <= 1:
+            higgs_dense_2bit_mla_decode(
+                q_nope,
+                q_rope,
+                layer_buffer,
+                page_table,
+                out,
+                self.higgs_codec.codebook,
+                sm_scale,
+            )
+            return out
+
+        mid_shape = (
+            q_nope.shape[0],
+            q_nope.shape[1],
+            num_splits,
+            self.kv_lora_rank + 2,
+        )
+        if (
+            self._higgs_mla_decode_mid is None
+            or self._higgs_mla_decode_mid.shape != mid_shape
+        ):
+            self._higgs_mla_decode_mid = torch.empty(
+                mid_shape,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+        q_rotated_shape = q_nope.shape
+        if (
+            self._higgs_mla_q_rotated is None
+            or self._higgs_mla_q_rotated.shape != q_rotated_shape
+        ):
+            self._higgs_mla_q_rotated = torch.empty(
+                q_rotated_shape,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+        higgs_dense_2bit_mla_rotate_query(
+            q_nope,
+            self._higgs_mla_q_rotated,
+        )
+        higgs_dense_2bit_mla_decode_split(
+            self._higgs_mla_q_rotated,
+            q_rope,
+            layer_buffer,
+            page_table,
+            self._higgs_mla_decode_mid,
+            out,
+            self.higgs_codec.codebook,
+            sm_scale,
+        )
+        return out
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        self.set_mla_kv_buffer(
+            layer,
+            loc,
+            cache_k[..., : self.kv_lora_rank],
+            cache_k[..., self.kv_lora_rank :],
+        )
+
+    def _set_higgs_mla_kv_buffer_to_buffer(
+        self,
+        kv_buffer: torch.Tensor,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> None:
+        if (
+            self.dtype == torch.bfloat16
+            and loc.is_cuda
+            and loc.dtype == torch.int64
+            and cache_k_nope.is_cuda
+            and cache_k_rope.is_cuda
+            and cache_k_nope.dtype == torch.bfloat16
+            and cache_k_rope.dtype == torch.bfloat16
+        ):
+            if cache_k_nope.dim() == 2:
+                cache_k_nope = cache_k_nope.unsqueeze(1)
+            if cache_k_rope.dim() == 2:
+                cache_k_rope = cache_k_rope.unsqueeze(1)
+            store_higgs_dense_2bit(
+                kv_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                self.higgs_codec.codebook,
+                self.higgs_codec.codebook_norm_sq,
+            )
+        else:
+            kv_buffer[loc] = self.higgs_codec.compress(
+                cache_k_nope,
+                cache_k_rope,
+            )
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        layer_idx = layer_id - self.start_layer
+        active_rows = self._layersplit_active_rows_from_loc(loc)
+        if not self.layersplit_owns_layer(layer_id):
+            kv_buffer = self._finish_layersplit_kv_prefetch_for_update(layer_id)
+            if kv_buffer is not None:
+                if self._uses_higgs_layer(layer_id):
+                    self._set_higgs_mla_kv_buffer_to_buffer(
+                        kv_buffer, loc, cache_k_nope, cache_k_rope
+                    )
+                else:
+                    self._set_mla_kv_buffer_to_buffer(
+                        kv_buffer, loc, cache_k_nope, cache_k_rope
+                    )
+            else:
+                self.prefetch_layersplit_kv_buffer(layer_id, active_rows=active_rows)
+            return
+
+        if not self._uses_higgs_layer(layer_id):
+            super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+            return
+
+        has_prefetched_kv = self._layersplit_kv_prefetch_layer_id == layer_id
+        if has_prefetched_kv:
+            self._finish_layersplit_kv_prefetch_for_update(layer_id)
+        self._set_higgs_mla_kv_buffer_to_buffer(
+            self.kv_buffer[layer_idx], loc, cache_k_nope, cache_k_rope
+        )
+        if not has_prefetched_kv:
+            self.prefetch_layersplit_kv_buffer(layer_id, active_rows=active_rows)
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        layer_id = layer.layer_id
+        if not self._uses_higgs_layer(layer_id):
+            return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+
+        dst_dtype = dst_dtype or self.dtype
+        kv = self.higgs_codec.decompress(
             self._get_layersplit_kv_buffer(layer_id)[loc], dst_dtype
         )
         return kv[..., : self.kv_lora_rank], kv[..., self.kv_lora_rank :]

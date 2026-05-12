@@ -50,6 +50,101 @@ Recognized presets: `latent_k8`, `latent_4bit_nc`, `latent_k3_nc`,
 `latent_2p5bit_nc`. Unknown presets are ignored (logged at INFO) so the
 checkpoint still loads on a stock SGLang build.
 
+### 1b. HIGGS 2-bit dense MLA KV (alternative to TurboQuant 2.5-bit)
+
+A second `kv_cache_scheme` flavor uses the HIGGS lattice-quantizer
+(Pletka et al., 2025; reference: the AquaKV
+`HiggsQuantizer` at https://github.com/goodevening13/aquakv) and
+yields a slightly smaller per-token slot than the 2.5-bit TurboQuant
+preset:
+
+```json
+{
+  "quantization_config": {
+    "kv_cache_scheme": {
+      "quant_method": "higgs_dense_2bit",
+      "slot_bytes": 258,
+      "packed_bits": 2,
+      "kv_dim": 576,
+      "latent_dim": 512,
+      "rope_dim": 64
+    }
+  }
+}
+```
+
+Effect on `server_args`:
+
+| Field          | Mutation                                              |
+|----------------|-------------------------------------------------------|
+| `quant_method` | If `"higgs_dense_2bit"`, `enable_higgs_dense_2bit_kv_cache` becomes `True`. |
+
+Slot layout (258 bytes / token, vs 274 for `latent_2p5bit_nc`):
+
+```
+[128 B packed 4-bit pair indices] [2 B fp16 block scale] [128 B bf16 rope]
+```
+
+* Codebook: EDEN2-16 (16 entries of 2-d float32, from the public
+  AquaKV grid). Quantization is by nearest-neighbor in 2-d
+  (`argmax 2 x.G^T - ||G||^2`).
+* Rotation: a single orthonormal block-Hadamard of order 512 per
+  token (the "block-diagonal Hadamard rotation" mandated by
+  SAW-INT4); since `latent_dim == hadamard_groupsize`, this is one
+  Hadamard block per token.
+* Per-token scale: `||FWHT(latent)|| / sqrt(512)` stored as fp16, so
+  the decode formula is `latent_recon = InvFWHT(scale * G[idx])`.
+
+The TurboQuant and HIGGS dense KV paths are mutually exclusive;
+declaring or enabling both raises `ValueError` loudly. The HIGGS
+path requires `--kv-cache-dtype=bfloat16` (set automatically when
+the auto default is used).
+
+#### Split-K decode (`--higgs-mla-decode-num-splits`)
+
+The HIGGS fused dense MLA decode kernel uses the same split-K
+parallelization pattern as TurboQuant's `decode_2p5_split_rotated`.
+The topk loop is sharded across `num_splits` blocks per
+`(row, head)`; each block produces a partial online-softmax tuple
+`(m, l, acc[0..511])`, and a merge stage combines partials via the
+log-sum-exp identity, normalizes by the global `l`, and runs the
+inverse FWHT_512.
+
+The `--higgs-mla-decode-num-splits` flag (default `16`, matching
+TurboQuant's tuned default) controls how aggressively the topk loop
+is parallelized:
+
+* `--higgs-mla-decode-num-splits=16` (default) — split-K decode.
+  Restores throughput at small batch sizes (b=1..4) where the
+  topk-reduction loop in the single-pass kernel would otherwise
+  starve SMs. Required for TTFT-sensitive paths and single-user
+  decode.
+* `--higgs-mla-decode-num-splits=1` — single-pass kernel. Acceptable
+  when `num_rows * num_heads` already saturates the GPU (typically
+  b >= 8 on H200); avoids the small `mid` scratch
+  (`R*H*num_splits*514*4B`) and `q_rotated` scratch
+  (`R*H*512*4B`).
+
+Surrogate gate (H200, kv_lora_rank=512, num_heads=128,
+pool=2 M tokens, RUNS=8, WARMUP=3); HIGGS row uses the split-K
+default:
+
+| batch | topk | HIGGS med (ms) | HIGGS p95 (ms) | TQ med (ms) | TQ p95 (ms) | d_med (%) |
+|------:|-----:|---------------:|---------------:|------------:|------------:|----------:|
+|     1 | 2048 |          0.185 |          0.191 |       0.299 |       0.302 |    -37.95 |
+|     1 | 4096 |          0.344 |          0.347 |       0.567 |       0.568 |    -39.32 |
+|     1 | 8192 |          0.662 |          0.663 |       1.107 |       1.107 |    -40.15 |
+|     2 | 2048 |          0.314 |          0.316 |       0.541 |       0.543 |    -42.05 |
+|     4 | 2048 |          0.574 |          0.576 |       0.993 |       0.994 |    -42.21 |
+|     8 | 2048 |          1.100 |          1.102 |       1.901 |       1.906 |    -42.11 |
+|    16 | 2048 |          2.140 |          2.141 |       3.710 |       3.712 |    -42.32 |
+|    32 | 2048 |          4.206 |          4.208 |       7.333 |       7.342 |    -42.64 |
+
+Before this kernel landed, the HIGGS single-pass decode was +344-379%
+slower than TurboQuant at b=1 (topk 2048-8192). The split-K port
+recovers the small-batch regression and adds a uniform ~38-43% win
+across the sweep on top of the already-favorable memory profile.
+
 ### 2. NSA indexer quantization
 
 A new top-level `indexer_quantization` field declares that the
@@ -204,12 +299,23 @@ runtime kernel dispatch).
 
 - No-op when `quantization_config` is absent.
 - TurboQuant `kv_cache_scheme` enables the flag and copies the preset.
+- HIGGS `kv_cache_scheme` (`quant_method=higgs_dense_2bit`) enables
+  `enable_higgs_dense_2bit_kv_cache`; a bare declaration with no
+  layout fields still enables; the CLI flag short-circuits a redundant
+  config-side promotion.
+- TurboQuant ↔ HIGGS mutual exclusion is enforced in both directions:
+  a config that declares one path while the CLI already enabled the
+  other raises `ValueError` loudly.
 - The CLI-supplied preset survives a config that asks for a different
   one.
 - Unknown `quant_method`, unknown preset, and missing fields all fall
-  back cleanly.
+  back cleanly. The unknown-method check is a regression guard for
+  both `enable_turboquant_dense_kv_cache` and
+  `enable_higgs_dense_2bit_kv_cache`.
 - The two fields compose (a config with both set in the same
   `quantization_config`).
+- A wrapper object that exposes `to_dict()` is coerced and applied
+  (both TurboQuant and HIGGS paths).
 - `should_use_nsa_fused_store`:
   - With no declaration, behavior matches the auto-detect path
     (regression guard for backward compatibility).

@@ -16,6 +16,8 @@
 
 #include <driver_types.h>
 
+#include <ATen/cuda/CUDAContext.h>
+
 #include <flashinfer/gemm/bmm_fp8.cuh>
 
 #include "pytorch_extension_utils.h"

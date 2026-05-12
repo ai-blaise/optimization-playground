@@ -14,6 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <ATen/cuda/CUDAContext.h>
+
 #include "pytorch_extension_utils.h"
 #include "speculative_sampling.cuh"
 

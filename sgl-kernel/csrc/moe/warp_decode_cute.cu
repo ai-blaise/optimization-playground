@@ -41,6 +41,21 @@ void MaybeSetSmemAttribute(KernelFunc kernel, int smem_bytes) {
   }
 }
 
+void CheckWarpDecodeCuteShape(int hidden_size, int intermediate_size) {
+  TORCH_CHECK(
+      hidden_size % kGateUpTileK == 0,
+      "warp_decode_cute requires hidden_size divisible by ", kGateUpTileK,
+      ", got ", hidden_size);
+  TORCH_CHECK(
+      hidden_size % kDownTileD == 0,
+      "warp_decode_cute requires hidden_size divisible by ", kDownTileD,
+      ", got ", hidden_size);
+  TORCH_CHECK(
+      intermediate_size % kDownTileN == 0,
+      "warp_decode_cute requires intermediate_size divisible by ", kDownTileN,
+      ", got ", intermediate_size);
+}
+
 // Launches the kernel with cudaLaunchAttributeProgrammaticStreamSerialization
 // when WD_PDL_ENABLED is set so the runtime can overlap the launch latency
 // with the prior in-stream kernel's tail. Falls back to triple-chevron
@@ -171,15 +186,31 @@ void warp_decode_cute_down_fp4(
 }
 
 torch::Tensor warp_decode_cute_moe(
-    const torch::Tensor& hidden_states, const torch::Tensor& w_gate, const torch::Tensor& w_up, const torch::Tensor& w_down,
-    const torch::Tensor& topk_ids, const torch::Tensor& topk_weights, bool inplace) {
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& w_gate,
+    const torch::Tensor& w_up,
+    const torch::Tensor& w_down,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights,
+    bool inplace) {
   TORCH_CHECK(hidden_states.dim() == 2);
   TORCH_CHECK(hidden_states.dtype() == torch::kBFloat16);
+  TORCH_CHECK(w_gate.dim() == 3);
+  TORCH_CHECK(w_up.dim() == 3);
+  TORCH_CHECK(w_down.dim() == 3);
+  TORCH_CHECK(w_gate.dtype() == torch::kBFloat16);
+  TORCH_CHECK(w_up.dtype() == torch::kBFloat16);
+  TORCH_CHECK(w_down.dtype() == torch::kBFloat16);
   const int num_tokens = hidden_states.size(0);
   const int hidden_size = hidden_states.size(1);
   const int intermediate_size = w_gate.size(1);
   const int top_k = topk_ids.size(1);
   if (num_tokens == 0) return inplace ? hidden_states : torch::empty_like(hidden_states);
+  TORCH_CHECK(w_gate.size(2) == hidden_size);
+  TORCH_CHECK(w_up.sizes() == w_gate.sizes());
+  TORCH_CHECK(w_down.size(1) == hidden_size);
+  TORCH_CHECK(w_down.size(2) == intermediate_size);
+  CheckWarpDecodeCuteShape(hidden_size, intermediate_size);
 
   auto expert_ids_i32 = topk_ids.to(torch::kInt32);
   auto routing_f32 = topk_weights.to(torch::kFloat32);
@@ -205,11 +236,21 @@ torch::Tensor warp_decode_cute_moe_packed(
     const torch::Tensor& topk_ids, const torch::Tensor& topk_weights,
     int64_t intermediate_size, bool inplace) {
   TORCH_CHECK(hidden_states.dim() == 2);
+  TORCH_CHECK(hidden_states.dtype() == torch::kBFloat16);
+  TORCH_CHECK(w13.dim() == 3);
+  TORCH_CHECK(w2.dim() == 3);
+  TORCH_CHECK(w13.dtype() == torch::kBFloat16);
+  TORCH_CHECK(w2.dtype() == torch::kBFloat16);
   const int num_tokens = hidden_states.size(0);
   const int hidden_size = hidden_states.size(1);
   if (intermediate_size <= 0) intermediate_size = w13.size(1) / 2;
   const int top_k = topk_ids.size(1);
   if (num_tokens == 0) return inplace ? hidden_states : torch::empty_like(hidden_states);
+  TORCH_CHECK(w13.size(1) == 2 * intermediate_size);
+  TORCH_CHECK(w13.size(2) == hidden_size);
+  TORCH_CHECK(w2.size(1) == hidden_size);
+  TORCH_CHECK(w2.size(2) == intermediate_size);
+  CheckWarpDecodeCuteShape(hidden_size, static_cast<int>(intermediate_size));
 
   auto expert_ids_i32 = topk_ids.to(torch::kInt32);
   auto routing_f32 = topk_weights.to(torch::kFloat32);
@@ -233,15 +274,25 @@ torch::Tensor warp_decode_cute_moe_packed(
 }  // namespace sglang
 
 torch::Tensor warp_decode_cute_moe_forward(
-    const torch::Tensor& hidden_states, const torch::Tensor& w_gate, const torch::Tensor& w_up,
-    const torch::Tensor& w_down, const torch::Tensor& topk_ids, const torch::Tensor& topk_weights, bool inplace) {
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& w_gate,
+    const torch::Tensor& w_up,
+    const torch::Tensor& w_down,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights,
+    bool inplace) {
   return sglang::warp_decode::warp_decode_cute_moe(
       hidden_states, w_gate, w_up, w_down, topk_ids, topk_weights, inplace);
 }
 
 torch::Tensor warp_decode_cute_moe_packed_forward(
-    const torch::Tensor& hidden_states, const torch::Tensor& w13, const torch::Tensor& w2,
-    const torch::Tensor& topk_ids, const torch::Tensor& topk_weights, int64_t intermediate_size, bool inplace) {
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& w13,
+    const torch::Tensor& w2,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights,
+    int64_t intermediate_size,
+    bool inplace) {
   return sglang::warp_decode::warp_decode_cute_moe_packed(
       hidden_states, w13, w2, topk_ids, topk_weights, intermediate_size, inplace);
 }

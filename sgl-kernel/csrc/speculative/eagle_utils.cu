@@ -23,7 +23,7 @@
 #include "pytorch_extension_utils_rocm.h"
 #endif
 
-typedef enum { FULL_MASK = 0, QLEN_ONLY = 1, QLEN_ONLY_BITPACKING = 2 } TreeMaskMode;
+typedef enum { TREE_FULL_MASK = 0, QLEN_ONLY = 1, QLEN_ONLY_BITPACKING = 2 } TreeMaskMode;
 
 // parent_list [bs, topk * (depth - 1) + 1)]
 // selected_index [bs, draft_token_num - 1]
@@ -56,7 +56,7 @@ __global__ void build_tree_efficient(
   }
   int seq_len = verified_seq_len[bid];
   int token_tree_idx;
-  if (tree_mask_mode == FULL_MASK) {
+  if (tree_mask_mode == TREE_FULL_MASK) {
     token_tree_idx = seq_tree_idx + (seq_len + draft_token_num) * tid + seq_len + 1;
   } else {
     token_tree_idx = draft_token_num * draft_token_num * bid + draft_token_num * tid + 1;

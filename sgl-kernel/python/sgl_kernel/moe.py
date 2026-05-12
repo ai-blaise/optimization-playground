@@ -251,6 +251,34 @@ def apply_shuffle_mul_sum(
     )
 
 
+def warp_decode_cute_moe_forward(
+    hidden_states: torch.Tensor,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+    w_down: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inplace: bool = False,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.warp_decode_cute_moe_forward.default(
+        hidden_states, w_gate, w_up, w_down, topk_ids, topk_weights, inplace
+    )
+
+
+def warp_decode_cute_moe_packed_forward(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    intermediate_size: int,
+    inplace: bool = False,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.warp_decode_cute_moe_packed_forward.default(
+        hidden_states, w13, w2, topk_ids, topk_weights, intermediate_size, inplace
+    )
+
+
 def fused_qk_norm_rope(
     qkv: torch.Tensor,
     num_heads_q: int,

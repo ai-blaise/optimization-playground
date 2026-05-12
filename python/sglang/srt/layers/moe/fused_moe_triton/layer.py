@@ -1057,6 +1057,22 @@ class FusedMoE(torch.nn.Module):
             return self.forward_impl(hidden_states, topk_output)
 
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        from sglang.srt.layers.moe.warp_decode.integration import (
+            maybe_warp_decode_forward,
+        )
+
+        warp_decode_output = maybe_warp_decode_forward(
+            self, hidden_states, topk_output
+        )
+        if warp_decode_output is not None:
+            if self.reduce_results and (
+                self.moe_tp_size > 1 or self.moe_ep_size > 1
+            ):
+                warp_decode_output = tensor_model_parallel_all_reduce(
+                    warp_decode_output
+                )
+            return warp_decode_output
+
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 

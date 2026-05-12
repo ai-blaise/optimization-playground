@@ -49,6 +49,9 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR` | Skip-softmax threshold scale factor for TRT-LLM prefill attention in flashinfer. `None` means standard attention. See https://arxiv.org/abs/2512.12087 | `None` |
 | `SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR` | Skip-softmax threshold scale factor for TRT-LLM decode attention in flashinfer. `None` means standard attention. See https://arxiv.org/abs/2512.12087 | `None` |
 | `SGLANG_USE_SGL_FA3_KERNEL`               | Use sgl-kernel implementation for FlashAttention v3 | `true` |
+| `SGLANG_ENABLE_WARP_DECODE` | Enable the Warp Decode MoE hook for small BF16 decode batches | `false` |
+| `SGLANG_WARP_DECODE_CUTE` | Select the CuTe Warp Decode kernel: `auto` uses it on Blackwell when the shape is supported, `0` disables it, and `1` forces it for supported shapes | `auto` |
+| `SGLANG_WARP_DECODE_MAX_BATCH` | Maximum decode batch size eligible for Warp Decode | `64` |
 
 
 ## DeepGEMM Configuration (Advanced Optimization)

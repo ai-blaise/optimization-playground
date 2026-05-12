@@ -23,7 +23,7 @@ trials × 500 iterations.
 | G1 Gate (CuTe) | `sgl-kernel/csrc/attention/g1_attention_cute.cuh` | `g1_gate_fwd_kernel` (in-file legacy) | 1.23-1.71x graph mode |
 | GatedNorm (CuTe) | `sgl-kernel/csrc/elementwise/gated_norm_cute.cu(h)` | upstream `gated_norm.py` (Triton + torch.mm dispatch) | R=16: 1.04-1.49x vs torch.mm; vs original cute up to 38.69x |
 | LayerSplit (CuTe) | `sgl-kernel/csrc/kvcacheio/layersplit_cute.cu` | `torch.Tensor.copy_` / sequential copies | 1.21-1.38x single; 1.14-1.34x@low-layers multi |
-| WarpDecode MoE (CuTe) | `sgl-kernel/csrc/moe/warp_decode_cute.cu(h)` | `fused_moe_triton` | 4.08x at N=1 (production decode); 1.02–1.05x further over opt_b2 with `-DWD_PDL_ENABLED=1` |
+| WarpDecode MoE (CuTe) | `sgl-kernel/csrc/moe/warp_decode_cute.cu(h)` | Triton Warp Decode fallback | 11.98-13.41x on B300 at DeepSeek MoE shape |
 
 ## Detailed comparisons
 
@@ -462,6 +462,45 @@ concentrate at small N (launch latency), wider LDS gains concentrate at
 large N (LDS bandwidth), so combining them adds register pressure that
 slightly attenuates each individual gain. Production deployment uses J+D
 only.
+
+**Current production dispatch.** The upstreamed runtime path exposes Warp
+Decode through `--moe-runner-backend warp_decode` and the environment-gated
+`FusedMoE` hook. The CuTe kernel is selected only for aligned Blackwell BF16
+decode shapes:
+
+- `hidden_size % 512 == 0`
+- `hidden_size % 8 == 0`
+- `intermediate_size % 1024 == 0`
+- BF16 hidden states and BF16 expert weights
+
+Unsupported shapes fall back through the Python wrapper and the direct
+`sgl_kernel` op rejects them before launch. This keeps the DeepSeek MoE shape
+(`D=7168`, `I=2048`, `topk=8`, `E=128`) on the optimized path without allowing
+the 512/1024-tile `cp.async` loads to read outside small synthetic tensors.
+
+**B300 validation.** CUDA 13.0, PyTorch 2.11.0+cu130, SM103/SM100
+`sgl-kernel` build:
+
+```
+pytest test/test_warp_decode.py -q -s
+# 25 passed
+
+# DeepSeek-shaped CuTe vs Triton fallback:
+# B=1, D=7168, I=2048, E=128, topk=8
+# cosine=0.99997520, max_abs=0.00006104, mean_abs=0.00001310
+```
+
+Target-shape A/B with `benchmark/warp_decode/bench_warp_decode.py`
+(`warmup=3`, `iters=10`, reference disabled):
+
+| Batch | Triton fallback | CuTe | Speedup |
+|---:|---:|---:|---:|
+| 1 | 1506.8us | 125.8us | 11.98x |
+| 4 | 5341.0us | 410.4us | 13.01x |
+| 8 | 10426.7us | 789.7us | 13.20x |
+| 16 | 20787.9us | 1550.1us | 13.41x |
+| 32 | 39960.8us | 3070.4us | 13.02x |
+| 64 | 77969.7us | 6141.2us | 12.70x |
 
 ## Build configuration
 

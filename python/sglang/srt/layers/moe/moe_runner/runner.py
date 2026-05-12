@@ -13,6 +13,7 @@ from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.warp_decode.runner import WarpDecodeRunnerCore
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -48,6 +49,10 @@ class MoeRunner:
             from sglang.srt.layers.moe.moe_runner import aiter  # noqa: F401
 
             self.runner_core = None  # AITER only supports fused path
+        elif runner_backend.is_warp_decode():
+            self.runner_core = WarpDecodeRunnerCore(
+                config, fallback_runner=TritonRunnerCore(config)
+            )
         elif runner_backend.is_marlin():
             if lora_enabled:
                 from sglang.srt.lora.lora_moe_runner_marlin import MarlinLoraRunnerCore

@@ -185,7 +185,9 @@ warp_decode_gate_up_cute_kernel(
     int hidden_size, int intermediate_size, int top_k, int num_tokens) {
   extern __shared__ __align__(16) char smem_raw[];
 
-  static_assert(TILE_N == NUM_WARPS, "Blog-strict requires TILE_N == NUM_WARPS (1 neuron per warp)");
+  static_assert(
+      TILE_N == NUM_WARPS,
+      "Blog-strict requires TILE_N == NUM_WARPS (1 neuron per warp)");
   constexpr int kNumThreads = NUM_WARPS * 32;
   constexpr int kVec = 8;
   constexpr int kSmemXOff = 0;
@@ -662,7 +664,8 @@ warp_decode_down_fp4_cute_kernel(
       const int n_base = n_iter * TILE_N;
       __nv_bfloat16* inter_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + smem_inter_byte_off);
       {
-        const __nv_bfloat16* inter_row = intermediate + (int64_t)te_idx * intermediate_size + n_base;
+        const __nv_bfloat16* inter_row =
+            intermediate + (int64_t)te_idx * intermediate_size + n_base;
         for (int i = tid; i < TILE_N; i += kNumThreads)
           inter_smem[i] = (n_base + i < intermediate_size) ? inter_row[i] : __float2bfloat16(0.0f);
       }

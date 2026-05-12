@@ -81,6 +81,8 @@ from sgl_kernel.moe import (
     prepare_moe_input,
     topk_sigmoid,
     topk_softmax,
+    warp_decode_cute_moe_forward,
+    warp_decode_cute_moe_packed_forward,
 )
 from sgl_kernel.quantization import (
     ggml_dequantize,

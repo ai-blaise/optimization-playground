@@ -50,10 +50,10 @@ Recognized presets: `latent_k8`, `latent_4bit_nc`, `latent_k3_nc`,
 `latent_2p5bit_nc`. Unknown presets are ignored (logged at INFO) so the
 checkpoint still loads on a stock SGLang build.
 
-### 2. IndexerK8 FP8 fused-store
+### 2. NSA indexer quantization
 
 A new top-level `indexer_quantization` field declares that the
-checkpoint expects the IndexerK8 FP8 fused-store path:
+checkpoint expects a specific NSA indexer cache format:
 
 ```json
 {
@@ -67,11 +67,30 @@ checkpoint expects the IndexerK8 FP8 fused-store path:
 }
 ```
 
+For the Blackwell NVFP4 indexer path, use:
+
+```json
+{
+  "quantization_config": {
+    "indexer_quantization": {
+      "quant_method": "nvfp4_e2m1_ue8m0",
+      "value_format": "e2m1",
+      "scale_format": "ue8m0",
+      "scale_block_size": 32
+    }
+  }
+}
+```
+
 Effect on `server_args`:
 
-| Field            | Mutation                                              |
-|------------------|-------------------------------------------------------|
-| `quant_method`   | If `"fp8_e4m3"` or `"disabled"`, the dict is recorded on `server_args.indexer_quantization_declared`. |
+| Field | Mutation |
+| --- | --- |
+| `quant_method` | If `"fp8_e4m3"`, `"nvfp4_e2m1_ue8m0"`, or `"disabled"`, the dict is recorded on `server_args.indexer_quantization_declared`. |
+
+This dispatch runs after the model config is loaded from Hugging Face, so a
+Hub checkpoint can select the indexer format from its `config.json` without a
+launcher override.
 
 Effect at runtime: the fused-store dispatch in
 `python/sglang/srt/layers/attention/nsa/nsa_indexer.py` calls
@@ -87,6 +106,11 @@ page_size, ...)`. That helper consults
   dtypes are compatible. Useful for A/B comparisons or for disabling
   the fused store on a specific deployment without rebuilding the
   checkpoint.
+* `quant_method == "nvfp4_e2m1_ue8m0"` disables the FP8 fused-store
+  gate and selects the Blackwell-only NVFP4 indexer route. That route
+  stores 64 packed E2M1 bytes plus one packed int32 UE8M0 scale word per
+  token, matching the DeepGEMM FP4 MQA indexer contract for
+  `head_dim=128`.
 * Field absent (`indexer_quantization_declared is None`): the helper
   falls through to the historical platform/dtype auto-detection
   (`_is_cuda and not _is_fp8_fnuz and can_use_nsa_fused_store(...)`).
@@ -111,6 +135,18 @@ Add to the model's `config.json`:
 
 The runtime always takes the fallback `act_quant` path even if every
 other auto-detection signal is positive.
+
+The same selection can be forced at launch with
+`--nsa-indexer-quantization`. The default value is `auto`, which uses the
+checkpoint declaration when present and otherwise keeps the FP8 path.
+
+The selected layout is passed through the NSA pool constructors, including the
+IndexCache, dense TurboQuant, HiSparse allocation, LayerSplit index-buffer, and
+hierarchical-cache host mirror paths. That keeps production memory sizing and
+cache offsets aligned for the full custom stack. The current HiSparse TileLang
+indexer kernels are FP8-layout-specific; when `nvfp4_e2m1_ue8m0` is selected,
+runtime dispatch uses the DeepGEMM FP4 IndexCache logits path instead of the
+HiSparse FP8 indexer kernels.
 
 ## Precedence
 

@@ -99,6 +99,41 @@ page-organized uint8 cache laid out as `(head_dim + 4)` bytes per token slot
 the same kernel with `__launch_bounds__(32, 1)` and a `PagedCacheLayout`
 helper struct.
 
+The opt-in `nvfp4_e2m1_ue8m0` NSA indexer path adds a separate
+Blackwell-only JIT module, `nvfp4_indexer_quant`, rather than replacing
+the FP8 default. It follows the DeepGEMM FP4 MQA indexer layout for the
+non-IndexCache reference path, then applies that layout to IndexCache:
+
+| Format | Value bytes/token | Scale bytes/token | Token slot |
+| --- | ---: | ---: | ---: |
+| `fp8_e4m3` | 128 | 4 FP32 bytes | 132 bytes |
+| `nvfp4_e2m1_ue8m0` | 64 packed E2M1 bytes | 4 packed UE8M0 bytes | 68 bytes |
+
+The NVFP4 path provides:
+
+* `quantize_indexer_q_nvfp4`: BF16 query rows `[tokens, heads, 128]`
+  to packed E2M1 query values plus int32 UE8M0 scale words.
+* `fused_store_index_k_cache_nvfp4`: BF16 key rows `[tokens, 128]` to
+  the 68-byte IndexCache page slot.
+* runtime dispatch through DeepGEMM's `fp8_fp4_mqa_logits` and
+  `fp8_fp4_paged_mqa_logits` entry points when the checkpoint or CLI
+  selects `nvfp4_e2m1_ue8m0`.
+
+This path requires compute capability 10.x with the `sm_*a` target. H200
+validation is limited to Python/source tests, non-Blackwell guard tests,
+and forced SM100a JIT compilation; byte-exact execution and IKP profiling
+must run on B200/B300.
+
+Validation on a B300 SXM6 node covered the executable JIT path:
+
+* `python -m pytest -q test/srt/test_quantization_config_dispatch.py \
+  test/srt/test_nsa_indexer_quantization_layout.py \
+  python/sglang/jit_kernel/tests/test_nvfp4_indexer.py -rs`
+  passed with `27 passed, 1 skipped`.
+* `ptxas -v` on the generated SM103a object reported no stack frame or
+  spills; the query quantization kernel used 19 registers and the fused
+  K-store kernel used 21 registers.
+
 **Optimization (Round 1):** Removed `__launch_bounds__(32, 1)`, switched to
 4-warp blocks, removed `PagedCacheLayout` helper struct, removed the redundant
 bounds check in the fast path.

@@ -13,12 +13,6 @@ _is_fp8_fnuz = is_fp8_fnuz()
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
-"""
-k: data, 128 item per token, fp8
-s: scale, 1 item per token, fp32
-"""
-
-
 class GetK:
     @classmethod
     def execute(cls, *args, **kwargs):
@@ -30,8 +24,9 @@ class GetK:
     ):
         num_pages = (seq_len + pool.page_size - 1) // pool.page_size
         seq_len_ = num_pages * pool.page_size
+        value_bytes = pool.indexer_cache_layout.value_bytes
         index_k_fp8 = torch.empty(
-            (seq_len_, pool.index_head_dim),
+            (seq_len_, value_bytes),
             dtype=torch.uint8,
             device=pool.device,
         )
@@ -39,7 +34,7 @@ class GetK:
             page_index = page_indices[i]
             index_k_fp8[i * pool.page_size : (i + 1) * pool.page_size] = buf[
                 page_index
-            ][: pool.page_size * pool.index_head_dim].view(-1, pool.index_head_dim)
+            ][: pool.page_size * value_bytes].view(-1, value_bytes)
 
         return index_k_fp8[:seq_len]
 
@@ -57,8 +52,8 @@ class GetK:
         # page_indices: (num_pages,), element := a page index
         buf_numel_per_page = buf.shape[1]
 
-        num_k_bytes_per_page = pool.page_size * pool.index_head_dim
-        num_k_bytes_per_token = pool.index_head_dim
+        num_k_bytes_per_token = pool.indexer_cache_layout.value_bytes
+        num_k_bytes_per_page = pool.page_size * num_k_bytes_per_token
 
         # buf: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4), uint8
         # flat_buf: (whatever,), uint8
@@ -71,7 +66,7 @@ class GetK:
         flat_indices = flat_indices.flatten()[: seq_len * num_k_bytes_per_token]
 
         out = flat_buf[flat_indices]
-        return out.view(-1, 128)
+        return out.view(-1, num_k_bytes_per_token)
 
     @classmethod
     def triton(
@@ -87,7 +82,7 @@ class GetK:
             page_indices=page_indices,
             seq_len=seq_len,
             page_size=pool.page_size,
-            index_head_dim=pool.index_head_dim,
+            index_head_dim=pool.indexer_cache_layout.value_bytes,
         )
 
 
@@ -102,9 +97,9 @@ class GetS:
     ):
         num_pages = (seq_len + pool.page_size - 1) // pool.page_size
         seq_len_ = num_pages * pool.page_size
-        assert pool.index_head_dim // pool.quant_block_size == 1
+        scale_bytes = pool.indexer_cache_layout.scale_bytes
         index_k_scale_fp8 = torch.empty(
-            (seq_len_, 4),
+            (seq_len_, scale_bytes),
             dtype=torch.uint8,
             device=pool.device,
         )
@@ -112,7 +107,9 @@ class GetS:
             page_index = page_indices[i]
             index_k_scale_fp8[i * pool.page_size : (i + 1) * pool.page_size] = buf[
                 page_index
-            ][pool.page_size * pool.index_head_dim :].view(-1, 4)
+            ][pool.page_size * pool.indexer_cache_layout.value_bytes :].view(
+                -1, scale_bytes
+            )
         return index_k_scale_fp8[:seq_len]
 
     @classmethod
@@ -125,9 +122,11 @@ class GetS:
         """
         buf_numel_per_page = buf.shape[1]
 
-        num_s_bytes_per_page = buf.shape[1] - pool.page_size * pool.index_head_dim
-        num_s_bytes_per_token = pool.index_head_dim // pool.quant_block_size * 4
-        s_offset_in_page = pool.page_size * pool.index_head_dim
+        num_s_bytes_per_page = (
+            buf.shape[1] - pool.page_size * pool.indexer_cache_layout.value_bytes
+        )
+        num_s_bytes_per_token = pool.indexer_cache_layout.scale_bytes
+        s_offset_in_page = pool.page_size * pool.indexer_cache_layout.value_bytes
 
         flat_buf = buf.flatten()
         flat_indices = (
@@ -140,7 +139,7 @@ class GetS:
         flat_indices = flat_indices.flatten()[: seq_len * num_s_bytes_per_token]
 
         out = flat_buf[flat_indices]
-        return out.view(-1, 4)
+        return out.view(-1, num_s_bytes_per_token)
 
     @classmethod
     def triton(
@@ -156,7 +155,8 @@ class GetS:
             page_indices=page_indices,
             seq_len=seq_len,
             page_size=pool.page_size,
-            index_head_dim=pool.index_head_dim,
+            index_head_dim=pool.indexer_cache_layout.value_bytes,
+            scale_bytes=pool.indexer_cache_layout.scale_bytes,
         )
 
 
@@ -192,7 +192,8 @@ class GetKAndS:
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
             page_size=pool.page_size,
-            index_head_dim=pool.index_head_dim,
+            index_head_dim=pool.indexer_cache_layout.value_bytes,
+            scale_bytes=pool.indexer_cache_layout.scale_bytes,
         )
 
 
@@ -212,9 +213,10 @@ class SetK:
         for i in range(len(loc)):
             page_index = loc[i] // pool.page_size
             offset = loc[i] % pool.page_size
+            value_bytes = pool.indexer_cache_layout.value_bytes
             buf[
                 page_index,
-                offset * pool.index_head_dim : (offset + 1) * pool.index_head_dim,
+                offset * value_bytes : (offset + 1) * value_bytes,
             ] = index_k[i].view(torch.uint8)
 
     @classmethod
@@ -227,7 +229,7 @@ class SetK:
     ):
         (num_tokens_to_write,) = loc.shape
         buf_numel_per_page = buf.shape[1]
-        num_k_bytes_per_token = pool.index_head_dim
+        num_k_bytes_per_token = pool.indexer_cache_layout.value_bytes
 
         # loc: (num_tokens_to_write,), int32, element := the token index to write to
         loc_page_index = loc // pool.page_size
@@ -262,8 +264,12 @@ class SetS:
         for i in range(len(loc)):
             page_index = loc[i] // pool.page_size
             offset = loc[i] % pool.page_size
-            start = pool.page_size * pool.index_head_dim
-            buf[page_index, start + offset * 4 : start + (offset + 1) * 4] = (
+            scale_bytes = pool.indexer_cache_layout.scale_bytes
+            start = pool.page_size * pool.indexer_cache_layout.value_bytes
+            buf[
+                page_index,
+                start + offset * scale_bytes : start + (offset + 1) * scale_bytes,
+            ] = (
                 index_k_scale[i].view(torch.uint8)
             )
 
@@ -277,8 +283,8 @@ class SetS:
     ):
         (num_tokens_to_write,) = loc.shape
         buf_numel_per_page = buf.shape[1]
-        num_s_bytes_per_token = 4
-        s_offset_in_page = pool.page_size * pool.index_head_dim
+        num_s_bytes_per_token = pool.indexer_cache_layout.scale_bytes
+        s_offset_in_page = pool.page_size * pool.indexer_cache_layout.value_bytes
 
         # loc: (num_tokens_to_write,), int32, element := the token index to write to
         loc_page_index = loc // pool.page_size
@@ -301,6 +307,9 @@ class SetS:
 class SetKAndS:
     @classmethod
     def execute(cls, *args, buf, **kwargs):
+        pool = args[0] if args else kwargs.get("pool")
+        if pool.indexer_cache_layout.value_bytes != pool.index_head_dim:
+            return cls.vanilla(*args, **kwargs, buf=buf)
         if 0:
             # print("SetK, SetS comparison test")
             buf_cloned = buf.clone()
@@ -538,6 +547,7 @@ def _get_s_triton(
     seq_len: int,
     page_size: int,
     index_head_dim: int,
+    scale_bytes: int,
 ):
     """
     Gather S (scale) data from paged buffer using Triton.
@@ -552,8 +562,7 @@ def _get_s_triton(
     num_pages, buf_numel_per_page = buf.shape
     s_offset_in_page = page_size * index_head_dim  # Scales start after K data
 
-    # Allocate output
-    out = torch.empty((seq_len, 4), dtype=torch.uint8, device=buf.device)
+    out = torch.empty((seq_len, scale_bytes), dtype=torch.uint8, device=buf.device)
 
     # Launch kernel with one thread per token
     grid = (seq_len,)
@@ -565,6 +574,7 @@ def _get_s_triton(
         page_size,
         buf_numel_per_page,
         s_offset_in_page,
+        scale_bytes,
     )
 
     return out
@@ -579,6 +589,7 @@ def _get_s_triton_kernel(
     page_size: tl.constexpr,
     buf_numel_per_page: tl.constexpr,
     s_offset_in_page: tl.constexpr,
+    scale_bytes: tl.constexpr,
 ):
     """
     Each program handles one token (seq_len tokens total).
@@ -600,13 +611,13 @@ def _get_s_triton_kernel(
         page_index * buf_numel_per_page + s_offset_in_page + token_offset_in_page * 4
     )
 
-    # Load 4 bytes (fp32 scale)
     offsets = tl.arange(0, 4)
-    data = tl.load(buf_ptr + src_base_offset + offsets)
+    scale_mask = offsets < scale_bytes
+    data = tl.load(buf_ptr + src_base_offset + offsets, mask=scale_mask)
 
     # Store to output
-    dst_offset = token_id * 4
-    tl.store(out_ptr + dst_offset + offsets, data)
+    dst_offset = token_id * scale_bytes
+    tl.store(out_ptr + dst_offset + offsets, data, mask=scale_mask)
 
 
 def _get_k_and_s_triton(
@@ -617,6 +628,7 @@ def _get_k_and_s_triton(
     max_seq_len: int,
     page_size: int,
     index_head_dim: int,
+    scale_bytes: int,
 ):
     """
     Fused gather of both K (key) and S (scale) data from paged buffer using Triton.
@@ -637,7 +649,7 @@ def _get_k_and_s_triton(
     k_out = torch.empty(
         (seq_len_sum, index_head_dim), dtype=torch.uint8, device=buf.device
     )
-    s_out = torch.empty((seq_len_sum, 4), dtype=torch.uint8, device=buf.device)
+    s_out = torch.empty((seq_len_sum, scale_bytes), dtype=torch.uint8, device=buf.device)
 
     _, buf_numel_per_page = buf.shape
     _, page_indice_batch_offset = page_indices.shape
@@ -666,6 +678,7 @@ def _get_k_and_s_triton(
         page_size=page_size,
         buf_numel_per_page=buf_numel_per_page,
         index_head_dim=index_head_dim,
+        scale_bytes=scale_bytes,
         s_offset_in_page=s_offset_in_page,
         page_indice_batch_offset=page_indice_batch_offset,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -686,6 +699,7 @@ def _get_k_and_s_triton_kernel(
     page_size: tl.constexpr,
     buf_numel_per_page: tl.constexpr,
     index_head_dim: tl.constexpr,
+    scale_bytes: tl.constexpr,
     s_offset_in_page: tl.constexpr,
     page_indice_batch_offset: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -742,16 +756,16 @@ def _get_k_and_s_triton_kernel(
 
     # ===== Load S data =====
     # The address calculation logic for S: page_index * total number of elements in a single page + starting offset of S within the page + offset of token within S in the page
-    s_src_token_offset = s_offset_in_page + token_offset_in_page * 4
+    s_src_token_offset = s_offset_in_page + token_offset_in_page * scale_bytes
     s_src_base_offset = page_index * buf_numel_per_page + s_src_token_offset
 
     s_offsets = tl.arange(0, 4)
     s_load_addr = buf_ptr + s_src_base_offset[:, None] + s_offsets[None, :]
-    s_mask = token_valid_mask[:, None] & (s_offsets[None, :] < 4)
+    s_mask = token_valid_mask[:, None] & (s_offsets[None, :] < scale_bytes)
     s_data = tl.load(s_load_addr, mask=s_mask, other=0)
 
     # Store S to output
     s_dst_token_offset = batch_token_offset + token_ids
-    s_dst_base_offset = s_dst_token_offset * 4
+    s_dst_base_offset = s_dst_token_offset * scale_bytes
     s_store_addr = s_out_ptr + s_dst_base_offset[:, None] + s_offsets[None, :]
     tl.store(s_store_addr, s_data, mask=s_mask)

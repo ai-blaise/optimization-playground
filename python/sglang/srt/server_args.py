@@ -31,6 +31,9 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.layers.attention.nsa.indexer_quantization import (
+    NSA_INDEXER_QUANTIZATION_CHOICES,
+)
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
@@ -572,6 +575,7 @@ class ServerArgs:
         None  # auto-detect based on hardware/kv_cache_dtype
     )
     nsa_indexer_mode: str = "vanilla"
+    nsa_indexer_quantization: str = "auto"
     nsa_indexcache_freq: int = 4
     nsa_indexcache_pattern: Optional[str] = None
     hisa_block_size: int = 128
@@ -5819,6 +5823,13 @@ class ServerArgs:
             type=str,
             choices=NSA_INDEXER_MODE_CHOICES,
             help="NSA indexer selection mode for DSA models.",
+        )
+        parser.add_argument(
+            "--nsa-indexer-quantization",
+            default=ServerArgs.nsa_indexer_quantization,
+            type=str,
+            choices=NSA_INDEXER_QUANTIZATION_CHOICES,
+            help="NSA indexer cache quantization. 'auto' uses checkpoint config or the FP8 default.",
         )
         parser.add_argument(
             "--nsa-indexcache-freq",

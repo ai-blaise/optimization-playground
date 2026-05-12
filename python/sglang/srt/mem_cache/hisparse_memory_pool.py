@@ -20,6 +20,9 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     TurboQuantNSATokenToKVPool,
 )
+from sglang.srt.layers.attention.nsa.indexer_quantization import (
+    INDEXER_FP8_QUANT_METHOD,
+)
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -54,6 +57,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         kv_cache_dim: int,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        indexer_quantization: str = INDEXER_FP8_QUANT_METHOD,
         host_to_device_ratio: int = 2,
     ):
         super().__init__(
@@ -70,6 +74,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=size * host_to_device_ratio,
+            indexer_quantization=indexer_quantization,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 
@@ -157,6 +162,7 @@ class HiSparseTurboQuantNSATokenToKVPool(TurboQuantNSATokenToKVPool):
         turboquant_skip_layers: Optional[set[int]] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        indexer_quantization: str = INDEXER_FP8_QUANT_METHOD,
         host_to_device_ratio: int = 2,
     ):
         super().__init__(
@@ -173,6 +179,7 @@ class HiSparseTurboQuantNSATokenToKVPool(TurboQuantNSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=size * host_to_device_ratio,
+            indexer_quantization=indexer_quantization,
             turboquant_dense_kv_preset=turboquant_dense_kv_preset,
             turboquant_execution_mode=turboquant_execution_mode,
             turboquant_mla_decode_num_splits=turboquant_mla_decode_num_splits,

@@ -15,7 +15,15 @@ from sglang.jit_kernel.fused_store_index_cache import (
     can_use_nsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.jit_kernel.nvfp4_indexer import (
+    can_use_nsa_nvfp4_indexer,
+    fused_store_index_k_cache_nvfp4,
+    quantize_indexer_q_nvfp4,
+)
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.indexer_quantization import (
+    INDEXER_NVFP4_QUANT_METHOD,
+)
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
@@ -71,6 +79,13 @@ def _deep_gemm_paged_mqa_context_lens(deep_gemm_module, seqlens: torch.Tensor):
     if hasattr(deep_gemm_module, "fp8_fp4_paged_mqa_logits") and seqlens.dim() == 1:
         return seqlens.view(-1, 1)
     return seqlens
+
+
+def _require_deep_gemm_kernel(name: str):
+    module = globals().get("deep_gemm")
+    if not _is_cuda or isinstance(module, Exception) or not hasattr(module, name):
+        raise RuntimeError(f"DeepGEMM kernel {name} is required for this NSA path.")
+    return getattr(module, name)
 
 
 def _pad_first_dim(tensor: torch.Tensor, pad_len: int) -> torch.Tensor:
@@ -164,6 +179,29 @@ def _deep_gemm_fp8_mqa_logits(
         logits = logits[:q_len]
     if kv_pad_len:
         logits = logits[:, :kv_len]
+    return logits
+
+
+def _deep_gemm_fp4_mqa_logits(
+    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    kv_fp4: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    *,
+    clean_logits: bool,
+) -> torch.Tensor:
+    q_values, q_scales = q_fp4
+    kv_values, kv_scales = kv_fp4
+    kernel = _require_deep_gemm_kernel("fp8_fp4_mqa_logits")
+    logits = kernel(
+        (q_values.view(torch.int8), q_scales),
+        (kv_values.view(torch.int8), kv_scales),
+        weights,
+        ks,
+        ke,
+        clean_logits=clean_logits,
+    )
     return logits
 
 
@@ -428,6 +466,56 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+    @staticmethod
+    def _uses_nvfp4_indexer(forward_batch: ForwardBatch) -> bool:
+        return (
+            getattr(forward_batch.token_to_kv_pool, "indexer_quantization", None)
+            == INDEXER_NVFP4_QUANT_METHOD
+        )
+
+    def _quantize_query_for_indexer(
+        self,
+        query: torch.Tensor,
+        forward_batch: ForwardBatch,
+        act_quant,
+    ):
+        if not self._uses_nvfp4_indexer(forward_batch):
+            return act_quant(query, self.block_size, self.scale_fmt)
+        if not can_use_nsa_nvfp4_indexer(
+            query.dtype,
+            forward_batch.out_cache_loc.dtype,
+            forward_batch.token_to_kv_pool.page_size,
+        ):
+            raise RuntimeError(
+                "NSA Indexer NVFP4 was requested but the Blackwell NVFP4 "
+                "JIT kernels are not available for this runtime."
+            )
+        return quantize_indexer_q_nvfp4(
+            query,
+            indices_dtype=forward_batch.out_cache_loc.dtype,
+            page_size=forward_batch.token_to_kv_pool.page_size,
+        )
+
+    def _get_logits_head_gate_for_indexer(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        q_scale: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ):
+        if self._uses_nvfp4_indexer(forward_batch):
+            weights = self._project_and_scale_head_gates(x)
+            return weights.unsqueeze(-1) * self.softmax_scale
+        assert q_scale is not None
+        return self._get_logits_head_gate(x, q_scale)
+
+    @staticmethod
+    def _split_indexer_query(q, split_size: int):
+        if isinstance(q, tuple):
+            values_prev, values_next = torch.split(q[0], split_size, dim=0)
+            scales_prev, scales_next = torch.split(q[1], split_size, dim=0)
+            return (values_prev, scales_prev), (values_next, scales_next)
+        return torch.split(q, split_size, dim=0)
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -622,6 +710,8 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
+        is_nvfp4 = isinstance(q_fp8, tuple)
+        q_tensor = q_fp8[0] if is_nvfp4 else q_fp8
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
@@ -649,11 +739,11 @@ class Indexer(MultiPlatformOp):
         # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
         # and it is necessary to extract the actual q length.
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
-        hisa_paged_ok = self._should_use_hisa_paged(
+        hisa_paged_ok = (not is_nvfp4) and self._should_use_hisa_paged(
             forward_batch, metadata, seqlens_32
         )
         if hisa_paged_ok:
-            profile_start = _hisa_profile_start(q_fp8.device)
+            profile_start = _hisa_profile_start(q_tensor.device)
             result = self._get_topk_hisa_paged(
                 q_fp8,
                 kv_cache_fp8,
@@ -665,18 +755,18 @@ class Indexer(MultiPlatformOp):
             _hisa_profile_end(
                 "hisa_paged",
                 profile_start,
-                q_fp8.device,
+                q_tensor.device,
                 layer_id=int(layer_id),
                 forward_mode=str(forward_batch.forward_mode),
                 q_offset=int(q_offset),
-                q_tokens=int(q_fp8.shape[0]),
+                q_tokens=int(q_tensor.shape[0]),
                 max_seq_len=int(max_seq_len),
                 batch_size=int(block_tables.shape[0]),
                 page_size=int(page_size),
             )
             return result
 
-        profile_start = _hisa_profile_start(q_fp8.device)
+        profile_start = _hisa_profile_start(q_tensor.device)
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
@@ -694,12 +784,22 @@ class Indexer(MultiPlatformOp):
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
-        assert len(q_fp8.shape) == 3
-        q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
+        if is_nvfp4:
+            q_values, q_scales = q_fp8
+            assert len(q_values.shape) == 3
+            q_fp8 = (
+                q_values.view(torch.int8).unsqueeze(1),
+                q_scales.unsqueeze(1),
+            )
+        else:
+            assert len(q_fp8.shape) == 3
+            q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 1 if _is_hip else 64
         num_heads_kv = 1
-        head_dim_with_sf = 132
+        head_dim_with_sf = (
+            forward_batch.token_to_kv_pool.indexer_cache_layout.token_bytes
+        )
         if _is_hip:
             kv_cache_fp8 = kv_cache_fp8.view(
                 -1, block_kv, num_heads_kv, head_dim_with_sf
@@ -733,22 +833,36 @@ class Indexer(MultiPlatformOp):
                 KVBlockSize=block_kv,
             )
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8[:q_offset],
-                kv_cache_fp8,
-                weights[:q_offset],
-                seqlens_32_2d,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                clean_logits=False,
-            )
+            if is_nvfp4:
+                kernel = _require_deep_gemm_kernel("fp8_fp4_paged_mqa_logits")
+                logits = kernel(
+                    (q_fp8[0][:q_offset], q_fp8[1][:q_offset]),
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=False,
+                )
+            else:
+                logits = deep_gemm.fp8_paged_mqa_logits(
+                    q_fp8[:q_offset],
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=False,
+                )
 
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
-        if not _is_hip and q_offset < q_fp8.shape[0]:
-            pad_len = q_fp8.shape[0] - q_offset
+        q_len = q_fp8[0].shape[0] if is_nvfp4 else q_fp8.shape[0]
+        if not _is_hip and q_offset < q_len:
+            pad_len = q_len - q_offset
             padding = torch.full(
                 (pad_len, topk_result.shape[1]),
                 -1,
@@ -759,11 +873,11 @@ class Indexer(MultiPlatformOp):
         _hisa_profile_end(
             "indexcache_paged",
             profile_start,
-            q_fp8.device,
+            q_tensor.device,
             layer_id=int(layer_id),
             forward_mode=str(forward_batch.forward_mode),
             q_offset=int(q_offset),
-            q_tokens=int(q_fp8.shape[0]),
+            q_tokens=int(q_len),
             max_seq_len=int(max_seq_len),
             batch_size=int(block_tables.shape[0]),
             page_size=int(page_size),
@@ -1038,9 +1152,11 @@ class Indexer(MultiPlatformOp):
             and forward_batch.extend_seq_lens_cpu is not None
         )
 
+        is_nvfp4 = isinstance(q_fp8, tuple)
+        q_tensor = q_fp8[0] if is_nvfp4 else q_fp8
         batch_size = len(block_tables)
-        token_nums, _, _ = q_fp8.shape
-        device = q_fp8.device
+        token_nums, _, _ = q_tensor.shape
+        device = q_tensor.device
 
         topk_result = torch.full(
             (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
@@ -1050,7 +1166,9 @@ class Indexer(MultiPlatformOp):
 
         ks, ke = metadata.get_indexer_kvcache_range()
         q_offset = ks.shape[0]
-        hisa_extend_ok = self._should_use_hisa_extend(forward_batch, metadata)
+        hisa_extend_ok = (not is_nvfp4) and self._should_use_hisa_extend(
+            forward_batch, metadata
+        )
         hisa_boundary_q = self.hisa_block_size * 16
 
         if hisa_extend_ok and q_offset >= hisa_boundary_q:
@@ -1095,13 +1213,18 @@ class Indexer(MultiPlatformOp):
             seq_len_sum,
             max_seq_len,
         )
-        if _is_fp8_fnuz:
+        if is_nvfp4:
+            k_fp8 = k_fp8.view(torch.int8)
+            k_scale = k_scale.view(torch.int32).reshape(-1)
+            kv_fp8 = (k_fp8, k_scale)
+        elif _is_fp8_fnuz:
             k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
+            k_scale = k_scale.view(torch.float32).squeeze(-1)
+            kv_fp8 = (k_fp8, k_scale)
         else:
             k_fp8 = k_fp8.view(torch.float8_e4m3fn)
-
-        k_scale = k_scale.view(torch.float32).squeeze(-1)
-        kv_fp8 = (k_fp8, k_scale)
+            k_scale = k_scale.view(torch.float32).squeeze(-1)
+            kv_fp8 = (k_fp8, k_scale)
 
         # Check if we need to chunk to avoid OOM
         seq_lens_expanded = metadata.get_seqlens_expanded()
@@ -1111,9 +1234,18 @@ class Indexer(MultiPlatformOp):
         need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
 
         if not need_chunk:
-            assert q_fp8[:q_offset].shape[0] != 0
+            assert q_tensor[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
-                if _is_hip:
+                if is_nvfp4:
+                    logits = _deep_gemm_fp4_mqa_logits(
+                        (q_fp8[0][:q_offset], q_fp8[1][:q_offset]),
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
+                elif _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -1175,7 +1307,16 @@ class Indexer(MultiPlatformOp):
             end = min(start + max_rows, q_offset)
 
             with self._with_real_sm_count():
-                if _is_hip:
+                if is_nvfp4:
+                    logits_chunk = _deep_gemm_fp4_mqa_logits(
+                        (q_fp8[0][start:end], q_fp8[1][start:end]),
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        clean_logits=False,
+                    )
+                elif _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -1360,22 +1501,38 @@ class Indexer(MultiPlatformOp):
                 actual_seq_q_list.append(actual_seq_q)
                 batch_idx_list.append(batch_idx)
 
-            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
-            k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
+            if is_nvfp4:
+                k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.int8)
+                k_scale = torch.cat(k_scale_list, dim=0).view(torch.int32).reshape(-1)
+            else:
+                k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
+                k_scale = (
+                    torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
+                )
             kv_fp8 = (k_fp8, k_scale)
             ks = torch.cat(ks_list, dim=0)
             ke_offset = torch.cat(ke_offset_list, dim=0)
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
-                logits = _deep_gemm_fp8_mqa_logits(
-                    q_fp8,
-                    kv_fp8,
-                    weights,
-                    ks,
-                    ke,
-                    clean_logits=False,
-                )
+                if is_nvfp4:
+                    logits = _deep_gemm_fp4_mqa_logits(
+                        (q_fp8[0], q_fp8[1]),
+                        kv_fp8,
+                        weights,
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
+                else:
+                    logits = _deep_gemm_fp8_mqa_logits(
+                        q_fp8,
+                        kv_fp8,
+                        weights,
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
             topk_result = metadata.topk_transform(
                 logits,
                 self.index_topk,
@@ -1399,8 +1556,12 @@ class Indexer(MultiPlatformOp):
                 block_tables[0],
             )
 
-            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
-            k_scale = k_scale.view(torch.float32).squeeze(-1)
+            if is_nvfp4:
+                k_fp8 = k_fp8.view(torch.int8)
+                k_scale = k_scale.view(torch.int32).reshape(-1)
+            else:
+                k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+                k_scale = k_scale.view(torch.float32).squeeze(-1)
             kv_fp8 = (k_fp8, k_scale)
             ks = torch.full((actual_seq_q,), offset, dtype=torch.int32, device="cuda")
             ke_offset = torch.arange(
@@ -1412,14 +1573,24 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
 
             with self._with_real_sm_count():
-                logits = _deep_gemm_fp8_mqa_logits(
-                    q_fp8,
-                    kv_fp8,
-                    weights,
-                    ks,
-                    ke,
-                    clean_logits=False,
-                )
+                if is_nvfp4:
+                    logits = _deep_gemm_fp4_mqa_logits(
+                        (q_fp8[0], q_fp8[1]),
+                        kv_fp8,
+                        weights,
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
+                else:
+                    logits = _deep_gemm_fp8_mqa_logits(
+                        q_fp8,
+                        kv_fp8,
+                        weights,
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True
             )
@@ -1531,6 +1702,24 @@ class Indexer(MultiPlatformOp):
 
         pool = forward_batch.token_to_kv_pool
         if not pool.layersplit_owns_layer(layer_id):
+            pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
+            return
+
+        if pool.indexer_quantization == INDEXER_NVFP4_QUANT_METHOD:
+            if not can_use_nsa_nvfp4_indexer(
+                key.dtype, forward_batch.out_cache_loc.dtype, pool.page_size
+            ):
+                raise RuntimeError(
+                    "NSA Indexer NVFP4 was requested but the Blackwell NVFP4 "
+                    "JIT kernels are not available for this runtime."
+                )
+            buf = pool.get_local_index_k_with_scale_buffer(layer_id=layer_id)
+            fused_store_index_k_cache_nvfp4(
+                key,
+                buf,
+                forward_batch.out_cache_loc,
+                pool.page_size,
+            )
             pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return
 
@@ -1667,7 +1856,9 @@ class Indexer(MultiPlatformOp):
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            q_fp8, q_scale = self._quantize_query_for_indexer(
+                query, forward_batch, act_quant
+            )
             with torch.cuda.stream(self.alt_stream):
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
@@ -1676,7 +1867,10 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+            if self._uses_nvfp4_indexer(forward_batch):
+                weights = weights.unsqueeze(-1) * self.softmax_scale
+            else:
+                weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         else:
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
@@ -1686,7 +1880,9 @@ class Indexer(MultiPlatformOp):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
 
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                q_fp8, q_scale = self._quantize_query_for_indexer(
+                    query, forward_batch, act_quant
+                )
                 with torch.cuda.stream(self.alt_stream):
                     self._store_index_k_cache(
                         forward_batch=forward_batch,
@@ -1696,7 +1892,9 @@ class Indexer(MultiPlatformOp):
                     )
                 current_stream.wait_stream(self.alt_stream)
             else:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                q_fp8, q_scale = self._quantize_query_for_indexer(
+                    query, forward_batch, act_quant
+                )
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
                     layer_id=layer_id,
@@ -1745,7 +1943,9 @@ class Indexer(MultiPlatformOp):
             else:
                 x_for_gate = x
 
-            weights = self._get_logits_head_gate(x_for_gate, q_scale)
+            weights = self._get_logits_head_gate_for_indexer(
+                x_for_gate, q_scale, forward_batch
+            )
 
         if _is_cuda or _is_hip:
             assert forward_batch.seq_lens_cpu is not None
@@ -1787,8 +1987,13 @@ class Indexer(MultiPlatformOp):
                     # cp_batch_seq_index_prev = forward_batch.attn_cp_metadata["cp_batch_seq_index_prev"]
                     # cp_batch_seq_index_next = forward_batch.attn_cp_metadata["cp_batch_seq_index_next"]
                     # TODO prev, next, combined into a single call
-                    q_fp8_prev, q_fp8_next = torch.split(
-                        q_fp8, (q_fp8.shape[0] + 1) // 2, dim=0
+                    q_split = (
+                        (q_fp8[0].shape[0] + 1) // 2
+                        if isinstance(q_fp8, tuple)
+                        else (q_fp8.shape[0] + 1) // 2
+                    )
+                    q_fp8_prev, q_fp8_next = self._split_indexer_query(
+                        q_fp8, q_split
                     )
                     weights_prev, weights_next = torch.split(
                         weights, (weights.shape[0] + 1) // 2, dim=0

@@ -25,6 +25,10 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.indexer_quantization import (
+    get_nsa_indexer_cache_layout,
+    get_nsa_indexer_quant_method,
+)
 from sglang.srt.layers.attention.nsa.layersplit import LayerSplitPolicy
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -182,9 +186,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         model_config = mr.model_config
         storage_layers = self._nsa_storage_layer_count(mr, num_layers)
         index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
-        indexer_size_per_token = (
-            index_head_dim + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+        indexer_layout = get_nsa_indexer_cache_layout(
+            get_nsa_indexer_quant_method(mr.server_args), index_head_dim
         )
+        indexer_size_per_token = indexer_layout.token_bytes
         indexer_element_size = torch._utils._element_size(
             NSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
@@ -400,6 +405,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
+        self.indexer_cache_layout = get_nsa_indexer_cache_layout(
+            get_nsa_indexer_quant_method(mr.server_args), self.indexer_head_dim
+        )
         self.compression_ratios = cfg.compress_ratios
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
@@ -446,10 +454,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
-        quant_block_size = 128
-        indexer_bytes = (
-            self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
-        )
+        indexer_bytes = self.indexer_cache_layout.token_bytes
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         state_dtype_size = 4

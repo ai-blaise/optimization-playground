@@ -17,6 +17,9 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_size,
     get_attention_tp_size,
 )
+from sglang.srt.layers.attention.nsa.indexer_quantization import (
+    get_nsa_indexer_quant_method,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -477,6 +480,9 @@ class ModelRunnerKVCacheMixin:
                 "start_layer": self.start_layer,
                 "end_layer": self.end_layer,
                 "index_head_dim": get_nsa_index_head_dim(self.model_config.hf_config),
+                "indexer_quantization": get_nsa_indexer_quant_method(
+                    self.server_args
+                ),
             }
             if self.enable_hisparse:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config

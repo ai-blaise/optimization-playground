@@ -35,14 +35,18 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, Optional
 
+from sglang.srt.layers.attention.nsa.indexer_quantization import (
+    INDEXER_DISABLED_QUANT_METHOD,
+    INDEXER_FP8_QUANT_METHOD,
+    INDEXER_NVFP4_QUANT_METHOD,
+    SUPPORTED_INDEXER_QUANT_METHODS,
+)
 from sglang.srt.layers.quantization.turboquant_dense_kv import (
     TURBOQUANT_DENSE_KV_PRESETS,
 )
 
 logger = logging.getLogger(__name__)
 
-INDEXER_FP8_QUANT_METHOD = "fp8_e4m3"
-INDEXER_DISABLED_QUANT_METHOD = "disabled"
 TURBOQUANT_DENSE_QUANT_METHOD = "turboquant_dense"
 DEFAULT_TURBOQUANT_DENSE_KV_PRESET = "latent_2p5bit_nc"
 
@@ -106,10 +110,10 @@ def _maybe_apply_indexer_quantization(
     if indexer_quant is None:
         return
     method = indexer_quant.get("quant_method")
-    if method not in (INDEXER_FP8_QUANT_METHOD, INDEXER_DISABLED_QUANT_METHOD):
+    if method not in SUPPORTED_INDEXER_QUANT_METHODS:
         logger.info(
             "quantization_config.indexer_quantization.quant_method=%r is "
-            "not supported by the IndexerK8 FP8 fused-store path; "
+            "not supported by the NSA Indexer quantization path; "
             "ignoring config-side dispatch.",
             method,
         )
@@ -169,6 +173,19 @@ def should_use_nsa_fused_store(
         ``auto_compat_check`` rejects the runtime ``(key_dtype,
         indices_dtype, page_size)`` triple.
     """
+    cli_method = getattr(server_args, "nsa_indexer_quantization", None)
+    if cli_method == INDEXER_FP8_QUANT_METHOD:
+        if not auto_compat_check(key_dtype, indices_dtype, page_size):
+            raise RuntimeError(
+                "--nsa-indexer-quantization=fp8_e4m3 was set but the NSA "
+                "fused-store kernel rejected the runtime tensor shapes "
+                f"(key_dtype={key_dtype}, indices_dtype={indices_dtype}, "
+                f"page_size={page_size})."
+            )
+        return True
+    if cli_method in (INDEXER_DISABLED_QUANT_METHOD, INDEXER_NVFP4_QUANT_METHOD):
+        return False
+
     declared = getattr(server_args, "indexer_quantization_declared", None)
     if isinstance(declared, dict):
         method = declared.get("quant_method")
@@ -184,6 +201,8 @@ def should_use_nsa_fused_store(
                 )
             return True
         if method == INDEXER_DISABLED_QUANT_METHOD:
+            return False
+        if method == INDEXER_NVFP4_QUANT_METHOD:
             return False
     return auto_platform_ok and auto_compat_check(
         key_dtype, indices_dtype, page_size

@@ -1873,12 +1873,10 @@ class NSAIndexerPoolHost(HostKVCache):
         self.layer_num = device_pool.layer_num
 
         self.index_head_dim = device_pool.index_head_dim
+        self.indexer_cache_layout = device_pool.indexer_cache_layout
         self.indexer_quant_block_size = device_pool.quant_block_size
         self.indexer_dtype = NSATokenToKVPool.index_k_with_scale_buffer_dtype
-        self.indexer_size_per_token = (
-            self.index_head_dim
-            + self.index_head_dim // self.indexer_quant_block_size * 4
-        )
+        self.indexer_size_per_token = self.indexer_cache_layout.token_bytes
         self.size = anchor_host.size
         self.page_num = anchor_host.page_num
 

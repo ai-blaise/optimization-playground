@@ -53,6 +53,10 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa import index_buf_accessor
+from sglang.srt.layers.attention.nsa.indexer_quantization import (
+    INDEXER_FP8_QUANT_METHOD,
+    get_nsa_indexer_cache_layout,
+)
 from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
@@ -2207,6 +2211,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        indexer_quantization: str = INDEXER_FP8_QUANT_METHOD,
     ):
 
         override_dim = (
@@ -2234,6 +2239,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
             index_buf_size = size
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
+        self.indexer_cache_layout = get_nsa_indexer_cache_layout(
+            indexer_quantization, index_head_dim
+        )
+        self.indexer_quantization = self.indexer_cache_layout.quant_method
+        self.quant_block_size = self.indexer_cache_layout.quant_block_size
 
         if _is_hip:
             assert self.page_size == 1
@@ -2251,14 +2261,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 rows = index_rows if self.layersplit_owns_layer(layer_id) else 1
                 self.index_k_with_scale_buffer.append(
                     torch.zeros(
-                        (
-                            rows,
-                            self.page_size
-                            * (
-                                index_head_dim
-                                + index_head_dim // self.quant_block_size * 4
-                            ),
-                        ),
+                        (rows, self.indexer_cache_layout.page_bytes(self.page_size)),
                         dtype=self.index_k_with_scale_buffer_dtype,
                         device=device,
                     )
@@ -2268,11 +2271,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 self.layersplit_index_k_with_scale_buffer = torch.zeros(
                     (
                         index_rows,
-                        self.page_size
-                        * (
-                            index_head_dim
-                            + index_head_dim // self.quant_block_size * 4
-                        ),
+                        self.indexer_cache_layout.page_bytes(self.page_size),
                     ),
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=device,

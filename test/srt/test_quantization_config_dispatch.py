@@ -25,14 +25,26 @@ def _load_module(name: str, path: Path):
 
 
 # Stub out parent packages and the (heavy) ``turboquant_dense_kv`` module so
-# we can load only the dispatcher without pulling in torch / CUDA.
-for module_name in [
-    "sglang",
-    "sglang.srt",
-    "sglang.srt.layers",
-    "sglang.srt.layers.quantization",
-]:
-    sys.modules.setdefault(module_name, types.ModuleType(module_name))
+# we can load only the dispatcher without pulling in torch / CUDA. Keep package
+# paths intact so later tests in the same process can still import real SGLang
+# modules from disk.
+_PACKAGE_PATHS = {
+    "sglang": ROOT / "python/sglang",
+    "sglang.srt": ROOT / "python/sglang/srt",
+    "sglang.srt.layers": ROOT / "python/sglang/srt/layers",
+    "sglang.srt.layers.attention": ROOT / "python/sglang/srt/layers/attention",
+    "sglang.srt.layers.attention.nsa": ROOT
+    / "python/sglang/srt/layers/attention/nsa",
+    "sglang.srt.layers.quantization": ROOT / "python/sglang/srt/layers/quantization",
+}
+for module_name, package_path in _PACKAGE_PATHS.items():
+    module = sys.modules.setdefault(module_name, types.ModuleType(module_name))
+    module.__path__ = [str(package_path)]
+
+_load_module(
+    "sglang.srt.layers.attention.nsa.indexer_quantization",
+    ROOT / "python/sglang/srt/layers/attention/nsa/indexer_quantization.py",
+)
 
 _stub = types.ModuleType("sglang.srt.layers.quantization.turboquant_dense_kv")
 _stub.TURBOQUANT_DENSE_KV_PRESETS = {
@@ -53,6 +65,7 @@ dispatcher = _load_module(
 class FakeServerArgs:
     enable_turboquant_dense_kv_cache: bool = False
     turboquant_dense_kv_preset: str = "latent_2p5bit_nc"
+    nsa_indexer_quantization: str = "auto"
     indexer_quantization_declared: Optional[Dict[str, Any]] = None
 
 
@@ -120,6 +133,27 @@ def test_indexer_quantization_fp8_records_declaration():
         "quant_method": "fp8_e4m3",
         "scale_strategy": "per_token",
         "scale_bytes": 4,
+    }
+
+
+def test_indexer_quantization_nvfp4_records_declaration():
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "indexer_quantization": {
+                "quant_method": "nvfp4_e2m1_ue8m0",
+                "value_format": "e2m1",
+                "scale_format": "ue8m0",
+                "scale_block_size": 32,
+            },
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.indexer_quantization_declared == {
+        "quant_method": "nvfp4_e2m1_ue8m0",
+        "value_format": "e2m1",
+        "scale_format": "ue8m0",
+        "scale_block_size": 32,
     }
 
 
@@ -352,6 +386,38 @@ def test_should_use_fused_store_declared_disabled_forces_fallback():
     )
     # Even if auto-detect would happily pick the fused path, the
     # declaration forces fallback.
+    assert (
+        dispatcher.should_use_nsa_fused_store(
+            server_args,
+            _FakeDtype("bfloat16"),
+            _FakeDtype("int64"),
+            page_size=64,
+            auto_compat_check=_always_compatible,
+            auto_platform_ok=True,
+        )
+        is False
+    )
+
+
+def test_should_use_fused_store_declared_nvfp4_disables_fp8_path():
+    server_args = FakeServerArgs(
+        indexer_quantization_declared={"quant_method": "nvfp4_e2m1_ue8m0"}
+    )
+    assert (
+        dispatcher.should_use_nsa_fused_store(
+            server_args,
+            _FakeDtype("bfloat16"),
+            _FakeDtype("int64"),
+            page_size=64,
+            auto_compat_check=_always_compatible,
+            auto_platform_ok=True,
+        )
+        is False
+    )
+
+
+def test_should_use_fused_store_cli_nvfp4_disables_fp8_path():
+    server_args = FakeServerArgs(nsa_indexer_quantization="nvfp4_e2m1_ue8m0")
     assert (
         dispatcher.should_use_nsa_fused_store(
             server_args,

@@ -404,9 +404,9 @@ def test_rejects_bumkc_hvm_core_book_unknown_tensor_island(tmp_path):
     plan_dir = write_bumkc_artifact(tmp_path, executable=True)
     hvm_path = plan_dir / "ir" / "hvm-core-book.json"
     hvm_core_book = json.loads(hvm_path.read_text(encoding="utf-8"))
-    hvm_core_book["regions"][0]["nodes"][1]["kind"]["tensor_island"]["island"] = (
-        "island_missing"
-    )
+    hvm_core_book["regions"][0]["nodes"][1]["kind"]["tensor_island"][
+        "island"
+    ] = "island_missing"
     hvm_path.write_text(json.dumps(hvm_core_book), encoding="utf-8")
     refresh_bumkc_digests(plan_dir)
 
@@ -915,6 +915,19 @@ def test_rejects_bumkc_runtime_smoke_descriptor_mismatch(tmp_path):
     smoke_path = plan_dir / "generated" / "runtime-smoke.json"
     smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
     smoke["task_descriptors"][1]["side_effect_code_sum"] = 4
+    smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
+    refresh_bumkc_digests(plan_dir)
+
+    with pytest.raises(BumkcArtifactError, match="runtime smoke descriptor mismatch"):
+        load_bumkc_artifact(plan_dir)
+
+
+def test_rejects_bumkc_runtime_smoke_event_dispatch_mismatch(tmp_path):
+    plan_dir = write_bumkc_artifact(tmp_path, executable=True)
+    smoke_path = plan_dir / "generated" / "runtime-smoke.json"
+    smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    smoke["event_dispatch_descriptors"][1]["trigger_count"] = 0
+    populate_runtime_smoke_contracts(smoke)
     smoke_path.write_text(json.dumps(smoke), encoding="utf-8")
     refresh_bumkc_digests(plan_dir)
 
@@ -1749,6 +1762,17 @@ def write_bumkc_artifact(tmp_path, *, executable):
         "expected_event_notification_count": 1,
         "expected_event_execution_count": 2,
         "expected_event_simulation_violation_count": 0,
+        "expected_event_dispatch_range_count": 2,
+        "expected_event_dispatch_compact_range_count": 2,
+        "expected_event_dispatch_indexed_range_count": 0,
+        "expected_event_dispatch_task_count_sum": 2,
+        "expected_event_dispatch_trigger_count_sum": 1,
+        "expected_event_dispatch_trigger_match_count": 2,
+        "expected_event_dispatch_owner_scheduler_sum": 1,
+        "expected_event_dispatch_max_task_range_len": 1,
+        "expected_event_dispatch_max_trigger_count": 1,
+        "expected_event_dispatch_range_kind_code_sum": 2,
+        "expected_event_dispatch_invalid_range_count": 0,
         "expected_diagnostic_heartbeat_slot_count": 72,
         "expected_diagnostic_queue_snapshot_slot_count": 72,
         "expected_diagnostic_event_counter_snapshot_count": 2,
@@ -1768,6 +1792,24 @@ def write_bumkc_artifact(tmp_path, *, executable):
                 "event_id": "event_second",
                 "predecessor_event_count": 1,
                 "successor_event_count": 0,
+            },
+        ],
+        "event_dispatch_descriptors": [
+            {
+                "ordinal": 0,
+                "first_task_index": 0,
+                "task_count": 1,
+                "trigger_count": 0,
+                "owner_scheduler": 0,
+                "range_kind_code": 1,
+            },
+            {
+                "ordinal": 1,
+                "first_task_index": 1,
+                "task_count": 1,
+                "trigger_count": 1,
+                "owner_scheduler": 1,
+                "range_kind_code": 1,
             },
         ],
         "task_descriptors": [
@@ -1861,6 +1903,7 @@ def set_bumkc_runtime_mode(plan_dir, runtime_mode):
 def populate_runtime_smoke_contracts(smoke):
     descriptor_hash = bumkc_artifact._runtime_smoke_descriptor_contract_hash(
         smoke["event_descriptors"],
+        smoke["event_dispatch_descriptors"],
         smoke["task_descriptors"],
     )
     smoke["expected_schema_hash"] = bumkc_artifact._contract_hash_str(

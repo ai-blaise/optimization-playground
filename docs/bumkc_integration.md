@@ -33,7 +33,7 @@ validates:
 - engine-exported manifest schema/capability fields matching `manifest.json`,
 - engine-exported source schema matching `source/model-source.json`,
 - `runtime_abi_version == "bumkc.runtime.v1"`,
-- runtime smoke schema `bumkc.cuda_smoke.v13`,
+- runtime smoke schema `bumkc.cuda_smoke.v14`,
 - manifest runtime mode in `{debug, trace, profile, production}`,
 - engine-exported runtime mode matching the manifest for `v25` artifacts,
 - `engine == "sglang"`,
@@ -65,6 +65,8 @@ validates:
   Event Tensors, side-effect counts and code sums, Event Tensor edge counts,
   dependency tensor counts, notifications, execution count, and violation
   count,
+- runtime smoke event dispatch descriptors, including task-span bounds, trigger
+  counts, owner scheduler summaries, and compact/indexed range-kind summaries,
 - runtime summary fields against the runtime descriptor, including
   communication-plan collective counts, side-effect counts and code sums,
   serving-state dependency counts, dependency tensor count, dependency

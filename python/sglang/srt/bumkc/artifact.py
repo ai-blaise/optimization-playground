@@ -36,14 +36,14 @@ SUPPORTED_SCHEMA_VERSIONS = (
 )
 REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v11"
 REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
-REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v13"
+REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v14"
 SUPPORTED_RUNTIME_MODES = ("debug", "trace", "profile", "production")
 RUNTIME_SMOKE_BENCHMARK_ITERATIONS = 8
 RUNTIME_SMOKE_BENCHMARK_LAUNCH_CAP = 128
 _CONTRACT_HASH_OFFSET = 0xCBF29CE484222325
 _CONTRACT_HASH_PRIME = 0x00000100000001B3
 _U64_MASK = (1 << 64) - 1
-_DESCRIPTOR_CONTRACT_DOMAIN = "bumkc.cuda_smoke.descriptors.v1"
+_DESCRIPTOR_CONTRACT_DOMAIN = "bumkc.cuda_smoke.descriptors.v2"
 _SOURCE_CONTRACT_DOMAIN = "bumkc.cuda_smoke.source.v1"
 _SOURCE_CONTRACT_KEYS = (
     "expected_task_count",
@@ -90,6 +90,17 @@ _SOURCE_CONTRACT_KEYS = (
     "expected_event_notification_count",
     "expected_event_execution_count",
     "expected_event_simulation_violation_count",
+    "expected_event_dispatch_range_count",
+    "expected_event_dispatch_compact_range_count",
+    "expected_event_dispatch_indexed_range_count",
+    "expected_event_dispatch_task_count_sum",
+    "expected_event_dispatch_trigger_count_sum",
+    "expected_event_dispatch_trigger_match_count",
+    "expected_event_dispatch_owner_scheduler_sum",
+    "expected_event_dispatch_max_task_range_len",
+    "expected_event_dispatch_max_trigger_count",
+    "expected_event_dispatch_range_kind_code_sum",
+    "expected_event_dispatch_invalid_range_count",
     "expected_diagnostic_heartbeat_slot_count",
     "expected_diagnostic_queue_snapshot_slot_count",
     "expected_diagnostic_event_counter_snapshot_count",
@@ -1955,6 +1966,7 @@ def _validate_runtime_smoke_plan(
             raise BumkcArtifactError(f"BUMKC runtime smoke mismatch: {key}")
 
     event_descriptors = _read_list(runtime_smoke, "event_descriptors")
+    event_dispatch_descriptors = _read_list(runtime_smoke, "event_dispatch_descriptors")
     task_descriptors = _read_list(runtime_smoke, "task_descriptors")
     if len(event_descriptors) != compiler_summary.event_tensor_count:
         raise BumkcArtifactError(
@@ -1966,6 +1978,11 @@ def _validate_runtime_smoke_plan(
         runtime_smoke,
         event_descriptors,
     )
+    _validate_runtime_smoke_event_dispatch_descriptors(
+        runtime_smoke,
+        event_dispatch_descriptors,
+        task_descriptors,
+    )
     _validate_runtime_smoke_task_descriptors(
         runtime_smoke,
         task_descriptors,
@@ -1973,6 +1990,7 @@ def _validate_runtime_smoke_plan(
     _validate_runtime_smoke_contracts(
         runtime_smoke,
         event_descriptors,
+        event_dispatch_descriptors,
         task_descriptors,
     )
 
@@ -2100,13 +2118,84 @@ def _validate_runtime_smoke_task_descriptors(
             raise BumkcArtifactError(f"BUMKC runtime smoke descriptor mismatch: {key}")
 
 
+def _validate_runtime_smoke_event_dispatch_descriptors(
+    runtime_smoke: dict[str, Any],
+    event_dispatch_descriptors: list[dict[str, Any]],
+    task_descriptors: list[dict[str, Any]],
+) -> None:
+    expected = {
+        "expected_event_dispatch_range_count": len(event_dispatch_descriptors),
+        "expected_event_dispatch_compact_range_count": 0,
+        "expected_event_dispatch_indexed_range_count": 0,
+        "expected_event_dispatch_task_count_sum": 0,
+        "expected_event_dispatch_trigger_count_sum": 0,
+        "expected_event_dispatch_trigger_match_count": 0,
+        "expected_event_dispatch_owner_scheduler_sum": 0,
+        "expected_event_dispatch_max_task_range_len": 0,
+        "expected_event_dispatch_max_trigger_count": 0,
+        "expected_event_dispatch_range_kind_code_sum": 0,
+        "expected_event_dispatch_invalid_range_count": 0,
+    }
+    task_count = len(task_descriptors)
+    for ordinal, event_range in enumerate(event_dispatch_descriptors):
+        if _read_int(event_range, "ordinal") != ordinal:
+            raise BumkcArtifactError(
+                "BUMKC runtime smoke event dispatch ordinal mismatch"
+            )
+        first_task_index = _read_int(event_range, "first_task_index")
+        range_task_count = _read_int(event_range, "task_count")
+        trigger_count = _read_int(event_range, "trigger_count")
+        owner_scheduler = _read_int(event_range, "owner_scheduler")
+        range_kind_code = _read_int(event_range, "range_kind_code")
+        expected["expected_event_dispatch_task_count_sum"] += range_task_count
+        expected["expected_event_dispatch_trigger_count_sum"] += trigger_count
+        expected["expected_event_dispatch_owner_scheduler_sum"] += owner_scheduler
+        expected["expected_event_dispatch_range_kind_code_sum"] += range_kind_code
+        expected["expected_event_dispatch_compact_range_count"] += int(
+            range_kind_code == 1
+        )
+        expected["expected_event_dispatch_indexed_range_count"] += int(
+            range_kind_code == 2
+        )
+        expected["expected_event_dispatch_max_task_range_len"] = max(
+            expected["expected_event_dispatch_max_task_range_len"],
+            range_task_count,
+        )
+        expected["expected_event_dispatch_max_trigger_count"] = max(
+            expected["expected_event_dispatch_max_trigger_count"],
+            trigger_count,
+        )
+        range_end = first_task_index + range_task_count
+        invalid_range = (
+            range_task_count == 0
+            or first_task_index > task_count
+            or range_end > task_count
+            or range_end < first_task_index
+        )
+        expected["expected_event_dispatch_invalid_range_count"] += int(invalid_range)
+        if not invalid_range:
+            matching_task_count = 0
+            for task in task_descriptors[first_task_index:range_end]:
+                matching_task_count += int(
+                    _read_int(task, "predecessor_event_count") == trigger_count
+                )
+            expected["expected_event_dispatch_trigger_match_count"] += int(
+                matching_task_count == range_task_count
+            )
+    for key, value in expected.items():
+        if _read_int(runtime_smoke, key) != value:
+            raise BumkcArtifactError(f"BUMKC runtime smoke descriptor mismatch: {key}")
+
+
 def _validate_runtime_smoke_contracts(
     runtime_smoke: dict[str, Any],
     event_descriptors: list[dict[str, Any]],
+    event_dispatch_descriptors: list[dict[str, Any]],
     task_descriptors: list[dict[str, Any]],
 ) -> None:
     descriptor_hash = _runtime_smoke_descriptor_contract_hash(
         event_descriptors,
+        event_dispatch_descriptors,
         task_descriptors,
     )
     expected = {
@@ -2135,10 +2224,12 @@ def _validate_runtime_smoke_contracts(
 
 def _runtime_smoke_descriptor_contract_hash(
     event_descriptors: list[dict[str, Any]],
+    event_dispatch_descriptors: list[dict[str, Any]],
     task_descriptors: list[dict[str, Any]],
 ) -> int:
     hash_value = _mix_contract_str(_CONTRACT_HASH_OFFSET, _DESCRIPTOR_CONTRACT_DOMAIN)
     hash_value = _mix_contract_u64(hash_value, len(event_descriptors))
+    hash_value = _mix_contract_u64(hash_value, len(event_dispatch_descriptors))
     hash_value = _mix_contract_u64(hash_value, len(task_descriptors))
     for ordinal, event in enumerate(event_descriptors):
         hash_value = _mix_contract_u64(hash_value, ordinal)
@@ -2149,6 +2240,28 @@ def _runtime_smoke_descriptor_contract_hash(
         hash_value = _mix_contract_u64(
             hash_value,
             _read_int(event, "successor_event_count"),
+        )
+    for ordinal, event_range in enumerate(event_dispatch_descriptors):
+        hash_value = _mix_contract_u64(hash_value, ordinal)
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(event_range, "first_task_index"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(event_range, "task_count"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(event_range, "trigger_count"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(event_range, "owner_scheduler"),
+        )
+        hash_value = _mix_contract_u64(
+            hash_value,
+            _read_int(event_range, "range_kind_code"),
         )
     for ordinal, task in enumerate(task_descriptors):
         operator = _read_str(task, "operator")

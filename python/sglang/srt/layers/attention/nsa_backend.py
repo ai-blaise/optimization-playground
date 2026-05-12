@@ -1536,6 +1536,27 @@ class NativeSparseAttnBackend(
             and nsa_impl == "flashmla_kv"
             and getattr(
                 forward_batch.token_to_kv_pool,
+                "higgs_dense_2bit_preset",
+                None,
+            )
+            == "eden2_16"
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and page_table_1.is_cuda
+            and page_table_1.dtype == torch.int32
+        ):
+            return forward_batch.token_to_kv_pool.forward_higgs_dense_2bit_mla_decode(
+                layer.layer_id,
+                q_nope,
+                q_rope,
+                page_table_1,
+                layer.scaling,
+            )
+
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and nsa_impl == "flashmla_kv"
+            and getattr(
+                forward_batch.token_to_kv_pool,
                 "turboquant_execution_mode",
                 None,
             )
@@ -1559,6 +1580,25 @@ class NativeSparseAttnBackend(
             )
 
         if (
+            nsa_impl in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang")
+            or nsa_impl == "tokenspeed_mla"
+        ) and (
+            getattr(
+                forward_batch.token_to_kv_pool,
+                "higgs_dense_2bit_preset",
+                None,
+            )
+            == "eden2_16"
+            and topk_transform_method == TopkTransformMethod.PAGED
+        ):
+            kv_cache, page_table_1 = (
+                forward_batch.token_to_kv_pool.get_higgs_selected_kv_buffer(
+                    layer.layer_id,
+                    page_table_1,
+                    fp8_layout=nsa_impl == "flashmla_kv",
+                )
+            )
+        elif (
             nsa_impl in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang")
             or nsa_impl == "tokenspeed_mla"
         ) and (
@@ -1752,6 +1792,26 @@ class NativeSparseAttnBackend(
             self.nsa_decode_impl == "flashmla_kv"
             and getattr(
                 forward_batch.token_to_kv_pool,
+                "higgs_dense_2bit_preset",
+                None,
+            )
+            == "eden2_16"
+            and q_rope is not None
+            and page_table_1.is_cuda
+            and page_table_1.dtype == torch.int32
+        ):
+            return forward_batch.token_to_kv_pool.forward_higgs_dense_2bit_mla_decode(
+                layer.layer_id,
+                q_nope,
+                q_rope,
+                page_table_1,
+                layer.scaling,
+            )
+
+        if (
+            self.nsa_decode_impl == "flashmla_kv"
+            and getattr(
+                forward_batch.token_to_kv_pool,
                 "turboquant_execution_mode",
                 None,
             )
@@ -1775,6 +1835,23 @@ class NativeSparseAttnBackend(
             )
 
         if (
+            self.nsa_decode_impl
+            in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang", "tokenspeed_mla")
+            and getattr(
+                forward_batch.token_to_kv_pool,
+                "higgs_dense_2bit_preset",
+                None,
+            )
+            == "eden2_16"
+        ):
+            kv_cache, page_table_1 = (
+                forward_batch.token_to_kv_pool.get_higgs_selected_kv_buffer(
+                    layer.layer_id,
+                    page_table_1,
+                    fp8_layout=self.nsa_decode_impl == "flashmla_kv",
+                )
+            )
+        elif (
             self.nsa_decode_impl
             in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang", "tokenspeed_mla")
             and getattr(

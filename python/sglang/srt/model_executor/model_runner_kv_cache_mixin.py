@@ -27,11 +27,13 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseHiggsDense2BitNSATokenToKVPool,
     HiSparseNSATokenToKVPool,
     HiSparseTurboQuantNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    HiggsDense2BitNSATokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
@@ -520,6 +522,17 @@ class ModelRunnerKVCacheMixin:
                         self.server_args.turboquant_mla_decode_num_splits
                     ),
                     turboquant_skip_layers=skip_layers,
+                )
+            elif self.server_args.enable_higgs_dense_2bit_kv_cache:
+                pool_cls = (
+                    HiSparseHiggsDense2BitNSATokenToKVPool
+                    if self.enable_hisparse
+                    else HiggsDense2BitNSATokenToKVPool
+                )
+                self.token_to_kv_pool = pool_cls(
+                    **nsa_pool_kwargs,
+                    higgs_execution_mode="fused_decode",
+                    higgs_skip_layers=set(),
                 )
             elif self.enable_hisparse:
                 self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)

@@ -100,6 +100,51 @@ declaring or enabling both raises `ValueError` loudly. The HIGGS
 path requires `--kv-cache-dtype=bfloat16` (set automatically when
 the auto default is used).
 
+#### Split-K decode (`--higgs-mla-decode-num-splits`)
+
+The HIGGS fused dense MLA decode kernel uses the same split-K
+parallelization pattern as TurboQuant's `decode_2p5_split_rotated`.
+The topk loop is sharded across `num_splits` blocks per
+`(row, head)`; each block produces a partial online-softmax tuple
+`(m, l, acc[0..511])`, and a merge stage combines partials via the
+log-sum-exp identity, normalizes by the global `l`, and runs the
+inverse FWHT_512.
+
+The `--higgs-mla-decode-num-splits` flag (default `16`, matching
+TurboQuant's tuned default) controls how aggressively the topk loop
+is parallelized:
+
+* `--higgs-mla-decode-num-splits=16` (default) — split-K decode.
+  Restores throughput at small batch sizes (b=1..4) where the
+  topk-reduction loop in the single-pass kernel would otherwise
+  starve SMs. Required for TTFT-sensitive paths and single-user
+  decode.
+* `--higgs-mla-decode-num-splits=1` — single-pass kernel. Acceptable
+  when `num_rows * num_heads` already saturates the GPU (typically
+  b >= 8 on H200); avoids the small `mid` scratch
+  (`R*H*num_splits*514*4B`) and `q_rotated` scratch
+  (`R*H*512*4B`).
+
+Surrogate gate (H200, kv_lora_rank=512, num_heads=128,
+pool=2 M tokens, RUNS=8, WARMUP=3); HIGGS row uses the split-K
+default:
+
+| batch | topk | HIGGS med (ms) | HIGGS p95 (ms) | TQ med (ms) | TQ p95 (ms) | d_med (%) |
+|------:|-----:|---------------:|---------------:|------------:|------------:|----------:|
+|     1 | 2048 |          0.185 |          0.191 |       0.299 |       0.302 |    -37.95 |
+|     1 | 4096 |          0.344 |          0.347 |       0.567 |       0.568 |    -39.32 |
+|     1 | 8192 |          0.662 |          0.663 |       1.107 |       1.107 |    -40.15 |
+|     2 | 2048 |          0.314 |          0.316 |       0.541 |       0.543 |    -42.05 |
+|     4 | 2048 |          0.574 |          0.576 |       0.993 |       0.994 |    -42.21 |
+|     8 | 2048 |          1.100 |          1.102 |       1.901 |       1.906 |    -42.11 |
+|    16 | 2048 |          2.140 |          2.141 |       3.710 |       3.712 |    -42.32 |
+|    32 | 2048 |          4.206 |          4.208 |       7.333 |       7.342 |    -42.64 |
+
+Before this kernel landed, the HIGGS single-pass decode was +344-379%
+slower than TurboQuant at b=1 (topk 2048-8192). The split-K port
+recovers the small-batch regression and adds a uniform ~38-43% win
+across the sweep on top of the already-favorable memory profile.
+
 ### 2. NSA indexer quantization
 
 A new top-level `indexer_quantization` field declares that the

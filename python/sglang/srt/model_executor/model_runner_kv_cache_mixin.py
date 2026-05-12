@@ -533,6 +533,9 @@ class ModelRunnerKVCacheMixin:
                     **nsa_pool_kwargs,
                     higgs_execution_mode="fused_decode",
                     higgs_skip_layers=set(),
+                    higgs_mla_decode_num_splits=(
+                        self.server_args.higgs_mla_decode_num_splits
+                    ),
                 )
             elif self.enable_hisparse:
                 self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)

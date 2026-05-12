@@ -59,6 +59,7 @@ def _make_higgs_pool(
     kv_lora_rank: int = 512,
     qk_rope_head_dim: int = 64,
     index_head_dim: int = 128,
+    num_splits: int = 16,
 ):
     from sglang.srt.layers.attention.nsa.indexer_quantization import (
         INDEXER_FP8_QUANT_METHOD,
@@ -83,6 +84,7 @@ def _make_higgs_pool(
         indexer_quantization=INDEXER_FP8_QUANT_METHOD,
         higgs_execution_mode="fused_decode",
         higgs_skip_layers=set(),
+        higgs_mla_decode_num_splits=num_splits,
     )
 
 
@@ -302,3 +304,67 @@ def test_turboquant_pool_regression_round_trip():
     )
     assert out.shape == (num_rows, num_heads, kv_lora_rank)
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(not cuda_available, reason="requires CUDA")
+def test_higgs_split_k_matches_single_pass():
+    """Split-K decode (num_splits=16) matches the single-pass kernel.
+
+    Both kernels implement the same algorithm; split-K shards the
+    topk loop and merges per-split (m, l, acc) tuples via log-sum-exp.
+    Outputs must be numerically equivalent within bf16 rounding noise.
+    """
+    torch.manual_seed(17)
+    pool_split = _make_higgs_pool(size=256, page_size=64, num_splits=16)
+    pool_single = _make_higgs_pool(size=256, page_size=64, num_splits=1)
+
+    layer_id = 0
+    num_slots = 128
+    kv_lora_rank = pool_split.kv_lora_rank
+    qk_rope_head_dim = pool_split.qk_rope_head_dim
+    device = pool_split.device
+
+    latent = torch.randn(
+        num_slots, 1, kv_lora_rank, device=device, dtype=torch.bfloat16
+    )
+    rope = torch.randn(
+        num_slots, 1, qk_rope_head_dim, device=device, dtype=torch.bfloat16
+    )
+    loc = torch.arange(num_slots, device=device, dtype=torch.int64)
+    pool_split.set_mla_kv_buffer(
+        _make_radix_layer(layer_id), loc, latent.squeeze(1), rope.squeeze(1)
+    )
+    pool_single.set_mla_kv_buffer(
+        _make_radix_layer(layer_id), loc, latent.squeeze(1), rope.squeeze(1)
+    )
+
+    num_rows = 4
+    num_heads = 8
+    topk = 64
+    page_table = torch.randint(
+        0, num_slots, (num_rows, topk), device=device, dtype=torch.int32
+    )
+    q_nope = torch.randn(
+        num_rows, num_heads, kv_lora_rank, device=device, dtype=torch.bfloat16
+    )
+    q_rope = torch.randn(
+        num_rows, num_heads, qk_rope_head_dim, device=device, dtype=torch.bfloat16
+    )
+    sm_scale = 1.0 / float(kv_lora_rank) ** 0.5
+
+    out_split = pool_split.forward_higgs_dense_2bit_mla_decode(
+        layer_id, q_nope, q_rope, page_table, sm_scale
+    )
+    out_single = pool_single.forward_higgs_dense_2bit_mla_decode(
+        layer_id, q_nope, q_rope, page_table, sm_scale
+    )
+
+    torch.testing.assert_close(
+        out_split.float(), out_single.float(), rtol=5e-3, atol=5e-3
+    )
+    cos = torch.nn.functional.cosine_similarity(
+        out_split.float().reshape(-1, kv_lora_rank),
+        out_single.float().reshape(-1, kv_lora_rank),
+        dim=-1,
+    )
+    assert cos.min().item() >= 0.999976, f"min cos_sim = {cos.min().item()!r}"

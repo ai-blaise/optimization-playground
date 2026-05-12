@@ -56,6 +56,8 @@ from sglang.jit_kernel.higgs_dense_2bit import (
 )
 from sglang.jit_kernel.higgs_dense_2bit_mla_decode import (
     higgs_dense_2bit_mla_decode,
+    higgs_dense_2bit_mla_decode_split,
+    higgs_dense_2bit_mla_rotate_query,
 )
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -3149,6 +3151,7 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
         *args,
         higgs_execution_mode: str = "fused_decode",
         higgs_skip_layers: Optional[set[int]] = None,
+        higgs_mla_decode_num_splits: int = 16,
         **kwargs,
     ):
         self.higgs_execution_mode = higgs_execution_mode
@@ -3160,6 +3163,18 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
         self.turboquant_execution_mode = higgs_execution_mode
         self.higgs_dense_2bit_preset = "eden2_16"
         self.higgs_skip_layers = higgs_skip_layers or set()
+        self.higgs_mla_decode_num_splits = int(higgs_mla_decode_num_splits)
+        if self.higgs_mla_decode_num_splits < 1:
+            raise ValueError(
+                "higgs_mla_decode_num_splits must be >= 1; "
+                f"got {self.higgs_mla_decode_num_splits}."
+            )
+        # Lazily-allocated scratch buffers for the split-K decode path.
+        # Shapes depend on (batch, heads, num_splits) and the BF16 query;
+        # we allocate on first call and only reallocate when shapes
+        # change. Matches TurboQuant's pattern at line 2973 above.
+        self._higgs_mla_decode_mid: Optional[torch.Tensor] = None
+        self._higgs_mla_q_rotated: Optional[torch.Tensor] = None
         super().__init__(*args, **kwargs)
 
     def _create_buffers(self):
@@ -3333,10 +3348,16 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
     ) -> torch.Tensor:
         """Fused dense MLA decode on the 2-bit HIGGS packed slots.
 
-        Mirrors :meth:`TurboQuantNSATokenToKVPool.forward_turboquant_dense_mla_decode`
-        but the HIGGS decode kernel folds query rotation into the fused
-        kernel (no pre-rotate-query step) and uses a single ``codebook``
-        instead of TurboQuant's ``signs1/2 + centroids_high/low`` quad.
+        Mirrors :meth:`TurboQuantNSATokenToKVPool.forward_turboquant_dense_mla_decode`.
+        When ``higgs_mla_decode_num_splits > 1`` the split-K path runs:
+        FWHT_512 of ``q_nope`` into a ``q_rotated`` scratch, then the
+        topk loop is sharded across ``num_splits`` blocks per
+        ``(row, head)`` with a merge-and-inverse-FWHT stage. This
+        mirrors TurboQuant's ``decode_2p5_split_rotated`` two-stage
+        pipeline and recovers small-batch throughput on H200.
+        Setting ``num_splits == 1`` selects the original single-pass
+        kernel, useful when ``num_rows * num_heads`` already saturates
+        the GPU.
         """
         layer_buffer = self._get_layersplit_kv_buffer(layer_id)
         out = torch.empty(
@@ -3344,11 +3365,54 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
             dtype=self.dtype,
             device=q_nope.device,
         )
-        higgs_dense_2bit_mla_decode(
+        num_splits = self.higgs_mla_decode_num_splits
+        if num_splits <= 1:
+            higgs_dense_2bit_mla_decode(
+                q_nope,
+                q_rope,
+                layer_buffer,
+                page_table,
+                out,
+                self.higgs_codec.codebook,
+                sm_scale,
+            )
+            return out
+
+        mid_shape = (
+            q_nope.shape[0],
+            q_nope.shape[1],
+            num_splits,
+            self.kv_lora_rank + 2,
+        )
+        if (
+            self._higgs_mla_decode_mid is None
+            or self._higgs_mla_decode_mid.shape != mid_shape
+        ):
+            self._higgs_mla_decode_mid = torch.empty(
+                mid_shape,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+        q_rotated_shape = q_nope.shape
+        if (
+            self._higgs_mla_q_rotated is None
+            or self._higgs_mla_q_rotated.shape != q_rotated_shape
+        ):
+            self._higgs_mla_q_rotated = torch.empty(
+                q_rotated_shape,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+        higgs_dense_2bit_mla_rotate_query(
             q_nope,
+            self._higgs_mla_q_rotated,
+        )
+        higgs_dense_2bit_mla_decode_split(
+            self._higgs_mla_q_rotated,
             q_rope,
             layer_buffer,
             page_table,
+            self._higgs_mla_decode_mid,
             out,
             self.higgs_codec.codebook,
             sm_scale,

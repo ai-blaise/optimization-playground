@@ -50,6 +50,56 @@ Recognized presets: `latent_k8`, `latent_4bit_nc`, `latent_k3_nc`,
 `latent_2p5bit_nc`. Unknown presets are ignored (logged at INFO) so the
 checkpoint still loads on a stock SGLang build.
 
+### 1b. HIGGS 2-bit dense MLA KV (alternative to TurboQuant 2.5-bit)
+
+A second `kv_cache_scheme` flavor uses the HIGGS lattice-quantizer
+(Pletka et al., 2025; reference: the AquaKV
+`HiggsQuantizer` at https://github.com/goodevening13/aquakv) and
+yields a slightly smaller per-token slot than the 2.5-bit TurboQuant
+preset:
+
+```json
+{
+  "quantization_config": {
+    "kv_cache_scheme": {
+      "quant_method": "higgs_dense_2bit",
+      "slot_bytes": 258,
+      "packed_bits": 2,
+      "kv_dim": 576,
+      "latent_dim": 512,
+      "rope_dim": 64
+    }
+  }
+}
+```
+
+Effect on `server_args`:
+
+| Field          | Mutation                                              |
+|----------------|-------------------------------------------------------|
+| `quant_method` | If `"higgs_dense_2bit"`, `enable_higgs_dense_2bit_kv_cache` becomes `True`. |
+
+Slot layout (258 bytes / token, vs 274 for `latent_2p5bit_nc`):
+
+```
+[128 B packed 4-bit pair indices] [2 B fp16 block scale] [128 B bf16 rope]
+```
+
+* Codebook: EDEN2-16 (16 entries of 2-d float32, from the public
+  AquaKV grid). Quantization is by nearest-neighbor in 2-d
+  (`argmax 2 x.G^T - ||G||^2`).
+* Rotation: a single orthonormal block-Hadamard of order 512 per
+  token (the "block-diagonal Hadamard rotation" mandated by
+  SAW-INT4); since `latent_dim == hadamard_groupsize`, this is one
+  Hadamard block per token.
+* Per-token scale: `||FWHT(latent)|| / sqrt(512)` stored as fp16, so
+  the decode formula is `latent_recon = InvFWHT(scale * G[idx])`.
+
+The TurboQuant and HIGGS dense KV paths are mutually exclusive;
+declaring or enabling both raises `ValueError` loudly. The HIGGS
+path requires `--kv-cache-dtype=bfloat16` (set automatically when
+the auto default is used).
+
 ### 2. NSA indexer quantization
 
 A new top-level `indexer_quantization` field declares that the

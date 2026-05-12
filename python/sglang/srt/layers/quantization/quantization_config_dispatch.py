@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 TURBOQUANT_DENSE_QUANT_METHOD = "turboquant_dense"
 DEFAULT_TURBOQUANT_DENSE_KV_PRESET = "latent_2p5bit_nc"
+HIGGS_DENSE_2BIT_QUANT_METHOD = "higgs_dense_2bit"
 
 
 def _coerce_dict(value: Any) -> Optional[Dict[str, Any]]:
@@ -83,6 +84,14 @@ def _maybe_apply_turboquant_dense(
         )
         return
 
+    if getattr(server_args, "enable_higgs_dense_2bit_kv_cache", False):
+        raise ValueError(
+            "quantization_config.kv_cache_scheme.quant_method="
+            f"{TURBOQUANT_DENSE_QUANT_METHOD!r} conflicts with "
+            "--enable-higgs-dense-2bit-kv-cache; the two dense KV "
+            "compression paths are mutually exclusive."
+        )
+
     if not server_args.enable_turboquant_dense_kv_cache:
         server_args.enable_turboquant_dense_kv_cache = True
         logger.info(
@@ -100,6 +109,50 @@ def _maybe_apply_turboquant_dense(
         logger.info(
             "Setting --turboquant-dense-kv-preset=%s from quantization_config.",
             preset,
+        )
+
+
+def _maybe_apply_higgs_dense_2bit(
+    server_args: Any, quant_cfg: Dict[str, Any]
+) -> None:
+    """Promote a HIGGS 2-bit ``kv_cache_scheme`` declaration onto args.
+
+    Recognised JSON shape::
+
+        {
+          "kv_cache_scheme": {
+            "quant_method": "higgs_dense_2bit",
+            "latent_dim": 512,
+            "rope_dim": 64,
+            "slot_bytes": 258
+          }
+        }
+
+    Effect: sets ``server_args.enable_higgs_dense_2bit_kv_cache=True``.
+    The two TurboQuant and HIGGS dense KV paths are mutually
+    exclusive; a config that declares both, or a CLI override that
+    enables TurboQuant alongside this declaration, raises
+    ``ValueError``.
+    """
+    kv_cache_scheme = _coerce_dict(quant_cfg.get("kv_cache_scheme"))
+    if kv_cache_scheme is None:
+        return
+    if kv_cache_scheme.get("quant_method") != HIGGS_DENSE_2BIT_QUANT_METHOD:
+        return
+
+    if getattr(server_args, "enable_turboquant_dense_kv_cache", False):
+        raise ValueError(
+            "quantization_config.kv_cache_scheme.quant_method="
+            f"{HIGGS_DENSE_2BIT_QUANT_METHOD!r} conflicts with "
+            "--enable-turboquant-dense-kv-cache; the two dense KV "
+            "compression paths are mutually exclusive."
+        )
+
+    if not getattr(server_args, "enable_higgs_dense_2bit_kv_cache", False):
+        server_args.enable_higgs_dense_2bit_kv_cache = True
+        logger.info(
+            "Enabling HIGGS 2-bit dense KV from quantization_config "
+            "(kv_cache_scheme.quant_method=higgs_dense_2bit)."
         )
 
 
@@ -139,6 +192,7 @@ def apply_quantization_config_dispatch(
     if quant_cfg is None:
         return
     _maybe_apply_turboquant_dense(server_args, quant_cfg)
+    _maybe_apply_higgs_dense_2bit(server_args, quant_cfg)
     _maybe_apply_indexer_quantization(server_args, quant_cfg)
 
 

@@ -588,6 +588,7 @@ class ServerArgs:
     turboquant_skip_layers: Optional[str] = None
     turboquant_execution_mode: str = "fused_decode"
     turboquant_mla_decode_num_splits: int = 16
+    enable_higgs_dense_2bit_kv_cache: bool = False
     indexer_quantization_declared: Optional[Dict[str, Any]] = None
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
@@ -5906,6 +5907,13 @@ class ServerArgs:
             help="Number of sequence splits for TurboQuant fused dense MLA decode.",
         )
         parser.add_argument(
+            "--enable-higgs-dense-2bit-kv-cache",
+            action="store_true",
+            help="Enable 2-bit HIGGS compression for DeepSeek NSA dense MLA "
+            "KV cache. Mutually exclusive with "
+            "--enable-turboquant-dense-kv-cache.",
+        )
+        parser.add_argument(
             "--fp8-gemm-backend",
             type=str,
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
@@ -7674,6 +7682,33 @@ class ServerArgs:
                         raise ValueError(
                             "--turboquant-skip-layers must be a comma-separated list of layer IDs."
                         )
+
+        if self.enable_higgs_dense_2bit_kv_cache:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            if self.enable_turboquant_dense_kv_cache:
+                raise ValueError(
+                    "--enable-higgs-dense-2bit-kv-cache and "
+                    "--enable-turboquant-dense-kv-cache are mutually "
+                    "exclusive; pick one dense-MLA KV compression path."
+                )
+            hf_config = self.get_model_config().hf_config
+            if not is_deepseek_nsa(hf_config):
+                raise ValueError(
+                    "--enable-higgs-dense-2bit-kv-cache is only supported "
+                    "for DeepSeek Sparse Attention models."
+                )
+            if not is_cuda():
+                raise ValueError(
+                    "--enable-higgs-dense-2bit-kv-cache currently requires CUDA."
+                )
+            if self.kv_cache_dtype not in ("auto", "bfloat16"):
+                raise ValueError(
+                    "--enable-higgs-dense-2bit-kv-cache currently requires "
+                    "--kv-cache-dtype=bfloat16."
+                )
+            if self.kv_cache_dtype == "auto":
+                self.kv_cache_dtype = "bfloat16"
 
         assert (
             self.schedule_conservativeness >= 0

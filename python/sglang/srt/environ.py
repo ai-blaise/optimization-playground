@@ -257,6 +257,7 @@ class Envs:
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+    SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
@@ -525,6 +526,9 @@ class Envs:
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
+    # too short when many workers cold-start and load tokenizers in parallel.
+    SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
 
     # HTTP/2 Server
     SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
@@ -617,7 +621,7 @@ class Envs:
 
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
-
+    SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)

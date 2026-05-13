@@ -1,8 +1,8 @@
 # NVFP4 HISA IndexCache Indexer
 
 This experimental path adds a configurable HISA block-to-token selector for the
-NVFP4 IndexCache DSA Indexer. It is an alternative to the incumbent dense
-IndexCache selector, not a replacement.
+NVFP4 IndexCache DSA Indexer. It is evaluated only against the ordinary NVFP4
+IndexCache selector; no other baseline is in scope for this integration.
 
 Enablement:
 
@@ -34,28 +34,28 @@ Model config enablement:
 }
 ```
 
-The CLI takes precedence over model-card defaults. Set
-`--hisa-compression-ratio 0` to use the fixed `--hisa-block-topk` budget for
-debugging or A/B tests; fixed-budget mode also honors `--hisa-min-seq-len`.
+The CLI takes precedence over model-card defaults. The accepted NVFP4
+IndexCache+HISA integration uses strict `--hisa-compression-ratio 4.0`
+semantics; fixed-budget HISA debug modes are outside this contract.
 
 ## Contract
 
-The default path follows the HISA paper's compression-ratio form:
+The accepted path follows the HISA paper's compression-ratio form:
 
 - Logical block size is fixed to `B=128`.
 - For a prefix length `L`, the eligible block count is `M=ceil(L / B)`.
-- With `compression_ratio=4.0`, the selected block count is
-  `m=max(ceil(M / 4), ceil(k / B))`, capped by `M`.
+- With strict `compression_ratio=4.0` (Compression Ratio = 4:1), the selected block count is
+  `m=ceil(M / 4)`, capped by `M`.
 - The candidate token pool is `m * B`.
-- For short contexts where `L <= k`, the caller falls back to the incumbent
+- For short contexts where `L <= k`, the caller falls back to the ordinary
   NVFP4 IndexCache selector.
 - For dynamic compression-ratio mode, there is no additional sequence-length
   threshold. The 4:1 ratio is applied at every eligible `L > k`.
 - The first and last eligible blocks are forced into the selected block set.
 - Block representatives are mean-pooled over the NVFP4-dequantized indexing
   keys.
-- Block and token scoring use the same weighted ReLU DSA score as the incumbent
-  Indexer: `sum_h weight_h * relu(q_h dot k)`.
+- Block and token scoring use the same weighted ReLU DSA score as the ordinary
+  NVFP4 IndexCache Indexer: `sum_h weight_h * relu(q_h dot k)`.
 - Sparse MLA is unchanged; this path only changes the selected index set.
 - When the candidate token pool has exactly `k` tokens, the implementation skips
   candidate token scoring and maps the selected blocks directly to output token
@@ -81,7 +81,7 @@ logits/top-k. IKP source is available on the B200 VM under
 `/root/b200-phase/refs/intra-kernel-profiler` and should be used when changing
 the CUDA kernels.
 
-Paper-shaped kernel comparison:
+Paper-shaped forward comparison versus ordinary NVFP4 IndexCache:
 
 ```bash
 python benchmark/nsa/bench_nvfp4_hisa_indexer.py \
@@ -96,15 +96,14 @@ python benchmark/nsa/bench_nvfp4_hisa_indexer.py \
   --json-out /tmp/hisa_nvfp4_4to1_paper_shape.json
 ```
 
-B200 paper-shaped results from
-`/root/b200-phase/logs/worker_a_launchshape_4to1_repeat_20260513T004559Z`:
+B200 commit-readiness forward facts versus ordinary NVFP4 IndexCache:
 
-| Prefix length | Selected blocks `m` | Incumbent DeepGEMM (ms) | HISA 4:1 (ms) | Speedup |
+| Prefix length | Selected blocks `m` | Ordinary NVFP4 IndexCache (ms) | NVFP4 IndexCache+HISA 4:1 (ms) | Speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 8192 | 16 | 0.3545 | 0.0701 | 5.06x |
-| 16384 | 32 | 0.5675 | 0.1872 | 3.03x |
-| 32768 | 64 | 1.0010 | 0.2567 | 3.90x |
-| 65536 | 128 | 1.7773 | 0.4307 | 4.13x |
+| 8192 | 16 | 0.360976 | 0.072824 | 4.9569x |
+| 16384 | 32 | 0.531413 | 0.191044 | 2.7816x |
+| 32768 | 64 | 1.006156 | 0.259645 | 3.8751x |
+| 65536 | 128 | 1.781986 | 0.429308 | 4.1508x |
 
 This accepted path uses precomputed/store-maintained HISA block
 representatives, exact four-pass radix fused mask/top-k/map, dynamic
@@ -113,7 +112,7 @@ representatives, exact four-pass radix fused mask/top-k/map, dynamic
 the top radix byte and was not exact; strict B200 tests now compare selected
 token sets against `torch.topk`.
 
-Decode-shaped comparison:
+Decode-shaped sanity check against ordinary NVFP4 IndexCache:
 
 ```bash
 python benchmark/nsa/bench_nvfp4_hisa_indexer.py \
@@ -129,7 +128,7 @@ python benchmark/nsa/bench_nvfp4_hisa_indexer.py \
 
 ## Acceptance
 
-The 4:1 path must beat incumbent NVFP4 IndexCache on the paper-shaped
+The 4:1 path must beat ordinary NVFP4 IndexCache on the paper-shaped
 multi-query benchmark and pass focused correctness tests before it is used. The
-runtime dispatch keeps the decode-shaped one-query path on dense IndexCache by
+runtime dispatch keeps the decode-shaped one-query path on ordinary NVFP4 IndexCache by
 default because HISA's block-selection overhead does not amortize there.

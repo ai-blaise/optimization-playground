@@ -327,8 +327,8 @@ def test_indexer_quantization_nvfp4_hisa_enables_config_surface():
 
 def test_indexer_quantization_nvfp4_hisa_preserves_cli_hisa_values():
     server_args = FakeServerArgs(
-        nsa_indexer_mode="hisa",
-        hisa_compression_ratio=0.0,
+        nsa_indexer_mode="indexcache-hisa",
+        hisa_compression_ratio=4.0,
         hisa_min_seq_len=32768,
     )
     hf_config = FakeHfConfig(
@@ -341,8 +341,8 @@ def test_indexer_quantization_nvfp4_hisa_preserves_cli_hisa_values():
     )
     dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
     assert server_args.enable_nsa_nvfp4_hisa is True
-    assert server_args.nsa_indexer_mode == "hisa"
-    assert server_args.hisa_compression_ratio == 0.0
+    assert server_args.nsa_indexer_mode == "indexcache-hisa"
+    assert server_args.hisa_compression_ratio == 4.0
     assert server_args.hisa_min_seq_len == 32768
 
 

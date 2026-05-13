@@ -86,7 +86,7 @@ def _nvfp4_supported() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)
 
 
-def _dense_reference_topk(q, k, weights, prefix_len, topk):
+def _ordinary_indexcache_reference_topk(q, k, weights, prefix_len, topk):
     scores = torch.einsum("qhd,kd->qkh", q.float(), k[:prefix_len].float())
     scores = torch.relu(scores) * weights.float().unsqueeze(1)
     scores = scores.sum(dim=-1)
@@ -134,7 +134,7 @@ def _sorted_valid_indices(x):
 
 @pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
 @pytest.mark.parametrize("topk", (2048, 1024))
-def test_nvfp4_hisa_defaults_to_incumbent_when_t_le_k(topk):
+def test_nvfp4_hisa_defaults_to_ordinary_indexcache_when_t_le_k(topk):
     for prefix_len in (1, topk - 1, topk):
         q, weights, q_fp4, cache, page_table, seq_lens, token_to_batch_idx = _build_case(
             prefix_len
@@ -152,7 +152,7 @@ def test_nvfp4_hisa_defaults_to_incumbent_when_t_le_k(topk):
             is None
         )
         q_deq = dequantize_indexer_nvfp4(q_fp4[0].cpu(), q_fp4[1].cpu())
-        ref = _dense_reference_topk(
+        ref = _ordinary_indexcache_reference_topk(
             q_deq, _dequant_cache(cache, prefix_len), weights.cpu(), prefix_len, topk
         )
         assert ref.shape == (1, topk)
@@ -176,7 +176,6 @@ def test_nvfp4_hisa_gpu_matches_pytorch_reference_required_prefixes(topk):
             weights,
             token_to_batch_idx,
             topk_tokens=topk,
-            fallback_to_dense_if_short=False,
         )
         assert actual is not None
 
@@ -187,7 +186,6 @@ def test_nvfp4_hisa_gpu_matches_pytorch_reference_required_prefixes(topk):
             torch.tensor([prefix_len], dtype=torch.int64),
             torch.zeros((1,), dtype=torch.int64),
             topk_tokens=topk,
-            fallback_to_dense_if_short=False,
         )
         assert expected is not None
         torch.testing.assert_close(
@@ -196,7 +194,7 @@ def test_nvfp4_hisa_gpu_matches_pytorch_reference_required_prefixes(topk):
 
 
 def test_nvfp4_hisa_compression_ratio_4to1_block_budget_table():
-    block_counts = torch.tensor((64, 128, 256, 512), dtype=torch.int32)
+    block_counts = torch.tensor((32, 64, 128, 256, 512), dtype=torch.int32)
     selected, width = _hisa_block_topk_counts(
         block_counts,
         block_size=128,
@@ -204,7 +202,11 @@ def test_nvfp4_hisa_compression_ratio_4to1_block_budget_table():
         compression_ratio=4.0,
     )
     torch.testing.assert_close(
-        selected, torch.tensor((16, 32, 64, 128), dtype=torch.int32)
+        selected, torch.tensor((8, 16, 32, 64, 128), dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        selected * 128,
+        torch.tensor((1024, 2048, 4096, 8192, 16384), dtype=torch.int32),
     )
     assert width == 128
 
@@ -225,7 +227,6 @@ def test_nvfp4_hisa_uses_compression_ratio_4to1_contract():
         block_topk=64,
         compression_ratio=4.0,
         topk_tokens=2048,
-        fallback_to_dense_if_short=False,
     )
     assert out is not None
     assert out.shape == (1, 2048)
@@ -266,7 +267,6 @@ def test_nvfp4_hisa_precomputed_deepgemm_matches_inline_deepgemm():
             weights,
             token_to_batch_idx,
             topk_tokens=2048,
-            fallback_to_dense_if_short=False,
         )
         precomputed = nvfp4_hisa_indexer_paged_deepgemm_precomputed(
             q_fp4,
@@ -278,7 +278,6 @@ def test_nvfp4_hisa_precomputed_deepgemm_matches_inline_deepgemm():
             rep_fp4,
             max_blocks,
             topk_tokens=2048,
-            fallback_to_dense_if_short=False,
         )
     except RuntimeError as exc:
         if "PyObjectSlot" in str(exc) or "no interpreter set" in str(exc):

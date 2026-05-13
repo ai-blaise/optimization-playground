@@ -10,7 +10,6 @@ import torch
 
 from sglang.jit_kernel.nvfp4_indexer import (
     _hisa_block_topk_counts,
-    dequantize_indexer_nvfp4,
     fused_store_index_k_cache_nvfp4,
     hisa_precompute_block_reps_indexer_cache_nvfp4,
     nvfp4_hisa_indexer_paged_deepgemm,
@@ -61,22 +60,7 @@ def _time_cuda(fn, warmup: int, iters: int) -> tuple[float, list[float]]:
     return statistics.median(samples), samples
 
 
-def _incumbent_dense_torch(q_fp4, cache, seq_lens, weights, topk: int):
-    prefix_len = int(seq_lens[0].item())
-    q = dequantize_indexer_nvfp4(q_fp4[0], q_fp4[1])
-    values = cache[:, : 64 * 64].reshape(-1, 64)[:prefix_len]
-    scales = cache[:, 64 * 64 : 64 * 68].reshape(-1, 4)[:prefix_len]
-    k = dequantize_indexer_nvfp4(
-        values, scales.contiguous().view(torch.int32).reshape(-1)
-    )
-    scores = torch.einsum("qhd,kd->qkh", q.float(), k.float())
-    scores = torch.relu(scores) * weights.float().unsqueeze(1)
-    scores = scores.sum(dim=-1)
-    keep = min(topk, prefix_len)
-    return torch.topk(scores, k=keep, dim=-1, sorted=False).indices
-
-
-def _incumbent_deepgemm_paged(
+def _indexcache_nvfp4_paged(
     q_fp4, cache, page_table, seq_lens, weights, topk: int
 ):
     import deep_gemm
@@ -124,7 +108,11 @@ def _summarize_counts(counts: torch.Tensor | None):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare ordinary NVFP4 IndexCache with NVFP4 IndexCache+HISA."
+        )
+    )
     parser.add_argument(
         "--prefix-lengths",
         default="1024,2048,4096,8192,8193,16384,32768,65536,131072",
@@ -144,7 +132,7 @@ def main() -> None:
         "--hisa-compression-ratio",
         type=float,
         default=4.0,
-        help="Use 0 to benchmark the legacy fixed --hisa-block-topk budget.",
+        help="HISA compression ratio. Commit-readiness runs must use 4.0.",
     )
     parser.add_argument("--json-out")
     args = parser.parse_args()
@@ -155,23 +143,18 @@ def main() -> None:
         for prefix_len in [int(x) for x in args.prefix_lengths.split(",") if x]:
             case = _build_case(prefix_len, args.heads, args.query_rows, args.seed)
             q_fp4, cache, page_table, seq_lens, weights, token_to_batch_idx = case
-            deepgemm_error = None
+            indexcache_error = None
             try:
-                incumbent_ms, _ = _time_cuda(
-                    lambda: _incumbent_deepgemm_paged(
+                indexcache_ms, _ = _time_cuda(
+                    lambda: _indexcache_nvfp4_paged(
                         q_fp4, cache, page_table, seq_lens, weights, topk
                     ),
                     args.warmup,
                     args.iters,
                 )
             except Exception as exc:
-                incumbent_ms = None
-                deepgemm_error = repr(exc)
-            dense_torch_ms, _ = _time_cuda(
-                lambda: _incumbent_dense_torch(q_fp4, cache, seq_lens, weights, topk),
-                max(1, args.warmup // 2),
-                max(1, args.iters // 2),
-            )
+                indexcache_ms = None
+                indexcache_error = repr(exc)
             precompute_reps_ms = None
             precomputed_reps = None
             precomputed_max_blocks = None
@@ -288,10 +271,9 @@ def main() -> None:
                 "prefix_len": prefix_len,
                 "topk": topk,
                 "query_rows": args.query_rows,
-                "incumbent_deepgemm_paged_ms": incumbent_ms,
-                "incumbent_deepgemm_error": deepgemm_error,
-                "incumbent_dense_torch_ms": dense_torch_ms,
-                "hisa_nvfp4_ms": hisa_ms,
+                "indexcache_nvfp4_ms": indexcache_ms,
+                "indexcache_nvfp4_error": indexcache_error,
+                "hisa_nvfp4_indexcache_ms": hisa_ms,
                 "hisa_candidate_scorer": args.hisa_candidate_scorer,
                 "hisa_compression_ratio": compression_ratio,
                 "hisa_effective_block_topk": effective_block_topk,
@@ -299,11 +281,8 @@ def main() -> None:
                     prepared_block_topk_counts
                 ),
                 "precompute_reps_ms": precompute_reps_ms,
-                "speedup_vs_deepgemm": incumbent_ms / hisa_ms
-                if incumbent_ms and hisa_ms
-                else None,
-                "speedup_vs_dense_torch": dense_torch_ms / hisa_ms
-                if hisa_ms
+                "speedup_vs_indexcache_nvfp4": indexcache_ms / hisa_ms
+                if indexcache_ms and hisa_ms
                 else None,
             }
             print(json.dumps(row, sort_keys=True))

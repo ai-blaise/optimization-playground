@@ -652,13 +652,11 @@ def _hisa_block_topk_counts(
 ) -> tuple[torch.Tensor, int]:
     if compression_ratio is None or compression_ratio <= 0:
         raise ValueError("compression_ratio must be positive for dynamic HISA budgets.")
-    min_blocks_for_topk = (topk_tokens + block_size - 1) // block_size
     if abs(compression_ratio - round(compression_ratio)) < 1e-6:
         ratio = int(round(compression_ratio))
         selected = torch.div(block_counts + ratio - 1, ratio, rounding_mode="floor")
     else:
         selected = torch.ceil(block_counts.float() / compression_ratio).to(torch.int32)
-    selected = torch.maximum(selected, torch.full_like(selected, min_blocks_for_topk))
     selected = torch.minimum(selected, block_counts)
     selected = torch.where(block_counts > 0, selected, torch.zeros_like(selected))
     max_selected = int(selected.max().item()) if selected.numel() else 0

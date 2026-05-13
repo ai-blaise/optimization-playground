@@ -264,6 +264,8 @@ def main() -> None:
                     prepared_block_ends=prepared_block_ends,
                     prepared_candidate_context_lens=prepared_candidate_context_lens,
                     prepared_candidate_schedule_metadata=prepared_candidate_schedule_metadata,
+                    prepared_block_topk_counts=prepared_block_topk_counts,
+                    prepared_effective_block_topk=effective_block_topk,
                 )
             else:
                 hisa_call = lambda: nvfp4_hisa_indexer_paged_torch(

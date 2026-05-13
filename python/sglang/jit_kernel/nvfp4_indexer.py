@@ -27,6 +27,18 @@ logger = logging.getLogger(__name__)
 
 _cached_module = None
 _cached_key = None
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "off", "no", "")
+
+
+# Use the fused exact radix top-k tail by default. Disable via env to fall back
+# to the mask + torch.topk + map reference path for A/B testing.
+_hisa_fused_topk = _env_bool("SGLANG_NSA_HISA_FUSED_TOPK", True)
+
+
 _hisa_profile_path = os.environ.get(
     "SGLANG_NSA_NVFP4_HISA_PROFILE_PATH"
 ) or os.environ.get("SGLANG_NSA_HISA_PROFILE_PATH")
@@ -93,6 +105,10 @@ def _jit_nvfp4_indexer_module(
                 (
                     "hisa_map_candidate_indices_indexer_cache_nvfp4",
                     f"NVFP4IndexerQuantKernel<{args}>::hisa_map_candidate_indices",
+                ),
+                (
+                    "hisa_fused_mask_topk_map_indexer_cache_nvfp4",
+                    f"NVFP4IndexerQuantKernel<{args}>::hisa_fused_mask_topk_map",
                 ),
             ],
             extra_cuda_cflags=_nvfp4_cuda_flags(),
@@ -427,6 +443,37 @@ def hisa_map_topk_indices_indexer_cache_nvfp4(
         torch.bfloat16, page_table_dtype, page_size
     ).hisa_map_topk_indices_indexer_cache_nvfp4(
         relevant_topk_indices, top_blocks, prefix_lens, topk_indices
+    )
+    return topk_indices
+
+
+@debug_kernel_api
+def hisa_fused_mask_topk_map_indexer_cache_nvfp4(
+    logits: torch.Tensor,
+    top_blocks: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    topk_tokens: int,
+    page_table_dtype: torch.dtype = torch.int32,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """Fused exact mask + radix top-k + position-to-token map."""
+    if not logits.is_contiguous():
+        raise ValueError("NVFP4 HISA fused mask+topk+map requires contiguous logits.")
+    if top_blocks.dtype != torch.int32:
+        top_blocks = top_blocks.to(torch.int32)
+    if prefix_lens.dtype != torch.int32:
+        prefix_lens = prefix_lens.to(torch.int32)
+    top_blocks = top_blocks.contiguous()
+    prefix_lens = prefix_lens.contiguous()
+    topk_indices = torch.empty(
+        (logits.shape[0], topk_tokens),
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table_dtype, page_size
+    ).hisa_fused_mask_topk_map_indexer_cache_nvfp4(
+        logits, top_blocks, prefix_lens, topk_indices
     )
     return topk_indices
 
@@ -1018,6 +1065,8 @@ def nvfp4_hisa_indexer_paged_deepgemm_precomputed(
     prepared_block_ends: Optional[torch.Tensor] = None,
     prepared_candidate_context_lens: Optional[torch.Tensor] = None,
     prepared_candidate_schedule_metadata: Optional[object] = None,
+    prepared_block_topk_counts: Optional[torch.Tensor] = None,
+    prepared_effective_block_topk: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
     if block_size != 128:
         raise ValueError("DeepGEMM-backed NVFP4 HISA path requires block_size=128.")
@@ -1076,7 +1125,14 @@ def nvfp4_hisa_indexer_paged_deepgemm_precomputed(
     )
 
     stage = _profile_start(q_values.device)
-    if compression_ratio is None or compression_ratio <= 0:
+    if prepared_block_topk_counts is not None and prepared_effective_block_topk is not None:
+        # Hot-path fast path: caller already computed per-row counts AND the
+        # max on host side, so we avoid the .item() sync inside this function.
+        block_topk_counts = prepared_block_topk_counts.to(
+            device=q_values.device, dtype=torch.int32
+        )
+        effective_block_topk = int(prepared_effective_block_topk)
+    elif compression_ratio is None or compression_ratio <= 0:
         block_topk_counts = None
         effective_block_topk = block_topk
     else:
@@ -1172,39 +1228,59 @@ def nvfp4_hisa_indexer_paged_deepgemm_precomputed(
         candidate_len=candidate_len,
     )
 
-    stage = _profile_start(q_values.device)
-    hisa_mask_logits_indexer_cache_nvfp4(
-        logits,
-        top_blocks,
-        prefix_lens.to(torch.int32),
-        page_table_dtype=page_table.dtype,
-    )
-    _profile_end(
-        "mask_map",
-        stage,
-        q_values.device,
-        rows=int(q_values.shape[0]),
-        candidate_len=candidate_len,
-        fused_cuda=True,
-    )
-
-    stage = _profile_start(q_values.device)
     keep = min(topk_tokens, candidate_len)
-    relevant_topk_indices = torch.topk(logits, k=keep, dim=-1, sorted=False).indices
-    topk_indices = hisa_map_topk_indices_indexer_cache_nvfp4(
-        relevant_topk_indices,
-        top_blocks,
-        prefix_lens.to(torch.int32),
-        page_table_dtype=page_table.dtype,
-    )
-    _profile_end(
-        "final_topk_gather",
-        stage,
-        q_values.device,
-        rows=int(q_values.shape[0]),
-        candidate_len=candidate_len,
-        topk_tokens=int(keep),
-    )
+    if _hisa_fused_topk and keep <= candidate_len and top_blocks.shape[1] <= 256:
+        # Fused mask + radix-topk + token-id map in a single launch.
+        stage = _profile_start(q_values.device)
+        topk_indices = hisa_fused_mask_topk_map_indexer_cache_nvfp4(
+            logits,
+            top_blocks,
+            prefix_lens.to(torch.int32),
+            keep,
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "fused_mask_topk_map",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            topk_tokens=int(keep),
+            fused_cuda=True,
+        )
+    else:
+        stage = _profile_start(q_values.device)
+        hisa_mask_logits_indexer_cache_nvfp4(
+            logits,
+            top_blocks,
+            prefix_lens.to(torch.int32),
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "mask_map",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            fused_cuda=True,
+        )
+
+        stage = _profile_start(q_values.device)
+        relevant_topk_indices = torch.topk(logits, k=keep, dim=-1, sorted=False).indices
+        topk_indices = hisa_map_topk_indices_indexer_cache_nvfp4(
+            relevant_topk_indices,
+            top_blocks,
+            prefix_lens.to(torch.int32),
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "final_topk_gather",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            topk_tokens=int(keep),
+        )
 
     if keep < topk_tokens:
         padding = torch.full(
@@ -1401,39 +1477,58 @@ def nvfp4_hisa_indexer_paged_deepgemm(
         candidate_len=candidate_len,
     )
 
-    stage = _profile_start(q_values.device)
-    hisa_mask_logits_indexer_cache_nvfp4(
-        logits,
-        top_blocks,
-        prefix_lens.to(torch.int32),
-        page_table_dtype=page_table.dtype,
-    )
-    _profile_end(
-        "candidate_mask_map",
-        stage,
-        q_values.device,
-        rows=int(q_values.shape[0]),
-        candidate_len=candidate_len,
-        fused_cuda=True,
-    )
-
-    stage = _profile_start(q_values.device)
     keep = min(topk_tokens, candidate_len)
-    relevant_topk_indices = torch.topk(logits, k=keep, dim=-1, sorted=False).indices
-    topk_indices = hisa_map_topk_indices_indexer_cache_nvfp4(
-        relevant_topk_indices,
-        top_blocks,
-        prefix_lens.to(torch.int32),
-        page_table_dtype=page_table.dtype,
-    )
-    _profile_end(
-        "candidate_topk",
-        stage,
-        q_values.device,
-        rows=int(q_values.shape[0]),
-        candidate_len=candidate_len,
-        topk_tokens=int(keep),
-    )
+    if _hisa_fused_topk and keep <= candidate_len and top_blocks.shape[1] <= 256:
+        stage = _profile_start(q_values.device)
+        topk_indices = hisa_fused_mask_topk_map_indexer_cache_nvfp4(
+            logits,
+            top_blocks,
+            prefix_lens.to(torch.int32),
+            keep,
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "fused_mask_topk_map",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            topk_tokens=int(keep),
+            fused_cuda=True,
+        )
+    else:
+        stage = _profile_start(q_values.device)
+        hisa_mask_logits_indexer_cache_nvfp4(
+            logits,
+            top_blocks,
+            prefix_lens.to(torch.int32),
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "candidate_mask_map",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            fused_cuda=True,
+        )
+
+        stage = _profile_start(q_values.device)
+        relevant_topk_indices = torch.topk(logits, k=keep, dim=-1, sorted=False).indices
+        topk_indices = hisa_map_topk_indices_indexer_cache_nvfp4(
+            relevant_topk_indices,
+            top_blocks,
+            prefix_lens.to(torch.int32),
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "candidate_topk",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            topk_tokens=int(keep),
+        )
 
     if keep < topk_tokens:
         padding = torch.full(

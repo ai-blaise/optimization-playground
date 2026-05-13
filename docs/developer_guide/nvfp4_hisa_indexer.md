@@ -74,10 +74,10 @@ is:
 
 ## Profiling
 
-The benchmark JSONL profile contains the HISA stages `mean_pool`, `block_score`,
-`block_topk`, `candidate_dequant`, `candidate_score`, `candidate_topk`, and
-`map/store`. Exact-pool cases use `candidate_map_all` instead of
-`candidate_score` and `candidate_topk`. IKP source is available on the B200 VM under
+The benchmark JSONL profile contains the HISA stages `blockscore_precomputed`,
+`block_topk`, `candidate_pages`, `candidate_logits`, `fused_mask_topk_map`, and
+`map/store`. Exact-pool cases use `candidate_map_all` instead of candidate
+logits/top-k. IKP source is available on the B200 VM under
 `/root/b200-phase/refs/intra-kernel-profiler` and should be used when changing
 the CUDA kernels.
 
@@ -97,14 +97,21 @@ python benchmark/nsa/bench_nvfp4_hisa_indexer.py \
 ```
 
 B200 paper-shaped results from
-`/root/b200-phase/logs/hisa_nvfp4_4to1_final_20260512T233704Z`:
+`/root/b200-phase/logs/worker_a_launchshape_4to1_repeat_20260513T004559Z`:
 
 | Prefix length | Selected blocks `m` | Incumbent DeepGEMM (ms) | HISA 4:1 (ms) | Speedup |
 | ---: | ---: | ---: | ---: | ---: |
-| 8192 | 16 | 0.3598 | 0.2747 | 1.31x |
-| 16384 | 32 | 0.5663 | 0.5089 | 1.11x |
-| 32768 | 64 | 1.0004 | 0.6087 | 1.64x |
-| 65536 | 128 | 1.7847 | 0.8853 | 2.02x |
+| 8192 | 16 | 0.3545 | 0.0701 | 5.06x |
+| 16384 | 32 | 0.5675 | 0.1872 | 3.03x |
+| 32768 | 64 | 1.0010 | 0.2567 | 3.90x |
+| 65536 | 128 | 1.7773 | 0.4307 | 4.13x |
+
+This accepted path uses precomputed/store-maintained HISA block
+representatives, exact four-pass radix fused mask/top-k/map, dynamic
+`block_topk` launch widths for the 4:1 chart shapes, and a row-wise
+`candidate_pages` kernel. A rejected earlier fused top-k candidate used only
+the top radix byte and was not exact; strict B200 tests now compare selected
+token sets against `torch.topk`.
 
 Decode-shaped comparison:
 

@@ -129,6 +129,163 @@ struct NVFP4HISAMapCandidatesParam {
   uint32_t block_topk;
 };
 
+// Fused exact mask + radix top-k + candidate-position map for HISA.  This uses
+// the same CUB-style float key transform as DeviceRadixSort, then refines the
+// kth threshold byte-by-byte so boundary buckets are not approximate.
+
+struct NVFP4HISAFusedMaskTopKMapParam {
+  const void* __restrict__ logits;   // [q_rows, candidate_len] float
+  const void* __restrict__ top_blocks;       // [q_rows, block_topk] int32
+  const void* __restrict__ prefix_lens;      // [q_rows] int32
+  void* __restrict__ topk_indices;           // [q_rows, topk] int32, written
+  uint32_t q_rows;
+  uint32_t topk;
+  uint32_t block_topk;
+  uint32_t candidate_len;
+};
+
+SGL_DEVICE uint32_t fp32_to_radix_desc(uint32_t bits) {
+  const auto asc_key = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+  return ~asc_key;
+}
+
+__global__ void hisa_fused_mask_topk_map_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISAFusedMaskTopKMapParam param) {
+  constexpr uint32_t kHISABlockSize = 128;
+  constexpr uint32_t kBins = 256;
+  constexpr uint32_t kThreads = 256;
+
+  __shared__ uint32_t s_hist[kBins];
+  __shared__ uint32_t s_prefix[kBins];
+  __shared__ uint32_t s_threshold_key;
+  __shared__ uint32_t s_less_count;
+  __shared__ uint32_t s_boundary_quota;
+  __shared__ uint32_t s_boundary_used;
+  __shared__ uint32_t s_above_used;
+
+  const auto row = blockIdx.x;
+  if (row >= param.q_rows) return;
+  const auto tid = threadIdx.x;
+  const auto keep = param.topk < param.candidate_len ? param.topk : param.candidate_len;
+  const auto candidate_len = param.candidate_len;
+
+  __shared__ int32_t s_top_blocks[256];
+  if (tid < param.block_topk) {
+    s_top_blocks[tid] = static_cast<const int32_t*>(param.top_blocks)[row * param.block_topk + tid];
+  }
+  __shared__ int32_t s_prefix_len;
+  if (tid == 0) {
+    s_prefix_len = static_cast<const int32_t*>(param.prefix_lens)[row];
+    s_threshold_key = 0;
+    s_less_count = 0;
+    s_above_used = 0;
+    s_boundary_used = 0;
+  }
+  __syncthreads();
+
+  const auto* logits_row =
+      static_cast<const float*>(param.logits) + static_cast<int64_t>(row) * candidate_len;
+  auto* out_row =
+      static_cast<int32_t*>(param.topk_indices) + static_cast<int64_t>(row) * param.topk;
+
+  #pragma unroll
+  for (int pass = 0; pass < 4; ++pass) {
+    const auto shift = 24u - static_cast<uint32_t>(pass) * 8u;
+    const auto prefix_mask =
+        pass == 0 ? 0u : (0xffffffffu << (shift + 8u));
+    const auto selected_prefix = s_threshold_key & prefix_mask;
+
+    s_hist[tid] = 0;
+    __syncthreads();
+
+    for (uint32_t i = tid; i < candidate_len; i += kThreads) {
+      const auto block_slot = i / kHISABlockSize;
+      const auto block_offset = i - block_slot * kHISABlockSize;
+      int32_t top_block = -1;
+      if (block_slot < param.block_topk) top_block = s_top_blocks[block_slot];
+      int32_t token = -1;
+      if (top_block >= 0) {
+        token = top_block * static_cast<int32_t>(kHISABlockSize) +
+                static_cast<int32_t>(block_offset);
+      }
+      const bool valid = (token >= 0) && (token < s_prefix_len);
+      const auto key =
+          valid ? fp32_to_radix_desc(__float_as_uint(logits_row[i])) : 0xffffffffu;
+      if (pass == 0 || ((key & prefix_mask) == selected_prefix)) {
+        atomicAdd(&s_hist[(key >> shift) & 0xffu], 1u);
+      }
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+      uint32_t lane_sum = 0;
+      for (uint32_t b = tid * 8; b < (tid + 1) * 8; ++b) lane_sum += s_hist[b];
+      uint32_t scan = lane_sum;
+      #pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const auto y = __shfl_up_sync(0xffffffff, scan, off);
+        if (static_cast<int>(tid) >= off) scan += y;
+      }
+      const auto base = scan - lane_sum;
+      uint32_t running = base;
+      for (uint32_t b = tid * 8; b < (tid + 1) * 8; ++b) {
+        running += s_hist[b];
+        s_prefix[b] = running;
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      const auto target = keep > s_less_count ? keep - s_less_count : 1u;
+      uint32_t b = 0;
+      while (b + 1 < kBins && s_prefix[b] < target) ++b;
+      const auto before = b == 0 ? 0u : s_prefix[b - 1];
+      s_less_count += before;
+      s_threshold_key = selected_prefix | (b << shift);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    s_boundary_quota = keep > s_less_count ? keep - s_less_count : 0u;
+    s_above_used = 0;
+    s_boundary_used = 0;
+  }
+  __syncthreads();
+
+  const auto threshold_key = s_threshold_key;
+  const auto above_count = s_less_count;
+  const auto boundary_quota = s_boundary_quota;
+
+  for (uint32_t i = tid; i < candidate_len; i += kThreads) {
+    const auto block_slot = i / kHISABlockSize;
+    const auto block_offset = i - block_slot * kHISABlockSize;
+    int32_t top_block = -1;
+    if (block_slot < param.block_topk) top_block = s_top_blocks[block_slot];
+    int32_t token = -1;
+    if (top_block >= 0) {
+      token = top_block * static_cast<int32_t>(kHISABlockSize) +
+              static_cast<int32_t>(block_offset);
+    }
+    const bool valid = (token >= 0) && (token < s_prefix_len);
+    const auto key =
+        valid ? fp32_to_radix_desc(__float_as_uint(logits_row[i])) : 0xffffffffu;
+    if (valid && key < threshold_key) {
+      const auto slot = atomicAdd(&s_above_used, 1u);
+      if (slot < above_count) out_row[slot] = token;
+    } else if (valid && key == threshold_key) {
+      const auto slot = atomicAdd(&s_boundary_used, 1u);
+      if (slot < boundary_quota) out_row[above_count + slot] = token;
+    }
+  }
+  __syncthreads();
+
+  // Pad remaining [keep, topk) slots with -1.
+  for (uint32_t i = keep + tid; i < param.topk; i += kThreads) {
+    out_row[i] = -1;
+  }
+}
+
 SGL_DEVICE float reduce_max_width8(float value) {
   value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, 4, 8));
   value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, 2, 8));
@@ -682,23 +839,25 @@ template <typename IndicesT>
 __global__ void hisa_candidate_pages_indexer_cache_nvfp4(
     const __grid_constant__ NVFP4HISACandidatePagesParam param) {
   const auto row = blockIdx.x;
-  const auto block_slot = blockIdx.y;
-  const auto half = threadIdx.x;
-  if (row >= param.q_rows || block_slot >= param.block_topk || half >= 2) return;
+  if (row >= param.q_rows) return;
 
-  const auto top_block =
-      static_cast<const int32_t*>(param.top_blocks)[row * param.block_topk + block_slot];
-  const auto out_idx = static_cast<int64_t>(row) * param.block_topk * 2 +
-                       block_slot * 2 + half;
-  if (top_block < 0) {
-    static_cast<IndicesT*>(param.candidate_page_table)[out_idx] = 0;
-    return;
+  for (uint32_t idx = threadIdx.x; idx < param.block_topk * 2; idx += blockDim.x) {
+    const auto block_slot = idx >> 1;
+    const auto half = idx & 1;
+    const auto top_block =
+        static_cast<const int32_t*>(param.top_blocks)[row * param.block_topk + block_slot];
+    const auto out_idx =
+        static_cast<int64_t>(row) * param.block_topk * 2 + idx;
+    if (top_block < 0) {
+      static_cast<IndicesT*>(param.candidate_page_table)[out_idx] = 0;
+      continue;
+    }
+    const auto batch = static_cast<const int32_t*>(param.token_to_batch_idx)[row];
+    const auto logical_page = static_cast<uint32_t>(top_block) * 2 + half;
+    static_cast<IndicesT*>(param.candidate_page_table)[out_idx] =
+        static_cast<const IndicesT*>(param.page_table)[batch * param.page_table_stride +
+                                                       logical_page];
   }
-  const auto batch = static_cast<const int32_t*>(param.token_to_batch_idx)[row];
-  const auto logical_page = static_cast<uint32_t>(top_block) * 2 + half;
-  static_cast<IndicesT*>(param.candidate_page_table)[out_idx] =
-      static_cast<const IndicesT*>(param.page_table)[batch * param.page_table_stride +
-                                                     logical_page];
 }
 
 __global__ void hisa_mask_candidate_logits_indexer_cache_nvfp4(
@@ -829,6 +988,8 @@ struct NVFP4IndexerQuantKernel {
       hisa_map_topk_indices_indexer_cache_nvfp4;
   static constexpr auto map_candidates_kernel =
       hisa_map_candidate_indices_indexer_cache_nvfp4;
+  static constexpr auto fused_mask_topk_map_kernel =
+      hisa_fused_mask_topk_map_indexer_cache_nvfp4;
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);
@@ -1070,10 +1231,15 @@ struct NVFP4IndexerQuantKernel {
         .max_blocks = static_cast<uint32_t>(MB.unwrap()),
         .block_topk = static_cast<uint32_t>(BT.unwrap()),
     };
-    constexpr uint32_t kThreads = 1024;
-    const auto smem_bytes = kThreads * (sizeof(float) + sizeof(int32_t)) +
+    uint32_t threads = 32;
+    const auto required =
+        params.max_blocks > params.block_topk ? params.max_blocks : params.block_topk;
+    while (threads < required && threads < 1024) {
+      threads <<= 1;
+    }
+    const auto smem_bytes = threads * (sizeof(float) + sizeof(int32_t)) +
                             params.block_topk * sizeof(int32_t);
-    LaunchKernel(params.q_rows, kThreads, device_.unwrap(), smem_bytes)(
+    LaunchKernel(params.q_rows, threads, device_.unwrap(), smem_bytes)(
         block_topk_kernel, params);
   }
 
@@ -1110,8 +1276,8 @@ struct NVFP4IndexerQuantKernel {
         .block_topk = static_cast<uint32_t>(BT.unwrap()),
         .page_table_stride = static_cast<uint32_t>(P.unwrap()),
     };
-    LaunchKernel(dim3(params.q_rows, params.block_topk), 2, device_.unwrap())(
-        candidate_pages_kernel, params);
+    constexpr uint32_t kThreads = 256;
+    LaunchKernel(params.q_rows, kThreads, device_.unwrap())(candidate_pages_kernel, params);
   }
 
   static void hisa_mask_candidate_logits(
@@ -1212,6 +1378,44 @@ struct NVFP4IndexerQuantKernel {
     const auto total = params.q_rows * params.topk;
     LaunchKernel(div_ceil(total, kThreads), kThreads, device_.unwrap())(
         map_topk_kernel, params);
+  }
+
+  static void hisa_fused_mask_topk_map(
+      tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView top_blocks,
+      tvm::ffi::TensorView prefix_lens,
+      tvm::ffi::TensorView topk_indices) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto CL = SymbolicSize{"candidate_len"};
+    auto BT = SymbolicSize{"block_topk"};
+    auto K = SymbolicSize{"topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, CL}).with_dtype<float>().with_device(device_).verify(logits);
+    TensorMatcher({Q, BT}).with_dtype<int32_t>().with_device(device_).verify(top_blocks);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(prefix_lens);
+    TensorMatcher({Q, K}).with_dtype<int32_t>().with_device(device_).verify(topk_indices);
+    if (static_cast<uint32_t>(CL.unwrap()) != static_cast<uint32_t>(BT.unwrap()) * 128) {
+      throw std::runtime_error("candidate_len must equal block_topk * 128");
+    }
+    if (static_cast<uint32_t>(BT.unwrap()) > 256) {
+      throw std::runtime_error("fused_mask_topk_map: block_topk must be <= 256");
+    }
+    const auto params = NVFP4HISAFusedMaskTopKMapParam{
+        .logits = logits.data_ptr(),
+        .top_blocks = top_blocks.data_ptr(),
+        .prefix_lens = prefix_lens.data_ptr(),
+        .topk_indices = topk_indices.data_ptr(),
+        .q_rows = static_cast<uint32_t>(Q.unwrap()),
+        .topk = static_cast<uint32_t>(K.unwrap()),
+        .block_topk = static_cast<uint32_t>(BT.unwrap()),
+        .candidate_len = static_cast<uint32_t>(CL.unwrap()),
+    };
+    constexpr uint32_t kThreads = 256;
+    LaunchKernel(params.q_rows, kThreads, device_.unwrap())(
+        fused_mask_topk_map_kernel, params);
   }
 
   static void hisa_map_candidate_indices(

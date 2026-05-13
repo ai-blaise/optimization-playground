@@ -11,6 +11,7 @@ if torch is not None:
             _hisa_block_topk_counts,
             dequantize_indexer_nvfp4,
             fused_store_index_k_cache_nvfp4,
+            hisa_fused_mask_topk_map_indexer_cache_nvfp4,
             hisa_map_candidate_indices_indexer_cache_nvfp4,
             hisa_precompute_block_reps_indexer_cache_nvfp4,
             nvfp4_hisa_indexer_from_dequant,
@@ -23,6 +24,7 @@ if torch is not None:
         _hisa_block_topk_counts = None
         dequantize_indexer_nvfp4 = None
         fused_store_index_k_cache_nvfp4 = None
+        hisa_fused_mask_topk_map_indexer_cache_nvfp4 = None
         hisa_map_candidate_indices_indexer_cache_nvfp4 = None
         hisa_precompute_block_reps_indexer_cache_nvfp4 = None
         nvfp4_hisa_indexer_from_dequant = None
@@ -34,6 +36,7 @@ else:
     _hisa_block_topk_counts = None
     dequantize_indexer_nvfp4 = None
     fused_store_index_k_cache_nvfp4 = None
+    hisa_fused_mask_topk_map_indexer_cache_nvfp4 = None
     hisa_map_candidate_indices_indexer_cache_nvfp4 = None
     hisa_precompute_block_reps_indexer_cache_nvfp4 = None
     nvfp4_hisa_indexer_from_dequant = None
@@ -315,3 +318,48 @@ def test_nvfp4_hisa_map_all_candidates_masks_past_prefix():
     expected = torch.arange(0, 256, dtype=torch.int32)
     expected[192:] = -1
     torch.testing.assert_close(actual.cpu(), expected.view(1, 256))
+
+
+@pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
+def test_nvfp4_hisa_fused_radix_topk_matches_torch_boundary_bucket():
+    candidate_len = 4096
+    topk = 2048
+    top_blocks = torch.arange(candidate_len // 128, device="cuda", dtype=torch.int32).view(
+        1, -1
+    )
+    prefix_lens = torch.tensor([candidate_len], device="cuda", dtype=torch.int32)
+    logits = (
+        torch.arange(candidate_len, device="cuda", dtype=torch.float32)
+        * (1.0 / (candidate_len * 4096.0))
+        + 1.0
+    ).view(1, -1)
+
+    actual = hisa_fused_mask_topk_map_indexer_cache_nvfp4(
+        logits, top_blocks, prefix_lens, topk
+    )
+    expected = torch.topk(logits, k=topk, dim=-1, sorted=False).indices.to(torch.int32)
+    torch.testing.assert_close(
+        torch.sort(actual.cpu(), dim=-1).values,
+        torch.sort(expected.cpu(), dim=-1).values,
+    )
+
+
+@pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
+def test_nvfp4_hisa_fused_radix_topk_matches_torch_random_rows():
+    candidate_len = 4096
+    topk = 2048
+    rows = 4
+    torch.manual_seed(20260513)
+    top_blocks = torch.arange(candidate_len // 128, device="cuda", dtype=torch.int32)
+    top_blocks = top_blocks.view(1, -1).expand(rows, -1).contiguous()
+    prefix_lens = torch.full((rows,), candidate_len, device="cuda", dtype=torch.int32)
+    logits = torch.randn((rows, candidate_len), device="cuda", dtype=torch.float32)
+
+    actual = hisa_fused_mask_topk_map_indexer_cache_nvfp4(
+        logits, top_blocks, prefix_lens, topk
+    )
+    expected = torch.topk(logits, k=topk, dim=-1, sorted=False).indices.to(torch.int32)
+    torch.testing.assert_close(
+        torch.sort(actual.cpu(), dim=-1).values,
+        torch.sort(expected.cpu(), dim=-1).values,
+    )

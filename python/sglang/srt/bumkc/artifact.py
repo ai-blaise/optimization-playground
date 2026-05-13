@@ -126,6 +126,7 @@ _OPERATOR_CODES = {
     "kv_cache_read": 7,
     "kv_cache_write": 8,
     "collective": 9,
+    "add": 10,
     "unknown": 0,
 }
 _SCHEDULING_POLICY_CODES = {

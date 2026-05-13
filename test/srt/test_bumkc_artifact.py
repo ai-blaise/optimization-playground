@@ -1925,6 +1925,10 @@ def populate_runtime_smoke_contracts(smoke):
     )
 
 
+def test_bumkc_operator_codes_include_residual_add():
+    assert bumkc_artifact._OPERATOR_CODES["add"] == 10
+
+
 def refresh_bumkc_digests(plan_dir):
     files = []
     digest_path = plan_dir / "reports" / "artifact-digests.json"

@@ -1,9 +1,10 @@
 # Config-Side Dispatch for Custom KV / Indexer Kernels
 
-A model checkpoint can opt into the TurboQuant 2.5-bit dense KV kernel
-and the IndexerK8 FP8 fused-store path declaratively via fields in
-`config.json`'s `quantization_config` block, without requiring the
-operator to pass CLI flags at server launch.
+A model checkpoint can opt into the TurboQuant 2.5-bit dense KV kernel,
+HIGGS 2-bit dense KV kernel, NSA IndexCache mode, and the IndexerK8
+FP8/NVFP4 cache formats declaratively via fields in `config.json`'s
+`quantization_config` block, without requiring the operator to pass CLI
+flags at server launch.
 
 The dispatcher lives in
 `python/sglang/srt/layers/quantization/quantization_config_dispatch.py`
@@ -177,11 +178,41 @@ For the Blackwell NVFP4 indexer path, use:
 }
 ```
 
+To enable ordinary IndexCache from the model card without enabling HISA,
+add the nested `indexcache` declaration:
+
+```json
+{
+  "quantization_config": {
+    "indexer_quantization": {
+      "quant_method": "nvfp4_e2m1_ue8m0",
+      "indexcache": {
+        "enabled": true,
+        "freq": 4,
+        "pattern": "FSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSF"
+      }
+    }
+  }
+}
+```
+
+`indexer_mode: "indexcache"` is also accepted directly under
+`indexer_quantization`. The nested `indexcache` block may use either the
+launcher names (`freq`, `pattern`) or the model override names
+(`index_topk_freq`, `index_topk_pattern`). CLI/deployment values still
+take precedence: the config only fills in `nsa_indexer_mode`,
+`nsa_indexcache_freq`, and `nsa_indexcache_pattern` when those values are
+still at their defaults.
+
 Effect on `server_args`:
 
 | Field | Mutation |
 | --- | --- |
 | `quant_method` | If `"fp8_e4m3"`, `"nvfp4_e2m1_ue8m0"`, or `"disabled"`, the dict is recorded on `server_args.indexer_quantization_declared`. |
+| `indexer_mode` | If `"indexcache"` and the launch did not already select another NSA indexer mode, `nsa_indexer_mode` becomes `"indexcache"`. |
+| `indexcache.enabled` | If `true` and `indexer_mode` is absent, selects `"indexcache"` under the same CLI-precedence rule. |
+| `indexcache.freq` / `index_topk_freq` | Copied into `nsa_indexcache_freq` when the launch still uses the default frequency. |
+| `indexcache.pattern` / `index_topk_pattern` | Copied into `nsa_indexcache_pattern` when the launch did not already supply a pattern. |
 
 This dispatch runs after the model config is loaded from Hugging Face, so a
 Hub checkpoint can select the indexer format from its `config.json` without a
@@ -262,11 +293,18 @@ For TurboQuant 2.5-bit dense KV:
 
 For the IndexCache FP8 fused-store dispatch (high to low):
 
-1. CLI flag (none today; reserved for a future
-   `--nsa-fused-store-mode={force,disable,auto}` knob).
+1. CLI flag `--nsa-indexer-quantization`.
 2. `quantization_config.indexer_quantization.quant_method`:
    `"fp8_e4m3"` → force fused-store; `"disabled"` → force fallback.
 3. Auto-detection by platform and `can_use_nsa_fused_store(...)`.
+
+For IndexCache mode selection (high to low):
+
+1. CLI/deployment flags `--nsa-indexer-mode`,
+   `--nsa-indexcache-freq`, and `--nsa-indexcache-pattern`.
+2. `quantization_config.indexer_quantization.indexer_mode` or the
+   nested `indexcache` declaration.
+3. Dataclass defaults (`vanilla`, frequency `4`, no explicit pattern).
 
 This matches the precedence pattern used elsewhere in `server_args.py`
 (e.g. `nsa_prefill_backend`, `nsa_decode_backend`).
@@ -314,6 +352,10 @@ runtime kernel dispatch).
   `enable_higgs_dense_2bit_kv_cache`.
 - The two fields compose (a config with both set in the same
   `quantization_config`).
+- Plain IndexCache can be selected from HF config through
+  `indexer_quantization.indexcache.enabled=true` or
+  `indexer_quantization.indexer_mode="indexcache"`, including frequency
+  and pattern propagation, while preserving CLI/deployment overrides.
 - A wrapper object that exposes `to_dict()` is coerced and applied
   (both TurboQuant and HIGGS paths).
 - `should_use_nsa_fused_store`:

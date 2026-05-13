@@ -68,6 +68,8 @@ class FakeServerArgs:
     enable_higgs_dense_2bit_kv_cache: bool = False
     nsa_indexer_mode: str = "vanilla"
     nsa_indexer_quantization: str = "auto"
+    nsa_indexcache_freq: int = 4
+    nsa_indexcache_pattern: Optional[str] = None
     hisa_block_size: int = 128
     hisa_block_topk: int = 64
     hisa_compression_ratio: float = 4.0
@@ -87,6 +89,7 @@ def test_no_quantization_config_is_noop():
     dispatcher.apply_quantization_config_dispatch(server_args, FakeHfConfig())
     assert server_args.enable_turboquant_dense_kv_cache is False
     assert server_args.turboquant_dense_kv_preset == "latent_2p5bit_nc"
+    assert server_args.nsa_indexer_mode == "vanilla"
     assert server_args.enable_nsa_nvfp4_hisa is False
     assert server_args.indexer_quantization_declared is None
 
@@ -299,6 +302,79 @@ def test_indexer_quantization_nvfp4_records_declaration():
     assert server_args.enable_nsa_nvfp4_hisa is False
 
 
+def test_indexer_quantization_indexcache_enables_config_surface():
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "indexer_quantization": {
+                "quant_method": "nvfp4_e2m1_ue8m0",
+                "indexcache": {
+                    "enabled": True,
+                    "freq": 2,
+                    "pattern": "FSFS",
+                },
+            },
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.indexer_quantization_declared == {
+        "quant_method": "nvfp4_e2m1_ue8m0",
+        "indexcache": {
+            "enabled": True,
+            "freq": 2,
+            "pattern": "FSFS",
+        },
+    }
+    assert server_args.nsa_indexer_mode == "indexcache"
+    assert server_args.nsa_indexcache_freq == 2
+    assert server_args.nsa_indexcache_pattern == "FSFS"
+    assert server_args.enable_nsa_nvfp4_hisa is False
+
+
+def test_indexer_quantization_indexcache_can_be_mode_only():
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "indexer_quantization": {
+                "indexer_mode": "indexcache",
+                "indexcache": {
+                    "index_topk_freq": 3,
+                    "index_topk_pattern": "FSS",
+                },
+            },
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.indexer_quantization_declared is None
+    assert server_args.nsa_indexer_mode == "indexcache"
+    assert server_args.nsa_indexcache_freq == 3
+    assert server_args.nsa_indexcache_pattern == "FSS"
+
+
+def test_indexer_quantization_indexcache_preserves_cli_mode_and_pattern():
+    server_args = FakeServerArgs(
+        nsa_indexer_mode="indexcache",
+        nsa_indexcache_freq=8,
+        nsa_indexcache_pattern="FFFF",
+    )
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "indexer_quantization": {
+                "indexer_mode": "indexcache",
+                "indexcache": {
+                    "enabled": True,
+                    "freq": 2,
+                    "pattern": "FSFS",
+                },
+            },
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.nsa_indexer_mode == "indexcache"
+    assert server_args.nsa_indexcache_freq == 8
+    assert server_args.nsa_indexcache_pattern == "FFFF"
+
+
 def test_indexer_quantization_nvfp4_hisa_enables_config_surface():
     server_args = FakeServerArgs()
     hf_config = FakeHfConfig(
@@ -323,6 +399,23 @@ def test_indexer_quantization_nvfp4_hisa_enables_config_surface():
     assert server_args.hisa_compression_ratio == 4.0
     assert server_args.hisa_min_seq_len == 8192
     assert server_args.hisa_execution_mode == "optimized"
+
+
+def test_indexer_quantization_nvfp4_hisa_keeps_hisa_mode_with_indexcache_cfg():
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "indexer_quantization": {
+                "quant_method": "nvfp4_e2m1_ue8m0",
+                "indexcache": {"enabled": True, "freq": 2},
+                "hisa": {"enabled": True},
+            },
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.enable_nsa_nvfp4_hisa is True
+    assert server_args.nsa_indexer_mode == "indexcache-hisa"
+    assert server_args.nsa_indexcache_freq == 2
 
 
 def test_indexer_quantization_nvfp4_hisa_preserves_cli_hisa_values():

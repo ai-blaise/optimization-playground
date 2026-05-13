@@ -3,8 +3,8 @@
 Reads optional declarative fields from a model's ``quantization_config``
 (typically ``hf_config.quantization_config``) and promotes them onto
 ``server_args``, so that a checkpoint can opt into TurboQuant 2.5-bit
-dense KV or the IndexerK8 FP8 fused-store path without requiring the
-operator to pass CLI flags.
+dense KV, HIGGS 2-bit dense KV, NSA IndexCache, or NSA indexer cache
+formats without requiring the operator to pass CLI flags.
 
 Two fields are recognized:
 
@@ -13,12 +13,10 @@ Two fields are recognized:
    ``server_args.enable_turboquant_dense_kv_cache = True`` and copies the
    ``preset`` field into ``server_args.turboquant_dense_kv_preset``.
 
-2. ``indexer_quantization``: a new top-level dict; when
-   ``quant_method == "fp8_e4m3"``, the declaration is recorded on
-   ``server_args.indexer_quantization_declared``. The runtime fused-store
-   dispatch in ``nsa_indexer.py`` consults this attribute via
-   ``should_use_nsa_fused_store`` so the field actively gates the FP8
-   path rather than only documenting intent.
+2. ``indexer_quantization``: a new top-level dict; records supported
+   cache formats on ``server_args.indexer_quantization_declared`` and can
+   select ordinary IndexCache through either ``indexer_mode`` or a nested
+   ``indexcache`` declaration.
 
 CLI flags take precedence: if the operator already passed
 ``--enable-turboquant-dense-kv-cache`` (i.e. the flag is ``True``) the
@@ -50,6 +48,8 @@ logger = logging.getLogger(__name__)
 TURBOQUANT_DENSE_QUANT_METHOD = "turboquant_dense"
 DEFAULT_TURBOQUANT_DENSE_KV_PRESET = "latent_2p5bit_nc"
 HIGGS_DENSE_2BIT_QUANT_METHOD = "higgs_dense_2bit"
+DEFAULT_NSA_INDEXCACHE_FREQ = 4
+SUPPORTED_CONFIG_INDEXER_MODES = ("vanilla", "indexcache")
 
 
 def _coerce_dict(value: Any) -> Optional[Dict[str, Any]]:
@@ -163,7 +163,7 @@ def _maybe_apply_indexer_quantization(
     if indexer_quant is None:
         return
     method = indexer_quant.get("quant_method")
-    if method not in SUPPORTED_INDEXER_QUANT_METHODS:
+    if method is not None and method not in SUPPORTED_INDEXER_QUANT_METHODS:
         logger.info(
             "quantization_config.indexer_quantization.quant_method=%r is "
             "not supported by the NSA Indexer quantization path; "
@@ -172,17 +172,24 @@ def _maybe_apply_indexer_quantization(
         )
         return
 
-    server_args.indexer_quantization_declared = dict(indexer_quant)
-    logger.info(
-        "Recording indexer_quantization declaration from quantization_config "
-        "(indexer_quantization.quant_method=%s).",
-        method,
-    )
+    if method in SUPPORTED_INDEXER_QUANT_METHODS:
+        server_args.indexer_quantization_declared = dict(indexer_quant)
+        logger.info(
+            "Recording indexer_quantization declaration from quantization_config "
+            "(indexer_quantization.quant_method=%s).",
+            method,
+        )
 
     hisa_cfg = _coerce_dict(indexer_quant.get("hisa"))
-    if method != INDEXER_NVFP4_QUANT_METHOD or hisa_cfg is None:
-        return
-    if not bool(hisa_cfg.get("enabled", False)):
+    hisa_enabled = (
+        method == INDEXER_NVFP4_QUANT_METHOD
+        and hisa_cfg is not None
+        and bool(hisa_cfg.get("enabled", False))
+    )
+
+    _maybe_apply_indexcache(server_args, indexer_quant, apply_mode=not hisa_enabled)
+
+    if not hisa_enabled:
         return
 
     server_args.enable_nsa_nvfp4_hisa = True
@@ -221,6 +228,53 @@ def _maybe_apply_indexer_quantization(
         "Enabling NVFP4 HISA IndexCache indexer from "
         "quantization_config.indexer_quantization.hisa."
     )
+
+
+def _maybe_apply_indexcache(
+    server_args: Any, indexer_quant: Dict[str, Any], *, apply_mode: bool
+) -> None:
+    indexcache_cfg = _coerce_dict(indexer_quant.get("indexcache"))
+    mode = None
+    if apply_mode:
+        mode = indexer_quant.get("indexer_mode")
+        if (
+            mode is None
+            and indexcache_cfg is not None
+            and indexcache_cfg.get("enabled")
+        ):
+            mode = "indexcache"
+
+    if mode is not None:
+        mode = str(mode)
+        if mode not in SUPPORTED_CONFIG_INDEXER_MODES:
+            logger.info(
+                "quantization_config.indexer_quantization.indexer_mode=%r is "
+                "not supported for config-side dispatch; keeping the existing "
+                "NSA indexer mode.",
+                mode,
+            )
+        elif getattr(server_args, "nsa_indexer_mode", "vanilla") == "vanilla":
+            server_args.nsa_indexer_mode = mode
+
+    if indexcache_cfg is None:
+        return
+
+    freq = indexcache_cfg.get("freq", indexcache_cfg.get("index_topk_freq"))
+    if (
+        freq is not None
+        and getattr(
+            server_args, "nsa_indexcache_freq", DEFAULT_NSA_INDEXCACHE_FREQ
+        )
+        == DEFAULT_NSA_INDEXCACHE_FREQ
+    ):
+        server_args.nsa_indexcache_freq = int(freq)
+
+    pattern = indexcache_cfg.get("pattern", indexcache_cfg.get("index_topk_pattern"))
+    if (
+        pattern is not None
+        and getattr(server_args, "nsa_indexcache_pattern", None) is None
+    ):
+        server_args.nsa_indexcache_pattern = str(pattern)
 
 
 def apply_quantization_config_dispatch(

@@ -1,0 +1,54 @@
+{
+  "artifact_dir": "/root/b200-phase/logs/topk1024_forward_hisa_gate_20260513T023440Z",
+  "command": "python benchmark/nsa/bench_nvfp4_hisa_indexer.py --prefix-lengths 4096,8192,16384,32768,65536 --topks 1024 --heads 64 --query-rows 1024 --hisa-candidate-scorer precomputed --hisa-compression-ratio 4.0 --warmup 8 --iters 50",
+  "comparator": "ordinary NVFP4 IndexCache vs NVFP4 IndexCache+HISA 4:1",
+  "device": "NVIDIA B200, sm100",
+  "results": [
+    {
+      "hisa_effective_block_topk": 8,
+      "hisa_nvfp4_indexcache_ms": 0.06782499986002222,
+      "indexcache_nvfp4_ms": 0.27077350023319013,
+      "prefix_len": 4096,
+      "query_rows": 1024,
+      "speedup_vs_indexcache_nvfp4": 3.9922373872762944,
+      "topk": 1024
+    },
+    {
+      "hisa_effective_block_topk": 16,
+      "hisa_nvfp4_indexcache_ms": 0.1497055000072578,
+      "indexcache_nvfp4_ms": 0.356632997863926,
+      "prefix_len": 8192,
+      "query_rows": 1024,
+      "speedup_vs_indexcache_nvfp4": 2.3822304313912066,
+      "topk": 1024
+    },
+    {
+      "hisa_effective_block_topk": 32,
+      "hisa_nvfp4_indexcache_ms": 0.18607600031828042,
+      "indexcache_nvfp4_ms": 0.5341380001482321,
+      "prefix_len": 16384,
+      "query_rows": 1024,
+      "speedup_vs_indexcache_nvfp4": 2.870536765808575,
+      "topk": 1024
+    },
+    {
+      "hisa_effective_block_topk": 64,
+      "hisa_nvfp4_indexcache_ms": 0.2544250019127503,
+      "indexcache_nvfp4_ms": 1.0004075011238456,
+      "prefix_len": 32768,
+      "query_rows": 1024,
+      "speedup_vs_indexcache_nvfp4": 3.932032990479899,
+      "topk": 1024
+    },
+    {
+      "hisa_effective_block_topk": 128,
+      "hisa_nvfp4_indexcache_ms": 0.4241439983161399,
+      "indexcache_nvfp4_ms": 1.7780574999051169,
+      "prefix_len": 65536,
+      "query_rows": 1024,
+      "speedup_vs_indexcache_nvfp4": 4.1921081212136455,
+      "topk": 1024
+    }
+  ],
+  "timestamp_utc": "2026-05-13T02:34:40Z"
+}

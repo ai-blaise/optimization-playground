@@ -96,7 +96,8 @@ python benchmark/nsa/bench_nvfp4_hisa_indexer.py \
   --json-out /tmp/hisa_nvfp4_4to1_paper_shape.json
 ```
 
-B200 commit-readiness forward facts versus ordinary NVFP4 IndexCache:
+B200 `topk=2048` commit-readiness forward facts versus ordinary NVFP4
+IndexCache:
 
 | Prefix length | Selected blocks `m` | Ordinary NVFP4 IndexCache (ms) | NVFP4 IndexCache+HISA 4:1 (ms) | Speedup |
 | ---: | ---: | ---: | ---: | ---: |
@@ -104,6 +105,17 @@ B200 commit-readiness forward facts versus ordinary NVFP4 IndexCache:
 | 16384 | 32 | 0.531413 | 0.191044 | 2.7816x |
 | 32768 | 64 | 1.006156 | 0.259645 | 3.8751x |
 | 65536 | 128 | 1.781986 | 0.429308 | 4.1508x |
+
+B200 `topk=1024` forward facts versus ordinary NVFP4 IndexCache, using
+`benchmark/nsa/topk1024_forward_hisa_b200_20260513.json`:
+
+| Prefix length | Selected blocks `m` | Ordinary NVFP4 IndexCache (ms) | NVFP4 IndexCache+HISA 4:1 (ms) | Speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 4096 | 8 | 0.270774 | 0.067825 | 3.9922x |
+| 8192 | 16 | 0.356633 | 0.149706 | 2.3822x |
+| 16384 | 32 | 0.534138 | 0.186076 | 2.8705x |
+| 32768 | 64 | 1.000408 | 0.254425 | 3.9320x |
+| 65536 | 128 | 1.778057 | 0.424144 | 4.1921x |
 
 This accepted path uses precomputed/store-maintained HISA block
 representatives, exact four-pass radix fused mask/top-k/map, dynamic

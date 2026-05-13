@@ -193,12 +193,13 @@ def test_nvfp4_hisa_gpu_matches_pytorch_reference_required_prefixes(topk):
         )
 
 
-def test_nvfp4_hisa_compression_ratio_4to1_block_budget_table():
+@pytest.mark.parametrize("topk", (2048, 1024))
+def test_nvfp4_hisa_compression_ratio_4to1_block_budget_table(topk):
     block_counts = torch.tensor((32, 64, 128, 256, 512), dtype=torch.int32)
     selected, width = _hisa_block_topk_counts(
         block_counts,
         block_size=128,
-        topk_tokens=2048,
+        topk_tokens=topk,
         compression_ratio=4.0,
     )
     torch.testing.assert_close(
@@ -344,9 +345,8 @@ def test_nvfp4_hisa_fused_radix_topk_matches_torch_boundary_bucket():
 
 
 @pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
-def test_nvfp4_hisa_fused_radix_topk_matches_torch_random_rows():
-    candidate_len = 4096
-    topk = 2048
+@pytest.mark.parametrize(("candidate_len", "topk"), ((4096, 2048), (2048, 1024)))
+def test_nvfp4_hisa_fused_radix_topk_matches_torch_random_rows(candidate_len, topk):
     rows = 4
     torch.manual_seed(20260513)
     top_blocks = torch.arange(candidate_len // 128, device="cuda", dtype=torch.int32)

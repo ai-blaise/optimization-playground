@@ -727,12 +727,13 @@ class Indexer(MultiPlatformOp):
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
-            assert page_size == 1, "only support page size 1"
-            block_tables = metadata.get_page_table_1()
+            assert (
+                page_size % 16 == 0
+            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
-            # NOTE(dark): this support extend/decode/decode+graph
-            block_tables = metadata.get_page_table_64()
+        # NOTE(dark): this support extend/decode/decode+graph
+        block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
@@ -838,19 +839,14 @@ class Indexer(MultiPlatformOp):
             assert len(q_fp8.shape) == 3
             q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
-        block_kv = 1 if _is_hip else 64
+        block_kv = page_size
         num_heads_kv = 1
         head_dim_with_sf = (
             forward_batch.token_to_kv_pool.indexer_cache_layout.token_bytes
         )
-        if _is_hip:
-            kv_cache_fp8 = kv_cache_fp8.view(
-                -1, block_kv, num_heads_kv, head_dim_with_sf
-            )
-        else:
-            kv_cache_fp8 = kv_cache_fp8.view(
-                kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-            )
+        kv_cache_fp8 = kv_cache_fp8.view(
+            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+        )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
@@ -858,9 +854,8 @@ class Indexer(MultiPlatformOp):
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
             batch_size, next_n, heads, _ = q_fp8.shape
-            logits = torch.full(
+            logits = torch.empty(
                 (batch_size * next_n, max_seq_len),
-                float("-inf"),
                 device=q_fp8.device,
                 dtype=torch.float32,
             )
@@ -872,7 +867,7 @@ class Indexer(MultiPlatformOp):
                 seqlens_32,
                 block_tables,
                 max_seq_len,
-                Preshuffle=False,
+                Preshuffle=_use_aiter,
                 KVBlockSize=block_kv,
             )
         else:
@@ -1276,7 +1271,9 @@ class Indexer(MultiPlatformOp):
 
         page_size = forward_batch.token_to_kv_pool.page_size
         if _is_hip:
-            assert page_size == 1, "only support page size 1"
+            assert (
+                page_size % 16 == 0
+            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
 
@@ -1287,10 +1284,7 @@ class Indexer(MultiPlatformOp):
         )
         weights = weights.squeeze(-1)
 
-        if _is_hip:
-            block_tables = metadata.get_page_table_1()
-        else:
-            block_tables = metadata.get_page_table_64()
+        block_tables = metadata.get_page_table_64()
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -1891,17 +1885,24 @@ class Indexer(MultiPlatformOp):
             pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return
 
-        # Fast path: AITER fused quant + cache store (HIP, page_size=1)
+        # Fast path: AITER fused quant + cache store (HIP, preshuffle)
         if _use_aiter:
+            page_size = pool.page_size
             buf = pool.get_local_index_k_with_scale_buffer(layer_id=layer_id)
-            # Reshape from (num_pages, 132) uint8 to (num_pages, 1, 132) fp8
+            head_dim_with_sf = pool.indexer_cache_layout.token_bytes
+            # Reshape from (num_pages, page_size * token_bytes) uint8
             # to match kernel's (num_blocks, block_size, head_dim + scale_bytes) layout
-            kv_cache = buf.unsqueeze(1).view(fp8_dtype)
+            kv_cache = buf.view(-1, page_size, head_dim_with_sf).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
             indexer_k_quant_and_cache(
-                key, kv_cache, out_loc, self.block_size, self.scale_fmt
+                key,
+                kv_cache,
+                out_loc,
+                self.block_size,
+                self.scale_fmt,
+                preshuffle=True,
             )
             pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return

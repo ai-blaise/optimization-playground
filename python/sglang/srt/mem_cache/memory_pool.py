@@ -2376,7 +2376,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         self.quant_block_size = self.indexer_cache_layout.quant_block_size
 
         if _is_hip:
-            assert self.page_size == 1
+            assert (
+                self.page_size % 16 == 0
+            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
         else:
             assert self.page_size == 64
         index_rows = (index_buf_size + page_size + 1) // self.page_size

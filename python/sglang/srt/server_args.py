@@ -272,6 +272,11 @@ NSA_CHOICES = [
     "tokenspeed_mla",
 ]
 
+NSA_PREFILL_BACKENDS_BY_KV_DTYPE = {
+    "bfloat16": {"flashmla_sparse", "tokenspeed_mla"},
+    "fp8_e4m3": {"flashmla_kv", "trtllm"},
+}
+
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
@@ -340,7 +345,10 @@ def _resolve_speculative_algorithm_alias(
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
     is_gemma4_draft = False
-    if speculative_draft_model_path:
+    if (
+        speculative_algorithm in ("NEXTN", "EAGLE", "EAGLE3")
+        and speculative_draft_model_path
+    ):
         from transformers import AutoConfig
 
         cfg = AutoConfig.from_pretrained(
@@ -510,6 +518,9 @@ class ServerArgs:
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
+    enable_forward_pass_metrics: bool = False
+    forward_pass_metrics_worker_id: str = ""
+    forward_pass_metrics_ipc_name: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
 
@@ -984,6 +995,9 @@ class ServerArgs:
 
         # Set kernel backends.
         self._handle_sampling_backend()
+        # Must run before _handle_attention_backend_compatibility so the
+        # deterministic backend is set before auto-detection fills it in.
+        self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
         self._handle_linear_attn_backend()
@@ -1043,9 +1057,6 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
-
-        # Handle deterministic inference.
-        self._handle_deterministic_inference()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -1985,15 +1996,8 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    if is_hip():
-                        self.page_size = 1
-                        logger.warning(
-                            "Setting page size to 1 for DeepSeek DSA on ROCm."
-                        )
-                    else:
-                        # For CUDA GPU
-                        self.page_size = 64
-                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    self.page_size = 64
+                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     import torch
 
@@ -2900,12 +2904,20 @@ class ServerArgs:
             self.nsa_prefill_backend,
             self.nsa_decode_backend,
         ):
+            nsa_tokenspeed_kv_dtype = (
+                "bfloat16" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+            )
             if not is_sm100_supported():
                 raise ValueError(
                     "TokenSpeed MLA NSA backend is only supported on SM100 GPUs. "
                     "Please use a different NSA backend on this device."
                 )
-            if self.kv_cache_dtype not in ["bfloat16", "bf16"]:
+            if (
+                "tokenspeed_mla"
+                not in NSA_PREFILL_BACKENDS_BY_KV_DTYPE.get(
+                    nsa_tokenspeed_kv_dtype, set()
+                )
+            ):
                 raise ValueError(
                     "TokenSpeed MLA NSA selected-page integration currently "
                     "requires --kv-cache-dtype=bfloat16."
@@ -5584,6 +5596,25 @@ class ServerArgs:
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
         )
         parser.add_argument(
+            "--enable-forward-pass-metrics",
+            action="store_true",
+            help="Enable per-iteration forward pass metrics via ZMQ IPC. "
+            "External consumers (e.g. Dynamo planner) subscribe to the IPC "
+            "endpoint exposed in server_args.forward_pass_metrics_ipc_name.",
+        )
+        parser.add_argument(
+            "--forward-pass-metrics-worker-id",
+            type=str,
+            default="",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--forward-pass-metrics-ipc-name",
+            type=str,
+            default=None,
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
             "--enable-trace",
             action="store_true",
             help="Enable opentelemetry trace",
@@ -6115,6 +6146,9 @@ class ServerArgs:
             "MLA decode kernel. Default 16 matches the TurboQuant split-K "
             "tuning and recovers small-batch throughput on H200. Set to 1 "
             "to fall back to the single-pass kernel.",
+        )
+        parser.set_defaults(
+            indexer_quantization_declared=ServerArgs.indexer_quantization_declared
         )
         parser.add_argument(
             "--fp8-gemm-backend",

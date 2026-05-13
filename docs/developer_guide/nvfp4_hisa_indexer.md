@@ -117,6 +117,12 @@ B200 `topk=1024` forward facts versus ordinary NVFP4 IndexCache, using
 | 32768 | 64 | 1.000408 | 0.254425 | 3.9320x |
 | 65536 | 128 | 1.778057 | 0.424144 | 4.1921x |
 
+The post-acceptance fused-top-k toggle loop kept the exact radix fused
+mask/top-k/map path enabled. Disabling it preserved the comparator but slowed
+HISA to 0.250560/0.288241/0.373699/0.584942 ms at
+8K/16K/32K/64K, versus 0.149637/0.186061/0.254515/0.420654 ms with the fused
+path.
+
 This accepted path uses precomputed/store-maintained HISA block
 representatives, exact four-pass radix fused mask/top-k/map, dynamic
 `block_topk` launch widths for the 4:1 chart shapes, and a row-wise

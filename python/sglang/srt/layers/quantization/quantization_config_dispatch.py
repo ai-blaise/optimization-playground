@@ -180,6 +180,10 @@ def _maybe_apply_indexer_quantization(
             method,
         )
 
+    indexcache_cfg = _coerce_dict(indexer_quant.get("indexcache"))
+    indexcache_enabled = (
+        indexcache_cfg is not None and bool(indexcache_cfg.get("enabled", False))
+    )
     hisa_cfg = _coerce_dict(indexer_quant.get("hisa"))
     hisa_enabled = (
         method == INDEXER_NVFP4_QUANT_METHOD
@@ -194,6 +198,13 @@ def _maybe_apply_indexer_quantization(
 
     server_args.enable_nsa_nvfp4_hisa = True
     mode = str(hisa_cfg.get("mode", "indexcache-hisa"))
+    if indexcache_enabled and mode == "hisa":
+        raise ValueError(
+            "quantization_config.indexer_quantization declares "
+            "indexcache.enabled=true but hisa.mode='hisa'. Use "
+            "hisa.mode='indexcache-hisa' for the NVFP4 IndexCache+HISA "
+            "deployment path."
+        )
     if mode not in ("hisa", "indexcache-hisa"):
         logger.info(
             "quantization_config.indexer_quantization.hisa.mode=%r is not "

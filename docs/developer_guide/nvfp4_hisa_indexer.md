@@ -23,10 +23,17 @@ Model config enablement:
       "value_format": "e2m1",
       "scale_format": "ue8m0",
       "scale_block_size": 32,
+      "indexcache": {
+        "enabled": true,
+        "freq": 4,
+        "pattern": "FSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSF"
+      },
       "hisa": {
         "enabled": true,
+        "mode": "indexcache-hisa",
         "block_size": 128,
         "compression_ratio": 4.0,
+        "min_seq_len": 8192,
         "execution_mode": "optimized"
       }
     }
@@ -34,9 +41,16 @@ Model config enablement:
 }
 ```
 
-The CLI takes precedence over model-card defaults. The accepted NVFP4
-IndexCache+HISA integration uses strict `--hisa-compression-ratio 4.0`
-semantics; fixed-budget HISA debug modes are outside this contract.
+The CLI takes precedence over model-card defaults. The production model-card
+shape above resolves to the same serving state as
+`--nsa-indexer-quantization nvfp4_e2m1_ue8m0 --nsa-indexer-mode indexcache-hisa
+--enable-nsa-nvfp4-hisa --hisa-compression-ratio 4.0`, with the optional
+IndexCache frequency or pattern copied from the `indexcache` block when launch
+flags do not override them. If `indexcache.enabled=true` is present, then
+`hisa.mode` must be `indexcache-hisa`; selecting standalone `hisa` is rejected
+as a contradictory deployment config. The accepted NVFP4 IndexCache+HISA
+integration uses strict `--hisa-compression-ratio 4.0` semantics; fixed-budget
+HISA debug modes are outside this contract.
 
 ## Contract
 

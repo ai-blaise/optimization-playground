@@ -407,8 +407,22 @@ def test_indexer_quantization_nvfp4_hisa_keeps_hisa_mode_with_indexcache_cfg():
         quantization_config={
             "indexer_quantization": {
                 "quant_method": "nvfp4_e2m1_ue8m0",
-                "indexcache": {"enabled": True, "freq": 2},
-                "hisa": {"enabled": True},
+                "value_format": "e2m1",
+                "scale_format": "ue8m0",
+                "scale_block_size": 32,
+                "indexcache": {
+                    "enabled": True,
+                    "freq": 2,
+                    "pattern": "FSFS",
+                },
+                "hisa": {
+                    "enabled": True,
+                    "mode": "indexcache-hisa",
+                    "block_size": 128,
+                    "compression_ratio": 4.0,
+                    "min_seq_len": 8192,
+                    "execution_mode": "optimized",
+                },
             },
         }
     )
@@ -416,6 +430,35 @@ def test_indexer_quantization_nvfp4_hisa_keeps_hisa_mode_with_indexcache_cfg():
     assert server_args.enable_nsa_nvfp4_hisa is True
     assert server_args.nsa_indexer_mode == "indexcache-hisa"
     assert server_args.nsa_indexcache_freq == 2
+    assert server_args.nsa_indexcache_pattern == "FSFS"
+    assert server_args.hisa_block_size == 128
+    assert server_args.hisa_compression_ratio == 4.0
+    assert server_args.hisa_min_seq_len == 8192
+    assert server_args.hisa_execution_mode == "optimized"
+
+
+def test_indexer_quantization_nvfp4_hisa_rejects_non_combo_mode():
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "indexer_quantization": {
+                "quant_method": "nvfp4_e2m1_ue8m0",
+                "indexcache": {"enabled": True},
+                "hisa": {"enabled": True, "mode": "hisa"},
+            },
+        }
+    )
+    try:
+        dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    except ValueError as exc:
+        message = str(exc)
+        assert "indexcache.enabled=true" in message
+        assert "indexcache-hisa" in message
+    else:
+        raise AssertionError(
+            "A model config that enables IndexCache but selects standalone HISA "
+            "must fail loudly instead of silently disabling the production combo."
+        )
 
 
 def test_indexer_quantization_nvfp4_hisa_preserves_cli_hisa_values():

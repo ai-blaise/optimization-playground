@@ -196,6 +196,41 @@ add the nested `indexcache` declaration:
 }
 ```
 
+For the production NVFP4 IndexCache+HISA deployment, keep the same
+IndexCache declaration and add `hisa.enabled=true` with
+`mode: "indexcache-hisa"`:
+
+```json
+{
+  "quantization_config": {
+    "indexer_quantization": {
+      "quant_method": "nvfp4_e2m1_ue8m0",
+      "value_format": "e2m1",
+      "scale_format": "ue8m0",
+      "scale_block_size": 32,
+      "indexcache": {
+        "enabled": true,
+        "freq": 4,
+        "pattern": "FSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSF"
+      },
+      "hisa": {
+        "enabled": true,
+        "mode": "indexcache-hisa",
+        "block_size": 128,
+        "compression_ratio": 4.0,
+        "min_seq_len": 8192,
+        "execution_mode": "optimized"
+      }
+    }
+  }
+}
+```
+
+If `indexcache.enabled=true` is combined with `hisa.enabled=true`, the
+dispatcher requires the combined `indexcache-hisa` mode. A contradictory
+`hisa.mode: "hisa"` declaration raises `ValueError` instead of silently
+dropping the IndexCache half of the production path.
+
 `indexer_mode: "indexcache"` is also accepted directly under
 `indexer_quantization`. The nested `indexcache` block may use either the
 launcher names (`freq`, `pattern`) or the model override names
@@ -213,6 +248,7 @@ Effect on `server_args`:
 | `indexcache.enabled` | If `true` and `indexer_mode` is absent, selects `"indexcache"` under the same CLI-precedence rule. |
 | `indexcache.freq` / `index_topk_freq` | Copied into `nsa_indexcache_freq` when the launch still uses the default frequency. |
 | `indexcache.pattern` / `index_topk_pattern` | Copied into `nsa_indexcache_pattern` when the launch did not already supply a pattern. |
+| `hisa.enabled` with NVFP4 | Enables `enable_nsa_nvfp4_hisa`; defaults to `nsa_indexer_mode="indexcache-hisa"` when launch flags did not already select a mode. |
 
 This dispatch runs after the model config is loaded from Hugging Face, so a
 Hub checkpoint can select the indexer format from its `config.json` without a
@@ -356,6 +392,11 @@ runtime kernel dispatch).
   `indexer_quantization.indexcache.enabled=true` or
   `indexer_quantization.indexer_mode="indexcache"`, including frequency
   and pattern propagation, while preserving CLI/deployment overrides.
+- The production NVFP4 IndexCache+HISA config composes these fields:
+  `quant_method="nvfp4_e2m1_ue8m0"`, `indexcache.enabled=true`, and
+  `hisa.enabled=true` resolve to `nsa_indexer_mode="indexcache-hisa"`.
+  A contradictory `indexcache.enabled=true` plus `hisa.mode="hisa"`
+  declaration raises `ValueError`.
 - A wrapper object that exposes `to_dict()` is coerced and applied
   (both TurboQuant and HIGGS paths).
 - `should_use_nsa_fused_store`:

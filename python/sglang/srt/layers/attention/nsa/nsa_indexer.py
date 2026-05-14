@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import threading
 import time
@@ -22,8 +23,14 @@ from sglang.jit_kernel.nvfp4_indexer import (
     quantize_indexer_q_nvfp4,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.indexer_policy import uses_hisa
 from sglang.srt.layers.attention.nsa.indexer_quantization import (
     INDEXER_NVFP4_QUANT_METHOD,
+)
+from sglang.srt.layers.attention.nsa.utils import (
+    aiter_can_use_preshuffle_paged_mqa,
+    is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_in_seq_split,
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
@@ -45,6 +52,8 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+
+logger = logging.getLogger(__name__)
 
 global _use_multi_stream
 _is_cuda = is_cuda()
@@ -75,6 +84,16 @@ _torch_mqa_fallback_max_elements = get_int_env_var(
 )
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+# Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
+# KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
+# path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
+_use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
+if _use_aiter and not _use_aiter_preshuffle:
+    logger.warning(
+        "ROCm NSA indexer: aiter preshuffle paged-MQA path is unavailable "
+        "(needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1); "
+        "falling back to legacy page_size=1 / KVBlockSize=1 path."
+    )
 if _is_cuda:
     try:
         import deep_gemm
@@ -267,11 +286,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.nsa.utils import (
-    is_nsa_enable_prefill_cp,
-    is_nsa_prefill_cp_in_seq_split,
-)
-from sglang.srt.layers.attention.nsa.indexer_policy import uses_hisa
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -727,13 +741,21 @@ class Indexer(MultiPlatformOp):
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
-            assert (
-                page_size % 16 == 0
-            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+            if _use_aiter_preshuffle:
+                assert (
+                    page_size % 16 == 0
+                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+            else:
+                assert (
+                    page_size == 1
+                ), f"HIP legacy NSA path requires page_size == 1, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
-        block_tables = metadata.get_page_table_64()
+        if _is_hip and not _use_aiter_preshuffle:
+            block_tables = metadata.get_page_table_1()
+        else:
+            block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
@@ -867,7 +889,7 @@ class Indexer(MultiPlatformOp):
                 seqlens_32,
                 block_tables,
                 max_seq_len,
-                Preshuffle=_use_aiter,
+                Preshuffle=_use_aiter_preshuffle,
                 KVBlockSize=block_kv,
             )
         else:
@@ -1271,9 +1293,14 @@ class Indexer(MultiPlatformOp):
 
         page_size = forward_batch.token_to_kv_pool.page_size
         if _is_hip:
-            assert (
-                page_size % 16 == 0
-            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+            if _use_aiter_preshuffle:
+                assert (
+                    page_size % 16 == 0
+                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+            else:
+                assert (
+                    page_size == 1
+                ), f"HIP legacy NSA path requires page_size == 1, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
 
@@ -1284,7 +1311,10 @@ class Indexer(MultiPlatformOp):
         )
         weights = weights.squeeze(-1)
 
-        block_tables = metadata.get_page_table_64()
+        if _is_hip and not _use_aiter_preshuffle:
+            block_tables = metadata.get_page_table_1()
+        else:
+            block_tables = metadata.get_page_table_64()
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -1885,13 +1915,17 @@ class Indexer(MultiPlatformOp):
             pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return
 
-        # Fast path: AITER fused quant + cache store (HIP, preshuffle)
+        # Fast path: AITER fused quant + cache store
+        # When _use_aiter_preshuffle is True we use the new MFMA 16x16 preshuffle
+        # layout (page_size>=16). Otherwise we fall back to the legacy row-major
+        # layout with page_size=1; the same kv_cache.view works for both cases
+        # because page_size is 1 there.
         if _use_aiter:
             page_size = pool.page_size
             buf = pool.get_local_index_k_with_scale_buffer(layer_id=layer_id)
             head_dim_with_sf = pool.indexer_cache_layout.token_bytes
             # Reshape from (num_pages, page_size * token_bytes) uint8
-            # to match kernel's (num_blocks, block_size, head_dim + scale_bytes) layout
+            # to match kernel's (num_blocks, block_size, head_dim + scale_bytes) layout.
             kv_cache = buf.view(-1, page_size, head_dim_with_sf).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():
@@ -1902,7 +1936,7 @@ class Indexer(MultiPlatformOp):
                 out_loc,
                 self.block_size,
                 self.scale_fmt,
-                preshuffle=True,
+                preshuffle=_use_aiter_preshuffle,
             )
             pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return

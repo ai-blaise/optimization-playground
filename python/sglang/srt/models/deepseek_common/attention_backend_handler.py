@@ -135,7 +135,9 @@ def handle_attention_trtllm_mla(attn, forward_batch):
 
 
 def handle_attention_tokenspeed_mla(attn, forward_batch):
-    return _dispatch_mla_subtype(attn, forward_batch)
+    # tokenspeed_mla shares the trtllm_mla dispatch pattern: pure prefill goes
+    # via MHA chunked KV (TRT-LLM ragged), spec decode / decode goes via MLA.
+    return handle_attention_trtllm_mla(attn, forward_batch)
 
 
 def handle_attention_aiter(attn, forward_batch):

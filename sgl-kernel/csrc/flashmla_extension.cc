@@ -90,7 +90,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "-> Tensor[]");
   m.impl("fwd_kvcache_mla", torch::kCUDA, &fwd_kvcache_mla);
 
-#ifdef SGL_KERNEL_ENABLE_SM100A
+#ifdef FLASHMLA_ENABLE_SM100
   m.def(
       "dense_prefill_fwd(Tensor workspace_buffer, Tensor q, Tensor k, Tensor v, Tensor cumulative_seqlen_q, Tensor "
       "cumulative_seqlen_kv, Tensor o, Tensor lse, int mask_mode_code, float softmax_scale, int max_seqlen_q, int "

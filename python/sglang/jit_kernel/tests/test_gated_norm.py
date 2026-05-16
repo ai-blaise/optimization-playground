@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.gated_norm import gated_norm_forward
+from sglang.jit_kernel.gated_norm import _cute_declines_shape, gated_norm_forward
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, suite="stage-b-kernel-unit-1-gpu-large")
@@ -16,7 +16,9 @@ SHAPES = [(1, 128), (7, 512), (2, 3, 1024), (4, 7168)]
 RANKS = [1, 8, 32, 64]
 
 
-def _reference(normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor) -> torch.Tensor:
+def _reference(
+    normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor
+) -> torch.Tensor:
     z = normed.float() @ w_down.float().t()
     gate = torch.sigmoid(F.silu(z) @ w_up.float().t())
     return (normed.float() * gate).to(normed.dtype)
@@ -32,8 +34,7 @@ def test_gated_norm_forward(shape: tuple[int, ...], rank: int) -> None:
         / hidden_size**0.5
     )
     w_up = (
-        torch.randn(hidden_size, rank, device="cuda", dtype=torch.bfloat16)
-        / rank**0.5
+        torch.randn(hidden_size, rank, device="cuda", dtype=torch.bfloat16) / rank**0.5
     )
 
     actual = gated_norm_forward(normed, w_down, w_up)
@@ -64,6 +65,13 @@ def test_gated_norm_torch_mm_path(monkeypatch: pytest.MonkeyPatch) -> None:
     actual = gated_norm_forward(normed, w_down, w_up)
     expected = _reference(normed, w_down, w_up)
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_gated_norm_cute_documented_shape_fallbacks() -> None:
+    assert _cute_declines_shape(16, 64)
+    assert _cute_declines_shape(4096, 32)
+    assert not _cute_declines_shape(15, 64)
+    assert not _cute_declines_shape(4095, 32)
 
 
 def test_gated_norm_rejects_non_bf16() -> None:

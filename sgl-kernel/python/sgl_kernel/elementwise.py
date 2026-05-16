@@ -245,6 +245,18 @@ def gemma_fused_add_rmsnorm(
         _gemma_fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
 
 
+def gated_norm_cute_forward(
+    normed: torch.Tensor,
+    w_down: torch.Tensor,
+    w_up: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if out is None:
+        out = torch.empty_like(normed, memory_format=torch.contiguous_format)
+    torch.ops.sgl_kernel.gated_norm_cute_forward.default(normed, w_down, w_up, out)
+    return out
+
+
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert (

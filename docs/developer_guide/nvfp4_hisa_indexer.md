@@ -90,8 +90,8 @@ is:
 
 The benchmark JSONL profile contains the HISA stages `blockscore_precomputed`,
 `block_topk`, `candidate_pages`, `candidate_logits`, `fused_mask_topk_map`, and
-`map/store`. Exact-pool cases use `candidate_map_all` instead of candidate
-logits/top-k. IKP source is available on the B200 VM under
+`map/store`. Exact-pool cases use `block_topk_map_all` instead of candidate
+logits/top-k, fusing block selection and token-id mapping into one CUDA launch. IKP source is available on the B200 VM under
 `/root/b200-phase/refs/intra-kernel-profiler` and should be used when changing
 the CUDA kernels.
 
@@ -164,3 +164,61 @@ The 4:1 path must beat ordinary NVFP4 IndexCache on the paper-shaped
 multi-query benchmark and pass focused correctness tests before it is used. The
 runtime dispatch keeps the decode-shaped one-query path on ordinary NVFP4 IndexCache by
 default because HISA's block-selection overhead does not amortize there.
+
+
+## 2026-05-17 Restart Follow-up
+
+Hardware and environment: B200 VM `root@31.22.104.123`, branch
+`codex/hisa-indexcache-tensor-op-loop-20260517`, shared venv
+`/root/work/optimization-playground/.venv`. CUDA-event microbenchmarks and
+pytest used GPU 1 via `/root/agent-runs/gpu_locked.sh`; the final Nsight and
+64-head DeepGEMM probes used GPU 0. Build/JIT-load probes were run outside the
+GPU lock.
+
+Exact-pool helper artifacts:
+
+- Round 1 fused map-all benchmark:
+  `/root/agent-runs/hisa-indexcache-round1-mapall-candidate-gpu1.jsonl`.
+- Round 2 tail-clear benchmark:
+  `/root/agent-runs/hisa-indexcache-round2-tail-clear-candidate-gpu1.jsonl`.
+- Final Nsight report:
+  `/root/agent-runs/hisa-indexcache-final-fused-mapall-nsys.nsys-rep`, kernel
+  CSV `/root/agent-runs/hisa-indexcache-final-fused-mapall-kernels.csv`.
+
+B200 CUDA-event medians for dynamic 4:1 exact-pool shapes where
+`effective_block_topk * 128 == topk_tokens`:
+
+| Shape | Two-step incumbent ms | Fused accepted ms | Tail-clear final ms | Final speedup vs two-step |
+| --- | ---: | ---: | ---: | ---: |
+| topk1024 prefix4096 rows32 | 0.013760 | 0.011776 | 0.011120 | 1.24x |
+| topk1024 prefix4096 rows1024 | 0.015584 | 0.013536 | 0.012864 | 1.21x |
+| topk2048 prefix8192 rows32 | 0.015712 | 0.015008 | 0.013216 | 1.19x |
+| topk2048 prefix8192 rows1024 | 0.022768 | 0.017696 | 0.015136 | 1.50x |
+
+Nsight Systems measured the final
+`hisa_block_topk_map_all_indexer_cache_nvfp4` CUDA kernel itself at 8.688 us
+median over 10 launches for topk2048/prefix8192/rows1024 on GPU 0. A launch
+geometry candidate that capped the fused helper at 32 threads was rejected using
+`/root/agent-runs/hisa-indexcache-round4-threads32-reject-gpu1.jsonl`: it
+regressed topk2048/prefix8192/rows1024 from 0.015136 ms to 0.029600 ms
+(1.96x slower).
+
+DeepGEMM FP4 MQA support is limited to packed Q tensors with 64 heads in this
+venv. Probe artifact `/root/agent-runs/hisa-indexcache-round3-deepgemm-head64-gpu0.txt`
+measured 64-head precomputed HISA at topk2048/prefix8192/query_rows1 as
+0.052403 ms versus ordinary NVFP4 IndexCache 0.154877 ms (2.96x). The 32-head
+artifacts `/root/agent-runs/hisa-indexcache-round3-deepgemm-head32-gpu1.txt`
+and `/root/agent-runs/hisa-indexcache-restart-deepgemm-head32-gpu0.txt` fail at
+DeepGEMM JIT compile time with `Unsupported TMEM load size`: the current
+Blackwell FP4 MQA implementation splits heads into two TMEM loads of
+`kNumHeads / 2`, so 32 heads produces an unsupported 16-wide TMEM load. The
+HISA DeepGEMM path therefore returns `None` for 32-head tensors; direct fallback
+proof is in `/root/agent-runs/hisa-indexcache-round3-direct-head32-fallback-gpu1.txt`.
+
+Verification artifacts: round 1 focused pytest
+`/root/agent-runs/hisa-indexcache-round1-fused-mapall-pytest-gpu1.txt` passed
+`16 passed`; round 2
+`/root/agent-runs/hisa-indexcache-round2-tail-clear-pytest-gpu1.txt` passed
+`16 passed`; round 3
+`/root/agent-runs/hisa-indexcache-round3-deepgemm-guard-pytest-gpu1.txt` passed
+`17 passed`.

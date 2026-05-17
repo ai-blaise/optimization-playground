@@ -26,7 +26,7 @@
  *      WD_PDL_ENABLED build flag; no-ops out when not defined.
  *
  * Invariants preserved:
- *   1. 8 warps × 1 neuron in gate/up.
+ *   1. 4 warps × 1 neuron in gate/up.
  *   2. 8 warps × 1 dim in down.
  *   3. No cross-warp synchronization or shared mutable state between warps
  *      (the PDL trigger is a grid-level dependency edge, not warp sync).
@@ -81,9 +81,9 @@ __device__ __forceinline__ float NvFp4Dequant(uint8_t nibble, float scale) {
 // ---------------------------------------------------------------------------
 
 struct GateUpTileConfigBlog {
-  static constexpr int kTileN = 8;       // 8 neurons per CTA
+  static constexpr int kTileN = 4;       // 4 neurons per CTA
   static constexpr int kTileK = 128;
-  static constexpr int kNumWarps = 8;    // 8 warps -> 1 neuron each
+  static constexpr int kNumWarps = 4;    // 4 warps -> 1 neuron each
   static constexpr int kNumThreads = kNumWarps * 32;
   static constexpr int kSmemXElems = kTileK;
   static constexpr int kSmemWElems = kTileN * kTileK;

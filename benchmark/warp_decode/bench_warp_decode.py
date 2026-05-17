@@ -40,6 +40,19 @@ def cute_shape_supported(
     )
 
 
+def cute_runtime_available(
+    hidden_size: int, intermediate_size: int, top_k: int
+) -> bool:
+    if not cute_shape_supported(hidden_size, intermediate_size, top_k):
+        return False
+    try:
+        from sglang.srt.layers.moe.warp_decode.kernels import _can_use_cute
+
+        return _can_use_cute(hidden_size, intermediate_size, top_k)
+    except ImportError:
+        return False
+
+
 def generate_moe_data(
     batch_size: int,
     hidden_size: int,
@@ -206,7 +219,7 @@ def benchmark_cute_warp_decode(
     Returns:
         Tuple of (mean_latency_us, bandwidth_gb_s), or (-1, -1) if unavailable.
     """
-    if not cute_shape_supported(
+    if not cute_runtime_available(
         hidden_states.shape[1], intermediate_size, topk_ids.shape[1]
     ):
         return -1.0, -1.0
@@ -284,7 +297,7 @@ def main():
         import sgl_kernel
         cute_available = (
             hasattr(sgl_kernel, "warp_decode_cute_moe_packed_forward")
-            and cute_shape_supported(
+            and cute_runtime_available(
                 args.hidden_size, args.intermediate_size, args.top_k
             )
         )

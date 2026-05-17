@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 // ==============================================================================
 // Blog-strict warp_decode_cute dispatch (https://cursor.com/blog/warp-decode):
-//   - Gate/Up: TILE_N=8 (one neuron per warp), TILE_K=1024, NUM_WARPS=8
+//   - Gate/Up: TILE_N=4 (one neuron per warp), TILE_K=1024, NUM_WARPS=4
 //   - Down:    TILE_D=8 (one dim per warp),    TILE_N=2048, NUM_WARPS=8
 // 3-stage cp.async pipeline; optional gate/up→down PDL chain via WD_PDL_ENABLED.
 
@@ -15,9 +15,9 @@
 namespace sglang {
 namespace warp_decode {
 
-constexpr int kGateUpTileN = 8;
+constexpr int kGateUpTileN = 4;
 constexpr int kGateUpTileK = 1024;
-constexpr int kGateUpNumWarps = 8;
+constexpr int kGateUpNumWarps = 4;
 constexpr int kGateUpNumThreads = kGateUpNumWarps * 32;
 
 constexpr int kDownTileD = 8;

@@ -450,8 +450,9 @@ For the target model (`D=7168`, `I=2048`, `topk=8`, `E=128`), those predicates
 hold exactly. Other shapes still use the existing Triton Warp Decode path rather
 than an older CuTe tile variant.
 
-The target path keeps the blog-strict execution model: 8 warps per CTA, one
-intermediate neuron per warp in gate/up, one output dimension per warp in down,
+The target path keeps the one-output-element-per-warp execution model. The current
+B200 gate/up path uses 4 warps per CTA, one intermediate neuron per warp;
+the down path uses 8 warps per CTA, one output dimension per warp,
 `__shfl_xor_sync` reductions, FP32 final accumulators, and no tensor cores. The
 accepted kernel raises gate/up `TILE_K` from 512 to 1024, raises down `TILE_N`
 from 1024 to 2048, specializes `top_k=8` index math, and keeps split-FP32
@@ -538,6 +539,144 @@ The B64 final number uses a dedicated `warmup=30`, `iters=200` rerun
 B200 down-tile variants remain rejected: `TILE_N=1024` regressed at every target
 batch, and `TILE_N=1536` violates the target `I=2048` shape guard without
 tail-safe vector loads.
+
+
+**2026-05-17 stricter restart: CuTe gate/up occupancy round.** The stricter
+restart reopened WarpDecode after the Triton fallback pass because the installed
+SM100 `sgl_kernel` artifact was now valid on the B200 VM. Fresh CUDA-event and
+`nsys` evidence showed the CuTe path, not the Triton fallback, was the best
+accepted incumbent: B1 production benchmark was 120.2us for CuTe versus 307.9us
+for Triton, and the B1 `nsys` capture attributed the CuTe work to
+`warp_decode_gate_up_packed_cute_kernel<8,1024,8>` at 71.0us average and
+`warp_decode_down_cute_kernel<8,2048,8>` at 38.6us average.
+
+The accepted candidate changes only gate/up CTA geometry from 8 warps per CTA to
+4 warps per CTA while preserving one intermediate neuron per warp, `TILE_K=1024`,
+the 3-stage `cp.async` pipeline, split-FP32 accumulation, fast SiLU, PDL, and the
+existing down kernel. The motivation came from the B200 profile: gate/up was the
+larger CuTe launch, and halving gate CTA shared memory lets more gate CTAs
+reside without changing math or memory coalescing within each warp.
+
+Direct-extension CUDA-event verification used isolated JIT builds under
+`/root/agent-runs/warpdecode_ext_cache`, with NVCC builds outside the GPU lock
+and only CUDA execution under `/root/agent-runs/gpu_locked_any.sh`. The table
+compares the source-equivalent direct control to the accepted gate/up 4-warp
+candidate; correctness was exact versus the installed CuTe incumbent for every
+batch (`cosine=1.0000001`, max abs `0`).
+
+| Batch | Direct control mean us | Gate/up 4-warp mean us | Speedup |
+|---:|---:|---:|---:|
+| 1 | 114.8 | 113.6 | 1.010x |
+| 4 | 395.5 | 393.9 | 1.004x |
+| 8 | 781.6 | 773.5 | 1.010x |
+| 16 | 1543.7 | 1528.9 | 1.010x |
+| 32 | 3082.7 | 3033.9 | 1.016x |
+| 64 | 6156.1 | 6095.8 | 1.010x |
+
+Rejected restart probes against the CuTe incumbent:
+
+| Candidate | B1 mean us | Decision |
+|---|---:|---|
+| PDL disabled | 119.2 | Reject: slower than direct PDL control; source already requires PDL for launch overlap. |
+| gate/up `TILE_N=16`, `NUM_WARPS=16` | 121.0 | Reject: larger CTA regressed B1 and reduces residency. |
+| gate/up `TILE_K=512` | 115.6 | Reject: B1 tied, but B8/B16/B32/B64 regressed versus 4-warp gate/up. |
+| down `TILE_D=4`, `NUM_WARPS=4` | 117.0 | Reject: B1-only hint did not compose; `gate_n4_down_d4` regressed B4 and larger batches. |
+| down `TILE_D=16`, `NUM_WARPS=16` | 120.7 | Reject: B1 regression. |
+| down `TILE_N=1024` | 122.6 | Reject: two down N-iterations outweighed any residency gain. |
+
+Direct IKP instrumentation was not added in this restart round because the
+kernel's PDL contract and PyTorch op boundary would require a separate ABI with
+extra trace-buffer parameters, and inserting trace markers around the tight
+`cp.async` pipeline would perturb the launch and fence behavior being measured.
+The replacement evidence is CUDA-event A/B against the source-equivalent control
+plus `nsys --trace=cuda,nvtx --stats=true` kernel attribution for the incumbent.
+
+After accepting and committing the 4-warp gate/up change as `dbaac1e5e`, a
+post-commit saturation round compared additional candidates against the new
+incumbent, again using isolated JIT extension builds and CUDA-event timing under
+`gpu_locked_any.sh` only for execution:
+
+| Candidate vs `dbaac1e5e` | B1 | B4 | B8 | B16 | B32 | B64 | Decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| gate/up `TILE_N=2`, `NUM_WARPS=2` | 0.999x | 0.994x | 0.986x | 0.966x | 0.967x | 0.969x | Reject: B1 tie and clear larger-batch regression from too many CTAs. |
+| writer-lane fence + single CTA trigger | 1.004x | 0.997x | 0.998x | 0.996x | 0.997x | 0.999x | Reject: B1 improvement is below noise and other batches regress/tie. |
+| PDL disabled | 0.984x | 0.988x | 0.989x | 0.996x | 0.997x | 0.999x | Reject: PDL remains useful, especially at small batch. |
+
+The final `dbaac1e5e` B1 `nsys` capture reported
+`warp_decode_gate_up_packed_cute_kernel<4,1024,4>` at 40 launches averaging
+69.3us and `warp_decode_down_cute_kernel<8,2048,8>` at 40 launches averaging
+38.5us. Compared with the pre-change CuTe incumbent profile (`<8,1024,8>`
+gate/up at 71.0us and down at 38.6us), remaining headroom is concentrated in
+the same gate/down memory-streaming work. Further scalar/CTA scheduling tweaks
+have now tied or regressed across the batch sweep; larger structural changes
+would need a different tensor-core/UMMA grouped-GEMM design, which is outside
+this blog-strict WarpDecode lane.
+
+**WarpDecode Triton fallback B200 acceptance chain.** The 2026-05-17
+WarpDecode worker rebased on optimization-playground `origin/main`
+`44a6d42a9101972191f5b5aca5c32b643922b572` and kept the CuTe path disabled
+when the loaded `sgl_kernel.common_ops` artifact does not match the active
+device. On the shared B200 VM, the installed `sgl_kernel/sm100/common_ops`
+resolved to the SM90 binary, and the direct CuTe tests failed before the guard;
+the measurements below are therefore for the production Triton fallback with
+`SGLANG_WARP_DECODE_CUTE=0`, not for the CuTe direct-extension path above.
+
+Hardware and shape: NVIDIA B200 (`sm_100`), BF16 packed weights,
+`B=1`, `D=7168`, `I=2048`, `E=128`, `topk=8`, seed `20260517`,
+CUDA-event timing under `/root/agent-runs/gpu_locked.sh`. The round harness
+compared each candidate to the current committed incumbent; the final
+production benchmark command was:
+
+```bash
+SGLANG_WARP_DECODE_CUTE=0 \
+python benchmark/warp_decode/bench_warp_decode.py \
+  --hidden-size 7168 --intermediate-size 2048 --num-experts 128 \
+  --top-k 8 --batch-sizes 1,4,8,16,32,64 --warmup 20 --iters 100 \
+  --skip-reference
+```
+
+Accepted chain:
+
+| Round | Incumbent -> candidate | Commit | Mean us | Speedup | Hotspot result | Correctness |
+|---:|---|---|---:|---:|---|---|
+| 1 | `32,128,32,128` -> `16,128,16,128` | `d5ba8ab11` | 1567.8 -> 765.5 | 2.048x | gate/up 977.5 -> 455.8 us; down 598.8 -> 316.8 us | cosine 1.0; max abs 0.0078125 |
+| 2 | `16,128,16,128` -> `8,128,8,128` | `52ecaacc4` | 763.4 -> 492.4 | 1.550x | gate/up 455.3 -> 334.2 us; down 315.9 -> 173.8 us | cosine 1.0; max abs 0.00390625 |
+| 3 | `8,128,8,128` -> `8,256,8,128` | `b1e90376d` | 498.9 -> 421.0 | 1.185x | gate/up 330.4 -> 250.8 us; down flat at ~174 us | cosine 1.0; max abs 1.49e-08 |
+| 4 | `8,256,8,128` -> `4,256,4,128` | `128866ab2` | 415.9 -> 347.3 | 1.197x | gate/up 250.0 -> 188.3 us; down 174.1 -> 164.5 us | cosine 0.99999994; max abs 0.0078125 |
+| 5 | `4,256,4,128` -> `4,512,4,128` | `091ba3dba` | 345.3 -> 322.6 | 1.070x | gate/up 188.7 -> 164.4 us; down flat at ~164.6 us | cosine 0.99999994; max abs 0.0078125 |
+
+Relative to the original committed Triton fallback tile shape, the final
+accepted target-shape dispatch improved the B1 round harness from 1567.8 us to
+322.6 us, or 4.86x. The production benchmark after `091ba3dba` measured:
+
+| Batch | Triton us | Effective BW |
+|---:|---:|---:|
+| 1 | 307.3 | 2293.06 GB/s |
+| 4 | 1210.0 | 2329.47 GB/s |
+| 8 | 2276.6 | 2476.16 GB/s |
+| 16 | 4388.6 | 2569.06 GB/s |
+| 32 | 8628.8 | 2613.24 GB/s |
+| 64 | 17191.5 | 2623.28 GB/s |
+
+Rejected saturation probes compared against the final `091ba3dba` incumbent:
+
+| Candidate blocks | Mean us | Speedup vs incumbent | Decision |
+|---|---:|---:|---|
+| `4,1024,4,128` | 318.5 | 1.0036x | Reject: within timing noise; no source change |
+| `2,512,4,128` | 324.6 | 0.9853x | Reject: gate/up regression |
+| `4,512,2,128` | 442.5 | 0.7235x | Reject: down projection regression |
+| `4,512,4,256` | 332.4 | 0.9649x | Reject: down projection regression |
+| `4,512,4,64` | 387.0 | 0.8276x | Reject: down projection regression |
+| `2,1024,2,128` | 429.3 | 0.7453x | Reject: down projection regression |
+
+IKP was not directly integrated for this fallback pass because IKP requires
+instrumentation inside compiled CUDA/CuTe kernels, while the accepted path here
+is Triton JIT and the CuTe extension on this VM was not a valid SM100 binary.
+CUDA-event phase timing and `nsys profile --trace=cuda,nvtx --stats=true`
+were used instead. The final `nsys` capture reported
+`_warp_decode_gate_up_packed_kernel` at 32 launches averaging 151.7 us and
+`_warp_decode_down_kernel` at 30 launches averaging 150.4 us; further K-tile
+widening tied within noise and smaller/larger vector/down tiles regressed.
 
 ## Build configuration
 

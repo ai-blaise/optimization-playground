@@ -479,6 +479,18 @@ class TestWarpDecodeCuTe(unittest.TestCase):
                 raise unittest.SkipTest(
                     "sgl_kernel missing CuTe warp decode ops"
                 )
+            common_ops = getattr(sgl_kernel, "common_ops", None)
+            common_ops_file = getattr(common_ops, "__file__", None)
+            if torch.cuda.get_device_capability()[0] >= 10:
+                loaded_arch = None
+                if common_ops_file is not None:
+                    from pathlib import Path
+
+                    loaded_arch = Path(common_ops_file).resolve().parent.name
+                if loaded_arch != "sm100":
+                    raise unittest.SkipTest(
+                        "sgl_kernel common_ops was not built for SM100"
+                    )
         except ImportError:
             raise unittest.SkipTest("sgl_kernel not installed")
 

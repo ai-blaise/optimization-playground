@@ -217,8 +217,36 @@ Round 0 incumbent -> candidate -> decision:
 | 32 | 0.048544 | 0.047206 | 2.76% faster | accept |
 | 64 | 0.049855 | 0.049906 | 0.10% slower, within noise | accept for B200 provider correctness |
 
-New incumbent commit: pending in this worker branch before subsequent accepted
-source candidates. Caveat: the VM shared venv was missing an SM100
+New incumbent commit: `2564780c6` (`Route FlashSampling target provider to Blackwell`).
+
+Subsequent rounds compare against this committed incumbent. The command shape was:
+
+```bash
+/root/agent-runs/gpu_locked.sh bash -lc '
+  cd /root/work/op-kernel-flashsampling &&   source /root/work/optimization-playground/.venv/bin/activate &&   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/root/work/op-kernel-flashsampling/python:$PYTHONPATH   python scripts/playground/bench_flashsampling_provider.py     --providers target --vocab-size 16160 --hidden-size 7168     --batch-sizes 1 32 64 --warmup 20 --iters 200     --direct-module-import --output-json /root/agent-runs/flashsampling-round-<name>.json     <candidate override>
+'
+```
+
+| Round | Incumbent | Candidate | BS1 ms | BS32 ms | BS64 ms | Decision |
+| :--- | :--- | :--- | ---: | ---: | ---: | :--- |
+| 1 | `2564780c6` target Blackwell | `BLOCK_D=64` | 0.052593 | 0.053097 | 0.053800 | reject: slower than incumbent 0.047034 / 0.047219 / 0.049948 |
+| 2 | `2564780c6` target Blackwell | `BLOCK_V=256` | 0.060053 | 0.061689 | 0.112338 | reject: slower, especially BS64 |
+| 3 | `2564780c6` target Blackwell | `num_warps=4` | 0.047127 | 0.047231 | 0.050833 | reject: tie at BS1/32, slower at BS64 |
+| 4 | `2564780c6` target Blackwell | `BLOCK_D=256` | 0.047521 | 0.065580 | 0.068808 | reject: large BS32/64 regression |
+| 5 | `2564780c6` target Blackwell | force `num_stages=4` | 0.049225 | 0.048805 | 0.049842 | reject: slower at BS1/32, BS64 tie |
+| 6 | `2564780c6` target Blackwell | force `num_stages=3` | 0.052469 | 0.052031 | 0.053871 | reject: slower |
+| 7 | `2564780c6` target Blackwell | force `num_stages=2` | 0.080342 | 0.080238 | 0.083285 | reject: much slower |
+
+All rejected candidates matched dense argmax correctness. No rejected kernel
+constant changes are left in source; these candidates were measured through the
+benchmark harness override flags. A dense matmul+argmax floor check on the same
+shape measured 0.049364 / 0.051334 / 0.053421 ms for BS1/32/64, while the
+incumbent target path measured 0.047164 / 0.047247 / 0.049800 ms, so the
+incumbent is already at or faster than the closest cuBLAS+dense sampling
+reference for this kernel-only shape. Nearby Blackwell schedule candidates all
+regressed or tied, so no further source optimization was accepted.
+
+Caveat: the VM shared venv was missing an SM100
 `sgl_kernel/common_ops` binary, so standalone kernel profiling used
 `--direct-module-import`; server-level B200 TPOT benchmarking is blocked until
 that shared install is restored.

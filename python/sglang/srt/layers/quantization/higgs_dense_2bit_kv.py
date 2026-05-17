@@ -95,16 +95,26 @@ def select_higgs_mla_decode_num_splits(
     if topk >= 4096:
         if row_head_ctas <= 8:
             return 128
-        if 64 <= row_head_ctas <= 256:
+        if row_head_ctas <= 16:
+            return 96
+        if row_head_ctas in (32, 64, 256):
+            return 48
+        if row_head_ctas == 128:
             return 64
         return 32
     if topk >= 2048:
-        if row_head_ctas <= 8 or 64 <= row_head_ctas <= 128:
+        if row_head_ctas <= 8:
+            return 96
+        if row_head_ctas <= 16:
             return 64
+        if row_head_ctas in (32, 64, 128):
+            return 48
         return 32
     if topk >= 1024:
-        if row_head_ctas <= 8 or row_head_ctas == 64:
+        if row_head_ctas <= 16:
             return 64
+        if row_head_ctas == 64:
+            return 48
     return 32
 
 

@@ -219,3 +219,74 @@ corner because they regress topk512/1024 and rows>=8 shapes.
 Decision: keep. The candidate improves the long-topk and rows=8/16 cases
 without sacrificing the rows=4 fixed-32 guardrail, and manual fixed split
 counts remain deployable by passing a positive value.
+
+New incumbent commit: `9dae7c63d`.
+
+## Restart Round 6: Fractional Split Policy
+
+Incumbent: round-5 commit `9dae7c63d`, auto policy using 32/64/128 splits.
+
+Hotspot/profile evidence: the same stage1-vs-stage2 tradeoff remained after
+round 5. Stage1 still benefits from more parallel splits on long topk, but
+stage2 merge cost and launch/CTA overhead make powers of two too coarse for
+several shapes. Because the kernel accepts arbitrary positive split counts,
+the next empirical candidate tested fractional counts `48` and `96` alongside
+`32/64/128`; all CUDA runs used `/root/agent-runs/gpu_locked_any.sh` only
+around the benchmark process.
+
+Candidate: refine the auto policy to include 48 and 96 splits:
+
+* topk >= 4096: 128 for `rows*heads <= 8`, 96 for `<= 16`, 48 for
+  `32/64/256`, 64 for `128`, otherwise 32.
+* topk >= 2048: 96 for `rows*heads <= 8`, 64 for `<= 16`, 48 for
+  `32/64/128`, otherwise 32.
+* topk >= 1024: 64 for `rows*heads <= 16`, 48 for `rows*heads == 64`,
+  otherwise 32.
+
+Direct HIGGS JIT evidence for the refined split choices:
+
+| Shape | Prior auto | Fractional best | Best split | Decision |
+| --- | ---: | ---: | ---: | --- |
+| r1 h8 topk2048 | 0.043112 ms | 0.042360 ms | 96 | keep 96 |
+| r2 h8 topk4096 | 0.069743 ms | 0.069273 ms | 96 | keep 96 |
+| r4 h8 topk2048 | 0.063563 ms | 0.061496 ms | 48 | keep 48 |
+| r4 h8 topk4096 | 0.109041 ms | 0.100508 ms | 48 | keep 48 |
+| r8 h8 topk1024 | 0.061551 ms | 0.058968 ms | 48 | keep 48 |
+| r8 h8 topk2048 | 0.098360 ms | 0.094531 ms | 48 | keep 48 |
+| r8 h8 topk4096 | 0.171236 ms | 0.167478 ms | 48 | keep 48 |
+| r16 h8 topk2048 | 0.162186 ms | 0.160794 ms | 48 | keep 48 |
+| r32 h8 topk4096 | 0.555462 ms | 0.550627 ms | 48 | keep 48 |
+
+Guardrails:
+
+| Shape | 32 | 48 | 64 | 96 | 128 | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| r4 h8 topk512 | 0.028889 | 0.030845 | 0.034910 | 0.038954 | 0.045956 | stay 32 |
+| r4 h8 topk1024 | 0.039705 | 0.041084 | 0.046812 | 0.049148 | 0.054693 | stay 32 |
+| r16 h8 topk4096 | 0.313044 | 0.297348 | 0.297113 | 0.299223 | 0.305123 | stay 64 |
+
+Post-change pool-level validation with `splits=0,32,48,64,96,128`:
+
+| Shape | Prior round-5 auto | New auto | Fixed-32 | Correctness |
+| --- | ---: | ---: | ---: | --- |
+| r1 h8 topk2048 | 0.043172 ms | 0.043496 ms | 0.057510 ms | max_abs 0, min_cos 0.99999988 |
+| r2 h8 topk2048 | 0.059334 ms | 0.046160 ms | 0.058945 ms | max_abs 0, min_cos 0.99999982 |
+| r2 h8 topk4096 | 0.100889 ms | 0.069737 ms | 0.100596 ms | max_abs 0, min_cos 0.99999988 |
+| r4 h8 topk1024 | 0.040389 ms | 0.040925 ms | 0.040612 ms | exact vs auto ref |
+| r4 h8 topk2048 | 0.064746 ms | 0.061598 ms | 0.063921 ms | exact vs auto ref |
+| r4 h8 topk4096 | 0.110221 ms | 0.100655 ms | 0.109987 ms | exact vs auto ref |
+| r8 h8 topk1024 | 0.061622 ms | 0.058716 ms | 0.064622 ms | exact vs auto ref |
+| r8 h8 topk2048 | 0.098472 ms | 0.094605 ms | 0.109808 ms | exact vs auto ref |
+| r8 h8 topk4096 | 0.171134 ms | 0.167687 ms | 0.200050 ms | exact vs auto ref |
+| r16 h8 topk2048 | 0.162415 ms | 0.160780 ms | 0.166925 ms | exact vs auto ref |
+| r16 h8 topk4096 | 0.297146 ms | 0.297382 ms | 0.312969 ms | max_abs 0, min_cos 0.99999982 |
+| r32 h8 topk4096 | 0.555454 ms | 0.550546 ms | 0.562262 ms | exact vs auto ref |
+
+Rejected sub-candidates: blanket 48 splits is rejected because it regresses
+rows=4 topk512/1024; 96 splits are rejected outside the low-CTA long-topk
+cases because stage2 overhead dominates; 128 remains useful only for the
+single-row topk4096 corner.
+
+Decision: keep. The candidate improves several shapes left on the table by
+round 5, preserves fixed positive override deployability, and leaves the
+short/topk guardrails on the fixed-32 incumbent.

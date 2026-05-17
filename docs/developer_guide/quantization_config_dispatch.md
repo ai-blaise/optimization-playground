@@ -116,7 +116,7 @@ the topk loop is parallelized:
 
 * `--higgs-mla-decode-num-splits=0` (default) — B200 auto policy.
   Uses the fixed-32 incumbent for shapes where extra split overhead
-  regresses, and selects 64 or 128 splits for measured long-topk
+  regresses, and selects 48, 64, 96, or 128 splits for measured long-topk
   shapes where additional stage1 parallelism wins.
 * `--higgs-mla-decode-num-splits=32` — fixed split-K decode.
   Restores throughput at small batch sizes (b=1..16) where the

@@ -40,6 +40,13 @@ struct NVFP4IndexerQuantParam {
   uint32_t num_rows;
 };
 
+struct NVFP4IndexerDequantParam {
+  const void* __restrict__ values;
+  const void* __restrict__ scales;
+  void* __restrict__ output;
+  uint32_t num_rows;
+};
+
 struct NVFP4HISAMeanPoolParam {
   const void* __restrict__ cache;
   const void* __restrict__ page_table;
@@ -459,6 +466,35 @@ SGL_DEVICE void quantize_indexer_row_half_warp(
   if (lane_row == 0) {
     static_cast<uint32_t*>(scales)[output_row_id] = scale_word;
   }
+}
+
+__global__ void dequantize_indexer_nvfp4(
+    const __grid_constant__ NVFP4IndexerDequantParam param) {
+  const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const auto global_hwid = global_tid / 16;
+  if (global_hwid >= param.num_rows) return;
+
+  const auto lane_id = threadIdx.x & 31;
+  const auto lane_row = lane_id & 15;
+  const auto value_word = static_cast<const uint32_t*>(param.values)[
+      static_cast<int64_t>(global_hwid) * 16 + lane_row];
+  const auto scale_word = static_cast<const uint32_t*>(param.scales)[global_hwid];
+  const auto scale_exp = (scale_word >> ((lane_row >> 2) * 8)) & 0xffu;
+  const auto scale = __uint_as_float(scale_exp << 23);
+
+  float decoded[8];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    decoded[i] = decode_e2m1_nibble((value_word >> (i * 4)) & 0xfu, scale);
+  }
+
+  auto* output_vec = reinterpret_cast<float4*>(
+      static_cast<float*>(param.output) +
+      static_cast<int64_t>(global_hwid) * kIndexerHeadDim);
+  output_vec[lane_row * 2] =
+      make_float4(decoded[0], decoded[1], decoded[2], decoded[3]);
+  output_vec[lane_row * 2 + 1] =
+      make_float4(decoded[4], decoded[5], decoded[6], decoded[7]);
 }
 
 template <typename KeyT, typename IndicesT, uint32_t kPageBits,
@@ -970,6 +1006,7 @@ struct NVFP4IndexerQuantKernel {
   static constexpr auto store_kernel =
       fused_store_indexer_cache_nvfp4<KeyT, IndicesT, kLogSize, kUsePDL>;
   static constexpr auto q_kernel = quantize_indexer_q_nvfp4<KeyT>;
+  static constexpr auto dequant_kernel = dequantize_indexer_nvfp4;
   static constexpr auto mean_pool_kernel =
       hisa_mean_pool_indexer_cache_nvfp4<IndicesT, kPageSize>;
   static constexpr auto candidate_score_kernel =
@@ -1054,6 +1091,36 @@ struct NVFP4IndexerQuantKernel {
     constexpr auto kBlockSize = 256;
     const auto num_blocks = div_ceil(num_rows * 16, kBlockSize);
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap())(q_kernel, params);
+  }
+
+  static void dequantize(
+      tvm::ffi::TensorView values,
+      tvm::ffi::TensorView scales,
+      tvm::ffi::TensorView output) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_rows"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({N, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(values);
+    TensorMatcher({N}).with_dtype<int32_t>().with_device(device_).verify(scales);
+    TensorMatcher({N, kIndexerHeadDim})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(output);
+    const auto num_rows = static_cast<uint32_t>(N.unwrap());
+    const auto params = NVFP4IndexerDequantParam{
+        .values = values.data_ptr(),
+        .scales = scales.data_ptr(),
+        .output = output.data_ptr(),
+        .num_rows = num_rows,
+    };
+    constexpr auto kBlockSize = 256;
+    const auto num_blocks = div_ceil(num_rows * 16, kBlockSize);
+    LaunchKernel(num_blocks, kBlockSize, device_.unwrap())(dequant_kernel, params);
   }
 
   static void hisa_mean_pool(

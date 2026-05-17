@@ -82,7 +82,8 @@ class TestFlashSamplingKernel(unittest.TestCase):
             _block_h_blackwell,
         )
 
-        self.assertEqual(_block_h_blackwell(1), 16)
+        self.assertEqual(_block_h_blackwell(1, greedy_sampling=True), 16)
+        self.assertEqual(_block_h_blackwell(1, greedy_sampling=False), 8)
         self.assertEqual(_block_h_blackwell(2), 8)
         self.assertEqual(_block_h_blackwell(8), 8)
         self.assertEqual(_block_h_blackwell(32), 32)

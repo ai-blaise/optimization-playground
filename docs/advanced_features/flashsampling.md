@@ -266,6 +266,25 @@ Additional restart candidates rejected against the best accepted incumbent:
 | Use `BLOCK_H=128` for H128/H256 buckets | H128 0.065801 ms vs incumbent 0.057755 ms; forced H256 0.123797 ms vs 0.084151 ms | reject: accumulator pressure outweighs fewer H tiles |
 | Add `maxnreg=255` launch hint | single run was noise-level (H1 0.046647 ms vs 0.046713 ms; H32 0.047221 ms vs 0.047225 ms) and did not explain the paired small-H win | reject: removed from source |
 
+Restart round 9 accepted after `c251cb7bb`:
+
+- Incumbent: `c251cb7bb`, which uses `BLOCK_H=8` for greedy and non-greedy `2 <= H <= 8`, but keeps H1 on `BLOCK_H=16`.
+- Candidate: use `BLOCK_H=8` for non-greedy H1 only. The greedy H1 path stays on `BLOCK_H=16` because its earlier paired greedy measurements were noise-level, while non-greedy H1 spends extra work generating Gumbel noise for unused columns.
+- Paired CUDA-event artifact: `/root/agent-runs/flashsampling-restart-round5-sampling-h1-blockh8-candidate-gpu-any.json`.
+
+| Batch | Incumbent non-greedy ms | Candidate non-greedy ms | Change | Decision |
+| ---: | ---: | ---: | ---: | :--- |
+| 1 | 0.047392 | 0.045498 | 4.00% faster | accept |
+| 2 | 0.045277 | 0.045281 | tie | neutral |
+| 4 | 0.045330 | 0.045285 | 0.10% faster | neutral |
+| 8 | 0.045256 | 0.045206 | 0.11% faster | neutral |
+
+Restart candidate rejected after `c251cb7bb`:
+
+| Candidate | Evidence | Decision |
+| :--- | :--- | :--- |
+| Replace per-H local-reduce CTAs with one small-H CTA | `/root/agent-runs/flashsampling-restart-round4-smallh-reduce-candidate-gpu-any.json`: H2 0.045240 -> 0.045315 ms, H4 0.045117 -> 0.045092 ms, H8 0.045114 -> 0.045105 ms | reject: launch floor dominates and changes are ties/noise |
+
 All rejected candidates matched dense argmax correctness. No rejected kernel
 constant changes are left in source; these candidates were measured through the
 benchmark harness override flags. A dense matmul+argmax floor check on the same

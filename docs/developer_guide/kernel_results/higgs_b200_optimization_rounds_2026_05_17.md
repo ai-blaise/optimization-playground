@@ -384,3 +384,46 @@ immediate local neighborhoods. Remaining improvements from split retuning are
 at or below noise, and the accepted policy now sits at local minima for the
 measured B200 decode shapes. Further material gains require a different kernel
 design rather than more split-count tuning.
+
+New incumbent commit: `767a15ae3`.
+
+## Final Profile And Stop Point
+
+Current incumbent: `767a15ae3`.
+
+Final nsys/IKP import:
+
+* Profile command wrote `/root/agent-runs/higgs-final-current-r4k2048.nsys-rep`
+  and CUDA-event JSON `/root/agent-runs/higgs-final-current-r4k2048.json`.
+* IKP nsys import wrote `/root/agent-runs/higgs-ikp-final-current-r4k2048`.
+* Shape: `num_slots=8192`, `rows=4`, `heads=8`, `topk=2048`,
+  auto split policy (`0`, selecting 56 splits).
+* CUDA-event decode time: `0.062161600589752196 ms`, finite output, min cosine
+  `0.9999998211860657`.
+
+Final IKP/nsys kernel attribution:
+
+| Kernel | Count | Avg us | Total us |
+| --- | ---: | ---: | ---: |
+| `higgs_dense_2bit_mla_decode_stage1_split_kernel` | 27 | 41.675 | 1125.234 |
+| `higgs_dense_2bit_mla_decode_stage2_kernel` | 27 | 11.771 | 317.820 |
+| `higgs_dense_2bit_store_kernel` | 1 | 66.911 | 66.911 |
+| `higgs_dense_2bit_mla_rotate_query_kernel` | 27 | 1.921 | 51.872 |
+
+The final profile agrees with the earlier IKP hotspot story: stage1 is still
+the dominant cost, but the accepted split policy already balances stage1
+parallelism against stage2 merge overhead for the measured shapes. The
+remaining stage1 work is the scalar HIGGS codec loop over packed EDEN2-16
+indices, scale, rope, and online-softmax accumulation. The packed 258 B slot
+layout is not tensor-core tile shaped; further material speedup would require
+a new layout or staging design for a CuTe/CZS tensor-op path, not additional
+split-count retuning.
+
+Final stop rationale: stop after rounds 5-8 because the plausible scalar
+split-K search space is saturated by empirical CUDA-event and IKP/nsys
+evidence. Coarse split defaults, fractional split counts, and immediate
+neighborhoods have either been accepted or rejected, and the only surviving
+round-8 gain was a repeat-confirmed ~0.1% local tweak. More local split probes
+are unlikely to survive noise; the next meaningful candidate would be a larger
+layout/tensor-op rewrite with CZS proof artifacts, which is outside a safe
+incremental patch for this packed compatibility path.

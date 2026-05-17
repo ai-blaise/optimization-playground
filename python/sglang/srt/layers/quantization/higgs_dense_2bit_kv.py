@@ -116,7 +116,7 @@ def select_higgs_mla_decode_num_splits(
         if row_head_ctas == 64:
             return 48
         if row_head_ctas == 128:
-            return 40
+            return 36
         return 32
     if topk >= 1024:
         if row_head_ctas <= 16:

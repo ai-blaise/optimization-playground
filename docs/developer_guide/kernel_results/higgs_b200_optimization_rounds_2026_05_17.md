@@ -338,3 +338,49 @@ direct and pool measurements indicated a win.
 Decision: keep the confirmed neighborhood refinements. Gains are smaller than
 rounds 5-6 but still measurable on shapes that remain relevant to long-topk
 decode, and the policy still preserves fixed positive split overrides.
+
+New incumbent commit: `c9967a43a`.
+
+## Restart Round 8: Saturation Neighborhood
+
+Incumbent: round-7 commit `c9967a43a`.
+
+Hotspot/profile evidence: after round 7, the only remaining plausible knob in
+the current scalar split-K implementation was one-step split-count adjustment
+around the selected values. The probe tested `80/88/96` for r1 topk2048,
+`120/128/136` for r1 topk4096, `72/80/88` for r2 topk4096,
+`52/56/60` for rows=4 long-topk, `68/72/76` for rows=8 topk4096, and
+`36/40/44` for rows=16 topk2048 and rows=32 topk4096.
+
+Direct HIGGS JIT saturation evidence:
+
+| Shape | Incumbent split | Best tested neighbor | Decision |
+| --- | ---: | ---: | --- |
+| r1 h8 topk2048 | 96: 0.041294 ms | 80: 0.041863 ms | reject |
+| r1 h8 topk4096 | 128: 0.056459 ms | 120: 0.056062 ms | pool rejected |
+| r2 h8 topk4096 | 80: 0.067680 ms | 72: 0.067825 ms | reject |
+| r4 h8 topk2048 | 56: 0.061293 ms | 52: 0.062072 ms | reject |
+| r4 h8 topk4096 | 56: 0.097865 ms | 52: 0.101092 ms | reject |
+| r8 h8 topk4096 | 72: 0.166117 ms | 76: 0.166420 ms | reject |
+| r16 h8 topk2048 | 40: 0.160097 ms | 36: 0.159834 ms | pool repeat accepted |
+| r32 h8 topk4096 | 40: 0.550106 ms | 44: 0.552913 ms | reject |
+
+Pool-level follow-up:
+
+| Shape | Incumbent auto | Candidate | Candidate ms | Decision |
+| --- | ---: | ---: | ---: | --- |
+| r1 h8 topk4096 | 128 | 120 | 0.057564 ms vs auto 0.056009 ms | reject |
+| r16 h8 topk2048 repeat 1 | 40 | 36 | 0.159847 ms vs auto 0.159989 ms | keep |
+| r16 h8 topk2048 repeat 2 | 40 | 36 | 0.159832 ms vs auto 0.160076 ms | keep |
+| r16 h8 topk2048 repeat 3 | 40 | 36 | 0.159829 ms vs auto 0.159990 ms | keep |
+
+Decision: accept only the repeat-confirmed r16/topk2048 36-split adjustment.
+All other neighbors either regressed directly, failed pool validation, or were
+within measurement noise without a consistent advantage.
+
+Stop rationale for the split-policy lane: rounds 5-8 exhausted the useful
+split-count search from coarse powers of two through fractional counts and
+immediate local neighborhoods. Remaining improvements from split retuning are
+at or below noise, and the accepted policy now sits at local minima for the
+measured B200 decode shapes. Further material gains require a different kernel
+design rather than more split-count tuning.

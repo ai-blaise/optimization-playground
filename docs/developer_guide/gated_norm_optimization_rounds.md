@@ -512,4 +512,3 @@ python3 /root/work/rule7-refs/intra-kernel-profiler/scripts/ikp_nsys_import.py -
 Artifacts: `/root/agent-runs/gatednorm-final-r16-t2048.nsys-rep`, `/root/agent-runs/gatednorm-final-r16-t2048.sqlite`, `/root/agent-runs/gatednorm-final-r16-t2048-kernsum.txt`, `/root/agent-runs/gatednorm-final-ikp/nsys_kernels.json`.
 
 Final rank 16, 2048-token kernel summary after Round 2: `_sigmoid_mul_kernel` 36.6% (11.62 us average), first cuBLAS GEMM 24.3% (7.70 us), second cuBLAS GEMM 19.5% (6.19 us), cuBLAS split-K reduce 12.1% (3.83 us), PyTorch SiLU 6.9% (2.19 us). The remaining low-risk epilogue candidates were rejected within noise; further material improvement likely requires a larger tensor-op-first CUTLASS/CuTe rewrite that fuses the GEMM epilogue or replaces the PyTorch/cuBLAS multi-launch path. The legacy `gated_norm_cute_forward` name remains historical: the checked source is hand-written CUDA inline MMA/ldmatrix/cp.async, not CuTe-generated code.
-

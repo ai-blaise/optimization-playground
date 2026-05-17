@@ -138,6 +138,16 @@ def _num_stages_blackwell(block_h: int) -> int:
     return 1
 
 
+def _block_h_blackwell(
+    num_hidden_states: int, greedy_sampling: bool = True
+) -> int:
+    if num_hidden_states == 1 and not greedy_sampling:
+        return 8
+    if 1 < num_hidden_states <= 8:
+        return 8
+    return max(16, bsz_h(num_hidden_states))
+
+
 def fused_mm_sample_blackwell(
     weights: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -146,10 +156,13 @@ def fused_mm_sample_blackwell(
     seed: int,
     greedy_sampling: bool = False,
     tp: "TPInfo" = TP1,
+    return_logits: bool = False,
+    return_scores: bool = False,
     valid_vocab_size: int | None = None,
     vocab_start_index: int | None = None,
     maxs_workspace: torch.Tensor | None = None,
     maxs_idx_workspace: torch.Tensor | None = None,
+    logits_out_workspace: torch.Tensor | None = None,
 ):
     """FlashSampling for Blackwell (SM100) TP-sharded vocab shapes.
 
@@ -162,11 +175,11 @@ def fused_mm_sample_blackwell(
     NUM_SMS = num_sms_cached(weights.device.index)
 
     num_pid_v = triton.cdiv(V, _BLOCK_V_BLACKWELL)
-    BLOCK_H = max(16, bsz_h(H))
+    BLOCK_H = _block_h_blackwell(H, greedy_sampling)
     num_pid_h = triton.cdiv(H, BLOCK_H)
     total_tiles = num_pid_v * num_pid_h
 
-    if total_tiles > NUM_SMS or tp.size > 1:
+    if total_tiles > NUM_SMS or return_logits or tp.size > 1:
         return fused_mm_sample_triton(
             weights=weights,
             hidden_states=hidden_states,
@@ -175,10 +188,13 @@ def fused_mm_sample_blackwell(
             seed=seed,
             greedy_sampling=greedy_sampling,
             tp=tp,
+            return_logits=return_logits,
+            return_scores=return_scores,
             valid_vocab_size=valid_vocab_size,
             vocab_start_index=vocab_start_index,
             maxs_workspace=maxs_workspace,
             maxs_idx_workspace=maxs_idx_workspace,
+            logits_out_workspace=logits_out_workspace,
         )
 
     set_torch_allocator_for_tma_descriptors_cached()
@@ -221,11 +237,18 @@ def fused_mm_sample_blackwell(
     if vocab_start_index is None:
         vocab_start_index = tp.rank * V
 
-    return _local_reduce_samples_triton(
-        maxs[:, :num_pid_v, :],
-        maxs_idx[:, :num_pid_v, :],
-        vocab_start_index,
-    )
+    maxs_sliced = maxs[:, :num_pid_v, :]
+    maxs_idx_sliced = maxs_idx[:, :num_pid_v, :]
+
+    if return_scores:
+        from .core import _local_reduce
+
+        samples, max_values = _local_reduce(
+            maxs_sliced, maxs_idx_sliced, vocab_start_index
+        )
+        return samples, max_values
+
+    return _local_reduce_samples_triton(maxs_sliced, maxs_idx_sliced, vocab_start_index)
 
 
 def fused_mm_sample_adaptive(
@@ -236,10 +259,13 @@ def fused_mm_sample_adaptive(
     seed: int,
     greedy_sampling: bool = False,
     tp: "TPInfo" = TP1,
+    return_logits: bool = False,
+    return_scores: bool = False,
     valid_vocab_size: int | None = None,
     vocab_start_index: int | None = None,
     maxs_workspace: torch.Tensor | None = None,
     maxs_idx_workspace: torch.Tensor | None = None,
+    logits_out_workspace: torch.Tensor | None = None,
 ):
     """Auto-select H200 or Blackwell kernel based on device capability."""
     cc = torch.cuda.get_device_capability(weights.device.index)
@@ -252,10 +278,13 @@ def fused_mm_sample_adaptive(
             seed=seed,
             greedy_sampling=greedy_sampling,
             tp=tp,
+            return_logits=return_logits,
+            return_scores=return_scores,
             valid_vocab_size=valid_vocab_size,
             vocab_start_index=vocab_start_index,
             maxs_workspace=maxs_workspace,
             maxs_idx_workspace=maxs_idx_workspace,
+            logits_out_workspace=logits_out_workspace,
         )
     else:
         from .target_kernel import fused_mm_sample_target
@@ -267,8 +296,11 @@ def fused_mm_sample_adaptive(
             seed=seed,
             greedy_sampling=greedy_sampling,
             tp=tp,
+            return_logits=return_logits,
+            return_scores=return_scores,
             valid_vocab_size=valid_vocab_size,
             vocab_start_index=vocab_start_index,
             maxs_workspace=maxs_workspace,
             maxs_idx_workspace=maxs_idx_workspace,
+            logits_out_workspace=logits_out_workspace,
         )

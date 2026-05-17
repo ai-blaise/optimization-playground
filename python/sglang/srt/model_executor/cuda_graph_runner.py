@@ -786,8 +786,6 @@ class CudaGraphRunner:
             top_ps=torch.ones((bs,), dtype=torch.float32, device=device),
             top_ks=torch.full((bs,), TOP_K_ALL, dtype=torch.int32, device=device),
             min_ps=torch.zeros((bs,), dtype=torch.float32, device=device),
-            temperature_value=1.0,
-            temperature_is_uniform=True,
             is_all_greedy=False,
             need_top_p_sampling=False,
             need_top_k_sampling=False,

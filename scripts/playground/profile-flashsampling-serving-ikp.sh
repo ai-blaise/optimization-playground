@@ -19,6 +19,7 @@ SERVER_READY_TIMEOUT_SECONDS=${SERVER_READY_TIMEOUT_SECONDS:-900}
 SAMPLING_BACKEND=${SAMPLING_BACKEND:-}
 WARMUP_REQUESTS=${WARMUP_REQUESTS:-1}
 FLASHSAMPLING_WARMUP_BATCH_SIZES=${FLASHSAMPLING_WARMUP_BATCH_SIZES:-}
+FLASHSAMPLING_PROVIDER=${FLASHSAMPLING_PROVIDER:-}
 FLASHSAMPLING_MIN_BATCH_SIZE=${FLASHSAMPLING_MIN_BATCH_SIZE:-}
 FLASHSAMPLING_MAX_BATCH_SIZE=${FLASHSAMPLING_MAX_BATCH_SIZE:-}
 EXTRA_REQUEST_BODY=${EXTRA_REQUEST_BODY:-'{"temperature":0.6,"top_k":-1,"top_p":1.0}'}
@@ -86,6 +87,9 @@ server_cmd() {
   fi
   if [[ "${variant}" == "flashsampling" ]]; then
     args+=(--enable-flashsampling --flashsampling-fallback error)
+    if [[ -n "${FLASHSAMPLING_PROVIDER}" ]]; then
+      args+=(--flashsampling-provider "${FLASHSAMPLING_PROVIDER}")
+    fi
     if [[ -n "${FLASHSAMPLING_MIN_BATCH_SIZE}" ]]; then
       args+=(--flashsampling-min-batch-size "${FLASHSAMPLING_MIN_BATCH_SIZE}")
     fi

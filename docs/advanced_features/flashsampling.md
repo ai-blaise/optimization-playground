@@ -32,8 +32,10 @@ batch is not eligible.
 The `target` provider uses a non-persistent grid-launch kernel optimized for
 shapes where the total number of (V, H) tiles fits in a single SM wave
 (tiles <= NUM_SMS). This is the typical case for TP-sharded vocab sizes
-(e.g. V=16160 on TP=8 DeepSeek-V3.2-REAP). When tiles exceed NUM_SMS, the
-target provider falls back to the persistent kernel automatically.
+(e.g. V=16160 on TP=8 DeepSeek-V3.2-REAP). On Blackwell (SM100/B200),
+`target` dispatches to the Blackwell-tuned variant with adaptive pipeline
+stages; older CUDA devices use the generic target kernel. When tiles exceed
+NUM_SMS, the target provider falls back to the persistent kernel automatically.
 
 IKP-validated performance on H200 (V=16160, D=7168, TP=8):
 - Kernel-only: 0.061ms (3.80 TB/s, 79% peak) vs persistent: 0.086ms (2.68 TB/s)
@@ -108,6 +110,12 @@ FLASHSAMPLING_MIN_BATCH_SIZE=128 \
 scripts/playground/run-flashsampling-paper-ab.sh
 ```
 
+To compare the Blackwell target provider explicitly, add:
+
+```bash
+FLASHSAMPLING_PROVIDER=target
+```
+
 For Qwen3-8B paper-style validation on H200, use the paper gate rather than the
 conservative production gate:
 
@@ -173,6 +181,130 @@ CONCURRENCY=128 \
 WARMUP_REQUESTS=concurrency \
 scripts/playground/profile-flashsampling-serving-ikp.sh
 ```
+
+### B200 Target-Provider Optimization Log
+
+Hardware: 1x NVIDIA B200 (SM100), `CUDA_VISIBLE_DEVICES=0`. Shape:
+`V=16160`, `D=7168`, BF16 weights/hidden states, greedy sampling, 20 warmup
+iterations and 200 timed iterations unless noted. Correctness means sampled ids
+match dense BF16 matmul argmax. Benchmarks used `/root/agent-runs/gpu_locked.sh`.
+
+Hotspot attribution: IKP imported the Nsight trace
+`/root/agent-runs/nsys-flashsampling-target-h64.nsys-rep` into
+`/root/agent-runs/ikp-flashsampling-target-h64/nsys_kernels.json`. Matmul/sample
+work dominates: `flashsample_blackwell_kernel` was 619.039 us total across 14
+calls (44.217 us mean); `_local_reduce_samples_kernel` was 32.992 us total
+(2.357 us mean). Optimization rounds therefore targeted the Blackwell matmul
+kernel schedule, not the local reduction.
+
+Round 0 incumbent -> candidate -> decision:
+
+- Incumbent: `--flashsampling-provider target` used the generic target kernel on
+  B200.
+- Candidate: dispatch `target` to `target_kernel_blackwell.py` on SM100 and add
+  API parity for `return_scores`/fallback args.
+- Command:
+
+```bash
+/root/agent-runs/gpu_locked.sh bash -lc '
+  cd /root/work/op-kernel-flashsampling &&   source /root/work/optimization-playground/.venv/bin/activate &&   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/root/work/op-kernel-flashsampling/python:$PYTHONPATH   python scripts/playground/bench_flashsampling_provider.py     --providers target_generic target     --vocab-size 16160 --hidden-size 7168 --batch-sizes 1 32 64     --warmup 20 --iters 200 --direct-module-import     --output-json /root/agent-runs/flashsampling-round0-generic-vs-blackwell.json
+'
+```
+
+| Batch | Incumbent `target_generic` ms | Candidate `target_blackwell` ms | Change | Decision |
+| ---: | ---: | ---: | ---: | :--- |
+| 1 | 0.049059 | 0.047400 | 3.38% faster | accept |
+| 32 | 0.048544 | 0.047206 | 2.76% faster | accept |
+| 64 | 0.049855 | 0.049906 | 0.10% slower, within noise | accept for B200 provider correctness |
+
+New incumbent commit: `2564780c6` (`Route FlashSampling target provider to Blackwell`).
+
+Subsequent rounds compare against this committed incumbent. The command shape was:
+
+```bash
+/root/agent-runs/gpu_locked.sh bash -lc '
+  cd /root/work/op-kernel-flashsampling &&   source /root/work/optimization-playground/.venv/bin/activate &&   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/root/work/op-kernel-flashsampling/python:$PYTHONPATH   python scripts/playground/bench_flashsampling_provider.py     --providers target --vocab-size 16160 --hidden-size 7168     --batch-sizes 1 32 64 --warmup 20 --iters 200     --direct-module-import --output-json /root/agent-runs/flashsampling-round-<name>.json     <candidate override>
+'
+```
+
+| Round | Incumbent | Candidate | BS1 ms | BS32 ms | BS64 ms | Decision |
+| :--- | :--- | :--- | ---: | ---: | ---: | :--- |
+| 1 | `2564780c6` target Blackwell | `BLOCK_D=64` | 0.052593 | 0.053097 | 0.053800 | reject: slower than incumbent 0.047034 / 0.047219 / 0.049948 |
+| 2 | `2564780c6` target Blackwell | `BLOCK_V=256` | 0.060053 | 0.061689 | 0.112338 | reject: slower, especially BS64 |
+| 3 | `2564780c6` target Blackwell | `num_warps=4` | 0.047127 | 0.047231 | 0.050833 | reject: tie at BS1/32, slower at BS64 |
+| 4 | `2564780c6` target Blackwell | `BLOCK_D=256` | 0.047521 | 0.065580 | 0.068808 | reject: large BS32/64 regression |
+| 5 | `2564780c6` target Blackwell | force `num_stages=4` | 0.049225 | 0.048805 | 0.049842 | reject: slower at BS1/32, BS64 tie |
+| 6 | `2564780c6` target Blackwell | force `num_stages=3` | 0.052469 | 0.052031 | 0.053871 | reject: slower |
+| 7 | `2564780c6` target Blackwell | force `num_stages=2` | 0.080342 | 0.080238 | 0.083285 | reject: much slower |
+
+Restart round 8 accepted under the stricter close premise:
+
+- Incumbent: committed Blackwell target provider at `2564780c6`, with `BLOCK_H=16` for all `H <= 16`.
+- Candidate: keep `H=1` on `BLOCK_H=16`, but use `BLOCK_H=8` for small warmup/sweep buckets `2 <= H <= 8`. This avoids doing a 16-column MMA tile for multi-request buckets that only need 2-8 columns, while preserving the incumbent launch shape for `H=1`, `H=32`, and `H=64`.
+- Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 /root/agent-runs/gpu_locked.sh python - <<'PY'
+# paired CUDA-event benchmark; artifact:
+# /root/agent-runs/flashsampling-restart-round3-blockh2to8-final-paired-gpu1.json
+PY
+```
+
+| Batch | Incumbent old `BLOCK_H=16` ms | Candidate ms | Change | Decision |
+| ---: | ---: | ---: | ---: | :--- |
+| 2 | 0.045983 | 0.045243 | 1.61% faster | accept |
+| 4 | 0.045770 | 0.045088 | 1.49% faster | accept |
+| 8 | 0.045824 | 0.045118 | 1.54% faster | accept |
+| 32 | 0.047171 | 0.047173 | tie | neutral |
+| 64 | 0.049540 | 0.049684 | 0.29% slower, within noise for unchanged tile | neutral |
+
+Additional restart candidates rejected against the best accepted incumbent:
+
+| Candidate | Evidence | Decision |
+| :--- | :--- | :--- |
+| Force non-persistent target dispatch beyond one SM wave | H128 0.086338 ms vs incumbent 0.057755 ms; H256 0.161747 ms vs 0.084151 ms | reject: two-wave target grid rereads weights and is much slower |
+| Use `BLOCK_H=128` for H128/H256 buckets | H128 0.065801 ms vs incumbent 0.057755 ms; forced H256 0.123797 ms vs 0.084151 ms | reject: accumulator pressure outweighs fewer H tiles |
+| Add `maxnreg=255` launch hint | single run was noise-level (H1 0.046647 ms vs 0.046713 ms; H32 0.047221 ms vs 0.047225 ms) and did not explain the paired small-H win | reject: removed from source |
+
+Restart round 9 accepted after `c251cb7bb`:
+
+- Incumbent: `c251cb7bb`, which uses `BLOCK_H=8` for greedy and non-greedy `2 <= H <= 8`, but keeps H1 on `BLOCK_H=16`.
+- Candidate: use `BLOCK_H=8` for non-greedy H1 only. The greedy H1 path stays on `BLOCK_H=16` because its earlier paired greedy measurements were noise-level, while non-greedy H1 spends extra work generating Gumbel noise for unused columns.
+- Paired CUDA-event artifact: `/root/agent-runs/flashsampling-restart-round5-sampling-h1-blockh8-candidate-gpu-any.json`.
+
+| Batch | Incumbent non-greedy ms | Candidate non-greedy ms | Change | Decision |
+| ---: | ---: | ---: | ---: | :--- |
+| 1 | 0.047392 | 0.045498 | 4.00% faster | accept |
+| 2 | 0.045277 | 0.045281 | tie | neutral |
+| 4 | 0.045330 | 0.045285 | 0.10% faster | neutral |
+| 8 | 0.045256 | 0.045206 | 0.11% faster | neutral |
+
+Restart candidate rejected after `c251cb7bb`:
+
+| Candidate | Evidence | Decision |
+| :--- | :--- | :--- |
+| Replace per-H local-reduce CTAs with one small-H CTA | `/root/agent-runs/flashsampling-restart-round4-smallh-reduce-candidate-gpu-any.json`: H2 0.045240 -> 0.045315 ms, H4 0.045117 -> 0.045092 ms, H8 0.045114 -> 0.045105 ms | reject: launch floor dominates and changes are ties/noise |
+
+All rejected candidates matched dense argmax correctness or, for stochastic
+sampling probes, produced in-range token ids. No rejected kernel constant changes
+are left in source. A dense matmul+argmax floor check on the original greedy
+shape measured 0.049364 / 0.051334 / 0.053421 ms for BS1/32/64, while the
+post-restart target path measures 0.046680 / 0.047191 / 0.050074 ms for the
+same buckets and 0.045159 / 0.045169 / 0.045117 ms for BS2/4/8. The final
+non-greedy H1/2/4/8 sweep measured 0.045485 / 0.045252 / 0.045424 /
+0.045425 ms. Final IKP/nsys attribution for non-greedy H1 shows
+`flashsample_blackwell_kernel` still dominates at 39.937 us mean, while
+`_local_reduce_samples_kernel` is 2.415 us mean. Stopping rationale: the
+remaining work is the matmul/noise kernel plus one small fixed reduction launch;
+Rule 7/CuTe constraints make `BLOCK_H=8` the smallest plausible tensor-core N
+tile, and further tested surfaces (two-wave non-persistent dispatch, `BLOCK_H=128`,
+local-reduce fusion, `maxnreg=255`, stage/warp/D/V tile changes) regressed or
+tied within noise against the best accepted incumbent.
+
+Caveat: the VM shared venv was missing an SM100
+`sgl_kernel/common_ops` binary, so standalone kernel profiling used
+`--direct-module-import`; server-level B200 TPOT benchmarking is blocked until
+that shared install is restored.
 
 The direct kernel tests validate greedy equality, logits debug mode, sampled-id
 range, seed sensitivity, vocabulary-shard offsets, and compact local index

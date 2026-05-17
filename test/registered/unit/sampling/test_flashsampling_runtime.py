@@ -20,8 +20,6 @@ def _sampling_info(**overrides):
         top_ps=torch.ones(2),
         top_ks=torch.full((2,), TOP_K_ALL, dtype=torch.int32),
         min_ps=torch.zeros(2),
-        temperature_value=1.0,
-        temperature_is_uniform=True,
         is_all_greedy=False,
         need_top_p_sampling=False,
         need_top_k_sampling=False,

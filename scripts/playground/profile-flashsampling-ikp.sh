@@ -12,6 +12,7 @@ WARMUP_ITERS=${WARMUP_ITERS:-10}
 ITERS=${ITERS:-50}
 KERNEL_REGEX=${KERNEL_REGEX:-"fused_mm_sample|triton|gemm|matmul|argmax|rand|uniform|exponential"}
 PROFILE_CAPTURE_RANGE=${PROFILE_CAPTURE_RANGE:-1}
+FLASHSAMPLING_PROVIDER=${FLASHSAMPLING_PROVIDER:-triton}
 
 mkdir -p "${OUT_DIR}/nsys" "${OUT_DIR}/ikp"
 
@@ -22,7 +23,22 @@ import pathlib
 
 import torch
 
-from sglang.srt.layers.flashsampling.core import fused_mm_sample_triton
+provider = os.environ.get("FLASHSAMPLING_PROVIDER", "triton")
+if provider == "target":
+    if torch.cuda.get_device_capability()[0] >= 10:
+        from sglang.srt.layers.flashsampling.target_kernel_blackwell import (
+            fused_mm_sample_blackwell as fused_mm_sample,
+        )
+    else:
+        from sglang.srt.layers.flashsampling.target_kernel import (
+            fused_mm_sample_target as fused_mm_sample,
+        )
+elif provider == "triton":
+    from sglang.srt.layers.flashsampling.core import (
+        fused_mm_sample_triton as fused_mm_sample,
+    )
+else:
+    raise ValueError(f"unknown FLASHSAMPLING_PROVIDER={provider!r}")
 
 
 device = torch.device(f"cuda:{os.environ.get('CUDA_DEVICE', '0')}")
@@ -76,7 +92,7 @@ for batch_size in batch_sizes:
 
     def fused():
         nonlocal_seed[0] += 1
-        return fused_mm_sample_triton(
+        return fused_mm_sample(
             weights=weights,
             hidden_states=hidden_states,
             num_samples=1,
@@ -104,6 +120,7 @@ for batch_size, hidden_states, fused in cases:
             "dense_ms": dense_ms,
             "flashsampling_ms": fused_ms,
             "speedup_pct": (dense_ms - fused_ms) / dense_ms * 100.0,
+            "provider": provider,
         }
     )
 
@@ -123,7 +140,7 @@ for row in rows:
 PY
 
 export CUDA_DEVICE VOCAB_SIZE HIDDEN_SIZE BATCH_SIZES WARMUP_ITERS ITERS OUT_DIR
-export PROFILE_CAPTURE_RANGE
+export PROFILE_CAPTURE_RANGE FLASHSAMPLING_PROVIDER
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-${CUDA_DEVICE}}
 
 nsys_args=(

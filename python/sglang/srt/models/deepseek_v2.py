@@ -1321,6 +1321,10 @@ try:
 except Exception:  # pragma: no cover - kernel always present in production image
     _g1_gate_forward = None
 try:
+    from sgl_kernel import g1_gate_forward_fused as _g1_gate_forward_fused
+except Exception:  # pragma: no cover - kernel always present in production image
+    _g1_gate_forward_fused = None
+try:
     from sglang.jit_kernel.gated_norm import gated_norm_forward as _gated_norm_forward
 except Exception:  # pragma: no cover
     _gated_norm_forward = None
@@ -1343,8 +1347,11 @@ def _apply_g1_gate(attn_output: torch.Tensor, gate: torch.Tensor) -> torch.Tenso
         and gate.dtype == torch.bfloat16
     ):
         out = torch.empty_like(attn_output)
-        gate_out = torch.empty_like(attn_output)
-        _g1_gate_forward(gate, attn_output, out, gate_out)
+        if _g1_gate_forward_fused is not None:
+            _g1_gate_forward_fused(gate, attn_output, out)
+        else:
+            gate_out = torch.empty_like(attn_output)
+            _g1_gate_forward(gate, attn_output, out, gate_out)
         return out
     # Fallback path keeps numerics identical to Megatron's
     # ``_apply_output_gate_torch`` (cast through fp32 sigmoid).

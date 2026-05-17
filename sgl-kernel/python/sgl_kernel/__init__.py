@@ -27,6 +27,7 @@ else:
         cutlass_mla_decode,
         cutlass_mla_get_workspace_size,
         g1_gate_forward,
+        g1_gate_forward_fused,
         merge_state_v2,
     )
     from sgl_kernel.cutlass_moe import (
@@ -168,6 +169,7 @@ else:
         "fused_add_rmsnorm",
         "fused_qk_norm_rope",
         "g1_gate_forward",
+        "g1_gate_forward_fused",
         "gelu_and_mul",
         "gelu_tanh_and_mul",
         "gemma_fused_add_rmsnorm",

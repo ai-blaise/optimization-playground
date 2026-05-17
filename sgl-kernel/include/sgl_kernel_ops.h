@@ -125,6 +125,7 @@ int64_t cutlass_mla_get_workspace_size(
     int64_t sm_count = 0,
     int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 void g1_gate_forward(at::Tensor linear_out, at::Tensor attn_out, at::Tensor output, at::Tensor gate);
+void g1_gate_forward_fused(at::Tensor linear_out, at::Tensor attn_out, at::Tensor output);
 
 /*
  * From csrc/elementwise

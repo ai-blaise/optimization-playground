@@ -9,15 +9,18 @@ if torch is not None:
     try:
         from sglang.jit_kernel.nvfp4_indexer import (
             can_use_nsa_nvfp4_indexer,
+            dequantize_indexer_nvfp4,
             fused_store_index_k_cache_nvfp4,
             quantize_indexer_q_nvfp4,
         )
     except ModuleNotFoundError:
         can_use_nsa_nvfp4_indexer = None
+        dequantize_indexer_nvfp4 = None
         fused_store_index_k_cache_nvfp4 = None
         quantize_indexer_q_nvfp4 = None
 else:
     can_use_nsa_nvfp4_indexer = None
+    dequantize_indexer_nvfp4 = None
     fused_store_index_k_cache_nvfp4 = None
     quantize_indexer_q_nvfp4 = None
 
@@ -81,6 +84,18 @@ def test_quantize_indexer_q_nvfp4_matches_reference():
     ref_values, ref_scales = _ref_indexer_nvfp4(query.view(-1, 128))
     torch.testing.assert_close(values.view(-1, 64), ref_values)
     torch.testing.assert_close(scales.view(-1), ref_scales.view(-1))
+
+
+@pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
+def test_dequantize_indexer_nvfp4_cuda_matches_torch_reference():
+    torch.manual_seed(2)
+    query = (torch.randn((5, 3, 128), device="cuda") * 0.5).to(torch.bfloat16)
+    values, scales = quantize_indexer_q_nvfp4(query)
+
+    actual = dequantize_indexer_nvfp4(values, scales)
+    expected = dequantize_indexer_nvfp4(values.cpu(), scales.cpu()).to("cuda")
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")

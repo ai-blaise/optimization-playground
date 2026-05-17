@@ -83,6 +83,10 @@ def _jit_nvfp4_indexer_module(
                     f"NVFP4IndexerQuantKernel<{args}>::quantize_q",
                 ),
                 (
+                    "dequantize_indexer_nvfp4",
+                    f"NVFP4IndexerQuantKernel<{args}>::dequantize",
+                ),
+                (
                     "hisa_mean_pool_indexer_cache_nvfp4",
                     f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool",
                 ),
@@ -625,6 +629,31 @@ def dequantize_indexer_nvfp4(
         raise ValueError(
             f"NVFP4 IndexCache values expect 64 packed bytes, got {values.shape}."
         )
+
+    original_shape = values.shape
+    if values.is_cuda:
+        values_2d = values.reshape(-1, original_shape[-1])
+        if values_2d.dtype != torch.uint8:
+            values_2d = values_2d.to(torch.uint8)
+        if not values_2d.is_contiguous():
+            values_2d = values_2d.contiguous()
+        scales_1d = scales.reshape(-1)
+        if scales_1d.dtype != torch.int32:
+            scales_1d = scales_1d.to(torch.int32)
+        if not scales_1d.is_contiguous():
+            scales_1d = scales_1d.contiguous()
+        if scales_1d.numel() != values_2d.shape[0]:
+            raise ValueError(
+                "NVFP4 IndexCache scales must have one int32 word per values row."
+            )
+        output = torch.empty(
+            (values_2d.shape[0], 128), dtype=torch.float32, device=values.device
+        )
+        _get_module_fast(
+            torch.bfloat16, torch.int64, 64
+        ).dequantize_indexer_nvfp4(values_2d, scales_1d, output)
+        return output.view(*original_shape[:-1], 128)
+
     values_u8 = values.to(torch.uint8)
     low = values_u8 & 0x0F
     high = (values_u8 >> 4) & 0x0F

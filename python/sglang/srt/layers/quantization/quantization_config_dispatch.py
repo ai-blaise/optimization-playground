@@ -3,10 +3,10 @@
 Reads optional declarative fields from a model's ``quantization_config``
 (typically ``hf_config.quantization_config``) and promotes them onto
 ``server_args``, so that a checkpoint can opt into TurboQuant 2.5-bit
-dense KV, HIGGS 2-bit dense KV, NSA IndexCache, or NSA indexer cache
-formats without requiring the operator to pass CLI flags.
+dense KV, HIGGS 2-bit dense KV, NSA IndexCache, NSA indexer cache formats,
+or a supported MoE runner without requiring the operator to pass CLI flags.
 
-Two fields are recognized:
+Three fields are recognized:
 
 1. ``kv_cache_scheme`` (extension of the existing dict already parsed by
    ``modelopt_quant``): when ``quant_method == "turboquant_dense"``, sets
@@ -17,6 +17,10 @@ Two fields are recognized:
    cache formats on ``server_args.indexer_quantization_declared`` and can
    select ordinary IndexCache through either ``indexer_mode`` or a nested
    ``indexcache`` declaration.
+
+3. ``moe_runner_backend``: when set to ``"warp_decode"``, selects the
+   small-batch Warp Decode MoE runner if the operator left
+   ``--moe-runner-backend`` at ``auto``.
 
 CLI flags take precedence: if the operator already passed
 ``--enable-turboquant-dense-kv-cache`` (i.e. the flag is ``True``) the
@@ -50,6 +54,7 @@ DEFAULT_TURBOQUANT_DENSE_KV_PRESET = "latent_2p5bit_nc"
 HIGGS_DENSE_2BIT_QUANT_METHOD = "higgs_dense_2bit"
 DEFAULT_NSA_INDEXCACHE_FREQ = 4
 SUPPORTED_CONFIG_INDEXER_MODES = ("vanilla", "indexcache")
+SUPPORTED_CONFIG_MOE_RUNNER_BACKENDS = ("warp_decode",)
 
 
 def _coerce_dict(value: Any) -> Optional[Dict[str, Any]]:
@@ -288,6 +293,30 @@ def _maybe_apply_indexcache(
         server_args.nsa_indexcache_pattern = str(pattern)
 
 
+def _maybe_apply_moe_runner_backend(
+    server_args: Any, quant_cfg: Dict[str, Any]
+) -> None:
+    backend = quant_cfg.get("moe_runner_backend")
+    if backend is None:
+        return
+
+    backend = str(backend)
+    if backend not in SUPPORTED_CONFIG_MOE_RUNNER_BACKENDS:
+        logger.info(
+            "quantization_config.moe_runner_backend=%r is not supported for "
+            "config-side dispatch; keeping the existing MoE runner backend.",
+            backend,
+        )
+        return
+
+    if getattr(server_args, "moe_runner_backend", "auto") == "auto":
+        server_args.moe_runner_backend = backend
+        logger.info(
+            "Setting --moe-runner-backend=%s from quantization_config.",
+            backend,
+        )
+
+
 def apply_quantization_config_dispatch(
     server_args: Any, hf_config: Any
 ) -> None:
@@ -302,6 +331,7 @@ def apply_quantization_config_dispatch(
     _maybe_apply_turboquant_dense(server_args, quant_cfg)
     _maybe_apply_higgs_dense_2bit(server_args, quant_cfg)
     _maybe_apply_indexer_quantization(server_args, quant_cfg)
+    _maybe_apply_moe_runner_backend(server_args, quant_cfg)
 
 
 def should_use_nsa_fused_store(

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -27,6 +28,7 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 _CUTE_AVAILABLE = False
+_CUTE_EXTENSION_PATH: Optional[Path] = None
 _CUTE_GATE_UP_TILE_K = 1024
 _CUTE_DOWN_TILE_D = 8
 _CUTE_DOWN_TILE_N = 2048
@@ -36,13 +38,37 @@ try:
 
     if hasattr(sgl_kernel, "warp_decode_cute_moe_packed_forward"):
         _CUTE_AVAILABLE = True
+        common_ops = getattr(sgl_kernel, "common_ops", None)
+        common_ops_file = getattr(common_ops, "__file__", None)
+        if common_ops_file is not None:
+            _CUTE_EXTENSION_PATH = Path(common_ops_file)
         logger.info("CuTe warp decode kernels available via sgl_kernel")
 except ImportError:
     pass
 
 
+def _loaded_common_ops_arch() -> Optional[str]:
+    if _CUTE_EXTENSION_PATH is None:
+        return None
+    return _CUTE_EXTENSION_PATH.resolve().parent.name
+
+
+def _cute_extension_matches_device() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    cc = torch.cuda.get_device_capability()
+    loaded_arch = _loaded_common_ops_arch()
+    if cc[0] >= 10:
+        return loaded_arch == "sm100"
+    if cc[0] == 9:
+        return loaded_arch == "sm90"
+    return False
+
+
 def _should_use_cute() -> bool:
     if not _CUTE_AVAILABLE:
+        return False
+    if not _cute_extension_matches_device():
         return False
     cute_mode = envs.SGLANG_WARP_DECODE_CUTE.get()
     if cute_mode == "0":
@@ -489,7 +515,6 @@ def warp_decode_moe(
         device=hidden_states.device,
     )
 
-    # Select block sizes based on dimensions
     BLOCK_N = min(32, intermediate_size)
     BLOCK_K = min(128, hidden_size)
     BLOCK_D = min(32, hidden_size)

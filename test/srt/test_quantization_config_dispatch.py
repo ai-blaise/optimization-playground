@@ -77,6 +77,7 @@ class FakeServerArgs:
     hisa_execution_mode: str = "optimized"
     enable_nsa_nvfp4_hisa: bool = False
     indexer_quantization_declared: Optional[Dict[str, Any]] = None
+    moe_runner_backend: str = "auto"
 
 
 @dataclass
@@ -538,6 +539,39 @@ def test_unknown_indexer_quant_method_is_ignored():
     )
     dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
     assert server_args.indexer_quantization_declared is None
+
+
+def test_warp_decode_moe_runner_backend_enables_from_config():
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "moe_runner_backend": "warp_decode",
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.moe_runner_backend == "warp_decode"
+
+
+def test_warp_decode_moe_runner_backend_preserves_cli_backend():
+    server_args = FakeServerArgs(moe_runner_backend="flashinfer_trtllm")
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "moe_runner_backend": "warp_decode",
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.moe_runner_backend == "flashinfer_trtllm"
+
+
+def test_unknown_moe_runner_backend_is_ignored():
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "moe_runner_backend": "not_a_backend",
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.moe_runner_backend == "auto"
 
 
 def test_quantization_config_object_with_to_dict():

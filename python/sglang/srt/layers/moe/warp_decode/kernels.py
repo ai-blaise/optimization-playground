@@ -106,7 +106,7 @@ def _triton_block_sizes(
     if top_k == 8 and hidden_size >= 1024 and intermediate_size >= 2048:
         return (
             min(8, intermediate_size),
-            min(128, hidden_size),
+            min(256, hidden_size),
             min(8, hidden_size),
             min(128, intermediate_size),
         )

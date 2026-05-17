@@ -83,3 +83,32 @@ because the shared venv's `sgl_kernel` package currently lacks SM100
 | r4 h8 topk1024 splits32 | 0.040624 ms | 0.040000 ms | 1.016x | Keep |
 
 Correctness verification: seeded direct-HIGGS output checksum matched the
+incumbent (`-21.94557762145996`) and the candidate output was finite. The first
+draft used a conditional warp collective and was rejected immediately after an
+illegal memory access; the committed candidate makes all lanes participate in
+the shuffle.
+
+New incumbent commit: `21805592c`.
+
+## Round 3: Read-Only Packed-Byte Loads
+
+Incumbent: round-2 commit `21805592c`.
+
+Hotspot/profile evidence: stage1 remains the only material target after round
+2. The paired-lane broadcast reduced duplicated byte loads, leaving the even
+lane packed-slot reads in the same stage1 loop.
+
+Candidate: use explicit `__ldg` for the four packed-byte reads performed by
+the loading lane. This is still scalar codec glue, but it is a minimal
+Blackwell-safe candidate before considering larger CuTe/CZS layout work.
+
+Before/after measurement against incumbent, direct HIGGS JIT harness:
+
+| Shape | Incumbent avg | Candidate avg | Speedup | Decision |
+| --- | ---: | ---: | ---: | --- |
+| r4 h8 topk1024 splits32 | 0.040000 ms | 0.039861 ms | 1.0035x | Keep |
+
+Correctness verification: seeded checksum matched the incumbent
+(`-21.94557762145996`) and output was finite.
+
+New incumbent commit: this round-3 commit.

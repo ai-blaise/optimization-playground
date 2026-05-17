@@ -153,10 +153,10 @@ __device__ __forceinline__ void higgs_unpack_indices(
   uint32_t b2 = 0;
   uint32_t b3 = 0;
   if (!coord_lane) {
-    b0 = slot[0 * 32 + byte_in_group];
-    b1 = slot[1 * 32 + byte_in_group];
-    b2 = slot[2 * 32 + byte_in_group];
-    b3 = slot[3 * 32 + byte_in_group];
+    b0 = __ldg(slot + 0 * 32 + byte_in_group);
+    b1 = __ldg(slot + 1 * 32 + byte_in_group);
+    b2 = __ldg(slot + 2 * 32 + byte_in_group);
+    b3 = __ldg(slot + 3 * 32 + byte_in_group);
   }
   const uint32_t peer_b0 = __shfl_xor_sync(0xffffffff, b0, 1);
   const uint32_t peer_b1 = __shfl_xor_sync(0xffffffff, b1, 1);

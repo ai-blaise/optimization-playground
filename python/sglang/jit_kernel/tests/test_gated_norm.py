@@ -85,6 +85,8 @@ def test_gated_norm_decode_gemm_thresholds() -> None:
     assert _should_use_torch_mm(1, 16)
     assert not _should_use_torch_mm(8, 8)
     assert _should_use_torch_mm(16, 8)
+    assert not _should_use_torch_mm(32, 5)
+    assert _should_use_torch_mm(64, 5)
     assert _should_use_torch_mm(1, 1)
     assert not _should_use_torch_mm(2048, 4)
 

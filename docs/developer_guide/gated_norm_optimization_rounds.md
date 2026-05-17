@@ -443,6 +443,49 @@ Correctness verification: all candidate outputs matched incumbent outputs with `
 
 Decision: accept rank 8-15 floor 16 and exact rank 1 floor 1; reject rank 8-15 floor 1 and broad rank 1-7 threshold changes. New incumbent commit: this commit.
 
+## Round 11: rank 5-7 monotonic floor
+
+Incumbent: `901463e61` (Round 10 low-rank floor 16 / exact rank 1 floor 1).
+
+Profiler/instrumentation: CUDA-event exact-rank sweep on B200 using `gpu_locked_any.sh` around the CUDA benchmark process.
+
+Hotspot/result: the broad rank 1-7 threshold was unsafe because ranks 2 and 4 regress, but exact-rank probing showed ranks 5-7 have a monotonic torch/cuBLAS win from 64 tokens upward. Rank 3 has a non-monotonic window (wins through 1024, regresses at 2048), which is rejected to preserve the simple min-token threshold contract.
+
+Candidate accepted: set rank 5-7 torch/cuBLAS threshold to 64 tokens. Keep ranks 2-4 at 4096 tokens.
+
+Command artifacts:
+
+```bash
+/root/agent-runs/gatednorm-restart-round15-rank2-7-exact-sweep.jsonl
+/root/agent-runs/gatednorm-restart-round16-rank5-7-floor64.jsonl
+/root/agent-runs/gatednorm-restart-round17-rank5-7-floor32.jsonl
+```
+
+Accepted rank 5-7 floor-64 evidence, median of 3 same-device CUDA-event repeats versus `901463e61`:
+
+| rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 5 | 64 | 0.043170 | 0.034905 | 1.24x | keep |
+| 5 | 128 | 0.043159 | 0.035026 | 1.23x | keep |
+| 6 | 64 | 0.039024 | 0.026351 | 1.48x | keep |
+| 6 | 128 | 0.039050 | 0.030791 | 1.27x | keep |
+| 7 | 64 | 0.043133 | 0.034914 | 1.24x | keep |
+| 7 | 128 | 0.043151 | 0.037502 | 1.15x | keep |
+
+Rejected exact-rank evidence:
+
+| candidate | rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| rank 5-7 floor 32 | 5 | 32 | 0.043167 | 0.044390 | 0.97x | reject |
+| rank 5-7 floor 32 | 7 | 32 | 0.043146 | 0.043583 | 0.99x | reject |
+| exact rank 2 floor | 2 | 128-2048 | see artifact | slower at every row | reject |
+| exact rank 4 floor | 4 | 128-2048 | see artifact | slower at every row | reject |
+| exact rank 3 window | 3 | 128-1024 | see artifact | wins, but 2048 is 0.89x | reject non-monotonic window |
+
+Correctness verification: all candidate outputs matched incumbent outputs with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` in the exact-rank probes.
+
+Decision: accept rank 5-7 floor 64; reject rank 5-7 floor 32, ranks 2/4, and rank 3's non-monotonic special window. New incumbent commit: this commit.
+
 ## Restart stop evidence
 
 Final accepted incumbent: this commit. Fresh post-restart profile command:

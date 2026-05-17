@@ -139,3 +139,73 @@ CUDA_VISIBLE_DEVICES=1 /root/agent-runs/gpu_locked.sh bash -lc '
 - Result: accepted. In the back-to-back same-GPU comparison, the 512 KiB threshold improved the common matrix by 1.083x on average and up to 1.150x. The intended 192-512 KiB cells improved 1.132x-1.150x; the 128 KiB, 1 MiB, and 2 MiB boundary/delegated cells were ties within about 1%. Final verification log: `/root/agent-runs/layersplit_round4_stage_backtoback_512.jsonl`; incumbent bracketing logs: `/root/agent-runs/layersplit_round4_stage_backtoback_incumbent_a.jsonl` and `_b.jsonl`.
 - Correctness: every benchmark cell checks active-prefix equality. `/root/agent-runs/layersplit_round4_stage_512_padding.jsonl` also verified inactive padding rows remained zero for 256 KiB and 512 KiB active prefixes.
 - Decision: accept. New incumbent: Round 4 512 KiB threshold commit.
+
+
+## Round 5: Fused Materialize CTA Threshold Sweep
+
+- Incumbent: `ba6b4a74141d16051e273c3af7fddc7e91bb823c4` (Round 4 512 KiB threshold commit). The stage-copy threshold does not change the fused materialize kernel, so the fused incumbent remains the existing 4-warp/8-warp dispatch with `total_ctas_8 < 150`.
+- Hotspot/profiler signal: Nsight Systems imported through IKP at `/root/agent-runs/layersplit_round4_fused_nsys/ikp/nsys_kernels.json` showed the representative fused path uses `layersplit_fused_materialize_kernel<(int)8>` with `block=[256,1,1]`, `grid=[16,layers,1]`, and 32 registers/thread; CUDA-event timings show launch-floor behavior at low layer counts and bandwidth/CTA-count scaling at high layer counts.
+- Candidate: sweep the 4-warp/8-warp dispatch threshold using prebuilt local extensions for `total_ctas_8 < {0,64,128,300,1024,2048}`. Extension builds ran outside GPU locks; timing used an explicit GPU-1 lock and loaded prebuilt `.so` files.
+- Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 /root/agent-runs/gpu_locked.sh bash -lc '
+  cd /root/work/op-kernel-layersplit &&
+  source /root/work/optimization-playground/.venv/bin/activate &&
+  export CUDA_HOME=/usr/local/cuda &&
+  export PATH=$CUDA_HOME/bin:$PATH &&
+  export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-} &&
+  export PYTHONPATH=/root/work/op-kernel-layersplit/python:${PYTHONPATH:-} &&
+  for label in inc thr0 thr64 thr128 thr300 thr1024 thr2048; do
+    lib=/tmp/layersplit_ext_round5_mat_${label}/layersplit_cute_round5_mat_${label}.so
+    python /root/agent-runs/layersplit_bench_fused.py \
+      --library $lib --layers 2,4,8,16,32,64 --rows 64,128,256 \
+      --row-bytes 7168 --warmup 50 --iters 1000 \
+      | tee /root/agent-runs/layersplit_round5_fused_mat_${label}.jsonl
+  done
+'
+```
+
+- Result: rejected. Against the incumbent, average speedups were `thr0=0.9905x`, `thr64=0.9947x`, `thr128=0.9931x`, `thr300=0.9996x`, `thr1024=0.9989x`, and `thr2048=1.0008x`. The only apparent `thr2048` win was a 1.011x single-cell noise-sized improvement at `(layers=8, rows=128)`, while the full matrix was effectively tied. Lower thresholds regressed the low-work `(layers=16, rows=64)` cell by 6-8%.
+- Correctness: every benchmark cell checks all fused destination rows against source rows.
+- Decision: reject. No source change; incumbent remains `ba6b4a741`.
+
+
+## Round 6: Fused Materialize 4-Way ILP Unroll
+
+- Incumbent: `ba6b4a74141d16051e273c3af7fddc7e91bb823c4`.
+- Candidate: use the existing `vec_copy_warp_unroll4` / `vec_copy_warp_8b_unroll4` helpers inside `layersplit_fused_materialize_kernel` instead of the simple per-row warp loop.
+- Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 /root/agent-runs/gpu_locked.sh bash -lc '
+  cd /root/work/op-kernel-layersplit &&
+  source /root/work/optimization-playground/.venv/bin/activate &&
+  export CUDA_HOME=/usr/local/cuda &&
+  export PATH=$CUDA_HOME/bin:$PATH &&
+  export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-} &&
+  export PYTHONPATH=/root/work/op-kernel-layersplit/python:${PYTHONPATH:-} &&
+  python /root/agent-runs/layersplit_bench_fused.py \
+    --library /tmp/layersplit_ext_round5_mat_inc/layersplit_cute_round5_mat_inc.so \
+    --layers 2,4,8,16,32,64 --rows 64,128,256 --row-bytes 7168 \
+    --warmup 50 --iters 1000 \
+    | tee /root/agent-runs/layersplit_round6_fused_incumbent.jsonl
+  python /root/agent-runs/layersplit_bench_fused.py \
+    --library /tmp/layersplit_ext_round6_mat_unroll4/layersplit_cute_round6_mat_unroll4.so \
+    --layers 2,4,8,16,32,64 --rows 64,128,256 --row-bytes 7168 \
+    --warmup 50 --iters 1000 \
+    | tee /root/agent-runs/layersplit_round6_fused_unroll4.jsonl
+'
+```
+
+- Result: rejected. The unroll4 candidate averaged 0.954x versus the incumbent, with worst cells at 0.851x `(layers=16, rows=64)`, 0.862x `(layers=8, rows=128)`, 0.866x `(layers=64, rows=128)`, and 0.871x `(layers=4, rows=256)`. This confirms the existing simple loop is preferable; the unrolled path likely adds register/instruction pressure without reducing the dominant launch/memory floor.
+- Correctness: every benchmark cell checks all fused destination rows against source rows.
+- Decision: reject. No source change; incumbent remains `ba6b4a741`.
+
+
+## Stop Rationale Under Restart Premise
+
+- Stage copy: the accepted 512 KiB threshold is now the best incumbent. Threshold probes below it remove real wins; probes above it hit the measured 1 MiB regression and larger-transfer copy-engine floor. The direct-prefix `cudaMemcpyAsync` path remains the correct owner for 1 MiB+ active prefixes.
+- Fused materialize: IKP-imported nsys evidence shows the representative fused kernel is already a 32-register, no-SMEM copy kernel with stable CTA geometry. The CTA-threshold sweep tied within noise or regressed, and the only remaining source-local loop candidate (`unroll4`) regressed materially.
+- Additional Rule 7/deep-reference candidates are not compelling for this kernel: the work is raw memory movement with no GEMM-shaped tensor-core/UMMA opportunity; CZS/CuTe tensor-op proof artifacts are therefore not applicable beyond using the existing Blackwell/CuTe copy-kernel references. QuACK memory-coalescing notes support keeping contiguous warp lanes and avoiding extra store fan-out; the current simple loop already does that.
+- Stop decision: saturated after one accepted stage-copy improvement and two rejected fused-materialize rounds beyond the prior closure. Further work would need a new algorithmic consumer/producer fusion opportunity outside the LayerSplit copy kernel itself, not another local threshold or loop-shape tweak.

@@ -1117,6 +1117,15 @@ class Indexer(MultiPlatformOp):
                 q_shape=tuple(int(dim) for dim in q_values.shape),
             )
             return None
+        if q_values.shape[1] not in (32, 64):
+            _hisa_profile_end(
+                "hisa_nvfp4_paged_skip",
+                _hisa_profile_start(q_values.device),
+                q_values.device,
+                reason="unsupported_head_count",
+                num_heads=int(q_values.shape[1]),
+            )
+            return None
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
         topk_result = torch.full(
             (q_values.shape[0], self.index_topk),

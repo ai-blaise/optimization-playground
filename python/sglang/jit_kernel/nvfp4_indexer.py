@@ -47,6 +47,15 @@ _hisa_profile_sync = os.environ.get(
 ).lower() in ("1", "true", "yes", "on")
 _hisa_profile_lock = threading.Lock()
 _NVFP4_E2M1_CODEBOOK = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_DEEPGEMM_FP4_MQA_HEAD_COUNTS = (32, 64)
+
+
+def _deepgemm_fp4_mqa_supports(q_values: torch.Tensor) -> bool:
+    return (
+        q_values.dim() == 3
+        and q_values.shape[1] in _DEEPGEMM_FP4_MQA_HEAD_COUNTS
+        and q_values.shape[-1] == 64
+    )
 
 
 @cache_once
@@ -1068,10 +1077,13 @@ def nvfp4_hisa_indexer_paged_deepgemm_precomputed(
 ) -> Optional[torch.Tensor]:
     if block_size != 128:
         raise ValueError("DeepGEMM-backed NVFP4 HISA path requires block_size=128.")
-    import deep_gemm
 
     q_values, q_scales = q_fp4
     rep_values, rep_scales = block_rep_fp4
+    if not _deepgemm_fp4_mqa_supports(q_values):
+        return None
+    import deep_gemm
+
     if weights.dim() == 3 and weights.shape[-1] == 1:
         weights = weights.squeeze(-1)
     token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
@@ -1315,9 +1327,12 @@ def nvfp4_hisa_indexer_paged_deepgemm(
 ) -> Optional[torch.Tensor]:
     if block_size != 128:
         raise ValueError("DeepGEMM-backed NVFP4 HISA path requires block_size=128.")
-    import deep_gemm
 
     q_values, q_scales = q_fp4
+    if not _deepgemm_fp4_mqa_supports(q_values):
+        return None
+    import deep_gemm
+
     if weights.dim() == 3 and weights.shape[-1] == 1:
         weights = weights.squeeze(-1)
     token_to_batch_idx = token_to_batch_idx.reshape(-1).to(

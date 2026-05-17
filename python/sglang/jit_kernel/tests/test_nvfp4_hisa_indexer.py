@@ -291,7 +291,7 @@ def test_nvfp4_hisa_precomputed_deepgemm_matches_inline_deepgemm():
 
 
 @pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
-def test_nvfp4_hisa_deepgemm_matches_torch_with_small_head_count():
+def test_nvfp4_hisa_deepgemm_skips_unsupported_head_count():
     pytest.importorskip("deep_gemm")
     _, weights, q_fp4, cache, page_table, seq_lens, token_to_batch_idx = _build_case(
         8193, heads=8
@@ -319,11 +319,8 @@ def test_nvfp4_hisa_deepgemm_matches_torch_with_small_head_count():
         if "PyObjectSlot" in str(exc) or "no interpreter set" in str(exc):
             pytest.skip(f"DeepGEMM ABI is not usable in this venv: {exc}")
         raise
-    assert torch_path is not None and deepgemm_path is not None
-    torch.testing.assert_close(
-        _sorted_valid_indices(deepgemm_path.cpu()),
-        _sorted_valid_indices(torch_path.cpu()),
-    )
+    assert torch_path is not None
+    assert deepgemm_path is None
 
 
 @pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")

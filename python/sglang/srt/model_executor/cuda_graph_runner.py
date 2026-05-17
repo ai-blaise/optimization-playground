@@ -179,6 +179,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
+        hc_hidden_size: Optional[int] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -212,10 +213,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
+                # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
+                is_mhc = hc_hidden_size is not None
+                hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
                 }
+                if not is_mhc:
+                    pp_proxy_tensors["residual"] = torch.zeros(
+                        (max_bs, hidden_size), dtype=dtype
+                    )
             else:
                 pp_proxy_tensors = None
 
@@ -396,7 +403,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
-# When capturing dual MoE backends, tracks which variant is being captured.
+
 # None = not dual, "lora" = capturing lora variant, "nolora" = capturing nolora variant.
 _capture_lora_variant: Optional[str] = None
 
@@ -561,12 +568,7 @@ def set_global_graph_memory_pool(val):
 
 
 def _default_make_graph_key(bs, stream_idx=None, variant_label=None):
-    """Build a graph dict key from batch size, stream index, and lora variant.
-
-    Standalone function so it can be used by CudaGraphRunner.capture() even when
-    called on subclasses (e.g. EAGLEDraftCudaGraphRunner) that don't inherit from
-    CudaGraphRunner and thus lack the method.
-    """
+    """Build a graph dict key from batch size, stream index, and lora variant."""
     key = bs if stream_idx is None else f"{stream_idx}_{bs}"
     if variant_label is not None:
         key = f"{variant_label}_{key}"
@@ -731,6 +733,9 @@ class CudaGraphRunner:
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
             is_hybrid_swa=model_runner.is_hybrid_swa,
+            hc_hidden_size=getattr(
+                self.model_runner.model_config, "hc_hidden_size", None
+            ),
         )
         buffer_pool_key = "default"
         if self.model_runner.spec_algorithm.is_smc():
@@ -941,13 +946,6 @@ class CudaGraphRunner:
                 tqdm.tqdm(list(reversed(self.capture_bs)))
                 if get_tensor_model_parallel_rank() == 0
                 else reversed(self.capture_bs)
-            )
-            # When record_nolora_graph is set, capture each batch size twice:
-            # once with LoRA hooks and once without.
-            lora_variants = (
-                [("lora", True), ("nolora", False)]
-                if getattr(self, "record_nolora_graph", False)
-                else [(None, None)]
             )
             for i, bs in enumerate(capture_range):
                 if get_tensor_model_parallel_rank() == 0:

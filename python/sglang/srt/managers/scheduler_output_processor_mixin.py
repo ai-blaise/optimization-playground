@@ -83,7 +83,7 @@ class SchedulerOutputProcessorMixin:
                 "host": req.cached_tokens_host,
             }
             # Only include storage fields if L3 storage is enabled
-            if getattr(self, "enable_hicache_storage", False):
+            if self.enable_hicache_storage:
                 details["storage"] = req.cached_tokens_storage
                 details["storage_backend"] = self._get_storage_backend_type()
             return details
@@ -269,7 +269,7 @@ class SchedulerOutputProcessorMixin:
                         req.time_stats.set_completion_time()
                     elif is_smc and req.smc_particle_idx is None:
                         smc_parent_group_jobs.append((i, req))
-                        if req.stream and not batch.return_logprob:
+                        if getattr(req, "stream", False) and not batch.return_logprob:
                             smc_prefill_stream_candidates.append(req)
                     elif is_smc and req.smc_particle_idx is not None:
                         if not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -460,7 +460,18 @@ class SchedulerOutputProcessorMixin:
 
         for i, req in smc_parent_group_jobs:
             assert self.smc_resampler is not None
-            self.smc_resampler.enqueue_parent_group(req)
+            if hasattr(self.smc_resampler, "enqueue_parent_group"):
+                self.smc_resampler.enqueue_parent_group(req)
+            else:
+                self.model_worker.materialize_smc_parent_draft_prefix(req)
+                self.smc_manager.create_group(req, self)
+                _release_smc_parent_req(
+                    req,
+                    tree_cache=self.tree_cache,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                )
+                self.smc_resampler.enqueue_group_for_running(req.rid)
             if smc_probe_enabled:
                 append_smc_probe_record(
                     {
@@ -513,12 +524,16 @@ class SchedulerOutputProcessorMixin:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(result.num_correct_drafts_per_req_cpu)
+        model_worker = getattr(self, "model_worker", None)
+        if model_worker is not None:
+            model_worker.on_verify_complete_cpu(result.num_correct_drafts_per_req_cpu)
 
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
+        if stride is None:
+            stride = getattr(self.draft_worker, "speculative_num_draft_tokens", None)
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
         for i, req in enumerate(batch.reqs):
@@ -541,8 +556,9 @@ class SchedulerOutputProcessorMixin:
                 req.kv_committed_len -= 1
                 continue
 
-            # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
+            if not batch.spec_algorithm.is_smc():
+                # -1 because prepare_for_decode pre-claimed the bonus slot.
+                req.kv_committed_len += accept_lens[i] - 1
             req.spec_verify_ct += 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
@@ -550,6 +566,11 @@ class SchedulerOutputProcessorMixin:
             req.update_spec_correct_drafts_histogram(num_correct_drafts)
 
         return predict_tokens
+
+    def _resolve_spec_overlap_token_ids(
+        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> List[List[int]]:
+        return self._resolve_spec_overlap_tokens(result, batch)
 
     def process_batch_result_idle(
         self: Scheduler,
@@ -645,7 +666,7 @@ class SchedulerOutputProcessorMixin:
         for i, req in enumerate(batch.reqs):
             req: Req
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
+            if (self.enable_overlap or getattr(self, "enable_overlap_mlx", False)) and (
                 req.finished() or req.is_retracted
             ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
@@ -1319,7 +1340,7 @@ class SchedulerOutputProcessorMixin:
                     req.finished_len = len(req.output_ids)
                 should_output = True
             else:
-                if req.stream:
+                if getattr(req, "stream", False):
                     stream_interval = (
                         req.sampling_params.stream_interval or self.stream_interval
                     )
@@ -1477,12 +1498,12 @@ class SchedulerOutputProcessorMixin:
 
             if (
                 req.finished()
-                and self.attn_tp_rank == 0
+                and self.ps.attn_tp_rank == 0
                 and self.server_args.enable_request_time_stats_logging
             ):
                 req.log_time_stats()
 
-        dp_ranks = [self.dp_rank] * len(rids) if rids else None
+        dp_ranks = [self.ps.dp_rank] * len(rids) if rids else None
 
         # Send to detokenizer
         if reqs or is_idle_batch:

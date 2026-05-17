@@ -96,6 +96,10 @@ def _jit_nvfp4_indexer_module(
                     f"NVFP4IndexerQuantKernel<{args}>::hisa_block_topk",
                 ),
                 (
+                    "hisa_block_topk_map_all_indexer_cache_nvfp4",
+                    f"NVFP4IndexerQuantKernel<{args}>::hisa_block_topk_map_all",
+                ),
+                (
                     "hisa_candidate_pages_indexer_cache_nvfp4",
                     f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_pages",
                 ),
@@ -351,6 +355,41 @@ def hisa_block_topk_indexer_cache_nvfp4(
         block_scores, block_counts, block_topk_counts, top_blocks
     )
     return top_blocks
+
+
+@debug_kernel_api
+def hisa_block_topk_map_all_indexer_cache_nvfp4(
+    block_scores: torch.Tensor,
+    block_counts: torch.Tensor,
+    block_topk: int,
+    prefix_lens: torch.Tensor,
+    block_topk_counts: Optional[torch.Tensor] = None,
+    page_table_dtype: torch.dtype = torch.int32,
+    page_size: int = 64,
+) -> torch.Tensor:
+    block_scores = block_scores.contiguous()
+    if block_counts.dtype != torch.int32:
+        block_counts = block_counts.to(torch.int32)
+    block_counts = block_counts.contiguous()
+    if block_topk_counts is None:
+        block_topk_counts = torch.full_like(block_counts, block_topk)
+    elif block_topk_counts.dtype != torch.int32:
+        block_topk_counts = block_topk_counts.to(torch.int32)
+    block_topk_counts = block_topk_counts.contiguous()
+    if prefix_lens.dtype != torch.int32:
+        prefix_lens = prefix_lens.to(torch.int32)
+    prefix_lens = prefix_lens.contiguous()
+    topk_indices = torch.empty(
+        (block_scores.shape[0], block_topk * 128),
+        dtype=torch.int32,
+        device=block_scores.device,
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table_dtype, page_size
+    ).hisa_block_topk_map_all_indexer_cache_nvfp4(
+        block_scores, block_counts, block_topk_counts, prefix_lens, topk_indices
+    )
+    return topk_indices
 
 
 @debug_kernel_api
@@ -957,6 +996,28 @@ def nvfp4_hisa_indexer_paged_torch(
             topk_tokens=topk_tokens,
             compression_ratio=compression_ratio,
         )
+    candidate_len = effective_block_topk * block_size
+    if candidate_len == topk_tokens:
+        topk_indices = hisa_block_topk_map_all_indexer_cache_nvfp4(
+            block_scores,
+            block_counts,
+            block_topk=effective_block_topk,
+            block_topk_counts=block_topk_counts,
+            prefix_lens=prefix_lens.to(torch.int32),
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "block_topk_map_all",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            block_topk=effective_block_topk,
+            compression_ratio=compression_ratio,
+            fused_cuda=True,
+        )
+        return topk_indices
+
     top_blocks = hisa_block_topk_indexer_cache_nvfp4(
         block_scores,
         block_counts,
@@ -973,25 +1034,6 @@ def nvfp4_hisa_indexer_paged_torch(
         compression_ratio=compression_ratio,
         fused_cuda=True,
     )
-
-    candidate_len = effective_block_topk * block_size
-    if candidate_len == topk_tokens:
-        stage = _profile_start(q_values.device)
-        topk_indices = hisa_map_candidate_indices_indexer_cache_nvfp4(
-            top_blocks,
-            prefix_lens.to(torch.int32),
-            topk_tokens,
-            page_table_dtype=page_table.dtype,
-        )
-        _profile_end(
-            "candidate_map_all",
-            stage,
-            q_values.device,
-            rows=int(q_values.shape[0]),
-            candidate_len=candidate_len,
-            fused_cuda=True,
-        )
-        return topk_indices
 
     stage = _profile_start(q_values.device)
     candidate_logits, candidate_indices = hisa_candidate_score_indexer_cache_nvfp4(
@@ -1152,6 +1194,28 @@ def nvfp4_hisa_indexer_paged_deepgemm_precomputed(
             topk_tokens=topk_tokens,
             compression_ratio=compression_ratio,
         )
+    candidate_len = effective_block_topk * block_size
+    if candidate_len == topk_tokens:
+        topk_indices = hisa_block_topk_map_all_indexer_cache_nvfp4(
+            block_scores,
+            block_counts,
+            block_topk=effective_block_topk,
+            block_topk_counts=block_topk_counts,
+            prefix_lens=prefix_lens.to(torch.int32),
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "block_topk_map_all",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            block_topk=effective_block_topk,
+            compression_ratio=compression_ratio,
+            fused_cuda=True,
+        )
+        return topk_indices
+
     top_blocks = hisa_block_topk_indexer_cache_nvfp4(
         block_scores,
         block_counts,
@@ -1168,25 +1232,6 @@ def nvfp4_hisa_indexer_paged_deepgemm_precomputed(
         compression_ratio=compression_ratio,
         fused_cuda=True,
     )
-
-    candidate_len = effective_block_topk * block_size
-    if candidate_len == topk_tokens:
-        stage = _profile_start(q_values.device)
-        topk_indices = hisa_map_candidate_indices_indexer_cache_nvfp4(
-            top_blocks,
-            prefix_lens.to(torch.int32),
-            topk_tokens,
-            page_table_dtype=page_table.dtype,
-        )
-        _profile_end(
-            "candidate_map_all",
-            stage,
-            q_values.device,
-            rows=int(q_values.shape[0]),
-            candidate_len=candidate_len,
-            fused_cuda=True,
-        )
-        return topk_indices
 
     stage = _profile_start(q_values.device)
     candidate_page_table = hisa_candidate_pages_indexer_cache_nvfp4(
@@ -1411,6 +1456,28 @@ def nvfp4_hisa_indexer_paged_deepgemm(
             topk_tokens=topk_tokens,
             compression_ratio=compression_ratio,
         )
+    candidate_len = effective_block_topk * block_size
+    if candidate_len == topk_tokens:
+        topk_indices = hisa_block_topk_map_all_indexer_cache_nvfp4(
+            block_scores,
+            block_counts,
+            block_topk=effective_block_topk,
+            block_topk_counts=block_topk_counts,
+            prefix_lens=prefix_lens.to(torch.int32),
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "block_topk_map_all",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            block_topk=effective_block_topk,
+            compression_ratio=compression_ratio,
+            fused_cuda=True,
+        )
+        return topk_indices
+
     top_blocks = hisa_block_topk_indexer_cache_nvfp4(
         block_scores,
         block_counts,
@@ -1427,25 +1494,6 @@ def nvfp4_hisa_indexer_paged_deepgemm(
         compression_ratio=compression_ratio,
         fused_cuda=True,
     )
-
-    candidate_len = effective_block_topk * block_size
-    if candidate_len == topk_tokens:
-        stage = _profile_start(q_values.device)
-        topk_indices = hisa_map_candidate_indices_indexer_cache_nvfp4(
-            top_blocks,
-            prefix_lens.to(torch.int32),
-            topk_tokens,
-            page_table_dtype=page_table.dtype,
-        )
-        _profile_end(
-            "candidate_map_all",
-            stage,
-            q_values.device,
-            rows=int(q_values.shape[0]),
-            candidate_len=candidate_len,
-            fused_cuda=True,
-        )
-        return topk_indices
 
     stage = _profile_start(q_values.device)
     candidate_page_table = hisa_candidate_pages_indexer_cache_nvfp4(

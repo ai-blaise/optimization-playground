@@ -57,12 +57,11 @@ Correctness verification:
 * `test/srt/test_higgs_dense_2bit_kv_integration.py::test_higgs_split_k_matches_single_pass`: passed.
 * `test/srt/test_quantization_config_dispatch.py`: 33 passed.
 
-New incumbent commit: this round-1 commit.
+New incumbent commit: `24b868a7a`.
 
 ## Round 2: Pair-Lane Packed-Byte Broadcast
 
-Incumbent: round-1 commit `24b868a7a`/`eb70a3553` lineage, default `32`
-splits. The final round-1 commit is the parent of this round-2 commit.
+Incumbent: round-1 commit `24b868a7a`, default `32` splits.
 
 Hotspot/profile evidence: the same IKP stage1 attribution from round 0 still
 applies after the round-1 split retune: the dominant kernel is the stage1
@@ -111,4 +110,42 @@ Before/after measurement against incumbent, direct HIGGS JIT harness:
 Correctness verification: seeded checksum matched the incumbent
 (`-21.94557762145996`) and output was finite.
 
-New incumbent commit: this round-3 commit.
+New incumbent commit: `f2b9395d6`.
+
+## Round 4: Split-64 Default Candidate
+
+Incumbent: round-3 commit `f2b9395d6`.
+
+Hotspot/profile evidence: IKP still points at stage1 topk work as the expensive
+region, and split count directly controls stage1 parallelism. The round-1
+pre-sweep hinted that 64 splits can help batch-1 long-topk cases, so this
+candidate was re-tested after the round-2 and round-3 stage1 micro-optimizations.
+
+Candidate: make 64 splits the default. No source change was kept while testing;
+the direct HIGGS JIT harness passed `--splits 64` against the current source.
+
+Before/after measurement against incumbent:
+
+| Shape | 32-split incumbent | 64-split candidate | Decision |
+| --- | ---: | ---: | --- |
+| r1 h8 topk512 | 0.026746 ms | 0.026777 ms | Reject |
+| r1 h8 topk1024 | 0.036982 ms | 0.032908 ms | Improves |
+| r1 h8 topk2048 | 0.057457 ms | 0.043188 ms | Improves |
+| r4 h8 topk512 | 0.028902 ms | 0.034955 ms | Reject |
+| r4 h8 topk1024 | 0.039838 ms | 0.047196 ms | Reject |
+| r4 h8 topk2048 | 0.063759 ms | 0.069809 ms | Reject |
+| r16 h8 topk512 | 0.057416 ms | 0.061615 ms | Reject |
+| r16 h8 topk1024 | 0.094287 ms | 0.094782 ms | Reject |
+| r16 h8 topk2048 | 0.166992 ms | 0.162284 ms | Improves |
+
+Correctness verification: all split-64 runs produced finite output. Checksums
+differ slightly from split 32 because split-K merge order changes BF16 rounding,
+matching the existing split-vs-single tolerance model.
+
+Decision: reject 64 as a global default because it regresses the rows 4 and
+rows 16 decode-like shapes that motivated the B200 default. A future adaptive
+runtime split policy could target the batch-1 long-topk cases, but the current
+pool-level import path is blocked by the shared venv missing SM100
+`sgl_kernel.common_ops`, so this branch leaves no adaptive source change.
+
+New incumbent commit: unchanged, `f2b9395d6`.

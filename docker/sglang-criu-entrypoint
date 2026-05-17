@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 BlaiseAI / ai-blaise. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# sglang-criu-entrypoint is the SGLang worker container's entry point
+# when snapshot fast-start is enabled. If a CRIU image directory is
+# present at $SNAPSHOT_DIR/img, it execs `criu restore`. If not, it
+# falls through to the original command — that path is also how the
+# first snapshot is taken (before any snapshot exists).
+#
+# The agent's snapshot-pull initContainer is responsible for placing
+# the image directory and validating the fingerprint.
+
+set -euo pipefail
+
+SNAPSHOT_DIR=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --snapshot-dir=*)
+            SNAPSHOT_DIR="${1#*=}"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo "sglang-criu-entrypoint: unknown arg $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+SENTINEL="${SNAPSHOT_DIR}/img/inventory.img"
+if [[ -z "${SNAPSHOT_DIR}" || ! -f "${SENTINEL}" ]]; then
+    exec "$@"
+fi
+
+CRIU=${CRIU:-/opt/criu-snapshots/criu}
+PLUGINS=${PLUGINS:-/opt/criu-snapshots/plugins}
+exec "${CRIU}" restore \
+    -D "${SNAPSHOT_DIR}/img" \
+    -W "${SNAPSHOT_DIR}/logs" \
+    -v4 -o restore.log \
+    -d --restore-detached \
+    --shell-job \
+    --tcp-established \
+    --ext-unix-sk \
+    --file-locks \
+    --manage-cgroups full \
+    --lazy-pages \
+    --lib "${PLUGINS}"

@@ -29,6 +29,13 @@ from sglang.srt.utils.common import suppress_noisy_warnings
 
 suppress_noisy_warnings()
 
+# Side-effect import: when SGLANG_SNAPSHOT_HOOKS=1, this module's top-level
+# code registers SIGRTMIN+5 (pre_snapshot) and SIGRTMIN+6 (post_resume)
+# handlers used by the criu-snapshots agent. Doing it here, in the worker
+# scheduler's init, ensures the handlers exist before any traffic flows.
+# See https://github.com/ai-blaise/criu-snapshots.
+from sglang.srt import snapshot_hooks  # noqa: F401
+
 import psutil
 import setproctitle
 import torch

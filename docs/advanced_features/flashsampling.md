@@ -237,6 +237,35 @@ Subsequent rounds compare against this committed incumbent. The command shape wa
 | 6 | `2564780c6` target Blackwell | force `num_stages=3` | 0.052469 | 0.052031 | 0.053871 | reject: slower |
 | 7 | `2564780c6` target Blackwell | force `num_stages=2` | 0.080342 | 0.080238 | 0.083285 | reject: much slower |
 
+Restart round 8 accepted under the stricter close premise:
+
+- Incumbent: committed Blackwell target provider at `2564780c6`, with `BLOCK_H=16` for all `H <= 16`.
+- Candidate: keep `H=1` on `BLOCK_H=16`, but use `BLOCK_H=8` for small warmup/sweep buckets `2 <= H <= 8`. This avoids doing a 16-column MMA tile for multi-request buckets that only need 2-8 columns, while preserving the incumbent launch shape for `H=1`, `H=32`, and `H=64`.
+- Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 /root/agent-runs/gpu_locked.sh python - <<'PY'
+# paired CUDA-event benchmark; artifact:
+# /root/agent-runs/flashsampling-restart-round3-blockh2to8-final-paired-gpu1.json
+PY
+```
+
+| Batch | Incumbent old `BLOCK_H=16` ms | Candidate ms | Change | Decision |
+| ---: | ---: | ---: | ---: | :--- |
+| 2 | 0.045983 | 0.045243 | 1.61% faster | accept |
+| 4 | 0.045770 | 0.045088 | 1.49% faster | accept |
+| 8 | 0.045824 | 0.045118 | 1.54% faster | accept |
+| 32 | 0.047171 | 0.047173 | tie | neutral |
+| 64 | 0.049540 | 0.049684 | 0.29% slower, within noise for unchanged tile | neutral |
+
+Additional restart candidates rejected against the best accepted incumbent:
+
+| Candidate | Evidence | Decision |
+| :--- | :--- | :--- |
+| Force non-persistent target dispatch beyond one SM wave | H128 0.086338 ms vs incumbent 0.057755 ms; H256 0.161747 ms vs 0.084151 ms | reject: two-wave target grid rereads weights and is much slower |
+| Use `BLOCK_H=128` for H128/H256 buckets | H128 0.065801 ms vs incumbent 0.057755 ms; forced H256 0.123797 ms vs 0.084151 ms | reject: accumulator pressure outweighs fewer H tiles |
+| Add `maxnreg=255` launch hint | single run was noise-level (H1 0.046647 ms vs 0.046713 ms; H32 0.047221 ms vs 0.047225 ms) and did not explain the paired small-H win | reject: removed from source |
+
 All rejected candidates matched dense argmax correctness. No rejected kernel
 constant changes are left in source; these candidates were measured through the
 benchmark harness override flags. A dense matmul+argmax floor check on the same

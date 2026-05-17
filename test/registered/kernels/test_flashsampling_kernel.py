@@ -77,6 +77,17 @@ class TestFlashSamplingKernel(unittest.TestCase):
         self.assertTrue(torch.equal(samples.cpu(), expected_samples.cpu()))
         self.assertLessEqual((scores - expected_scores).abs().max().item(), 0.30)
 
+    def test_blackwell_block_h_uses_small_tile_for_warmup_buckets(self):
+        from sglang.srt.layers.flashsampling.target_kernel_blackwell import (
+            _block_h_blackwell,
+        )
+
+        self.assertEqual(_block_h_blackwell(1), 16)
+        self.assertEqual(_block_h_blackwell(2), 8)
+        self.assertEqual(_block_h_blackwell(8), 8)
+        self.assertEqual(_block_h_blackwell(32), 32)
+        self.assertEqual(_block_h_blackwell(64), 64)
+
     def test_debug_logits_match_dense_matmul(self):
         torch.cuda.set_device(0)
         torch.manual_seed(1)

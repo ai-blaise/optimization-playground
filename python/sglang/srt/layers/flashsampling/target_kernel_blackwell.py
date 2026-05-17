@@ -138,6 +138,12 @@ def _num_stages_blackwell(block_h: int) -> int:
     return 1
 
 
+def _block_h_blackwell(num_hidden_states: int) -> int:
+    if 1 < num_hidden_states <= 8:
+        return 8
+    return max(16, bsz_h(num_hidden_states))
+
+
 def fused_mm_sample_blackwell(
     weights: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -165,7 +171,7 @@ def fused_mm_sample_blackwell(
     NUM_SMS = num_sms_cached(weights.device.index)
 
     num_pid_v = triton.cdiv(V, _BLOCK_V_BLACKWELL)
-    BLOCK_H = max(16, bsz_h(H))
+    BLOCK_H = _block_h_blackwell(H)
     num_pid_h = triton.cdiv(H, BLOCK_H)
     total_tiles = num_pid_v * num_pid_h
 

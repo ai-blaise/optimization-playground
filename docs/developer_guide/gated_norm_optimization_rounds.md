@@ -293,6 +293,53 @@ Correctness verification: candidate output matched the Round 6 incumbent output 
 
 Decision: accept. New incumbent commit: this commit.
 
+## Round 8: rank 16-31 decode GEMM dispatch
+
+Incumbent: `a70c7376a` (Round 7 rank 8-15 mid-batch dispatch).
+
+Profiler/instrumentation: CUDA-event threshold sweep and accepted candidate comparison on B200 using per-GPU locks only around the CUDA benchmark execution. As in Rounds 6-7, this is a Python dispatch candidate between existing Triton and torch/cuBLAS paths, so same-device CUDA-event timing is the direct evidence.
+
+Hotspot/result: the rank 16-31 band still used Triton below 64 tokens. Fresh threshold sweeps showed torch/cuBLAS was consistently faster for those decode rows, and rows at 64+ tied because the incumbent already used torch/cuBLAS.
+
+Candidate: lower the default rank 16-31 torch/cuBLAS threshold from 64 tokens to 1 token. Rank 8-15 remains at 256 tokens; rank >=32 already uses 1 token from Round 6.
+
+Command and artifact:
+
+```bash
+/root/agent-runs/gpu_locked_any.sh python <rank16-threshold-candidate sweep>
+# /root/agent-runs/gatednorm-restart-round8-r16-accepted-bench.jsonl
+```
+
+Measured candidate versus Round 7 incumbent, median of 5 same-device CUDA-event repeats:
+
+| rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 16 | 1 | 0.038987 | 0.028026 | 1.39x | keep |
+| 16 | 4 | 0.038995 | 0.027562 | 1.41x | keep |
+| 16 | 8 | 0.038994 | 0.027550 | 1.42x | keep |
+| 16 | 16 | 0.038995 | 0.027719 | 1.41x | keep |
+| 16 | 32 | 0.038980 | 0.027881 | 1.40x | keep |
+| 16 | 64 | 0.028258 | 0.027712 | 1.02x | tie |
+| 16 | 128 | 0.028567 | 0.027952 | 1.02x | tie |
+| 24 | 1 | 0.042041 | 0.027973 | 1.50x | keep |
+| 24 | 4 | 0.042880 | 0.027660 | 1.55x | keep |
+| 24 | 8 | 0.043071 | 0.027704 | 1.55x | keep |
+| 24 | 16 | 0.043070 | 0.027785 | 1.55x | keep |
+| 24 | 32 | 0.043066 | 0.027729 | 1.55x | keep |
+| 24 | 64 | 0.028501 | 0.027869 | 1.02x | tie |
+| 24 | 128 | 0.028326 | 0.027689 | 1.02x | tie |
+| 31 | 1 | 0.106597 | 0.026793 | 3.98x | keep |
+| 31 | 4 | 0.108578 | 0.026668 | 4.07x | keep |
+| 31 | 8 | 0.108580 | 0.040025 | 2.71x | keep |
+| 31 | 16 | 0.108421 | 0.029739 | 3.65x | keep |
+| 31 | 32 | 0.108612 | 0.036944 | 2.94x | keep |
+| 31 | 64 | 0.037973 | 0.037974 | 1.00x | tie |
+| 31 | 128 | 0.039913 | 0.039884 | 1.00x | tie |
+
+Correctness verification: candidate output matched the Round 7 incumbent output with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` for every measured row.
+
+Decision: accept. New incumbent commit: this commit.
+
 ## Pre-restart stop evidence (superseded)
 
 Accepted incumbent before the stricter restart: `fbfb08dc9`, merged into `11922dcd9`. Final pre-restart profile command:

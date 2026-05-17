@@ -145,12 +145,27 @@ __device__ __forceinline__ void higgs_unpack_indices(
     const uint8_t* __restrict__ slot, int tid,
     uint32_t& i0, uint32_t& i1, uint32_t& i2, uint32_t& i3) {
   const int pair_within_group = tid >> 1;
+  const bool coord_lane = tid & 1;
   const int byte_in_group = pair_within_group >> 1;
   const int nibble = pair_within_group & 1;
-  const uint8_t b0 = slot[0 * 32 + byte_in_group];
-  const uint8_t b1 = slot[1 * 32 + byte_in_group];
-  const uint8_t b2 = slot[2 * 32 + byte_in_group];
-  const uint8_t b3 = slot[3 * 32 + byte_in_group];
+  uint32_t b0 = 0;
+  uint32_t b1 = 0;
+  uint32_t b2 = 0;
+  uint32_t b3 = 0;
+  if (!coord_lane) {
+    b0 = __ldg(slot + 0 * 32 + byte_in_group);
+    b1 = __ldg(slot + 1 * 32 + byte_in_group);
+    b2 = __ldg(slot + 2 * 32 + byte_in_group);
+    b3 = __ldg(slot + 3 * 32 + byte_in_group);
+  }
+  const uint32_t peer_b0 = __shfl_xor_sync(0xffffffff, b0, 1);
+  const uint32_t peer_b1 = __shfl_xor_sync(0xffffffff, b1, 1);
+  const uint32_t peer_b2 = __shfl_xor_sync(0xffffffff, b2, 1);
+  const uint32_t peer_b3 = __shfl_xor_sync(0xffffffff, b3, 1);
+  b0 = coord_lane ? peer_b0 : b0;
+  b1 = coord_lane ? peer_b1 : b1;
+  b2 = coord_lane ? peer_b2 : b2;
+  b3 = coord_lane ? peer_b3 : b3;
   i0 = nibble ? (b0 >> 4) : (b0 & 0x0F);
   i1 = nibble ? (b1 >> 4) : (b1 & 0x0F);
   i2 = nibble ? (b2 >> 4) : (b2 & 0x0F);

@@ -58,3 +58,28 @@ Correctness verification:
 * `test/srt/test_quantization_config_dispatch.py`: 33 passed.
 
 New incumbent commit: this round-1 commit.
+
+## Round 2: Pair-Lane Packed-Byte Broadcast
+
+Incumbent: round-1 commit `24b868a7a`/`eb70a3553` lineage, default `32`
+splits. The final round-1 commit is the parent of this round-2 commit.
+
+Hotspot/profile evidence: the same IKP stage1 attribution from round 0 still
+applies after the round-1 split retune: the dominant kernel is the stage1
+topk loop. Within that loop, both coordinate lanes for a 2-D HIGGS pair loaded
+the same packed byte from each of the four 32-byte latent groups.
+
+Candidate: only the even coordinate lane loads each packed byte, then broadcasts
+it to its paired odd lane using warp shuffle. This follows the Blackwell/CuTe
+guidance to reduce redundant scalar memory traffic in codec glue while leaving
+the larger tensor-op/CuTe rewrite for a layout-compatible path.
+
+Before/after measurement against incumbent, using the direct HIGGS JIT harness
+because the shared venv's `sgl_kernel` package currently lacks SM100
+`common_ops` and cannot import the pool stack:
+
+| Shape | Incumbent avg | Candidate avg | Speedup | Decision |
+| --- | ---: | ---: | ---: | --- |
+| r4 h8 topk1024 splits32 | 0.040624 ms | 0.040000 ms | 1.016x | Keep |
+
+Correctness verification: seeded direct-HIGGS output checksum matched the

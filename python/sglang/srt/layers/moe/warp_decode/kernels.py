@@ -105,9 +105,9 @@ def _triton_block_sizes(
 ) -> tuple[int, int, int, int]:
     if top_k == 8 and hidden_size >= 1024 and intermediate_size >= 2048:
         return (
-            min(8, intermediate_size),
+            min(4, intermediate_size),
             min(256, hidden_size),
-            min(8, hidden_size),
+            min(4, hidden_size),
             min(128, intermediate_size),
         )
     return (

@@ -23,6 +23,7 @@ _TORCH_MM_RANK_MIN_TOKENS_ENV = {
 }
 _USE_TRITON_ENV = "SGLANG_GATED_NORM_USE_TRITON"
 _DISABLE_CUTE_ENV = "SGLANG_GATED_NORM_DISABLE_CUTE"
+_SIGMOID_MUL_FUSE_MIN_TOKENS = 1024
 _gated_norm_cute_forward_op: Optional[Callable[..., torch.Tensor]] = None
 _gated_norm_cute_load_failed = False
 
@@ -225,6 +226,21 @@ def _gated_norm_forward_kernel(
         tl.store(output_ptr + token_idx * hidden_size + h, y * gate, mask=h_mask)
 
 
+@triton.jit
+def _sigmoid_mul_kernel(
+    normed_ptr,
+    logits_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    logits = tl.load(logits_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    normed = tl.load(normed_ptr + offsets, mask=mask, other=0.0)
+    gate = 1.0 / (1.0 + tl.exp(-logits))
+    tl.store(output_ptr + offsets, normed * gate, mask=mask)
+
 
 def _gated_norm_torch_mm_forward(
     flat_normed: torch.Tensor,
@@ -236,8 +252,19 @@ def _gated_norm_torch_mm_forward(
     z = torch.mm(flat_normed, w_down.t())
     F.silu(z, inplace=True)
     logits = torch.mm(z, w_up.t())
-    torch.sigmoid(logits, out=logits)
-    torch.mul(flat_normed, logits, out=output.reshape(-1, hidden_size))
+    flat_output = output.reshape(-1, hidden_size)
+    if flat_normed.shape[0] >= _SIGMOID_MUL_FUSE_MIN_TOKENS:
+        n_elements = flat_normed.numel()
+        _sigmoid_mul_kernel[(triton.cdiv(n_elements, 1024),)](
+            flat_normed,
+            logits,
+            flat_output,
+            n_elements,
+            BLOCK=1024,
+        )
+    else:
+        torch.sigmoid(logits, out=logits)
+        torch.mul(flat_normed, logits, out=flat_output)
     return output
 
 

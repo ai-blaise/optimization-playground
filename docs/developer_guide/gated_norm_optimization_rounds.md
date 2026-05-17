@@ -42,7 +42,7 @@ Neutral cases where both incumbent and candidate already used GEMM: rank 8/16/32
 
 Correctness verification: candidate output was checked against the incumbent output with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` for every measured row. Full pytest: `python -m pytest -q python/sglang/jit_kernel/tests/test_gated_norm.py`.
 
-New incumbent commit: pending in this branch as "Tune GatedNorm GEMM thresholds".
+New incumbent commit: `bb4aefed5` (`Tune GatedNorm GEMM thresholds`).
 
 ## CZS proof surface
 
@@ -55,3 +55,41 @@ python scripts/playground/verify_gated_norm_czs.py
 ```
 
 Result: 15 CZS obligations proved (9 layout legality, 2 vectorization, 4 ldmatrix legality). Caveat: CZS 0.4.1 does not model the inline `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` atom used by the hand-written CUDA path, so this proves the available shared-memory/vectorization/ldmatrix surface, not the legacy inline MMA atom itself.
+
+## Round 2: fuse GEMM epilogue sigmoid and multiply
+
+Incumbent: `bb4aefed5` (Round 1 GEMM threshold tuning).
+
+Profiler/instrumentation: Nsight Systems kernel summary on rank 16, 2048 tokens after Round 1. IKP was not used for this round because the hotspot spans PyTorch/cuBLAS launches and a PyTorch elementwise epilogue rather than a source-instrumentable in-repo CUDA kernel. Replacement evidence: `nsys stats --report cuda_gpu_kern_sum /root/agent-runs/gatednorm-nsys-round1.sqlite`.
+
+Hotspot/result: after threshold tuning, the torch/cuBLAS path still launched separate sigmoid and multiply kernels after the second GEMM. The epilogue accounted for a material share of GPU time; a single fused elementwise pass should remove one launch and one memory round trip.
+
+Candidate: add a Triton `_sigmoid_mul_kernel` and dispatch it only for torch-MM shapes with at least 1024 tokens. Keep the incumbent PyTorch epilogue for smaller shapes where the fused launch was previously measured as neutral or slower.
+
+Command:
+
+```bash
+/root/agent-runs/gpu_locked.sh bash -lc '. /root/.cargo/env; source /root/work/optimization-playground/.venv/bin/activate; export CUDA_HOME=/usr/local/cuda; export PATH=$CUDA_HOME/bin:$PATH; export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}; export PYTHONPATH=/root/work/op-kernel-gatednorm/python:/root/work/op-kernel-gatednorm/sgl-kernel/python:${PYTHONPATH:-}; CUDA_VISIBLE_DEVICES=0 python /tmp/gatednorm_round2_bench_fair.py'
+```
+
+Measured before/after versus the Round 1 incumbent with the same public `gated_norm_forward` entrypoint, toggling only the fusion threshold:
+
+| rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 8 | 512 | 0.028341 | 0.027942 | 1.014x | same, keep incumbent path |
+| 8 | 1024 | 0.037190 | 0.031888 | 1.166x | keep |
+| 8 | 2048 | 0.045937 | 0.032865 | 1.398x | keep |
+| 8 | 4096 | 0.086844 | 0.059510 | 1.459x | keep |
+| 16 | 512 | 0.027783 | 0.027777 | 1.000x | same, keep incumbent path |
+| 16 | 1024 | 0.035941 | 0.031191 | 1.152x | keep |
+| 16 | 2048 | 0.045909 | 0.032203 | 1.426x | keep |
+| 16 | 4096 | 0.085015 | 0.057963 | 1.467x | keep |
+| 32 | 512 | 0.027943 | 0.027736 | 1.007x | same, keep incumbent path |
+| 32 | 1024 | 0.035961 | 0.031127 | 1.155x | keep |
+| 32 | 2048 | 0.047616 | 0.033642 | 1.415x | keep |
+| 32 | 4096 | 0.084625 | 0.057524 | 1.471x | keep |
+
+Correctness verification: candidate output matched the incumbent output with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` for every measured row.
+
+Decision: accept. New incumbent commit: pending.
+

@@ -72,3 +72,20 @@ export LAYERSPLIT_EXT_BUILD_DIR=/tmp/layersplit_ext_round0
 - Result: accepted. The 128 KiB cells improved from 0.800x to 1.048x vs direct `Tensor.copy_`; average `cute_ms` improved from 3.681 us to 2.849 us. Larger 256 KiB and 512 KiB delegated cells stayed near the incumbent and remain outside the custom threshold.
 - Correctness: every benchmark cell checks `torch.equal(src, dst)`.
 - Decision: accept. New incumbent: Round 2 threshold commit.
+
+
+## Round 3: Direct Prefix `cudaMemcpyAsync` For Delegated Path
+
+- Incumbent: `be1dbd3ab4283b602bbfa3811584fe65bca00f15` (Round 2 accepted 128 KiB threshold commit).
+- Hotspot/profiler signal: after Round 2, payloads above 128 KiB still delegated through `Tensor.copy_` inside the C++ op and stayed below direct Python `copy_` because the op adds dispatch overhead before reaching the same copy primitive. The delegated path also copied the whole tensor rather than the `active_rows` prefix, which is wrong for larger staging buffers.
+- Candidate: replace the delegated contiguous path with `cudaMemcpyAsync(dst.data_ptr(), src.data_ptr(), active_rows * row_bytes, cudaMemcpyDeviceToDevice, stream)` so the C++ op copies the active prefix directly.
+- Command:
+
+```bash
+/root/agent-runs/gpu_locked.sh env CUDA_VISIBLE_DEVICES=0   python test/manual/layers/attention/nsa/bench_layersplit_stage.py   --load-local-extension --extension-name layersplit_cute_round3_memcpy   --rows 64,128,256,512 --row-bytes 512,1024,2048,4096   --warmup 50 --iters 1000
+/root/agent-runs/gpu_locked.sh env CUDA_VISIBLE_DEVICES=0   python test/manual/layers/attention/nsa/bench_layersplit_stage.py   --load-local-extension --extension-name layersplit_cute_round3_memcpy   --rows 64,128 --row-bytes 2048,4096 --padding-rows 1   --warmup 10 --iters 50
+```
+
+- Result: accepted. On overlapping >128 KiB delegated cells, speedup vs direct Python `copy_` improved from roughly 0.80x to 0.89x-0.93x, and the 262 KiB active-prefix correctness cells measured 1.34x-1.43x when Python `copy_` copied the same active prefix. This path is still not faster than direct `copy_` for all large contiguous payloads, so the win is primarily reduced delegated-path overhead plus correct active-prefix semantics.
+- Correctness: every benchmark cell checks `torch.equal(src[:rows], dst[:rows])`; the `--padding-rows 1` run also verifies inactive rows remain zero.
+- Decision: accept. New incumbent: Round 3 direct-prefix memcpy commit.

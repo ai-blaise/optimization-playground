@@ -56,6 +56,7 @@ def main():
     parser.add_argument("--load-local-extension", action="store_true")
     parser.add_argument("--extension-name", default="layersplit_cute_bench")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--padding-rows", type=int, default=0)
     args = parser.parse_args()
 
     import torch
@@ -74,28 +75,37 @@ def main():
 
     for rows in parse_int_list(args.rows):
         for row_bytes in parse_int_list(args.row_bytes):
+            storage_rows = rows + args.padding_rows
             src = torch.randint(
-                0, 256, (rows, row_bytes), dtype=torch.uint8, device=device
+                0, 256, (storage_rows, row_bytes), dtype=torch.uint8, device=device
             )
             dst = torch.empty_like(src)
 
             def copy_run():
-                dst.copy_(src)
+                dst[:rows].copy_(src[:rows])
 
             def cute_run():
                 op(src, dst, rows, row_bytes)
 
             copy_ms = time_ms(torch, copy_run, args.warmup, args.iters)
             cute_ms = time_ms(torch, cute_run, args.warmup, args.iters)
-            if not torch.equal(src, dst):
+            dst.fill_(0)
+            cute_run()
+            torch.cuda.synchronize()
+            if not torch.equal(src[:rows], dst[:rows]):
                 raise AssertionError(
                     f"LayerSplit stage mismatch for rows={rows}, row_bytes={row_bytes}"
+                )
+            if args.padding_rows and torch.any(dst[rows:] != 0):
+                raise AssertionError(
+                    f"LayerSplit stage overwrote inactive rows for rows={rows}, row_bytes={row_bytes}"
                 )
             result = {
                 "benchmark_kind": "layersplit_stage",
                 "rows": rows,
                 "row_bytes": row_bytes,
                 "total_bytes": rows * row_bytes,
+                "padding_rows": args.padding_rows,
                 "copy_ms": copy_ms,
                 "cute_ms": cute_ms,
                 "speedup_vs_copy": copy_ms / max(cute_ms, 1e-12),

@@ -494,11 +494,10 @@ void layersplit_stage_for_broadcast(
             return;
         }
 
-        // path 2: medium-large contiguous payloads delegate to
-        // dst.copy_(src) . cudaMemcpyAsync direct lost
-        // 15% at rows=32 in v1 r3 testing — dst.copy_ is faster for
-        // these sizes.
-        const_cast<at::Tensor&>(dst).copy_(src);
+        // Copy only the active row prefix; src and dst may be larger staging buffers.
+        C10_CUDA_CHECK(cudaMemcpyAsync(
+            dst.data_ptr(), src.data_ptr(), total_bytes,
+            cudaMemcpyDeviceToDevice, stream));
         return;
     }
 

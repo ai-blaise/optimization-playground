@@ -279,7 +279,7 @@ class HiSparseHiggsDense2BitNSATokenToKVPool(HiggsDense2BitNSATokenToKVPool):
         kv_cache_dim: int,
         higgs_execution_mode: str = "fused_decode",
         higgs_skip_layers: Optional[set] = None,
-        higgs_mla_decode_num_splits: int = 32,
+        higgs_mla_decode_num_splits: int = 0,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         indexer_quantization: str = INDEXER_FP8_QUANT_METHOD,

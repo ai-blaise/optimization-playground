@@ -111,15 +111,17 @@ The topk loop is sharded across `num_splits` blocks per
 log-sum-exp identity, normalizes by the global `l`, and runs the
 inverse FWHT_512.
 
-The `--higgs-mla-decode-num-splits` flag (default `32` after B200
-profiling) controls how aggressively the topk loop
-is parallelized:
+The `--higgs-mla-decode-num-splits` flag controls how aggressively
+the topk loop is parallelized:
 
-* `--higgs-mla-decode-num-splits=32` (default) — split-K decode.
+* `--higgs-mla-decode-num-splits=0` (default) — B200 auto policy.
+  Uses the fixed-32 incumbent for shapes where extra split overhead
+  regresses, and selects 64 or 128 splits for measured long-topk
+  shapes where additional stage1 parallelism wins.
+* `--higgs-mla-decode-num-splits=32` — fixed split-K decode.
   Restores throughput at small batch sizes (b=1..16) where the
   topk-reduction loop in the single-pass kernel would otherwise
-  starve SMs. Required for TTFT-sensitive paths and single-user
-  decode.
+  starve SMs. Useful when deployments need a fully fixed split count.
 * `--higgs-mla-decode-num-splits=1` — single-pass kernel. Acceptable
   when `num_rows * num_heads` already saturates the GPU (typically
   at large batches); avoids the small `mid` scratch

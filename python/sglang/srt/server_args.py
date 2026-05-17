@@ -585,7 +585,7 @@ class ServerArgs:
     turboquant_execution_mode: str = "fused_decode"
     turboquant_mla_decode_num_splits: int = 16
     enable_higgs_dense_2bit_kv_cache: bool = False
-    higgs_mla_decode_num_splits: int = 32
+    higgs_mla_decode_num_splits: int = 0
     indexer_quantization_declared: Optional[Dict[str, Any]] = None
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
@@ -5746,9 +5746,9 @@ class ServerArgs:
             default=ServerArgs.higgs_mla_decode_num_splits,
             type=int,
             help="Number of sequence splits for the 2-bit HIGGS fused dense "
-            "MLA decode kernel. Default 32 matches B200 split-K tuning "
-            "for decode-like topk shapes. Set to 1 "
-            "to fall back to the single-pass kernel.",
+            "MLA decode kernel. Default 0 selects the B200 auto-tuned "
+            "split policy. Set to 1 to fall back to the single-pass kernel, "
+            "or to a positive value to force a fixed split count.",
         )
         parser.set_defaults(
             indexer_quantization_declared=ServerArgs.indexer_quantization_declared
@@ -7599,9 +7599,9 @@ class ServerArgs:
                 )
             if self.kv_cache_dtype == "auto":
                 self.kv_cache_dtype = "bfloat16"
-            if self.higgs_mla_decode_num_splits <= 0:
+            if self.higgs_mla_decode_num_splits < 0:
                 raise ValueError(
-                    "--higgs-mla-decode-num-splits must be positive."
+                    "--higgs-mla-decode-num-splits must be non-negative."
                 )
 
         assert (

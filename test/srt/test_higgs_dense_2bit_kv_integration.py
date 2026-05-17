@@ -125,6 +125,25 @@ def _make_turboquant_pool(
     )
 
 
+def test_higgs_auto_split_policy_from_b200_probe():
+    """Auto split policy preserves fixed-32 cases and long-topk wins."""
+
+    from sglang.srt.layers.quantization.higgs_dense_2bit_kv import (
+        select_higgs_mla_decode_num_splits,
+    )
+
+    select = select_higgs_mla_decode_num_splits
+    assert select(1, 8, 512) == 32
+    assert select(1, 8, 1024) == 64
+    assert select(1, 8, 2048) == 64
+    assert select(1, 8, 4096) == 128
+    assert select(4, 8, 4096) == 32
+    assert select(8, 8, 1024) == 64
+    assert select(16, 8, 2048) == 64
+    assert select(32, 8, 4096) == 64
+    assert select(64, 8, 4096) == 32
+
+
 @pytest.mark.skipif(not cuda_available, reason="requires CUDA")
 def test_higgs_pool_slot_layout():
     """Pool reports 258 B/slot/layer as designed."""

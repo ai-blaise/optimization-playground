@@ -80,6 +80,7 @@ from sglang.srt.layers.quantization.turboquant_dense_kv import (
 from sglang.srt.layers.quantization.higgs_dense_2bit_kv import (
     HiggsDense2BitCodec,
     HiggsDense2BitConfig,
+    select_higgs_mla_decode_num_splits,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
@@ -3278,7 +3279,7 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
         *args,
         higgs_execution_mode: str = "fused_decode",
         higgs_skip_layers: Optional[set[int]] = None,
-        higgs_mla_decode_num_splits: int = 32,
+        higgs_mla_decode_num_splits: int = 0,
         **kwargs,
     ):
         self.higgs_execution_mode = higgs_execution_mode
@@ -3291,9 +3292,9 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
         self.higgs_dense_2bit_preset = "eden2_16"
         self.higgs_skip_layers = higgs_skip_layers or set()
         self.higgs_mla_decode_num_splits = int(higgs_mla_decode_num_splits)
-        if self.higgs_mla_decode_num_splits < 1:
+        if self.higgs_mla_decode_num_splits < 0:
             raise ValueError(
-                "higgs_mla_decode_num_splits must be >= 1; "
+                "higgs_mla_decode_num_splits must be >= 0; "
                 f"got {self.higgs_mla_decode_num_splits}."
             )
         # Lazily-allocated scratch buffers for the split-K decode path.
@@ -3492,7 +3493,9 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
             dtype=self.dtype,
             device=q_nope.device,
         )
-        num_splits = self.higgs_mla_decode_num_splits
+        num_splits = self._select_higgs_mla_decode_num_splits(
+            q_nope.shape[0], q_nope.shape[1], page_table.shape[1]
+        )
         if num_splits <= 1:
             higgs_dense_2bit_mla_decode(
                 q_nope,
@@ -3545,6 +3548,19 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
             sm_scale,
         )
         return out
+
+    @staticmethod
+    def _auto_higgs_mla_decode_num_splits(
+        num_rows: int, num_heads: int, topk: int
+    ) -> int:
+        return select_higgs_mla_decode_num_splits(num_rows, num_heads, topk)
+
+    def _select_higgs_mla_decode_num_splits(
+        self, num_rows: int, num_heads: int, topk: int
+    ) -> int:
+        if self.higgs_mla_decode_num_splits > 0:
+            return self.higgs_mla_decode_num_splits
+        return self._auto_higgs_mla_decode_num_splits(num_rows, num_heads, topk)
 
     def set_kv_buffer(
         self,

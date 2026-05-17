@@ -8,8 +8,10 @@ Hardware: 1x NVIDIA B200 on `root@31.22.104.123`, CUDA 12.8 driver stack.
 
 IKP source: `/root/work/rule7-refs/intra-kernel-profiler`.
 
-GPU commands were run through `/root/agent-runs/gpu_locked.sh` with
-`CUDA_VISIBLE_DEVICES=0` and `/root/work/optimization-playground/.venv`.
+Initial GPU commands were run through `/root/agent-runs/gpu_locked.sh` with
+explicit `CUDA_VISIBLE_DEVICES`; reopened runs used the per-GPU locks in
+`/root/agent-runs/gpu_locked.sh` and `/root/agent-runs/gpu_locked_any.sh` so
+both B200s could stay busy without sharing one measurement lock.
 
 ## Round 0: Incumbent
 
@@ -149,3 +151,71 @@ pool-level import path is blocked by the shared venv missing SM100
 `sgl_kernel.common_ops`, so this branch leaves no adaptive source change.
 
 New incumbent commit: unchanged, `f2b9395d6`.
+
+## Restart Round 5: Auto Split Policy
+
+Incumbent: round-4 branch head `01f37e9ad`, code incumbent `f2b9395d6`
+with a fixed default of 32 splits.
+
+Hotspot/profile evidence: prior IKP/nsys still attributes the dominant
+work to the stage1 split kernel (`45.591 us` mean and 85.8% of HIGGS GPU
+time for the r4 h8 topk1024 default-16 baseline). Split count directly
+changes stage1 parallelism, while stage2 merge overhead grows with the
+number of splits. The round-4 rejection showed 64 was not a safe global
+default, so the reopened candidate first expanded the split probe to
+cover 32/64/128 splits, rows `1/4/8/16/32`, and topk `512/1024/2048/4096`.
+
+Candidate: make `--higgs-mla-decode-num-splits=0` the default auto mode
+and keep positive values as fixed overrides. The auto policy chooses:
+
+* 128 splits for `rows*heads <= 8` and `topk >= 4096`.
+* 64 splits for `rows*heads <= 8` and `topk >= 1024`.
+* 64 splits for `rows*heads == 64` and `topk >= 1024`.
+* 64 splits for `64 <= rows*heads <= 128` and `topk >= 2048`.
+* 64 splits for `64 <= rows*heads <= 256` and `topk >= 4096`.
+* 32 splits otherwise.
+
+Direct HIGGS JIT split-probe evidence against the fixed-32 incumbent:
+
+| Shape | 32 split | 64 split | 128 split | Auto decision |
+| --- | ---: | ---: | ---: | --- |
+| r1 h8 topk512 | 0.026742 ms | 0.026725 ms | 0.034943 ms | 32 |
+| r1 h8 topk1024 | 0.036938 ms | 0.032844 ms | 0.038996 ms | 64 |
+| r1 h8 topk2048 | 0.057444 ms | 0.043131 ms | 0.045149 ms | 64 |
+| r1 h8 topk4096 | 0.098394 ms | 0.064702 ms | 0.056004 ms | 128 |
+| r4 h8 topk1024 | 0.039806 ms | 0.046937 ms | 0.055129 ms | 32 |
+| r4 h8 topk2048 | 0.063600 ms | 0.069696 ms | 0.073488 ms | 32 |
+| r4 h8 topk4096 | 0.109355 ms | 0.114911 ms | 0.110337 ms | 32 |
+| r8 h8 topk1024 | 0.064491 ms | 0.061534 ms | 0.073738 ms | 64 |
+| r8 h8 topk2048 | 0.109683 ms | 0.098652 ms | 0.106674 ms | 64 |
+| r8 h8 topk4096 | 0.200518 ms | 0.171064 ms | 0.174230 ms | 64 |
+| r16 h8 topk1024 | 0.094365 ms | 0.094485 ms | 0.108833 ms | 32 |
+| r16 h8 topk2048 | 0.167424 ms | 0.161996 ms | 0.174552 ms | 64 |
+| r16 h8 topk4096 | 0.313301 ms | 0.296960 ms | 0.305236 ms | 64 |
+| r32 h8 topk2048 | 0.292929 ms | 0.294818 ms | 0.315097 ms | 32 |
+| r32 h8 topk4096 | 0.562323 ms | 0.555752 ms | 0.571687 ms | 64 |
+
+Pool-level before/after measurement using `splits=0,32`:
+
+| Shape | Fixed-32 incumbent | Auto candidate | Speedup | Correctness |
+| --- | ---: | ---: | ---: | --- |
+| r1 h8 topk1024 | 0.037023 ms | 0.032945 ms | 1.124x | max_abs 2.98e-08, min_cos 0.99999988 |
+| r1 h8 topk2048 | 0.057498 ms | 0.043172 ms | 1.332x | max_abs 1.53e-05, min_cos 0.99999988 |
+| r1 h8 topk4096 | 0.098443 ms | 0.057543 ms | 1.711x | max_abs 6.10e-05, min_cos 0.99999994 |
+| r4 h8 topk1024 | 0.040662 ms | 0.040420 ms | 1.006x | exact vs auto ref |
+| r4 h8 topk2048 | 0.064948 ms | 0.064624 ms | 1.005x | exact vs auto ref |
+| r4 h8 topk4096 | 0.110449 ms | 0.109948 ms | 1.005x | exact vs auto ref |
+| r8 h8 topk1024 | 0.064970 ms | 0.061618 ms | 1.054x | max_abs 2.44e-04, min_cos 0.99999988 |
+| r8 h8 topk2048 | 0.109852 ms | 0.098540 ms | 1.115x | max_abs 2.44e-04, min_cos 0.99999982 |
+| r8 h8 topk4096 | 0.200157 ms | 0.171649 ms | 1.166x | max_abs 2.44e-04, min_cos 0.99999982 |
+| r16 h8 topk2048 | 0.167461 ms | 0.162080 ms | 1.033x | max_abs 2.44e-04, min_cos 0.99999982 |
+| r16 h8 topk4096 | 0.313612 ms | 0.297313 ms | 1.055x | max_abs 2.44e-04, min_cos 0.99999982 |
+| r32 h8 topk4096 | 0.562692 ms | 0.555700 ms | 1.013x | max_abs 2.44e-04, min_cos 0.99999982 |
+
+Rejected sub-candidates: a global split-64 default remains rejected because
+rows=4 regresses; 128 splits are rejected except for the single-row topk4096
+corner because they regress topk512/1024 and rows>=8 shapes.
+
+Decision: keep. The candidate improves the long-topk and rows=8/16 cases
+without sacrificing the rows=4 fixed-32 guardrail, and manual fixed split
+counts remain deployable by passing a positive value.

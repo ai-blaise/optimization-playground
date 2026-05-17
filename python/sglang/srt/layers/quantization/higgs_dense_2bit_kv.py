@@ -84,6 +84,30 @@ HIGGS_HADAMARD_ORDER = 512  # block size for the rotation
 HIGGS_NORM_BYTES = 2  # fp16 scale per token
 
 
+def select_higgs_mla_decode_num_splits(
+    num_rows: int, num_heads: int, topk: int
+) -> int:
+    """B200 auto policy for HIGGS fused MLA split-K decode."""
+
+    row_head_ctas = int(num_rows) * int(num_heads)
+    topk = int(topk)
+
+    if topk >= 4096:
+        if row_head_ctas <= 8:
+            return 128
+        if 64 <= row_head_ctas <= 256:
+            return 64
+        return 32
+    if topk >= 2048:
+        if row_head_ctas <= 8 or 64 <= row_head_ctas <= 128:
+            return 64
+        return 32
+    if topk >= 1024:
+        if row_head_ctas <= 8 or row_head_ctas == 64:
+            return 64
+    return 32
+
+
 def _fwht(x: torch.Tensor) -> torch.Tensor:
     """Orthonormal Fast Walsh-Hadamard transform on the trailing dim.
 

@@ -465,6 +465,10 @@ void layersplit_stage_for_broadcast(
 
     if (active_rows <= 0) return;
 
+    TORCH_CHECK(src.is_cuda(), "src must be a CUDA tensor");
+    TORCH_CHECK(dst.is_cuda(), "dst must be a CUDA tensor");
+    TORCH_CHECK(row_bytes % 8 == 0, "row_bytes must be divisible by 8");
+
     if (__builtin_expect(src.is_contiguous() && dst.is_contiguous(), 1)) {
         const int64_t total_bytes = active_rows * row_bytes;
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -497,10 +501,6 @@ void layersplit_stage_for_broadcast(
         const_cast<at::Tensor&>(dst).copy_(src);
         return;
     }
-
-    TORCH_CHECK(src.is_cuda(), "src must be a CUDA tensor");
-    TORCH_CHECK(dst.is_cuda(), "dst must be a CUDA tensor");
-    TORCH_CHECK(row_bytes % 8 == 0, "row_bytes must be divisible by 8");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 

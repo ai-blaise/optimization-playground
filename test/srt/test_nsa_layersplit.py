@@ -278,3 +278,9 @@ def test_layersplit_server_arg_validation_accepts_prefill_cp_configs(
     validate_layersplit_server_args(
         **valid_layersplit_args(attn_cp_size=attn_cp_size)
     )
+
+
+def test_layersplit_cute_kernel_is_packaged():
+    cmake = (ROOT / "sgl-kernel/CMakeLists.txt").read_text()
+
+    assert '"csrc/kvcacheio/layersplit_cute.cu"' in cmake

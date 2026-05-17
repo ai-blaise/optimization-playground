@@ -11,7 +11,7 @@ The implementation is based on:
 - [FlashSampling/FlashSampling](https://github.com/FlashSampling/FlashSampling)
 
 Canonical B200 optimization results are tracked in
-[FlashSampling B200, 2026-05-17](../developer_guide/kernel_results/flashsampling_b200_2026_05_17.md).
+[FlashSampling](../developer_guide/kernel_results/flashsampling.md).
 
 ## Enabling
 

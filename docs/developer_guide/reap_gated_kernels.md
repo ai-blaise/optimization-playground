@@ -9,8 +9,8 @@ deployment lane:
 
 Canonical B200 optimization results are tracked in:
 
-- [G1 gate B200, 2026-05-17](kernel_results/g1_gate_b200_2026_05_17.md)
-- [GatedNorm B200, 2026-05-17](kernel_results/gated_norm_b200_2026_05_17.md)
+- [G1 gate](kernel_results/g1_gate.md)
+- [GatedNorm](kernel_results/gated_norm.md)
 
 ## G1 Attention Gate
 

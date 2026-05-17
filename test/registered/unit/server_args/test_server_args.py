@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
@@ -191,6 +192,39 @@ class TestFlashSamplingArgs(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "must be at least"):
             server_args._handle_flashsampling()
+
+
+class TestNSAIndexerModelOverrides(unittest.TestCase):
+    def test_higgs_dense_kv_auto_dtype_resolves_to_bfloat16(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.enable_higgs_dense_2bit_kv_cache = True
+
+        server_args._set_default_nsa_kv_cache_dtype(major=10, quantization=None)
+
+        self.assertEqual(server_args.kv_cache_dtype, "bfloat16")
+
+    def test_overrides_sync_to_loaded_hf_config(self):
+        server_args = ServerArgs(model_path="dummy")
+        hf_config = SimpleNamespace()
+        server_args.model_config = SimpleNamespace(hf_config=hf_config)
+        server_args.nsa_indexer_mode = "indexcache-hisa"
+        server_args.nsa_indexcache_freq = 4
+        server_args.hisa_block_size = 128
+        server_args.hisa_block_topk = 64
+        server_args.hisa_compression_ratio = 4.0
+        server_args.hisa_min_seq_len = 65536
+        server_args.hisa_execution_mode = "optimized"
+        server_args.enable_nsa_nvfp4_hisa = True
+
+        server_args._handle_nsa_indexer_model_overrides()
+
+        overrides = json.loads(server_args.json_model_override_args)
+        self.assertEqual(overrides["nsa_indexer_mode"], "indexcache-hisa")
+        self.assertEqual(overrides["index_topk_freq"], 4)
+        self.assertTrue(overrides["enable_nsa_nvfp4_hisa"])
+        self.assertEqual(hf_config.nsa_indexer_mode, "indexcache-hisa")
+        self.assertEqual(hf_config.index_topk_freq, 4)
+        self.assertTrue(hf_config.enable_nsa_nvfp4_hisa)
 
 
 class TestPortArgs(unittest.TestCase):

@@ -1219,8 +1219,23 @@ class ServerArgs:
             self.prefill_delayer_token_usage_low_watermark = x
 
     def _handle_nsa_indexer_model_overrides(self):
-        if self.nsa_indexer_mode == "vanilla":
+        overrides = self._get_nsa_indexer_model_overrides()
+        if not overrides:
             return
+
+        model_override_args = json.loads(self.json_model_override_args)
+        model_override_args.update(overrides)
+        self.json_model_override_args = json.dumps(model_override_args)
+
+        model_config = getattr(self, "model_config", None)
+        if model_config is not None:
+            hf_config = model_config.hf_config
+            for key, value in overrides.items():
+                setattr(hf_config, key, value)
+
+    def _get_nsa_indexer_model_overrides(self):
+        if self.nsa_indexer_mode == "vanilla":
+            return {}
 
         if self.hisa_block_size <= 0:
             raise ValueError("--hisa-block-size must be positive.")
@@ -1231,7 +1246,7 @@ class ServerArgs:
         if self.hisa_min_seq_len <= 0:
             raise ValueError("--hisa-min-seq-len must be positive.")
 
-        overrides = json.loads(self.json_model_override_args)
+        overrides = {}
         overrides["nsa_indexer_mode"] = self.nsa_indexer_mode
         overrides["hisa_block_size"] = self.hisa_block_size
         overrides["hisa_block_topk"] = self.hisa_block_topk
@@ -1247,7 +1262,7 @@ class ServerArgs:
             else:
                 overrides["index_topk_freq"] = self.nsa_indexcache_freq
 
-        self.json_model_override_args = json.dumps(overrides)
+        return overrides
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -1774,10 +1789,17 @@ class ServerArgs:
                 "DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
             )
 
-        if self.enable_turboquant_dense_kv_cache and self.kv_cache_dtype == "auto":
+        if (
+            self.enable_turboquant_dense_kv_cache
+            or self.enable_higgs_dense_2bit_kv_cache
+        ) and self.kv_cache_dtype == "auto":
             self.kv_cache_dtype = "bfloat16"
+            dense_kv_name = (
+                "TurboQuant" if self.enable_turboquant_dense_kv_cache else "HIGGS"
+            )
             logger.warning(
-                "Setting KV cache dtype to bfloat16 for TurboQuant dense MLA KV."
+                "Setting KV cache dtype to bfloat16 for %s dense MLA KV.",
+                dense_kv_name,
             )
         elif self.kv_cache_dtype == "auto":
             if major >= 10:
@@ -1789,12 +1811,13 @@ class ServerArgs:
             )
         if self.kv_cache_dtype == "bf16":
             self.kv_cache_dtype = "bfloat16"
-        if (
-            self.enable_turboquant_dense_kv_cache
-            and self.kv_cache_dtype != "bfloat16"
-        ):
+        if self.enable_turboquant_dense_kv_cache and self.kv_cache_dtype != "bfloat16":
             raise ValueError(
                 "TurboQuant dense MLA KV currently requires --kv-cache-dtype=bfloat16."
+            )
+        if self.enable_higgs_dense_2bit_kv_cache and self.kv_cache_dtype != "bfloat16":
+            raise ValueError(
+                "HIGGS dense MLA KV currently requires --kv-cache-dtype=bfloat16."
             )
         assert self.kv_cache_dtype in [
             "bfloat16",
@@ -1869,6 +1892,7 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         apply_quantization_config_dispatch(self, hf_config)
+        self._handle_nsa_indexer_model_overrides()
         model_arch = hf_config.architectures[0]
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
@@ -1959,9 +1983,7 @@ class ServerArgs:
                         if self.attn_cp_size == 1:
                             self.attn_cp_size = max_attn_cp_size
                         else:
-                            assert (
-                                max_attn_cp_size % self.attn_cp_size == 0
-                            ), (
+                            assert max_attn_cp_size % self.attn_cp_size == 0, (
                                 "attn_cp_size must divide tp_size // dp_size for "
                                 "DeepSeek DSA context parallelism."
                             )
@@ -2915,11 +2937,8 @@ class ServerArgs:
                     "TokenSpeed MLA NSA backend is only supported on SM100 GPUs. "
                     "Please use a different NSA backend on this device."
                 )
-            if (
-                "tokenspeed_mla"
-                not in NSA_PREFILL_BACKENDS_BY_KV_DTYPE.get(
-                    nsa_tokenspeed_kv_dtype, set()
-                )
+            if "tokenspeed_mla" not in NSA_PREFILL_BACKENDS_BY_KV_DTYPE.get(
+                nsa_tokenspeed_kv_dtype, set()
             ):
                 raise ValueError(
                     "TokenSpeed MLA NSA selected-page integration currently "
@@ -7477,9 +7496,7 @@ class ServerArgs:
                 ),
                 attn_cp_size=self.attn_cp_size,
                 disaggregation_mode=self.disaggregation_mode,
-                disaggregation_transfer_backend=(
-                    self.disaggregation_transfer_backend
-                ),
+                disaggregation_transfer_backend=(self.disaggregation_transfer_backend),
                 all_cp_ranks_transfer=(
                     envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
                 ),
@@ -7562,9 +7579,7 @@ class ServerArgs:
             if self.turboquant_residual_window_size <= 0:
                 raise ValueError("--turboquant-residual-window-size must be positive.")
             if self.turboquant_mla_decode_num_splits <= 0:
-                raise ValueError(
-                    "--turboquant-mla-decode-num-splits must be positive."
-                )
+                raise ValueError("--turboquant-mla-decode-num-splits must be positive.")
             validate_turboquant_dense_kv_preset(self.turboquant_dense_kv_preset)
             if self.turboquant_skip_layers:
                 for layer_id in self.turboquant_skip_layers.split(","):
@@ -7600,9 +7615,7 @@ class ServerArgs:
             if self.kv_cache_dtype == "auto":
                 self.kv_cache_dtype = "bfloat16"
             if self.higgs_mla_decode_num_splits <= 0:
-                raise ValueError(
-                    "--higgs-mla-decode-num-splits must be positive."
-                )
+                raise ValueError("--higgs-mla-decode-num-splits must be positive.")
 
         assert (
             self.schedule_conservativeness >= 0

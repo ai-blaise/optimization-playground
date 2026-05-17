@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -9,7 +9,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernel_api_logging import debug_kernel_api
-
 
 _MAX_BLOCK_H = 128
 _MAX_BLOCK_R = 64
@@ -22,6 +21,11 @@ _TORCH_MM_RANK_MIN_TOKENS_ENV = {
     32: "SGLANG_GATED_NORM_TORCH_MM_R32_MIN_TOKENS",
     64: "SGLANG_GATED_NORM_TORCH_MM_R64_MIN_TOKENS",
 }
+_USE_TRITON_ENV = "SGLANG_GATED_NORM_USE_TRITON"
+_DISABLE_CUTE_ENV = "SGLANG_GATED_NORM_DISABLE_CUTE"
+_SIGMOID_MUL_FUSE_MIN_TOKENS = 1024
+_gated_norm_cute_forward_op: Optional[Callable[..., torch.Tensor]] = None
+_gated_norm_cute_load_failed = False
 
 
 def _next_power_of_2(value: int, maximum: int) -> int:
@@ -35,8 +39,7 @@ def _parse_min_tokens(raw: str | None, default: int) -> int:
         value = int(raw)
     except ValueError as exc:
         raise ValueError(
-            "GatedNorm torch-MM token thresholds must be integers; "
-            f"got {raw!r}"
+            f"GatedNorm torch-MM token thresholds must be integers; got {raw!r}"
         ) from exc
     if value < 0:
         return _NEVER_USE_TORCH_MM
@@ -44,12 +47,16 @@ def _parse_min_tokens(raw: str | None, default: int) -> int:
 
 
 def _default_torch_mm_min_tokens(rank: int) -> int:
-    if rank >= 64:
-        return 256
     if rank >= 32:
-        return 512
+        return 1
+    if rank >= 16:
+        return 1
     if rank >= 8:
-        return 2048
+        return 16
+    if rank >= 5:
+        return 64
+    if rank == 1:
+        return 1
     if rank >= 1:
         return 4096
     return _NEVER_USE_TORCH_MM
@@ -74,6 +81,50 @@ def _should_use_torch_mm(num_tokens: int, rank: int) -> bool:
     return num_tokens >= _torch_mm_min_tokens(rank)
 
 
+def _cute_declines_shape(num_tokens: int, rank: int) -> bool:
+    if rank > 48 and num_tokens >= 16:
+        return True
+    return rank > 16 and rank <= 48 and num_tokens >= 4096
+
+
+def _device_supports_cute(tensor: torch.Tensor) -> bool:
+    major, _ = torch.cuda.get_device_capability(tensor.device)
+    return major >= 10
+
+
+def _load_gated_norm_cute_forward() -> Optional[Callable[..., torch.Tensor]]:
+    global _gated_norm_cute_forward_op, _gated_norm_cute_load_failed
+    if os.getenv(_DISABLE_CUTE_ENV) == "1":
+        return None
+    if _gated_norm_cute_forward_op is not None:
+        return _gated_norm_cute_forward_op
+    if _gated_norm_cute_load_failed:
+        return None
+    try:
+        from sgl_kernel import gated_norm_cute_forward
+    except (ImportError, RuntimeError, AttributeError):
+        _gated_norm_cute_load_failed = True
+        return None
+    _gated_norm_cute_forward_op = gated_norm_cute_forward
+    return _gated_norm_cute_forward_op
+
+
+def _gated_norm_cute_forward(
+    flat_normed: torch.Tensor,
+    w_down: torch.Tensor,
+    w_up: torch.Tensor,
+    output: torch.Tensor,
+    hidden_size: int,
+) -> bool:
+    if flat_normed.dtype != _SUPPORTED_DTYPE or not _device_supports_cute(flat_normed):
+        return False
+    op = _load_gated_norm_cute_forward()
+    if op is None:
+        return False
+    op(flat_normed, w_down, w_up, out=output.reshape(-1, hidden_size))
+    return True
+
+
 def _validate_gated_norm_inputs(
     normed: torch.Tensor,
     w_down: torch.Tensor,
@@ -83,7 +134,9 @@ def _validate_gated_norm_inputs(
     if not normed.is_cuda or not w_down.is_cuda or not w_up.is_cuda:
         raise RuntimeError("gated_norm_forward requires CUDA tensors")
     if normed.dim() < 2:
-        raise ValueError(f"normed must have at least 2 dimensions, got {tuple(normed.shape)}")
+        raise ValueError(
+            f"normed must have at least 2 dimensions, got {tuple(normed.shape)}"
+        )
     if normed.dtype != _SUPPORTED_DTYPE:
         raise TypeError(f"normed must have dtype bf16; got {normed.dtype}")
     if w_down.dtype != normed.dtype or w_up.dtype != normed.dtype:
@@ -112,15 +165,21 @@ def _validate_gated_norm_inputs(
             f"got {w_down.shape[0]} and {w_up.shape[1]}"
         )
     if rank <= 0 or rank > _MAX_BLOCK_R:
-        raise ValueError(f"gated_norm_forward supports 1 <= rank <= {_MAX_BLOCK_R}; got {rank}")
+        raise ValueError(
+            f"gated_norm_forward supports 1 <= rank <= {_MAX_BLOCK_R}; got {rank}"
+        )
 
     if out is not None:
         if not out.is_cuda:
             raise RuntimeError("out must be a CUDA tensor")
         if out.shape != normed.shape:
-            raise ValueError(f"out shape must match normed shape: {tuple(out.shape)} != {tuple(normed.shape)}")
+            raise ValueError(
+                f"out shape must match normed shape: {tuple(out.shape)} != {tuple(normed.shape)}"
+            )
         if out.dtype != normed.dtype:
-            raise TypeError(f"out dtype must match normed dtype: {out.dtype} != {normed.dtype}")
+            raise TypeError(
+                f"out dtype must match normed dtype: {out.dtype} != {normed.dtype}"
+            )
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
 
@@ -171,6 +230,22 @@ def _gated_norm_forward_kernel(
         tl.store(output_ptr + token_idx * hidden_size + h, y * gate, mask=h_mask)
 
 
+@triton.jit
+def _sigmoid_mul_kernel(
+    normed_ptr,
+    logits_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    logits = tl.load(logits_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    normed = tl.load(normed_ptr + offsets, mask=mask, other=0.0)
+    gate = 1.0 / (1.0 + tl.exp(-logits))
+    tl.store(output_ptr + offsets, normed * gate, mask=mask)
+
+
 def _gated_norm_torch_mm_forward(
     flat_normed: torch.Tensor,
     w_down: torch.Tensor,
@@ -181,8 +256,19 @@ def _gated_norm_torch_mm_forward(
     z = torch.mm(flat_normed, w_down.t())
     F.silu(z, inplace=True)
     logits = torch.mm(z, w_up.t())
-    torch.sigmoid(logits, out=logits)
-    torch.mul(flat_normed, logits, out=output.reshape(-1, hidden_size))
+    flat_output = output.reshape(-1, hidden_size)
+    if flat_normed.shape[0] >= _SIGMOID_MUL_FUSE_MIN_TOKENS:
+        n_elements = flat_normed.numel()
+        _sigmoid_mul_kernel[(triton.cdiv(n_elements, 1024),)](
+            flat_normed,
+            logits,
+            flat_output,
+            n_elements,
+            BLOCK=1024,
+        )
+    else:
+        torch.sigmoid(logits, out=logits)
+        torch.mul(flat_normed, logits, out=flat_output)
     return output
 
 
@@ -218,10 +304,18 @@ def gated_norm_forward(
 
     w_down = w_down.contiguous()
     w_up = w_up.contiguous()
-    if _should_use_torch_mm(num_tokens, rank):
+    use_triton = os.getenv(_USE_TRITON_ENV) == "1"
+    if not use_triton and (
+        _should_use_torch_mm(num_tokens, rank) or _cute_declines_shape(num_tokens, rank)
+    ):
         return _gated_norm_torch_mm_forward(
             flat_normed, w_down, w_up, output, hidden_size
         )
+
+    if not use_triton and _gated_norm_cute_forward(
+        flat_normed, w_down, w_up, output, hidden_size
+    ):
+        return output
 
     block_h = _next_power_of_2(hidden_size, _MAX_BLOCK_H)
     block_r = _next_power_of_2(rank, _MAX_BLOCK_R)

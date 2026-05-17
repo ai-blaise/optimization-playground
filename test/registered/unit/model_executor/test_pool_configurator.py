@@ -165,6 +165,42 @@ class TestDefaultConfigurator(unittest.TestCase):
         self.assertIsNone(config.swa_max_total_num_tokens)
 
 
+class TestNSAHiggsConfigurator(unittest.TestCase):
+    def _make_nsa_runner(self):
+        mr = _make_model_runner(
+            num_layers=2,
+            use_mla_backend=True,
+            page_size=1,
+        )
+        mr.calculate_mla_kv_cache_dim.return_value = 576
+        mr.model_config.kv_lora_rank = 512
+        mr.model_config.qk_rope_head_dim = 64
+        mr.model_config.hf_config = SimpleNamespace(
+            architectures=["DeepseekV3ForCausalLM"],
+            index_head_dim=128,
+            index_topk=2048,
+        )
+        mr.server_args.enable_higgs_dense_2bit_kv_cache = True
+        mr.server_args.enable_turboquant_dense_kv_cache = False
+        mr.server_args.nsa_indexer_quantization = "nvfp4_e2m1_ue8m0"
+        mr.server_args.indexer_quantization_declared = None
+        mr.server_args.nsa_prefill_cp_kv_storage_mode = "none"
+        mr.server_args.nsa_prefill_cp_layersplit_layout = "interleaved"
+        return mr
+
+    def test_higgs_dense_kv_uses_compressed_slot_for_memory_sizing(self):
+        mr = self._make_nsa_runner()
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(7_880, page_size=1)
+
+        self.assertEqual(config.max_total_num_tokens, 10)
+
+
 class TestHybridSWAConfigurator(unittest.TestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
 

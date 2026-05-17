@@ -35,6 +35,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_size,
     get_attention_tp_size,
 )
+from sglang.srt.layers.quantization.higgs_dense_2bit_kv import HiggsDense2BitConfig
 from sglang.srt.layers.quantization.turboquant_dense_kv import TurboQuantDenseKVConfig
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -196,6 +197,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         indexer_cell_size = (
             indexer_size_per_token * storage_layers * indexer_element_size
         )
+
+        if mr.server_args.enable_higgs_dense_2bit_kv_cache:
+            higgs_slot_bytes = HiggsDense2BitConfig(
+                latent_dim=model_config.kv_lora_rank,
+                rope_dim=model_config.qk_rope_head_dim,
+            ).slot_bytes
+            return higgs_slot_bytes * storage_layers + indexer_cell_size
 
         if not mr.server_args.enable_turboquant_dense_kv_cache:
             dense_cell_size = mr.calculate_mla_kv_cache_dim() * storage_layers * kv_size

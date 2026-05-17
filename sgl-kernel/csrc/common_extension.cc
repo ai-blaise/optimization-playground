@@ -77,6 +77,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
 
+  m.def("gated_norm_cute_forward(Tensor normed, Tensor w_down, Tensor w_up, Tensor! output) -> ()");
+  m.impl("gated_norm_cute_forward", torch::kCUDA, &sgl_gated_norm_cute_forward);
+
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 
@@ -252,19 +255,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "warp_decode_cute_moe_forward(Tensor hidden_states, Tensor w_gate, "
       "Tensor w_up, Tensor w_down, Tensor topk_ids, Tensor topk_weights, "
       "bool inplace) -> Tensor");
-  m.impl(
-      "warp_decode_cute_moe_forward",
-      torch::kCUDA,
-      &warp_decode_cute_moe_forward);
+  m.impl("warp_decode_cute_moe_forward", torch::kCUDA, &warp_decode_cute_moe_forward);
 
   m.def(
       "warp_decode_cute_moe_packed_forward(Tensor hidden_states, Tensor w13, "
       "Tensor w2, Tensor topk_ids, Tensor topk_weights, "
       "int intermediate_size, bool inplace) -> Tensor");
-  m.impl(
-      "warp_decode_cute_moe_packed_forward",
-      torch::kCUDA,
-      &warp_decode_cute_moe_packed_forward);
+  m.impl("warp_decode_cute_moe_packed_forward", torch::kCUDA, &warp_decode_cute_moe_packed_forward);
 
   /*
    * From csrc/speculative

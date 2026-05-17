@@ -275,6 +275,7 @@ set(SOURCES
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
+    "csrc/elementwise/gated_norm_cute.cu"
     "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"
     "csrc/expert_specialization/es_fp8_blockwise.cu"

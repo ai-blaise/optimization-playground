@@ -1,0 +1,114 @@
+{
+  "name": "gated_norm_mma_forward_b200",
+  "layouts": [
+    {
+      "label": "pass1_sA_BM16_BK64_pad8_row_major",
+      "shape": [{"is_static": true, "value": 16}, {"is_static": true, "value": 72}],
+      "stride": [{"is_static": true, "value": 72}, {"is_static": true, "value": 1}]
+    },
+    {
+      "label": "pass1_sA_BM64_BK64_pad8_row_major",
+      "shape": [{"is_static": true, "value": 64}, {"is_static": true, "value": 72}],
+      "stride": [{"is_static": true, "value": 72}, {"is_static": true, "value": 1}]
+    },
+    {
+      "label": "pass1_sA_BM128_BK64_pad8_row_major",
+      "shape": [{"is_static": true, "value": 128}, {"is_static": true, "value": 72}],
+      "stride": [{"is_static": true, "value": 72}, {"is_static": true, "value": 1}]
+    },
+    {
+      "label": "pass1_sB_rank64_BK64_pad8_row_major",
+      "shape": [{"is_static": true, "value": 64}, {"is_static": true, "value": 72}],
+      "stride": [{"is_static": true, "value": 72}, {"is_static": true, "value": 1}]
+    },
+    {
+      "label": "pass2_sA_BM64_rank64_pad8_row_major",
+      "shape": [{"is_static": true, "value": 64}, {"is_static": true, "value": 72}],
+      "stride": [{"is_static": true, "value": 72}, {"is_static": true, "value": 1}]
+    },
+    {
+      "label": "pass2_sB_BN64_rank64_pad8_row_major",
+      "shape": [{"is_static": true, "value": 64}, {"is_static": true, "value": 72}],
+      "stride": [{"is_static": true, "value": 72}, {"is_static": true, "value": 1}]
+    },
+    {
+      "label": "pass2_sN_BM64_BN64_pad8_row_major",
+      "shape": [{"is_static": true, "value": 64}, {"is_static": true, "value": 72}],
+      "stride": [{"is_static": true, "value": 72}, {"is_static": true, "value": 1}]
+    },
+    {
+      "label": "contiguous_cp_async_bf16x8",
+      "shape": [{"is_static": true, "value": 64}],
+      "stride": [{"is_static": true, "value": 1}]
+    },
+    {
+      "label": "contiguous_epilogue_bf16_pair",
+      "shape": [{"is_static": true, "value": 64}],
+      "stride": [{"is_static": true, "value": 1}]
+    }
+  ],
+  "swizzles": [],
+  "swizzled_layouts": [],
+  "tma_descriptors": [],
+  "mma_atoms": [],
+  "ldmatrix_ops": [
+    {
+      "label": "pass1_A_ldmatrix_x4_m8n8_b16",
+      "x": 4,
+      "m_size": 8,
+      "n_size": 8,
+      "is_trans": false,
+      "swizzled_layout_idx": -1,
+      "element_bytes": 2
+    },
+    {
+      "label": "pass1_B_ldmatrix_x2_m8n8_b16",
+      "x": 2,
+      "m_size": 8,
+      "n_size": 8,
+      "is_trans": false,
+      "swizzled_layout_idx": -1,
+      "element_bytes": 2
+    },
+    {
+      "label": "pass2_A_ldmatrix_x4_m8n8_b16",
+      "x": 4,
+      "m_size": 8,
+      "n_size": 8,
+      "is_trans": false,
+      "swizzled_layout_idx": -1,
+      "element_bytes": 2
+    },
+    {
+      "label": "pass2_B_ldmatrix_x2_m8n8_b16",
+      "x": 2,
+      "m_size": 8,
+      "n_size": 8,
+      "is_trans": false,
+      "swizzled_layout_idx": -1,
+      "element_bytes": 2
+    }
+  ],
+  "vectorization_ops": [
+    {
+      "label": "cp_async_16_bf16x8_aligned",
+      "layout_idx": 7,
+      "element_bytes": 2,
+      "vector_width": 8,
+      "base_address": {"is_static": true, "value": 0}
+    },
+    {
+      "label": "epilogue_bf16x2_aligned",
+      "layout_idx": 8,
+      "element_bytes": 2,
+      "vector_width": 2,
+      "base_address": {"is_static": true, "value": 0}
+    }
+  ],
+  "mbarrier_sites": [],
+  "tmem_traces": [],
+  "dsmem_sites": [],
+  "barrier_elision_sites": [],
+  "mma_overlap_sites": [],
+  "clc_sites": []
+}

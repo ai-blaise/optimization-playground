@@ -100,6 +100,24 @@ def _can_use_cute(hidden_size: int, intermediate_size: int, top_k: int) -> bool:
     )
 
 
+def _triton_block_sizes(
+    hidden_size: int, intermediate_size: int, top_k: int
+) -> tuple[int, int, int, int]:
+    if top_k == 8 and hidden_size >= 1024 and intermediate_size >= 2048:
+        return (
+            min(16, intermediate_size),
+            min(128, hidden_size),
+            min(16, hidden_size),
+            min(128, intermediate_size),
+        )
+    return (
+        min(32, intermediate_size),
+        min(128, hidden_size),
+        min(32, hidden_size),
+        min(128, intermediate_size),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Kernel 1: Gate/Up projection
 # ---------------------------------------------------------------------------
@@ -515,10 +533,9 @@ def warp_decode_moe(
         device=hidden_states.device,
     )
 
-    BLOCK_N = min(32, intermediate_size)
-    BLOCK_K = min(128, hidden_size)
-    BLOCK_D = min(32, hidden_size)
-    BLOCK_N_DOWN = min(128, intermediate_size)
+    BLOCK_N, BLOCK_K, BLOCK_D, BLOCK_N_DOWN = _triton_block_sizes(
+        hidden_size, intermediate_size, top_k
+    )
 
     # Round up to power of 2 for Triton
     BLOCK_N = triton.next_power_of_2(BLOCK_N)
@@ -673,10 +690,9 @@ def warp_decode_moe_packed(
         device=hidden_states.device,
     )
 
-    BLOCK_N = min(32, intermediate_size)
-    BLOCK_K = min(128, hidden_size)
-    BLOCK_D = min(32, hidden_size)
-    BLOCK_N_DOWN = min(128, intermediate_size)
+    BLOCK_N, BLOCK_K, BLOCK_D, BLOCK_N_DOWN = _triton_block_sizes(
+        hidden_size, intermediate_size, top_k
+    )
 
     BLOCK_N = triton.next_power_of_2(BLOCK_N)
     BLOCK_K = triton.next_power_of_2(BLOCK_K)

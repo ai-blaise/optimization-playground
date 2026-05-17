@@ -591,6 +591,27 @@ extra trace-buffer parameters, and inserting trace markers around the tight
 The replacement evidence is CUDA-event A/B against the source-equivalent control
 plus `nsys --trace=cuda,nvtx --stats=true` kernel attribution for the incumbent.
 
+After accepting and committing the 4-warp gate/up change as `dbaac1e5e`, a
+post-commit saturation round compared additional candidates against the new
+incumbent, again using isolated JIT extension builds and CUDA-event timing under
+`gpu_locked_any.sh` only for execution:
+
+| Candidate vs `dbaac1e5e` | B1 | B4 | B8 | B16 | B32 | B64 | Decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| gate/up `TILE_N=2`, `NUM_WARPS=2` | 0.999x | 0.994x | 0.986x | 0.966x | 0.967x | 0.969x | Reject: B1 tie and clear larger-batch regression from too many CTAs. |
+| writer-lane fence + single CTA trigger | 1.004x | 0.997x | 0.998x | 0.996x | 0.997x | 0.999x | Reject: B1 improvement is below noise and other batches regress/tie. |
+| PDL disabled | 0.984x | 0.988x | 0.989x | 0.996x | 0.997x | 0.999x | Reject: PDL remains useful, especially at small batch. |
+
+The final `dbaac1e5e` B1 `nsys` capture reported
+`warp_decode_gate_up_packed_cute_kernel<4,1024,4>` at 40 launches averaging
+69.3us and `warp_decode_down_cute_kernel<8,2048,8>` at 40 launches averaging
+38.5us. Compared with the pre-change CuTe incumbent profile (`<8,1024,8>`
+gate/up at 71.0us and down at 38.6us), remaining headroom is concentrated in
+the same gate/down memory-streaming work. Further scalar/CTA scheduling tweaks
+have now tied or regressed across the batch sweep; larger structural changes
+would need a different tensor-core/UMMA grouped-GEMM design, which is outside
+this blog-strict WarpDecode lane.
+
 **WarpDecode Triton fallback B200 acceptance chain.** The 2026-05-17
 WarpDecode worker rebased on optimization-playground `origin/main`
 `44a6d42a9101972191f5b5aca5c32b643922b572` and kept the CuTe path disabled

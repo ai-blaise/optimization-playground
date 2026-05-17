@@ -56,3 +56,19 @@ export LAYERSPLIT_EXT_BUILD_DIR=/tmp/layersplit_ext_round0
 - Result: rejected. On the same B200 matrix, <=116 KiB payload average changed from 1.058x to 1.054x vs `Tensor.copy_`, and average `cute_ms` regressed from 2.801 us to 2.850 us. Larger delegated payloads were also slightly worse. The fixed 148-CTA launch appears to trade idle warps for lower latency through broad SM residency; the benchmark remains launch-floor dominated.
 - Correctness: benchmark cells checked `torch.equal(src, dst)`.
 - Decision: reject. Source reverted; incumbent remains `a59198170391a9cfe1c36e539949f279793f2448`.
+
+
+## Round 2: Extend Small-Copy Threshold To 128 KiB
+
+- Incumbent: `a59198170391a9cfe1c36e539949f279793f2448` (Round 0 accepted source; Round 1 was rejected and did not change source).
+- Hotspot/profiler signal: CUDA event instrumentation showed all 128 KiB staged-copy cells were falling through to the C++ op's delegated `Tensor.copy_` path and paying an extra dispatch layer. The 128 KiB cells in Round 0 averaged 0.800x vs direct `Tensor.copy_` and 3.681 us in `cute_ms`.
+- Candidate: raise `kSmallByteThreshold` from 116 KiB to 128 KiB so exactly-128 KiB payloads use the custom fixed-CTA copy kernel.
+- Command:
+
+```bash
+/root/agent-runs/gpu_locked.sh env CUDA_VISIBLE_DEVICES=0   python test/manual/layers/attention/nsa/bench_layersplit_stage.py   --load-local-extension --extension-name layersplit_cute_round2_threshold   --rows 64,128,256 --row-bytes 512,1024,2048   --warmup 50 --iters 1000
+```
+
+- Result: accepted. The 128 KiB cells improved from 0.800x to 1.048x vs direct `Tensor.copy_`; average `cute_ms` improved from 3.681 us to 2.849 us. Larger 256 KiB and 512 KiB delegated cells stayed near the incumbent and remain outside the custom threshold.
+- Correctness: every benchmark cell checks `torch.equal(src, dst)`.
+- Decision: accept. New incumbent: Round 2 threshold commit.

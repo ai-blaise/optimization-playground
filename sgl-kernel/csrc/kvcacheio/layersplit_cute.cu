@@ -80,7 +80,7 @@ static constexpr int kMaterializeThreads = kMaterializeWarps * WARP_SIZE;
 
 // small-data threshold. Below this, the 148x256 vectorized kernel
 // beats the cudaMemcpyAsync copy-engine path by 1.2-1.3x.
-static constexpr int64_t kSmallByteThreshold = 116 * 1024;
+static constexpr int64_t kSmallByteThreshold = 128 * 1024;
 
 namespace {
 

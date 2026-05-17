@@ -23,6 +23,26 @@ Validation:
 python -m pytest -q sgl-kernel/tests/test_g1_attention.py
 ```
 
+### G1 B200 Iteration Log
+
+Round 0, deployability incumbent gate, 2026-05-17:
+
+- Incumbent: `0ea8076a1`, optimization-playground main. On NVIDIA B200
+  (`sm100`) the installed `sgl_kernel` loader selected `sgl_kernel/sm100`, but
+  the editable build only installed `sm90/common_ops.abi3.so`; a validation
+  symlink to the SM90 library contained no `sm_100` cubin and left
+  `g1_gate_forward` outputs unchanged/all-zero in the smoke probe.
+- Candidate: add generic `SGL_KERNEL_ENABLE_SM100` for CUDA compiler 12.8+
+  and install the common ops artifact into `sgl_kernel/sm100` when SM100A is
+  not requested. This is a packaging/runtime-dispatch fix; it is not claimed as
+  a kernel throughput optimization.
+- Result: accepted as the new incumbent because B200 now loads
+  `sgl_kernel/sm100/common_ops.abi3.so` containing `sm_100` cubins and the G1
+  smoke probe matches the BF16 torch reference exactly (`maxdiff output=0.0`,
+  `maxdiff gate=0.0`). Focused test result: `5 passed`.
+- Command: `. /root/work/optimization-playground/.venv/bin/activate && CUDA_VISIBLE_DEVICES=0 /root/agent-runs/gpu_locked.sh pytest -q -s sgl-kernel/tests/test_g1_attention.py`.
+- Caveat: full editable rebuild needed `CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DSGL_KERNEL_COMPILE_THREADS=1 -DENABLE_BELOW_SM90=OFF"` in this shared CMake 4.3 validation environment.
+
 ## GatedNorm Forward
 
 The `sglang.jit_kernel.gated_norm.gated_norm_forward` kernel applies the

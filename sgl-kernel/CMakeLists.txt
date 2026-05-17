@@ -182,6 +182,12 @@ option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
+if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+    set(DEFAULT_ENABLE_SM100 ON)
+else()
+    set(DEFAULT_ENABLE_SM100 OFF)
+endif()
+option(SGL_KERNEL_ENABLE_SM100            "Enable generic SM100"    ${DEFAULT_ENABLE_SM100})
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
 if (SGL_KERNEL_ENABLE_BF16)
@@ -209,6 +215,12 @@ if (ENABLE_BELOW_SM90)
         )
     endif()
 
+endif()
+
+if (SGL_KERNEL_ENABLE_SM100)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_100,code=sm_100"
+    )
 endif()
 
 if (SGL_KERNEL_ENABLE_SM100A)
@@ -410,7 +422,9 @@ endif()
 # CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
 # and install them to the specified destinations
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
-if (SGL_KERNEL_ENABLE_SM100A)
+if (SGL_KERNEL_ENABLE_SM100 AND NOT SGL_KERNEL_ENABLE_SM100A)
+    install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm100)
+elseif (SGL_KERNEL_ENABLE_SM100A)
     install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 endif()
 

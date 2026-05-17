@@ -116,12 +116,17 @@ def _gated_norm_cute_forward(
     output: torch.Tensor,
     hidden_size: int,
 ) -> bool:
+    global _gated_norm_cute_load_failed
     if flat_normed.dtype != _SUPPORTED_DTYPE or not _device_supports_cute(flat_normed):
         return False
     op = _load_gated_norm_cute_forward()
     if op is None:
         return False
-    op(flat_normed, w_down, w_up, out=output.reshape(-1, hidden_size))
+    try:
+        op(flat_normed, w_down, w_up, out=output.reshape(-1, hidden_size))
+    except AttributeError:
+        _gated_norm_cute_load_failed = True
+        return False
     return True
 
 

@@ -450,8 +450,9 @@ For the target model (`D=7168`, `I=2048`, `topk=8`, `E=128`), those predicates
 hold exactly. Other shapes still use the existing Triton Warp Decode path rather
 than an older CuTe tile variant.
 
-The target path keeps the blog-strict execution model: 8 warps per CTA, one
-intermediate neuron per warp in gate/up, one output dimension per warp in down,
+The target path keeps the one-output-element-per-warp execution model. The current
+B200 gate/up path uses 4 warps per CTA, one intermediate neuron per warp;
+the down path uses 8 warps per CTA, one output dimension per warp,
 `__shfl_xor_sync` reductions, FP32 final accumulators, and no tensor cores. The
 accepted kernel raises gate/up `TILE_K` from 512 to 1024, raises down `TILE_N`
 from 1024 to 2048, specializes `top_k=8` index math, and keeps split-FP32
@@ -538,6 +539,57 @@ The B64 final number uses a dedicated `warmup=30`, `iters=200` rerun
 B200 down-tile variants remain rejected: `TILE_N=1024` regressed at every target
 batch, and `TILE_N=1536` violates the target `I=2048` shape guard without
 tail-safe vector loads.
+
+
+**2026-05-17 stricter restart: CuTe gate/up occupancy round.** The stricter
+restart reopened WarpDecode after the Triton fallback pass because the installed
+SM100 `sgl_kernel` artifact was now valid on the B200 VM. Fresh CUDA-event and
+`nsys` evidence showed the CuTe path, not the Triton fallback, was the best
+accepted incumbent: B1 production benchmark was 120.2us for CuTe versus 307.9us
+for Triton, and the B1 `nsys` capture attributed the CuTe work to
+`warp_decode_gate_up_packed_cute_kernel<8,1024,8>` at 71.0us average and
+`warp_decode_down_cute_kernel<8,2048,8>` at 38.6us average.
+
+The accepted candidate changes only gate/up CTA geometry from 8 warps per CTA to
+4 warps per CTA while preserving one intermediate neuron per warp, `TILE_K=1024`,
+the 3-stage `cp.async` pipeline, split-FP32 accumulation, fast SiLU, PDL, and the
+existing down kernel. The motivation came from the B200 profile: gate/up was the
+larger CuTe launch, and halving gate CTA shared memory lets more gate CTAs
+reside without changing math or memory coalescing within each warp.
+
+Direct-extension CUDA-event verification used isolated JIT builds under
+`/root/agent-runs/warpdecode_ext_cache`, with NVCC builds outside the GPU lock
+and only CUDA execution under `/root/agent-runs/gpu_locked_any.sh`. The table
+compares the source-equivalent direct control to the accepted gate/up 4-warp
+candidate; correctness was exact versus the installed CuTe incumbent for every
+batch (`cosine=1.0000001`, max abs `0`).
+
+| Batch | Direct control mean us | Gate/up 4-warp mean us | Speedup |
+|---:|---:|---:|---:|
+| 1 | 114.8 | 113.6 | 1.010x |
+| 4 | 395.5 | 393.9 | 1.004x |
+| 8 | 781.6 | 773.5 | 1.010x |
+| 16 | 1543.7 | 1528.9 | 1.010x |
+| 32 | 3082.7 | 3033.9 | 1.016x |
+| 64 | 6156.1 | 6095.8 | 1.010x |
+
+Rejected restart probes against the CuTe incumbent:
+
+| Candidate | B1 mean us | Decision |
+|---|---:|---|
+| PDL disabled | 119.2 | Reject: slower than direct PDL control; source already requires PDL for launch overlap. |
+| gate/up `TILE_N=16`, `NUM_WARPS=16` | 121.0 | Reject: larger CTA regressed B1 and reduces residency. |
+| gate/up `TILE_K=512` | 115.6 | Reject: B1 tied, but B8/B16/B32/B64 regressed versus 4-warp gate/up. |
+| down `TILE_D=4`, `NUM_WARPS=4` | 117.0 | Reject: B1-only hint did not compose; `gate_n4_down_d4` regressed B4 and larger batches. |
+| down `TILE_D=16`, `NUM_WARPS=16` | 120.7 | Reject: B1 regression. |
+| down `TILE_N=1024` | 122.6 | Reject: two down N-iterations outweighed any residency gain. |
+
+Direct IKP instrumentation was not added in this restart round because the
+kernel's PDL contract and PyTorch op boundary would require a separate ABI with
+extra trace-buffer parameters, and inserting trace markers around the tight
+`cp.async` pipeline would perturb the launch and fence behavior being measured.
+The replacement evidence is CUDA-event A/B against the source-equivalent control
+plus `nsys --trace=cuda,nvtx --stats=true` kernel attribution for the incumbent.
 
 **WarpDecode Triton fallback B200 acceptance chain.** The 2026-05-17
 WarpDecode worker rebased on optimization-playground `origin/main`

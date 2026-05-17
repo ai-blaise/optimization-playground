@@ -382,6 +382,81 @@ Correctness verification: candidate output matched the incumbent output with `to
 
 Decision: accept exact-rank-1 only; reject the broad rank 1-7 threshold. New incumbent commit: this commit.
 
+## Round 10: low-rank boundary descent and saturation
+
+Incumbent: `e11396450` (Round 9 exact-rank-1 threshold at 1024 tokens).
+
+Profiler/instrumentation: CUDA-event boundary probes on B200 using `gpu_locked_any.sh` only around the CUDA benchmark process. This continued the dispatch-threshold surface after the stricter restart found the previous stop premature.
+
+Hotspot/result: descending the remaining low-rank thresholds showed more headroom. Rank 8-15 improves when the torch/cuBLAS floor moves below 256, but a floor of 1 is unsafe because rank 12 at 8 tokens regresses. Exact rank 1 keeps improving down to token 1. A broad rank 1-7 floor remains rejected because ranks 2 and 4 regress badly.
+
+Candidate accepted: set rank 8-15 torch/cuBLAS threshold to 16 tokens and exact rank 1 threshold to 1 token. Keep ranks 2-7 at 4096 tokens.
+
+Command artifacts:
+
+```bash
+# Boundary descent artifacts:
+/root/agent-runs/gatednorm-restart-round10-boundary-rejects.jsonl
+/root/agent-runs/gatednorm-restart-round11-next-lower-boundary.jsonl
+/root/agent-runs/gatednorm-restart-round12-lower-boundary.jsonl
+/root/agent-runs/gatednorm-restart-round13-floor1-probe.jsonl
+/root/agent-runs/gatednorm-restart-round14-r8-floor16.jsonl
+```
+
+Accepted rank 8-15 final boundary evidence, median of 5 same-device CUDA-event repeats versus `e11396450`:
+
+| rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 8 | 8 | 0.032876 | 0.032874 | 1.00x | tie, stays Triton |
+| 8 | 16 | 0.032879 | 0.028343 | 1.16x | keep |
+| 8 | 32 | 0.032880 | 0.028279 | 1.16x | keep |
+| 12 | 8 | 0.039030 | 0.039018 | 1.00x | tie, stays Triton |
+| 12 | 16 | 0.039647 | 0.030779 | 1.29x | keep |
+| 12 | 32 | 0.040209 | 0.026980 | 1.49x | keep |
+| 15 | 8 | 0.067575 | 0.067550 | 1.00x | tie, stays Triton |
+| 15 | 16 | 0.067015 | 0.026727 | 2.51x | keep |
+| 15 | 32 | 0.067889 | 0.036343 | 1.87x | keep |
+
+Accepted exact rank 1 floor-1 evidence, median of 5 same-device CUDA-event repeats versus `e11396450`:
+
+| rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 1 | 1 | 0.032857 | 0.026393 | 1.24x | keep |
+| 1 | 4 | 0.032856 | 0.026382 | 1.25x | keep |
+| 1 | 8 | 0.032874 | 0.027106 | 1.21x | keep |
+| 1 | 16 | 0.032875 | 0.027088 | 1.21x | keep |
+| 1 | 32 | 0.032876 | 0.027129 | 1.21x | keep |
+| 1 | 64 | 0.033902 | 0.027225 | 1.25x | keep |
+| 1 | 128 | 0.034198 | 0.027132 | 1.26x | keep |
+
+Rejected boundary evidence:
+
+| candidate | rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| rank 8-15 floor 1 | 12 | 8 | 0.039027 | 0.055357 | 0.71x | reject |
+| broad rank 1-7 floor 1024 | 2 | 1024 | 0.039015 | 0.046888 | 0.83x | reject |
+| broad rank 1-7 floor 1024 | 2 | 2048 | 0.055376 | 0.071694 | 0.77x | reject |
+| broad rank 1-7 floor 1024 | 4 | 1024 | 0.030797 | 0.048511 | 0.63x | reject |
+| broad rank 1-7 floor 1024 | 4 | 2048 | 0.052318 | 0.065549 | 0.80x | reject |
+
+Correctness verification: all candidate outputs matched incumbent outputs with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` in the boundary probes.
+
+Decision: accept rank 8-15 floor 16 and exact rank 1 floor 1; reject rank 8-15 floor 1 and broad rank 1-7 threshold changes. New incumbent commit: this commit.
+
+## Restart stop evidence
+
+Final accepted incumbent: this commit. Fresh post-restart profile command:
+
+```bash
+/root/agent-runs/gpu_locked_any.sh nsys profile --trace=cuda,nvtx --force-overwrite=true -o /root/agent-runs/gatednorm-restart-final-r16-t16 python <rank16-tokens16 profile>
+nsys stats --force-export=true --report cuda_gpu_kern_sum /root/agent-runs/gatednorm-restart-final-r16-t16.nsys-rep > /root/agent-runs/gatednorm-restart-final-r16-t16-kernsum.txt
+python3 /root/work/rule7-refs/intra-kernel-profiler/scripts/ikp_nsys_import.py --nsys-rep /root/agent-runs/gatednorm-restart-final-r16-t16.nsys-rep --out-dir /root/agent-runs/gatednorm-restart-final-r16-t16-ikp --skip-export
+```
+
+Artifacts: `/root/agent-runs/gatednorm-restart-final-r16-t16.nsys-rep`, `/root/agent-runs/gatednorm-restart-final-r16-t16.sqlite`, `/root/agent-runs/gatednorm-restart-final-r16-t16-kernsum.txt`, `/root/agent-runs/gatednorm-restart-final-r16-t16-ikp/nsys_kernels.json`.
+
+Final rank 16, 16-token profile after restart: first cuBLAS GEMM 23.0% (3.43 us average), cuBLAS split-K reduce 19.7% (2.94 us), second cuBLAS GEMM 16.2% (2.42 us), PyTorch sigmoid 15.4% (2.29 us), PyTorch SiLU 13.8% (2.06 us), and PyTorch multiply 11.0% (1.64 us). The remaining path is launch-floor dominated by several microsecond-scale library/elementwise launches. The earlier fused Triton epilogue only wins from 1024 tokens; lowering it was already rejected in Round 2/3 evidence. Further material improvement would require a larger fused CUTLASS/CuTe or custom CUDA path for the whole low-rank GEMM/activation/GEMM/gate sequence, which is beyond a low-risk threshold candidate and would need shared extension rebuild work.
+
 ## Pre-restart stop evidence (superseded)
 
 Accepted incumbent before the stricter restart: `fbfb08dc9`, merged into `11922dcd9`. Final pre-restart profile command:

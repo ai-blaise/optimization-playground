@@ -471,30 +471,34 @@ SGL_DEVICE void quantize_indexer_row_half_warp(
 __global__ void dequantize_indexer_nvfp4(
     const __grid_constant__ NVFP4IndexerDequantParam param) {
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const auto global_hwid = global_tid / 16;
-  if (global_hwid >= param.num_rows) return;
+  const auto global_row = global_tid / 8;
+  if (global_row >= param.num_rows) return;
 
-  const auto lane_id = threadIdx.x & 31;
-  const auto lane_row = lane_id & 15;
-  const auto value_word = static_cast<const uint32_t*>(param.values)[
-      static_cast<int64_t>(global_hwid) * 16 + lane_row];
-  const auto scale_word = static_cast<const uint32_t*>(param.scales)[global_hwid];
-  const auto scale_exp = (scale_word >> ((lane_row >> 2) * 8)) & 0xffu;
-  const auto scale = __uint_as_float(scale_exp << 23);
-
-  float decoded[8];
-  #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    decoded[i] = decode_e2m1_nibble((value_word >> (i * 4)) & 0xfu, scale);
-  }
-
+  const auto lane_row = global_tid & 7;
+  const auto scale_word = static_cast<const uint32_t*>(param.scales)[global_row];
   auto* output_vec = reinterpret_cast<float4*>(
       static_cast<float*>(param.output) +
-      static_cast<int64_t>(global_hwid) * kIndexerHeadDim);
-  output_vec[lane_row * 2] =
-      make_float4(decoded[0], decoded[1], decoded[2], decoded[3]);
-  output_vec[lane_row * 2 + 1] =
-      make_float4(decoded[4], decoded[5], decoded[6], decoded[7]);
+      static_cast<int64_t>(global_row) * kIndexerHeadDim);
+
+  #pragma unroll
+  for (int word_step = 0; word_step < 2; ++word_step) {
+    const auto word_idx = lane_row + word_step * 8;
+    const auto value_word = static_cast<const uint32_t*>(param.values)[
+        static_cast<int64_t>(global_row) * 16 + word_idx];
+    const auto scale_exp = (scale_word >> ((word_idx >> 2) * 8)) & 0xffu;
+    const auto scale = __uint_as_float(scale_exp << 23);
+
+    float decoded[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      decoded[i] = decode_e2m1_nibble((value_word >> (i * 4)) & 0xfu, scale);
+    }
+
+    output_vec[word_idx * 2] =
+        make_float4(decoded[0], decoded[1], decoded[2], decoded[3]);
+    output_vec[word_idx * 2 + 1] =
+        make_float4(decoded[4], decoded[5], decoded[6], decoded[7]);
+  }
 }
 
 template <typename KeyT, typename IndicesT, uint32_t kPageBits,
@@ -1119,7 +1123,7 @@ struct NVFP4IndexerQuantKernel {
         .num_rows = num_rows,
     };
     constexpr auto kBlockSize = 256;
-    const auto num_blocks = div_ceil(num_rows * 16, kBlockSize);
+    const auto num_blocks = div_ceil(num_rows * 8, kBlockSize);
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap())(dequant_kernel, params);
   }
 

@@ -39,3 +39,20 @@ export LAYERSPLIT_EXT_BUILD_DIR=/tmp/layersplit_ext_round0
 - Command: same environment as Round 0 with a temporary `--include-helper` benchmark variant.
 - Result: helper dispatch measured 4.03-4.88 us on representative 32 KiB-512 KiB staged buffers, while direct `Tensor.copy_` was about 2.94-3.04 us.
 - Decision: rejected. The source helper was removed; no runtime behavior change is kept.
+
+
+## Round 1: Dynamic Small-Copy CTA Count
+
+- Incumbent: `a59198170391a9cfe1c36e539949f279793f2448` (Round 0 accepted packaging commit).
+- Hotspot/profiler signal: direct IKP trace probe in `/root/agent-runs/layersplit_ikp_probe.cu` showed the fixed 148-CTA small-copy launch leaves most warps idle on small staged buffers. For 1x288 bytes, fixed launch used 1 active warp and 1183 idle warps; a one-block dynamic launch would use 1 active warp and 7 idle warps. For 64x1024 bytes, fixed launch used 128 active warps and 1056 idle warps; a 16-block dynamic launch would use 128 active warps and 0 idle warps.
+- Candidate: choose `min(148, ceil(num_vecs / 256))` CTAs for the 16-byte and 8-byte small-copy kernels.
+- Command:
+
+```bash
+/root/agent-runs/gpu_locked.sh env CUDA_VISIBLE_DEVICES=0   /root/agent-runs/layersplit_ikp_probe --rows=1 --row-bytes=288 --blocks=148   --out=/root/agent-runs/layersplit_ikp_fixed_1x288.json
+/root/agent-runs/gpu_locked.sh env CUDA_VISIBLE_DEVICES=0   python test/manual/layers/attention/nsa/bench_layersplit_stage.py   --load-local-extension --extension-name layersplit_cute_round1_dynamic   --rows 1,2,4,8,16,32,64,128,256   --row-bytes 288,512,1024,2048 --warmup 50 --iters 1000
+```
+
+- Result: rejected. On the same B200 matrix, <=116 KiB payload average changed from 1.058x to 1.054x vs `Tensor.copy_`, and average `cute_ms` regressed from 2.801 us to 2.850 us. Larger delegated payloads were also slightly worse. The fixed 148-CTA launch appears to trade idle warps for lower latency through broad SM residency; the benchmark remains launch-floor dominated.
+- Correctness: benchmark cells checked `torch.equal(src, dst)`.
+- Decision: reject. Source reverted; incumbent remains `a59198170391a9cfe1c36e539949f279793f2448`.

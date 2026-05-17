@@ -52,7 +52,7 @@ def _default_torch_mm_min_tokens(rank: int) -> int:
     if rank >= 16:
         return 64
     if rank >= 8:
-        return 512
+        return 256
     if rank >= 1:
         return 4096
     return _NEVER_USE_TORCH_MM

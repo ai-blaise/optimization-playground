@@ -252,6 +252,47 @@ Correctness verification: candidate output matched the old-threshold incumbent o
 
 Decision: accept. New incumbent commit: this commit.
 
+## Round 7: rank 8-15 mid-batch GEMM dispatch
+
+Incumbent: `84ccbadce` (Round 6 rank >=32 decode dispatch).
+
+Profiler/instrumentation: CUDA-event threshold sweep on B200 using per-GPU locks. This is a dispatch candidate between existing Triton and torch/cuBLAS paths, so direct CUDA events are the relevant comparison evidence; IKP source markers still do not apply to a Python-level path selection.
+
+Hotspot/result: after Round 6, a sweep of rank 8 and rank 12 with thresholds {256, 512, 1024, 2048} showed the 256-token row was still left on the slower Triton path. Rows at 512+ already use torch/cuBLAS under the incumbent threshold and remained same-path ties.
+
+Candidate: lower the default rank 8-15 torch/cuBLAS threshold from 512 tokens to 256 tokens.
+
+Command and artifact:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /root/agent-runs/gpu_locked.sh bash -lc '<env>; python <R8 threshold 256 candidate sweep>'
+# /root/agent-runs/gatednorm-restart-round7-r8-accepted-bench.jsonl
+```
+
+Measured candidate versus Round 6 incumbent, median of 5 same-device CUDA-event repeats:
+
+| rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 8 | 128 | 0.034773 | 0.034756 | 1.00x | tie |
+| 8 | 256 | 0.034909 | 0.027514 | 1.27x | keep |
+| 8 | 512 | 0.027602 | 0.027708 | 1.00x | tie/noise |
+| 8 | 1024 | 0.030677 | 0.030458 | 1.01x | tie |
+| 8 | 2048 | 0.032896 | 0.032878 | 1.00x | tie |
+| 12 | 128 | 0.041055 | 0.041025 | 1.00x | tie |
+| 12 | 256 | 0.049257 | 0.038779 | 1.27x | keep |
+| 12 | 512 | 0.044493 | 0.044537 | 1.00x | tie/noise |
+| 12 | 1024 | 0.045622 | 0.045641 | 1.00x | tie/noise |
+| 12 | 2048 | 0.066338 | 0.066287 | 1.00x | tie |
+| 15 | 128 | 0.067730 | 0.067701 | 1.00x | tie |
+| 15 | 256 | 0.079970 | 0.038965 | 2.05x | keep |
+| 15 | 512 | 0.044153 | 0.044128 | 1.00x | tie |
+| 15 | 1024 | 0.049202 | 0.049209 | 1.00x | tie/noise |
+| 15 | 2048 | 0.093420 | 0.093265 | 1.00x | tie |
+
+Correctness verification: candidate output matched the Round 6 incumbent output with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` for every measured row. Rows above 256 tokens execute the same torch/cuBLAS path under both thresholds; sub-1.0x rows are measurement noise on unchanged paths.
+
+Decision: accept. New incumbent commit: this commit.
+
 ## Pre-restart stop evidence (superseded)
 
 Accepted incumbent before the stricter restart: `fbfb08dc9`, merged into `11922dcd9`. Final pre-restart profile command:

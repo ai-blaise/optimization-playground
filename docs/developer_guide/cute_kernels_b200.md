@@ -539,6 +539,72 @@ B200 down-tile variants remain rejected: `TILE_N=1024` regressed at every target
 batch, and `TILE_N=1536` violates the target `I=2048` shape guard without
 tail-safe vector loads.
 
+**WarpDecode Triton fallback B200 acceptance chain.** The 2026-05-17
+WarpDecode worker rebased on optimization-playground `origin/main`
+`44a6d42a9101972191f5b5aca5c32b643922b572` and kept the CuTe path disabled
+when the loaded `sgl_kernel.common_ops` artifact does not match the active
+device. On the shared B200 VM, the installed `sgl_kernel/sm100/common_ops`
+resolved to the SM90 binary, and the direct CuTe tests failed before the guard;
+the measurements below are therefore for the production Triton fallback with
+`SGLANG_WARP_DECODE_CUTE=0`, not for the CuTe direct-extension path above.
+
+Hardware and shape: NVIDIA B200 (`sm_100`), BF16 packed weights,
+`B=1`, `D=7168`, `I=2048`, `E=128`, `topk=8`, seed `20260517`,
+CUDA-event timing under `/root/agent-runs/gpu_locked.sh`. The round harness
+compared each candidate to the current committed incumbent; the final
+production benchmark command was:
+
+```bash
+SGLANG_WARP_DECODE_CUTE=0 \
+python benchmark/warp_decode/bench_warp_decode.py \
+  --hidden-size 7168 --intermediate-size 2048 --num-experts 128 \
+  --top-k 8 --batch-sizes 1,4,8,16,32,64 --warmup 20 --iters 100 \
+  --skip-reference
+```
+
+Accepted chain:
+
+| Round | Incumbent -> candidate | Commit | Mean us | Speedup | Hotspot result | Correctness |
+|---:|---|---|---:|---:|---|---|
+| 1 | `32,128,32,128` -> `16,128,16,128` | `d5ba8ab11` | 1567.8 -> 765.5 | 2.048x | gate/up 977.5 -> 455.8 us; down 598.8 -> 316.8 us | cosine 1.0; max abs 0.0078125 |
+| 2 | `16,128,16,128` -> `8,128,8,128` | `52ecaacc4` | 763.4 -> 492.4 | 1.550x | gate/up 455.3 -> 334.2 us; down 315.9 -> 173.8 us | cosine 1.0; max abs 0.00390625 |
+| 3 | `8,128,8,128` -> `8,256,8,128` | `b1e90376d` | 498.9 -> 421.0 | 1.185x | gate/up 330.4 -> 250.8 us; down flat at ~174 us | cosine 1.0; max abs 1.49e-08 |
+| 4 | `8,256,8,128` -> `4,256,4,128` | `128866ab2` | 415.9 -> 347.3 | 1.197x | gate/up 250.0 -> 188.3 us; down 174.1 -> 164.5 us | cosine 0.99999994; max abs 0.0078125 |
+| 5 | `4,256,4,128` -> `4,512,4,128` | `091ba3dba` | 345.3 -> 322.6 | 1.070x | gate/up 188.7 -> 164.4 us; down flat at ~164.6 us | cosine 0.99999994; max abs 0.0078125 |
+
+Relative to the original committed Triton fallback tile shape, the final
+accepted target-shape dispatch improved the B1 round harness from 1567.8 us to
+322.6 us, or 4.86x. The production benchmark after `091ba3dba` measured:
+
+| Batch | Triton us | Effective BW |
+|---:|---:|---:|
+| 1 | 307.3 | 2293.06 GB/s |
+| 4 | 1210.0 | 2329.47 GB/s |
+| 8 | 2276.6 | 2476.16 GB/s |
+| 16 | 4388.6 | 2569.06 GB/s |
+| 32 | 8628.8 | 2613.24 GB/s |
+| 64 | 17191.5 | 2623.28 GB/s |
+
+Rejected saturation probes compared against the final `091ba3dba` incumbent:
+
+| Candidate blocks | Mean us | Speedup vs incumbent | Decision |
+|---|---:|---:|---|
+| `4,1024,4,128` | 318.5 | 1.0036x | Reject: within timing noise; no source change |
+| `2,512,4,128` | 324.6 | 0.9853x | Reject: gate/up regression |
+| `4,512,2,128` | 442.5 | 0.7235x | Reject: down projection regression |
+| `4,512,4,256` | 332.4 | 0.9649x | Reject: down projection regression |
+| `4,512,4,64` | 387.0 | 0.8276x | Reject: down projection regression |
+| `2,1024,2,128` | 429.3 | 0.7453x | Reject: down projection regression |
+
+IKP was not directly integrated for this fallback pass because IKP requires
+instrumentation inside compiled CUDA/CuTe kernels, while the accepted path here
+is Triton JIT and the CuTe extension on this VM was not a valid SM100 binary.
+CUDA-event phase timing and `nsys profile --trace=cuda,nvtx --stats=true`
+were used instead. The final `nsys` capture reported
+`_warp_decode_gate_up_packed_kernel` at 32 launches averaging 151.7 us and
+`_warp_decode_down_kernel` at 30 launches averaging 150.4 us; further K-tile
+widening tied within noise and smaller/larger vector/down tiles regressed.
+
 ## Build configuration
 
 The CuTe kernels build via `torch.utils.cpp_extension.load()` with:

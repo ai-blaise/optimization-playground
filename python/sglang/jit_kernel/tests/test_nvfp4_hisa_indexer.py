@@ -297,10 +297,11 @@ def test_nvfp4_hisa_precomputed_deepgemm_matches_inline_deepgemm():
 
 
 @pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
-def test_nvfp4_hisa_deepgemm_skips_unsupported_head_count():
+@pytest.mark.parametrize("heads", (8, 32))
+def test_nvfp4_hisa_deepgemm_skips_unsupported_head_count(heads):
     pytest.importorskip("deep_gemm")
     _, weights, q_fp4, cache, page_table, seq_lens, token_to_batch_idx = _build_case(
-        8193, heads=8
+        8193, heads=heads
     )
     torch_path = nvfp4_hisa_indexer_paged_torch(
         q_fp4,

@@ -47,7 +47,10 @@ _hisa_profile_sync = os.environ.get(
 ).lower() in ("1", "true", "yes", "on")
 _hisa_profile_lock = threading.Lock()
 _NVFP4_E2M1_CODEBOOK = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-_DEEPGEMM_FP4_MQA_HEAD_COUNTS = (32, 64)
+# DeepGEMM splits the head count into two TMEM loads of kNumHeads / 2.
+# The current Blackwell FP4 MQA kernels only support TMEM load widths 32/64,
+# so 32 heads would instantiate an unsupported 16-wide load and JIT-fail.
+_DEEPGEMM_FP4_MQA_HEAD_COUNTS = (64,)
 
 
 def _deepgemm_fp4_mqa_supports(q_values: torch.Tensor) -> bool:

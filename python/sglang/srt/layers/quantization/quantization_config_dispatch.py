@@ -11,7 +11,9 @@ Two fields are recognized:
 1. ``kv_cache_scheme`` (extension of the existing dict already parsed by
    ``modelopt_quant``): when ``quant_method == "turboquant_dense"``, sets
    ``server_args.enable_turboquant_dense_kv_cache = True`` and copies the
-   ``preset`` field into ``server_args.turboquant_dense_kv_preset``.
+   ``preset`` field into ``server_args.turboquant_dense_kv_preset``. When
+   ``quant_method == "higgs_dense_2bit"``, sets
+   ``server_args.enable_higgs_dense_2bit_kv_cache = True``.
 
 2. ``indexer_quantization``: a new top-level dict; records supported
    cache formats on ``server_args.indexer_quantization_declared`` and can
@@ -66,9 +68,7 @@ def _get_quantization_config(hf_config: Any) -> Optional[Dict[str, Any]]:
     return _coerce_dict(quant_cfg)
 
 
-def _maybe_apply_turboquant_dense(
-    server_args: Any, quant_cfg: Dict[str, Any]
-) -> None:
+def _maybe_apply_turboquant_dense(server_args: Any, quant_cfg: Dict[str, Any]) -> None:
     kv_cache_scheme = _coerce_dict(quant_cfg.get("kv_cache_scheme"))
     if kv_cache_scheme is None:
         return
@@ -101,8 +101,7 @@ def _maybe_apply_turboquant_dense(
 
     if (
         preset is not None
-        and server_args.turboquant_dense_kv_preset
-        == DEFAULT_TURBOQUANT_DENSE_KV_PRESET
+        and server_args.turboquant_dense_kv_preset == DEFAULT_TURBOQUANT_DENSE_KV_PRESET
         and preset != DEFAULT_TURBOQUANT_DENSE_KV_PRESET
     ):
         server_args.turboquant_dense_kv_preset = preset
@@ -112,9 +111,7 @@ def _maybe_apply_turboquant_dense(
         )
 
 
-def _maybe_apply_higgs_dense_2bit(
-    server_args: Any, quant_cfg: Dict[str, Any]
-) -> None:
+def _maybe_apply_higgs_dense_2bit(server_args: Any, quant_cfg: Dict[str, Any]) -> None:
     """Promote a HIGGS 2-bit ``kv_cache_scheme`` declaration onto args.
 
     Recognised JSON shape::
@@ -181,8 +178,8 @@ def _maybe_apply_indexer_quantization(
         )
 
     indexcache_cfg = _coerce_dict(indexer_quant.get("indexcache"))
-    indexcache_enabled = (
-        indexcache_cfg is not None and bool(indexcache_cfg.get("enabled", False))
+    indexcache_enabled = indexcache_cfg is not None and bool(
+        indexcache_cfg.get("enabled", False)
     )
     hisa_cfg = _coerce_dict(indexer_quant.get("hisa"))
     hisa_enabled = (
@@ -213,10 +210,7 @@ def _maybe_apply_indexer_quantization(
         )
     elif getattr(server_args, "nsa_indexer_mode", "vanilla") == "vanilla":
         server_args.nsa_indexer_mode = mode
-    if (
-        "block_size" in hisa_cfg
-        and getattr(server_args, "hisa_block_size", 128) == 128
-    ):
+    if "block_size" in hisa_cfg and getattr(server_args, "hisa_block_size", 128) == 128:
         server_args.hisa_block_size = int(hisa_cfg["block_size"])
     if "block_topk" in hisa_cfg and getattr(server_args, "hisa_block_topk", 64) == 64:
         server_args.hisa_block_topk = int(hisa_cfg["block_topk"])
@@ -273,9 +267,7 @@ def _maybe_apply_indexcache(
     freq = indexcache_cfg.get("freq", indexcache_cfg.get("index_topk_freq"))
     if (
         freq is not None
-        and getattr(
-            server_args, "nsa_indexcache_freq", DEFAULT_NSA_INDEXCACHE_FREQ
-        )
+        and getattr(server_args, "nsa_indexcache_freq", DEFAULT_NSA_INDEXCACHE_FREQ)
         == DEFAULT_NSA_INDEXCACHE_FREQ
     ):
         server_args.nsa_indexcache_freq = int(freq)
@@ -288,9 +280,7 @@ def _maybe_apply_indexcache(
         server_args.nsa_indexcache_pattern = str(pattern)
 
 
-def apply_quantization_config_dispatch(
-    server_args: Any, hf_config: Any
-) -> None:
+def apply_quantization_config_dispatch(server_args: Any, hf_config: Any) -> None:
     """Promote declarative ``quantization_config`` fields onto ``server_args``.
 
     Behavior is a no-op when ``hf_config.quantization_config`` is absent
@@ -366,6 +356,4 @@ def should_use_nsa_fused_store(
             return False
         if method == INDEXER_NVFP4_QUANT_METHOD:
             return False
-    return auto_platform_ok and auto_compat_check(
-        key_dtype, indices_dtype, page_size
-    )
+    return auto_platform_ok and auto_compat_check(key_dtype, indices_dtype, page_size)

@@ -33,8 +33,7 @@ _PACKAGE_PATHS = {
     "sglang.srt": ROOT / "python/sglang/srt",
     "sglang.srt.layers": ROOT / "python/sglang/srt/layers",
     "sglang.srt.layers.attention": ROOT / "python/sglang/srt/layers/attention",
-    "sglang.srt.layers.attention.nsa": ROOT
-    / "python/sglang/srt/layers/attention/nsa",
+    "sglang.srt.layers.attention.nsa": ROOT / "python/sglang/srt/layers/attention/nsa",
     "sglang.srt.layers.quantization": ROOT / "python/sglang/srt/layers/quantization",
 }
 for module_name, package_path in _PACKAGE_PATHS.items():
@@ -214,6 +213,56 @@ def test_higgs_quantization_config_object_with_to_dict():
     dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
     assert server_args.enable_higgs_dense_2bit_kv_cache is True
     assert server_args.enable_turboquant_dense_kv_cache is False
+
+
+def test_reap_higgs_nvfp4_hisa_config_shape_enables_deployment_stack():
+    server_args = FakeServerArgs()
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "kv_cache_scheme": {
+                "quant_method": "higgs_dense_2bit",
+                "preset": "eden2_16",
+                "slot_bytes": 258,
+                "packed_bits": 2,
+                "kv_dim": 576,
+                "latent_dim": 512,
+                "rope_dim": 64,
+            },
+            "indexer_quantization": {
+                "quant_method": "nvfp4_e2m1_ue8m0",
+                "hisa": {
+                    "enabled": True,
+                    "mode": "indexcache-hisa",
+                    "block_size": 128,
+                    "block_topk": 64,
+                    "compression_ratio": 4.0,
+                    "execution_mode": "optimized",
+                },
+            },
+        }
+    )
+    dispatcher.apply_quantization_config_dispatch(server_args, hf_config)
+    assert server_args.enable_higgs_dense_2bit_kv_cache is True
+    assert server_args.enable_turboquant_dense_kv_cache is False
+    assert server_args.indexer_quantization_declared == {
+        "quant_method": "nvfp4_e2m1_ue8m0",
+        "hisa": {
+            "enabled": True,
+            "mode": "indexcache-hisa",
+            "block_size": 128,
+            "block_topk": 64,
+            "compression_ratio": 4.0,
+            "execution_mode": "optimized",
+        },
+    }
+    assert server_args.enable_nsa_nvfp4_hisa is True
+    assert server_args.nsa_indexer_mode == "indexcache-hisa"
+    assert server_args.nsa_indexcache_freq == 4
+    assert server_args.nsa_indexcache_pattern is None
+    assert server_args.hisa_block_size == 128
+    assert server_args.hisa_block_topk == 64
+    assert server_args.hisa_compression_ratio == 4.0
+    assert server_args.hisa_execution_mode == "optimized"
 
 
 def test_higgs_declared_blocks_turboquant_cli():

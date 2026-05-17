@@ -196,9 +196,11 @@ add the nested `indexcache` declaration:
 }
 ```
 
-For the production NVFP4 IndexCache+HISA deployment, keep the same
-IndexCache declaration and add `hisa.enabled=true` with
-`mode: "indexcache-hisa"`:
+For the production NVFP4 IndexCache+HISA deployment, set
+`hisa.enabled=true` with `mode: "indexcache-hisa"`. A nested
+`indexcache` block is optional: include it when the model card needs a
+non-default frequency or explicit pattern, otherwise the dispatcher uses
+the normal `nsa_indexcache_freq` default.
 
 ```json
 {
@@ -219,6 +221,27 @@ IndexCache declaration and add `hisa.enabled=true` with
         "block_size": 128,
         "compression_ratio": 4.0,
         "min_seq_len": 8192,
+        "execution_mode": "optimized"
+      }
+    }
+  }
+}
+```
+
+The shorter form used by the active HIGGS/NVFP4-HISA checkpoint is also
+valid when the default IndexCache frequency is acceptable:
+
+```json
+{
+  "quantization_config": {
+    "indexer_quantization": {
+      "quant_method": "nvfp4_e2m1_ue8m0",
+      "hisa": {
+        "enabled": true,
+        "mode": "indexcache-hisa",
+        "block_size": 128,
+        "block_topk": 64,
+        "compression_ratio": 4.0,
         "execution_mode": "optimized"
       }
     }
@@ -250,9 +273,11 @@ Effect on `server_args`:
 | `indexcache.pattern` / `index_topk_pattern` | Copied into `nsa_indexcache_pattern` when the launch did not already supply a pattern. |
 | `hisa.enabled` with NVFP4 | Enables `enable_nsa_nvfp4_hisa`; defaults to `nsa_indexer_mode="indexcache-hisa"` when launch flags did not already select a mode. |
 
-This dispatch runs after the model config is loaded from Hugging Face, so a
-Hub checkpoint can select the indexer format from its `config.json` without a
-launcher override.
+This dispatch runs after the model config is loaded from Hugging Face. The
+promoted indexer fields are copied back onto the already-loaded
+`hf_config`, so the DeepSeek `Indexer` construction sees
+`nsa_indexer_mode="indexcache-hisa"` and the HISA knobs without a launcher
+override.
 
 Effect at runtime: the fused-store dispatch in
 `python/sglang/srt/layers/attention/nsa/nsa_indexer.py` calls
@@ -303,12 +328,12 @@ The same selection can be forced at launch with
 checkpoint declaration when present and otherwise keeps the FP8 path.
 
 The selected layout is passed through the NSA pool constructors, including the
-IndexCache, dense TurboQuant, HiSparse allocation, LayerSplit index-buffer, and
-hierarchical-cache host mirror paths. That keeps production memory sizing and
-cache offsets aligned for the full custom stack. The current HiSparse TileLang
-indexer kernels are FP8-layout-specific; when `nvfp4_e2m1_ue8m0` is selected,
-runtime dispatch uses the DeepGEMM FP4 IndexCache logits path instead of the
-HiSparse FP8 indexer kernels.
+IndexCache, dense TurboQuant, HIGGS dense KV, HiSparse allocation, LayerSplit
+index-buffer, and hierarchical-cache host mirror paths. That keeps production
+memory sizing and cache offsets aligned for the full custom stack. The current
+HiSparse TileLang indexer kernels are FP8-layout-specific; when
+`nvfp4_e2m1_ue8m0` is selected, runtime dispatch uses the DeepGEMM FP4
+IndexCache logits path instead of the HiSparse FP8 indexer kernels.
 
 ## Precedence
 
@@ -347,25 +372,26 @@ This matches the precedence pattern used elsewhere in `server_args.py`
 
 ## Worked example
 
-CLI form (existing, unchanged):
+CLI form for the legacy TurboQuant path:
 
 ```bash
 python -m sglang.launch_server \
-  --model-path BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1 \
+  --model-path <checkpoint-without-higgs-config-dispatch> \
   --enable-turboquant-dense-kv-cache \
   --turboquant-dense-kv-preset latent_2p5bit_nc
 ```
 
-Config form (new): no flags required if the model's `config.json`
-contains both fields above.
+Config form for the active HIGGS plus NVFP4 IndexCache+HISA path: no dense KV
+or indexer flags are required if the model's `config.json` contains both
+fields above.
 
 ```bash
 python -m sglang.launch_server \
-  --model-path BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1
+  --model-path BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4
 ```
 
-The two forms produce identical `server_args` (and therefore identical
-runtime kernel dispatch).
+The config form produces the same runtime kernel dispatch as supplying the
+equivalent HIGGS and NVFP4 IndexCache+HISA flags explicitly.
 
 ## Tests
 
@@ -393,8 +419,9 @@ runtime kernel dispatch).
   `indexer_quantization.indexer_mode="indexcache"`, including frequency
   and pattern propagation, while preserving CLI/deployment overrides.
 - The production NVFP4 IndexCache+HISA config composes these fields:
-  `quant_method="nvfp4_e2m1_ue8m0"`, `indexcache.enabled=true`, and
-  `hisa.enabled=true` resolve to `nsa_indexer_mode="indexcache-hisa"`.
+  `quant_method="nvfp4_e2m1_ue8m0"` and `hisa.enabled=true` resolve to
+  `nsa_indexer_mode="indexcache-hisa"`, with or without an explicit
+  `indexcache` block.
   A contradictory `indexcache.enabled=true` plus `hisa.mode="hisa"`
   declaration raises `ValueError`.
 - A wrapper object that exposes `to_dict()` is coerced and applied

@@ -40,6 +40,17 @@ def g1_gate_forward(
     return output, gate
 
 
+def g1_gate_forward_fused(
+    linear_out: torch.Tensor,
+    attn_out: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if output is None:
+        output = torch.empty_like(attn_out, memory_format=torch.contiguous_format)
+    torch.ops.sgl_kernel.g1_gate_forward_fused.default(linear_out, attn_out, output)
+    return output
+
+
 def cutlass_mla_decode(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,

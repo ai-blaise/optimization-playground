@@ -43,6 +43,30 @@ Round 0, deployability incumbent gate, 2026-05-17:
 - Command: `. /root/work/optimization-playground/.venv/bin/activate && CUDA_VISIBLE_DEVICES=0 /root/agent-runs/gpu_locked.sh pytest -q -s sgl-kernel/tests/test_g1_attention.py`.
 - Caveat: full editable rebuild needed `CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DSGL_KERNEL_COMPILE_THREADS=1 -DENABLE_BELOW_SM90=OFF"` in this shared CMake 4.3 validation environment.
 
+Round 1, output-only fused dispatch, 2026-05-17:
+
+- Incumbent: `d15e54257`, generic SM100 common ops deployability fix.
+- Hotspot/result: IKP NSys import for the incumbent full G1 path at 256 tokens x
+  hidden 7168 matched 200 launches of `g1_gate_cute_kernel_v2`, mean 3.152 us,
+  grid `[592,1,1]`, block `[256,1,1]`; model-side dispatch allocated and wrote
+  a gate tensor that is immediately discarded by `_apply_g1_gate`.
+- Candidate: expose the existing output-only CUDA entry point as
+  `g1_gate_forward_fused`, add Python binding/tests, and use it in the DeepSeek
+  G1 hook when available.
+- Result: accepted. On NVIDIA B200, `bench_g1_gate.py --tokens 1,16,64,256,1024
+  --warmup 100 --iters 500 --json` measured model-style allocation path
+  speedups of 19.9%, 20.1%, 20.7%, 20.6%, and 0.1% respectively; preallocated
+  path was neutral to mixed because both variants are launch-floor dominated.
+  IKP NSys import for fused 256-token path matched 200 launches of
+  `g1_gate_cute_fused_kernel_v2`, mean 2.894 us. Correctness maxdiff matched
+  the full kernel (`0.0` through 64 tokens, `0.0009765625` at 256 tokens,
+  `0.00390625` at 1024 tokens).
+- Correctness: `CUDA_VISIBLE_DEVICES=0 /root/agent-runs/gpu_locked.sh pytest -q
+  -s sgl-kernel/tests/test_g1_attention.py` -> `10 passed`.
+- Artifacts: `/root/agent-runs/g1-round1-fused-bench.json`,
+  `/root/agent-runs/g1-round1-incumbent-nsys`,
+  `/root/agent-runs/g1-round1-fused-nsys`.
+
 ## GatedNorm Forward
 
 The `sglang.jit_kernel.gated_norm.gated_norm_forward` kernel applies the

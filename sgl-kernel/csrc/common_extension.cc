@@ -59,6 +59,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
   m.def("g1_gate_forward(Tensor linear_out, Tensor attn_out, Tensor! output, Tensor! gate) -> ()");
   m.impl("g1_gate_forward", torch::kCUDA, &g1_gate_forward);
+  m.def("g1_gate_forward_fused(Tensor linear_out, Tensor attn_out, Tensor! output) -> ()");
+  m.impl("g1_gate_forward_fused", torch::kCUDA, &g1_gate_forward_fused);
 
   /*
    * From csrc/elementwise

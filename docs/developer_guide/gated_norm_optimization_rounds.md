@@ -91,5 +91,120 @@ Measured before/after versus the Round 1 incumbent with the same public `gated_n
 
 Correctness verification: candidate output matched the incumbent output with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` for every measured row.
 
-Decision: accept. New incumbent commit: pending.
+Decision: accept. New incumbent commit: `fbfb08dc9` (`Fuse GatedNorm torch-MM epilogue`).
+
+## Round 3: epilogue tile size 2048
+
+Incumbent: `fbfb08dc9` (Round 2 fused epilogue with `BLOCK=1024`).
+
+Profiler/instrumentation: CUDA-event candidate sweep against the accepted incumbent. IKP source markers were not feasible for this Triton/cuBLAS path: Triton JIT kernels cannot include IKP C++ trace macros, and the CUDA extension path could not be loaded on this VM because `sgl-kernel` has no local `common_ops` build.
+
+Hotspot/result: final profiling still showed `_sigmoid_mul_kernel` as the largest individual kernel at rank 16, 2048 tokens, so a larger one-dimensional epilogue tile was tested to reduce program count.
+
+Candidate: change the fused epilogue launch from `BLOCK=1024` to `BLOCK=2048`.
+
+Command:
+
+```bash
+/root/agent-runs/gpu_locked.sh bash -lc '. /root/.cargo/env; source /root/work/optimization-playground/.venv/bin/activate; export CUDA_HOME=/usr/local/cuda; export PATH=$CUDA_HOME/bin:$PATH; export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}; export PYTHONPATH=/root/work/op-kernel-gatednorm/python:/root/work/op-kernel-gatednorm/sgl-kernel/python:${PYTHONPATH:-}; CUDA_VISIBLE_DEVICES=0 python /tmp/gatednorm_round3_block2048_fair.py'
+```
+
+Measured before/after versus the Round 2 incumbent using identical direct torch-MM pipelines except for epilogue `BLOCK`:
+
+| rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 8 | 1024 | 0.029500 | 0.029466 | 1.001x | reject |
+| 8 | 2048 | 0.032888 | 0.032826 | 1.002x | reject |
+| 8 | 4096 | 0.059647 | 0.059487 | 1.003x | reject |
+| 16 | 1024 | 0.028697 | 0.028566 | 1.005x | reject |
+| 16 | 2048 | 0.031569 | 0.031521 | 1.002x | reject |
+| 16 | 4096 | 0.058484 | 0.057827 | 1.011x | reject/no broad win |
+| 32 | 1024 | 0.027467 | 0.027450 | 1.001x | reject |
+| 32 | 2048 | 0.033524 | 0.033129 | 1.012x | reject/no broad win |
+| 32 | 4096 | 0.057885 | 0.057498 | 1.007x | reject |
+
+Correctness verification: candidate output matched the incumbent output with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` for every measured row.
+
+Decision: reject. The only rows above 1% were isolated and the broad sweep was within measurement noise. Source remains at the Round 2 incumbent.
+
+## Round 4: Triton `tl.sigmoid` intrinsic in epilogue
+
+Incumbent: `fbfb08dc9` (Round 2 fused epilogue).
+
+Profiler/instrumentation: CUDA-event candidate sweep; IKP source markers remained infeasible for the same Triton/cuBLAS reasons as Round 3.
+
+Hotspot/result: `_sigmoid_mul_kernel` remained the largest individual kernel, and the epilogue computes sigmoid explicitly as `1 / (1 + exp(-x))`.
+
+Candidate: replace the explicit sigmoid expression with Triton's `tl.sigmoid(logits)` intrinsic in a temporary candidate kernel.
+
+Command:
+
+```bash
+/root/agent-runs/gpu_locked.sh bash -lc '. /root/.cargo/env; source /root/work/optimization-playground/.venv/bin/activate; export CUDA_HOME=/usr/local/cuda; export PATH=$CUDA_HOME/bin:$PATH; export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}; export PYTHONPATH=/root/work/op-kernel-gatednorm/python:/root/work/op-kernel-gatednorm/sgl-kernel/python:${PYTHONPATH:-}; CUDA_VISIBLE_DEVICES=0 python /tmp/gatednorm_round4_tl_sigmoid.py'
+```
+
+Measured before/after versus the Round 2 incumbent epilogue:
+
+| rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 8 | 1024 | 0.029396 | 0.029138 | 1.009x | reject |
+| 8 | 2048 | 0.032979 | 0.032938 | 1.001x | reject |
+| 8 | 4096 | 0.059603 | 0.059476 | 1.002x | reject |
+| 16 | 1024 | 0.028699 | 0.028706 | 1.000x | reject |
+| 16 | 2048 | 0.031774 | 0.031390 | 1.012x | reject/no broad win |
+| 16 | 4096 | 0.057874 | 0.057792 | 1.001x | reject |
+| 32 | 1024 | 0.026736 | 0.026684 | 1.002x | reject |
+| 32 | 2048 | 0.033502 | 0.032988 | 1.016x | reject/no broad win |
+| 32 | 4096 | 0.057593 | 0.057567 | 1.000x | reject |
+
+Correctness verification: candidate output matched the incumbent output with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` for every measured row.
+
+Decision: reject. The intrinsic form did not produce a broad or stable speedup. No source change.
+
+## Round 5: Triton epilogue `num_warps` launch tuning
+
+Incumbent: `fbfb08dc9` (Round 2 fused epilogue).
+
+Profiler/instrumentation: CUDA-event launch-configuration sweep; IKP source markers remained infeasible for the Triton/cuBLAS path.
+
+Hotspot/result: the fused epilogue remained visible in Nsight/IKP-imported system attribution, so launch configuration was the remaining low-risk candidate before a larger CUTLASS/CuTe rewrite.
+
+Candidate: explicitly launch `_sigmoid_mul_kernel` with `num_warps=4` and `num_warps=8` instead of the default.
+
+Command:
+
+```bash
+/root/agent-runs/gpu_locked.sh bash -lc '. /root/.cargo/env; source /root/work/optimization-playground/.venv/bin/activate; export CUDA_HOME=/usr/local/cuda; export PATH=$CUDA_HOME/bin:$PATH; export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}; export PYTHONPATH=/root/work/op-kernel-gatednorm/python:/root/work/op-kernel-gatednorm/sgl-kernel/python:${PYTHONPATH:-}; CUDA_VISIBLE_DEVICES=0 python /tmp/gatednorm_round5_numwarps.py'
+```
+
+Measured before/after versus the Round 2 incumbent default launch:
+
+| rank | tokens | incumbent ms | best candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 8 | 1024 | 0.029150 | 0.029222 | 0.998x | reject |
+| 8 | 2048 | 0.032946 | 0.032895 | 1.002x | reject |
+| 8 | 4096 | 0.059512 | 0.059697 | 0.997x | reject |
+| 16 | 1024 | 0.028731 | 0.028692 | 1.001x | reject |
+| 16 | 2048 | 0.031485 | 0.031279 | 1.007x | reject |
+| 16 | 4096 | 0.058203 | 0.057609 | 1.010x | reject/no broad win |
+| 32 | 1024 | 0.026794 | 0.026721 | 1.003x | reject |
+| 32 | 2048 | 0.033337 | 0.033161 | 1.005x | reject |
+| 32 | 4096 | 0.057834 | 0.057562 | 1.005x | reject |
+
+Correctness verification: both `num_warps=4` and `num_warps=8` outputs matched the incumbent output with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` for every measured row.
+
+Decision: reject. `num_warps=8` regressed larger rows and `num_warps=4` was effectively the default/noise floor. No source change.
+
+## Stop evidence
+
+Final accepted incumbent: `fbfb08dc9`. Final profile command:
+
+```bash
+/root/agent-runs/gpu_locked.sh bash -lc '. /root/.cargo/env; source /root/work/optimization-playground/.venv/bin/activate; export CUDA_HOME=/usr/local/cuda; export PATH=$CUDA_HOME/bin:$PATH; export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}; export PYTHONPATH=/root/work/op-kernel-gatednorm/python:/root/work/op-kernel-gatednorm/sgl-kernel/python:${PYTHONPATH:-}; CUDA_VISIBLE_DEVICES=0 nsys profile --force-overwrite=true -o /root/agent-runs/gatednorm-final-r16-t2048 python /tmp/gatednorm_profile_final.py'
+python3 /root/work/rule7-refs/intra-kernel-profiler/scripts/ikp_nsys_import.py --nsys-rep /root/agent-runs/gatednorm-final-r16-t2048.nsys-rep --out-dir /root/agent-runs/gatednorm-final-ikp --skip-export
+```
+
+Artifacts: `/root/agent-runs/gatednorm-final-r16-t2048.nsys-rep`, `/root/agent-runs/gatednorm-final-r16-t2048.sqlite`, `/root/agent-runs/gatednorm-final-r16-t2048-kernsum.txt`, `/root/agent-runs/gatednorm-final-ikp/nsys_kernels.json`.
+
+Final rank 16, 2048-token kernel summary after Round 2: `_sigmoid_mul_kernel` 36.6% (11.62 us average), first cuBLAS GEMM 24.3% (7.70 us), second cuBLAS GEMM 19.5% (6.19 us), cuBLAS split-K reduce 12.1% (3.83 us), PyTorch SiLU 6.9% (2.19 us). The remaining low-risk epilogue candidates were rejected within noise; further material improvement likely requires a larger tensor-op-first CUTLASS/CuTe rewrite that fuses the GEMM epilogue or replaces the PyTorch/cuBLAS multi-launch path. The legacy `gated_norm_cute_forward` name remains historical: the checked source is hand-written CUDA inline MMA/ldmatrix/cp.async, not CuTe-generated code.
 

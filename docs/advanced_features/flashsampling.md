@@ -285,14 +285,21 @@ Restart candidate rejected after `c251cb7bb`:
 | :--- | :--- | :--- |
 | Replace per-H local-reduce CTAs with one small-H CTA | `/root/agent-runs/flashsampling-restart-round4-smallh-reduce-candidate-gpu-any.json`: H2 0.045240 -> 0.045315 ms, H4 0.045117 -> 0.045092 ms, H8 0.045114 -> 0.045105 ms | reject: launch floor dominates and changes are ties/noise |
 
-All rejected candidates matched dense argmax correctness. No rejected kernel
-constant changes are left in source; these candidates were measured through the
-benchmark harness override flags. A dense matmul+argmax floor check on the same
+All rejected candidates matched dense argmax correctness or, for stochastic
+sampling probes, produced in-range token ids. No rejected kernel constant changes
+are left in source. A dense matmul+argmax floor check on the original greedy
 shape measured 0.049364 / 0.051334 / 0.053421 ms for BS1/32/64, while the
-incumbent target path measured 0.047164 / 0.047247 / 0.049800 ms, so the
-incumbent is already at or faster than the closest cuBLAS+dense sampling
-reference for this kernel-only shape. Nearby Blackwell schedule candidates all
-regressed or tied, so no further source optimization was accepted.
+post-restart target path measures 0.046680 / 0.047191 / 0.050074 ms for the
+same buckets and 0.045159 / 0.045169 / 0.045117 ms for BS2/4/8. The final
+non-greedy H1/2/4/8 sweep measured 0.045485 / 0.045252 / 0.045424 /
+0.045425 ms. Final IKP/nsys attribution for non-greedy H1 shows
+`flashsample_blackwell_kernel` still dominates at 39.937 us mean, while
+`_local_reduce_samples_kernel` is 2.415 us mean. Stopping rationale: the
+remaining work is the matmul/noise kernel plus one small fixed reduction launch;
+Rule 7/CuTe constraints make `BLOCK_H=8` the smallest plausible tensor-core N
+tile, and further tested surfaces (two-wave non-persistent dispatch, `BLOCK_H=128`,
+local-reduce fusion, `maxnreg=255`, stage/warp/D/V tile changes) regressed or
+tied within noise against the best accepted incumbent.
 
 Caveat: the VM shared venv was missing an SM100
 `sgl_kernel/common_ops` binary, so standalone kernel profiling used

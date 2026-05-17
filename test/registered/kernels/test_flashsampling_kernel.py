@@ -41,6 +41,42 @@ class TestFlashSamplingKernel(unittest.TestCase):
 
         self.assertTrue(torch.equal(samples.cpu(), expected.cpu()))
 
+    def test_blackwell_target_provider_matches_dense_argmax_and_scores(self):
+        torch.cuda.set_device(0)
+        if torch.cuda.get_device_capability(0)[0] < 10:
+            self.skipTest("Blackwell target provider requires SM100 or newer.")
+
+        from sglang.srt.layers.flashsampling.target_kernel_blackwell import (
+            fused_mm_sample_blackwell,
+        )
+
+        torch.manual_seed(3)
+        vocab_size, hidden_size, batch_size = 512, 128, 8
+        weights = torch.randn(
+            vocab_size, hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        hidden_states = torch.randn(
+            batch_size, hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        temperature = torch.tensor(1.0, device="cuda")
+
+        samples, scores = fused_mm_sample_blackwell(
+            weights,
+            hidden_states,
+            1,
+            temperature,
+            seed=0,
+            greedy_sampling=True,
+            return_scores=True,
+            valid_vocab_size=vocab_size,
+        )
+        expected_scores, expected_samples = (hidden_states @ weights.T).float().max(
+            dim=-1, keepdim=True
+        )
+
+        self.assertTrue(torch.equal(samples.cpu(), expected_samples.cpu()))
+        self.assertLessEqual((scores - expected_scores).abs().max().item(), 0.30)
+
     def test_debug_logits_match_dense_matmul(self):
         torch.cuda.set_device(0)
         torch.manual_seed(1)

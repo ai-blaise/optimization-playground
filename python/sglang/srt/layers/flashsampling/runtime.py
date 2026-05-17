@@ -108,7 +108,16 @@ def is_flashsampling_sampling_info_supported(
         return True
     if sampling_info.need_top_k_sampling:
         return False
-    return sampling_info.temperature_is_uniform
+    return _temperature_is_uniform(sampling_info)
+
+
+def _temperature_is_uniform(sampling_info: SamplingBatchInfo) -> bool:
+    temperature_is_uniform = getattr(sampling_info, "temperature_is_uniform", None)
+    if temperature_is_uniform is not None:
+        return temperature_is_uniform
+
+    temperatures = sampling_info.temperatures.reshape(-1)
+    return bool(torch.all(temperatures == temperatures[0]).item())
 
 
 def get_flashsampling_lm_head_metadata(
@@ -183,9 +192,17 @@ class FlashSamplingRuntime:
         server_args = get_global_server_args()
         use_target = getattr(server_args, "flashsampling_provider", "triton") == "target"
         if use_target:
-            from sglang.srt.layers.flashsampling.target_kernel import (
-                fused_mm_sample_target as _fused_mm_sample,
-            )
+            device_index = info.lm_head_weight.device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            if torch.cuda.get_device_capability(device_index)[0] >= 10:
+                from sglang.srt.layers.flashsampling.target_kernel_blackwell import (
+                    fused_mm_sample_blackwell as _fused_mm_sample,
+                )
+            else:
+                from sglang.srt.layers.flashsampling.target_kernel import (
+                    fused_mm_sample_target as _fused_mm_sample,
+                )
         else:
             from sglang.srt.layers.flashsampling.core import (
                 fused_mm_sample_triton as _fused_mm_sample,

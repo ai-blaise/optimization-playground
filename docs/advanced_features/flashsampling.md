@@ -32,8 +32,10 @@ batch is not eligible.
 The `target` provider uses a non-persistent grid-launch kernel optimized for
 shapes where the total number of (V, H) tiles fits in a single SM wave
 (tiles <= NUM_SMS). This is the typical case for TP-sharded vocab sizes
-(e.g. V=16160 on TP=8 DeepSeek-V3.2-REAP). When tiles exceed NUM_SMS, the
-target provider falls back to the persistent kernel automatically.
+(e.g. V=16160 on TP=8 DeepSeek-V3.2-REAP). On Blackwell (SM100/B200),
+`target` dispatches to the Blackwell-tuned variant with adaptive pipeline
+stages; older CUDA devices use the generic target kernel. When tiles exceed
+NUM_SMS, the target provider falls back to the persistent kernel automatically.
 
 IKP-validated performance on H200 (V=16160, D=7168, TP=8):
 - Kernel-only: 0.061ms (3.80 TB/s, 79% peak) vs persistent: 0.086ms (2.68 TB/s)
@@ -108,6 +110,12 @@ FLASHSAMPLING_MIN_BATCH_SIZE=128 \
 scripts/playground/run-flashsampling-paper-ab.sh
 ```
 
+To compare the Blackwell target provider explicitly, add:
+
+```bash
+FLASHSAMPLING_PROVIDER=target
+```
+
 For Qwen3-8B paper-style validation on H200, use the paper gate rather than the
 conservative production gate:
 
@@ -173,6 +181,47 @@ CONCURRENCY=128 \
 WARMUP_REQUESTS=concurrency \
 scripts/playground/profile-flashsampling-serving-ikp.sh
 ```
+
+### B200 Target-Provider Optimization Log
+
+Hardware: 1x NVIDIA B200 (SM100), `CUDA_VISIBLE_DEVICES=0`. Shape:
+`V=16160`, `D=7168`, BF16 weights/hidden states, greedy sampling, 20 warmup
+iterations and 200 timed iterations unless noted. Correctness means sampled ids
+match dense BF16 matmul argmax. Benchmarks used `/root/agent-runs/gpu_locked.sh`.
+
+Hotspot attribution: IKP imported the Nsight trace
+`/root/agent-runs/nsys-flashsampling-target-h64.nsys-rep` into
+`/root/agent-runs/ikp-flashsampling-target-h64/nsys_kernels.json`. Matmul/sample
+work dominates: `flashsample_blackwell_kernel` was 619.039 us total across 14
+calls (44.217 us mean); `_local_reduce_samples_kernel` was 32.992 us total
+(2.357 us mean). Optimization rounds therefore targeted the Blackwell matmul
+kernel schedule, not the local reduction.
+
+Round 0 incumbent -> candidate -> decision:
+
+- Incumbent: `--flashsampling-provider target` used the generic target kernel on
+  B200.
+- Candidate: dispatch `target` to `target_kernel_blackwell.py` on SM100 and add
+  API parity for `return_scores`/fallback args.
+- Command:
+
+```bash
+/root/agent-runs/gpu_locked.sh bash -lc '
+  cd /root/work/op-kernel-flashsampling &&   source /root/work/optimization-playground/.venv/bin/activate &&   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/root/work/op-kernel-flashsampling/python:$PYTHONPATH   python scripts/playground/bench_flashsampling_provider.py     --providers target_generic target     --vocab-size 16160 --hidden-size 7168 --batch-sizes 1 32 64     --warmup 20 --iters 200 --direct-module-import     --output-json /root/agent-runs/flashsampling-round0-generic-vs-blackwell.json
+'
+```
+
+| Batch | Incumbent `target_generic` ms | Candidate `target_blackwell` ms | Change | Decision |
+| ---: | ---: | ---: | ---: | :--- |
+| 1 | 0.049059 | 0.047400 | 3.38% faster | accept |
+| 32 | 0.048544 | 0.047206 | 2.76% faster | accept |
+| 64 | 0.049855 | 0.049906 | 0.10% slower, within noise | accept for B200 provider correctness |
+
+New incumbent commit: pending in this worker branch before subsequent accepted
+source candidates. Caveat: the VM shared venv was missing an SM100
+`sgl_kernel/common_ops` binary, so standalone kernel profiling used
+`--direct-module-import`; server-level B200 TPOT benchmarking is blocked until
+that shared install is restored.
 
 The direct kernel tests validate greedy equality, logits debug mode, sampled-id
 range, seed sensitivity, vocabulary-shard offsets, and compact local index

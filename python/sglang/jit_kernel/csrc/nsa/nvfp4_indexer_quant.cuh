@@ -878,23 +878,27 @@ __global__ void hisa_block_topk_map_all_indexer_cache_nvfp4(
   if (row >= param.q_rows) return;
   const auto tid = threadIdx.x;
 
-  for (uint32_t idx = tid; idx < param.topk; idx += blockDim.x) {
-    static_cast<int32_t*>(param.topk_indices)[
-        static_cast<int64_t>(row) * param.topk + idx] = -1;
-  }
-
+  constexpr uint32_t kHISABlockSize = 128;
   const auto block_count =
       min(static_cast<uint32_t>(static_cast<const int32_t*>(param.block_counts)[row]),
           param.max_blocks);
-  if (tid < param.block_topk) selected[tid] = -1;
-  __syncthreads();
-  if (block_count == 0) return;
-
   const auto row_block_topk =
       min(static_cast<uint32_t>(
               static_cast<const int32_t*>(param.block_topk_counts)[row]),
           param.block_topk);
   const auto keep = min(row_block_topk, block_count);
+
+  if (keep < param.block_topk) {
+    const auto clear_begin = keep * kHISABlockSize;
+    for (uint32_t idx = clear_begin + tid; idx < param.topk; idx += blockDim.x) {
+      static_cast<int32_t*>(param.topk_indices)[
+          static_cast<int64_t>(row) * param.topk + idx] = -1;
+    }
+  }
+
+  if (tid < param.block_topk) selected[tid] = -1;
+  __syncthreads();
+  if (block_count == 0) return;
   const auto prefix_len = static_cast<const int32_t*>(param.prefix_lens)[row];
   const auto* scores = static_cast<const float*>(param.block_scores) +
                        static_cast<int64_t>(row) * param.max_blocks;

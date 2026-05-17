@@ -195,9 +195,66 @@ Correctness verification: both `num_warps=4` and `num_warps=8` outputs matched t
 
 Decision: reject. `num_warps=8` regressed larger rows and `num_warps=4` was effectively the default/noise floor. No source change.
 
-## Stop evidence
+## Round 6: rank >=32 decode GEMM dispatch
 
-Final accepted incumbent: `fbfb08dc9`. Final profile command:
+Incumbent: `11922dcd9` (post-merge chain with Round 2 accepted threshold and epilogue fusion).
+
+Profiler/instrumentation: CUDA-event path sweep on both B200s using the updated per-GPU locks (`gpu_locked_any.sh`, then explicit GPU 1 and GPU 0 repeats). IKP source markers remained infeasible for this dispatch-level candidate because the compared path chooses between Triton JIT and PyTorch/cuBLAS launches rather than a single in-repo CUDA kernel region. Replacement evidence is direct same-device CUDA-event timing against the `11922dcd9` dispatch thresholds.
+
+Hotspot/result: the stricter restart sweep found the previous closure did not cover high-rank decode shapes below the accepted GEMM thresholds. Forced torch/cuBLAS was materially faster for rank 32/40/48 at 1-32 tokens and rank 64 at 1-8 tokens, while the old/current paths tied once the incumbent already used torch/cuBLAS.
+
+Candidate: change `_default_torch_mm_min_tokens` so `rank >= 32` dispatches to torch/cuBLAS from 1 token. Keep rank 16 at 64 tokens, rank 8 at 512 tokens, and rank 1 at 4096 tokens.
+
+Exploratory command and artifact:
+
+```bash
+/root/agent-runs/gpu_locked_any.sh bash -lc '<env>; python <path sweep>'
+# /root/agent-runs/gatednorm-restart-round6-path-sweep.jsonl
+```
+
+Accepted comparison command and artifact:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /root/agent-runs/gpu_locked.sh bash -lc '<env>; python <candidate-vs-old-threshold sweep>'
+# /root/agent-runs/gatednorm-restart-round6-accepted-bench.jsonl
+```
+
+Measured candidate default versus old `11922dcd9` thresholds, median of 5 same-device CUDA-event repeats:
+
+| rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 32 | 1 | 0.044897 | 0.028095 | 1.60x | keep |
+| 32 | 4 | 0.045130 | 0.027973 | 1.61x | keep |
+| 32 | 8 | 0.045152 | 0.028088 | 1.61x | keep |
+| 32 | 16 | 0.045162 | 0.027854 | 1.62x | keep |
+| 32 | 32 | 0.045130 | 0.028171 | 1.60x | keep |
+| 32 | 64 | 0.028101 | 0.028006 | 1.00x | tie |
+| 40 | 1 | 0.053328 | 0.028374 | 1.88x | keep |
+| 40 | 4 | 0.053353 | 0.028011 | 1.90x | keep |
+| 40 | 8 | 0.053334 | 0.028168 | 1.89x | keep |
+| 40 | 16 | 0.054215 | 0.028154 | 1.93x | keep |
+| 40 | 32 | 0.053534 | 0.027807 | 1.93x | keep |
+| 40 | 64 | 0.028059 | 0.028006 | 1.00x | tie |
+| 48 | 1 | 0.055366 | 0.028534 | 1.94x | keep |
+| 48 | 4 | 0.053773 | 0.028351 | 1.90x | keep |
+| 48 | 8 | 0.053715 | 0.028367 | 1.89x | keep |
+| 48 | 16 | 0.054182 | 0.028147 | 1.92x | keep |
+| 48 | 32 | 0.055249 | 0.028144 | 1.96x | keep |
+| 48 | 64 | 0.028558 | 0.028316 | 1.01x | tie |
+| 64 | 1 | 0.055746 | 0.028197 | 1.98x | keep |
+| 64 | 4 | 0.056225 | 0.028227 | 1.99x | keep |
+| 64 | 8 | 0.056503 | 0.028234 | 2.00x | keep |
+| 64 | 16 | 0.028016 | 0.027801 | 1.01x | tie |
+| 64 | 32 | 0.028037 | 0.027890 | 1.01x | tie |
+| 64 | 64 | 0.028194 | 0.028047 | 1.01x | tie |
+
+Correctness verification: candidate output matched the old-threshold incumbent output with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` for every measured row. Focused pytest: `python -m pytest -q python/sglang/jit_kernel/tests/test_gated_norm.py` -> 22 passed.
+
+Decision: accept. New incumbent commit: this commit.
+
+## Pre-restart stop evidence (superseded)
+
+Accepted incumbent before the stricter restart: `fbfb08dc9`, merged into `11922dcd9`. Final pre-restart profile command:
 
 ```bash
 /root/agent-runs/gpu_locked.sh bash -lc '. /root/.cargo/env; source /root/work/optimization-playground/.venv/bin/activate; export CUDA_HOME=/usr/local/cuda; export PATH=$CUDA_HOME/bin:$PATH; export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}; export PYTHONPATH=/root/work/op-kernel-gatednorm/python:/root/work/op-kernel-gatednorm/sgl-kernel/python:${PYTHONPATH:-}; CUDA_VISIBLE_DEVICES=0 nsys profile --force-overwrite=true -o /root/agent-runs/gatednorm-final-r16-t2048 python /tmp/gatednorm_profile_final.py'

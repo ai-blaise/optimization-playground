@@ -47,8 +47,8 @@ def _parse_min_tokens(raw: str | None, default: int) -> int:
 
 
 def _default_torch_mm_min_tokens(rank: int) -> int:
-    if rank >= 64:
-        return 256
+    if rank >= 32:
+        return 1
     if rank >= 16:
         return 64
     if rank >= 8:

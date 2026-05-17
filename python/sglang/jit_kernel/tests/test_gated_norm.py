@@ -5,7 +5,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.gated_norm import _cute_declines_shape, gated_norm_forward
+from sglang.jit_kernel.gated_norm import (
+    _cute_declines_shape,
+    _should_use_torch_mm,
+    gated_norm_forward,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, suite="stage-b-kernel-unit-1-gpu-large")
@@ -72,6 +76,15 @@ def test_gated_norm_cute_documented_shape_fallbacks() -> None:
     assert _cute_declines_shape(4096, 32)
     assert not _cute_declines_shape(15, 64)
     assert not _cute_declines_shape(4095, 32)
+
+
+def test_gated_norm_decode_gemm_thresholds() -> None:
+    assert _should_use_torch_mm(1, 32)
+    assert _should_use_torch_mm(1, 64)
+    assert _should_use_torch_mm(64, 16)
+    assert not _should_use_torch_mm(32, 16)
+    assert not _should_use_torch_mm(256, 8)
+    assert _should_use_torch_mm(512, 8)
 
 
 def test_gated_norm_rejects_non_bf16() -> None:

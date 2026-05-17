@@ -11,6 +11,8 @@ if torch is not None:
             _hisa_block_topk_counts,
             dequantize_indexer_nvfp4,
             fused_store_index_k_cache_nvfp4,
+            hisa_block_topk_map_all_indexer_cache_nvfp4,
+            hisa_block_topk_indexer_cache_nvfp4,
             hisa_fused_mask_topk_map_indexer_cache_nvfp4,
             hisa_map_candidate_indices_indexer_cache_nvfp4,
             hisa_precompute_block_reps_indexer_cache_nvfp4,
@@ -24,6 +26,8 @@ if torch is not None:
         _hisa_block_topk_counts = None
         dequantize_indexer_nvfp4 = None
         fused_store_index_k_cache_nvfp4 = None
+        hisa_block_topk_map_all_indexer_cache_nvfp4 = None
+        hisa_block_topk_indexer_cache_nvfp4 = None
         hisa_fused_mask_topk_map_indexer_cache_nvfp4 = None
         hisa_map_candidate_indices_indexer_cache_nvfp4 = None
         hisa_precompute_block_reps_indexer_cache_nvfp4 = None
@@ -36,6 +40,8 @@ else:
     _hisa_block_topk_counts = None
     dequantize_indexer_nvfp4 = None
     fused_store_index_k_cache_nvfp4 = None
+    hisa_block_topk_map_all_indexer_cache_nvfp4 = None
+    hisa_block_topk_indexer_cache_nvfp4 = None
     hisa_fused_mask_topk_map_indexer_cache_nvfp4 = None
     hisa_map_candidate_indices_indexer_cache_nvfp4 = None
     hisa_precompute_block_reps_indexer_cache_nvfp4 = None
@@ -291,6 +297,40 @@ def test_nvfp4_hisa_precomputed_deepgemm_matches_inline_deepgemm():
 
 
 @pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
+@pytest.mark.parametrize("heads", (8, 32))
+def test_nvfp4_hisa_deepgemm_skips_unsupported_head_count(heads):
+    pytest.importorskip("deep_gemm")
+    _, weights, q_fp4, cache, page_table, seq_lens, token_to_batch_idx = _build_case(
+        8193, heads=heads
+    )
+    torch_path = nvfp4_hisa_indexer_paged_torch(
+        q_fp4,
+        cache,
+        page_table,
+        seq_lens,
+        weights,
+        token_to_batch_idx,
+        topk_tokens=2048,
+    )
+    try:
+        deepgemm_path = nvfp4_hisa_indexer_paged_deepgemm(
+            q_fp4,
+            cache,
+            page_table,
+            seq_lens,
+            weights,
+            token_to_batch_idx,
+            topk_tokens=2048,
+        )
+    except RuntimeError as exc:
+        if "PyObjectSlot" in str(exc) or "no interpreter set" in str(exc):
+            pytest.skip(f"DeepGEMM ABI is not usable in this venv: {exc}")
+        raise
+    assert torch_path is not None
+    assert deepgemm_path is None
+
+
+@pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
 def test_nvfp4_hisa_map_all_candidates_matches_selected_blocks():
     top_blocks = torch.tensor([[0, 2, 63, -1]], device="cuda", dtype=torch.int32)
     prefix_lens = torch.tensor([8192], device="cuda", dtype=torch.int32)
@@ -318,6 +358,34 @@ def test_nvfp4_hisa_map_all_candidates_masks_past_prefix():
     expected = torch.arange(0, 256, dtype=torch.int32)
     expected[192:] = -1
     torch.testing.assert_close(actual.cpu(), expected.view(1, 256))
+
+
+@pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
+def test_nvfp4_hisa_fused_block_topk_map_all_matches_two_step_path():
+    torch.manual_seed(20260517)
+    rows = 4
+    block_counts = torch.full((rows,), 64, device="cuda", dtype=torch.int32)
+    block_topk_counts = torch.full((rows,), 16, device="cuda", dtype=torch.int32)
+    prefix_lens = torch.full((rows,), 8192, device="cuda", dtype=torch.int32)
+    block_scores = torch.randn((rows, 64), device="cuda", dtype=torch.float32)
+
+    top_blocks = hisa_block_topk_indexer_cache_nvfp4(
+        block_scores, block_counts, block_topk=16, block_topk_counts=block_topk_counts
+    )
+    expected = hisa_map_candidate_indices_indexer_cache_nvfp4(
+        top_blocks, prefix_lens, topk_tokens=2048
+    )
+    actual = hisa_block_topk_map_all_indexer_cache_nvfp4(
+        block_scores,
+        block_counts,
+        block_topk=16,
+        block_topk_counts=block_topk_counts,
+        prefix_lens=prefix_lens,
+    )
+    torch.testing.assert_close(
+        torch.sort(actual.cpu(), dim=-1).values,
+        torch.sort(expected.cpu(), dim=-1).values,
+    )
 
 
 @pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")

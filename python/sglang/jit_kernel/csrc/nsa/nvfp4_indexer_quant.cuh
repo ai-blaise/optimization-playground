@@ -90,6 +90,18 @@ struct NVFP4HISABlockTopKParam {
   uint32_t block_topk;
 };
 
+struct NVFP4HISABlockTopKMapAllParam {
+  const void* __restrict__ block_scores;
+  const void* __restrict__ block_counts;
+  const void* __restrict__ block_topk_counts;
+  const void* __restrict__ prefix_lens;
+  void* __restrict__ topk_indices;
+  uint32_t q_rows;
+  uint32_t max_blocks;
+  uint32_t block_topk;
+  uint32_t topk;
+};
+
 struct NVFP4HISACandidatePagesParam {
   const void* __restrict__ top_blocks;
   const void* __restrict__ page_table;
@@ -835,6 +847,150 @@ __global__ void hisa_block_topk_indexer_cache_nvfp4(
   }
 }
 
+SGL_DEVICE void write_hisa_block_tokens(
+    void* __restrict__ topk_indices,
+    uint32_t row,
+    uint32_t topk,
+    uint32_t out,
+    int32_t block_id,
+    int32_t prefix_len) {
+  constexpr uint32_t kHISABlockSize = 128;
+  const auto base = static_cast<int64_t>(row) * topk + out * kHISABlockSize;
+  for (uint32_t offset = threadIdx.x; offset < kHISABlockSize; offset += blockDim.x) {
+    int32_t token = -1;
+    if (block_id >= 0) {
+      token = block_id * static_cast<int32_t>(kHISABlockSize) +
+              static_cast<int32_t>(offset);
+      if (token >= prefix_len) token = -1;
+    }
+    static_cast<int32_t*>(topk_indices)[base + offset] = token;
+  }
+}
+
+__global__ void hisa_block_topk_map_all_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISABlockTopKMapAllParam param) {
+  extern __shared__ uint8_t smem[];
+  auto* best_vals = reinterpret_cast<float*>(smem);
+  auto* best_idxs = reinterpret_cast<int32_t*>(best_vals + blockDim.x);
+  auto* selected = best_idxs + blockDim.x;
+
+  const auto row = blockIdx.x;
+  if (row >= param.q_rows) return;
+  const auto tid = threadIdx.x;
+
+  constexpr uint32_t kHISABlockSize = 128;
+  const auto block_count =
+      min(static_cast<uint32_t>(static_cast<const int32_t*>(param.block_counts)[row]),
+          param.max_blocks);
+  const auto row_block_topk =
+      min(static_cast<uint32_t>(
+              static_cast<const int32_t*>(param.block_topk_counts)[row]),
+          param.block_topk);
+  const auto keep = min(row_block_topk, block_count);
+
+  if (keep < param.block_topk) {
+    const auto clear_begin = keep * kHISABlockSize;
+    for (uint32_t idx = clear_begin + tid; idx < param.topk; idx += blockDim.x) {
+      static_cast<int32_t*>(param.topk_indices)[
+          static_cast<int64_t>(row) * param.topk + idx] = -1;
+    }
+  }
+
+  if (tid < param.block_topk) selected[tid] = -1;
+  __syncthreads();
+  if (block_count == 0) return;
+  const auto prefix_len = static_cast<const int32_t*>(param.prefix_lens)[row];
+  const auto* scores = static_cast<const float*>(param.block_scores) +
+                       static_cast<int64_t>(row) * param.max_blocks;
+  if (block_count <= blockDim.x) {
+    auto score = tid < block_count ? scores[tid] : -INFINITY;
+    auto idx = tid < block_count ? static_cast<int32_t>(tid) : -1;
+    if (tid < block_count && (tid == 0 || tid + 1 == block_count)) {
+      score = INFINITY;
+    }
+    best_vals[tid] = score;
+    best_idxs[tid] = idx;
+    __syncthreads();
+
+    for (uint32_t width = 2; width <= blockDim.x; width <<= 1) {
+      for (uint32_t stride = width >> 1; stride > 0; stride >>= 1) {
+        const auto other = tid ^ stride;
+        if (other > tid) {
+          const auto self_val = best_vals[tid];
+          const auto other_val = best_vals[other];
+          const auto self_idx = best_idxs[tid];
+          const auto other_idx = best_idxs[other];
+          const auto other_better =
+              other_val > self_val ||
+              (other_val == self_val &&
+               (self_idx < 0 || (other_idx >= 0 && other_idx < self_idx)));
+          const auto self_better =
+              self_val > other_val ||
+              (self_val == other_val &&
+               (other_idx < 0 || (self_idx >= 0 && self_idx < other_idx)));
+          const auto descending = (tid & width) == 0;
+          if ((descending && other_better) || (!descending && self_better)) {
+            best_vals[tid] = other_val;
+            best_idxs[tid] = other_idx;
+            best_vals[other] = self_val;
+            best_idxs[other] = self_idx;
+          }
+        }
+        __syncthreads();
+      }
+    }
+    for (uint32_t out = 0; out < keep; ++out) {
+      write_hisa_block_tokens(
+          param.topk_indices, row, param.topk, out, best_idxs[out], prefix_len);
+    }
+    return;
+  }
+
+  for (uint32_t out = 0; out < keep; ++out) {
+    float local_best = -INFINITY;
+    int32_t local_idx = -1;
+    for (uint32_t block_id = tid; block_id < block_count; block_id += blockDim.x) {
+      bool already_selected = false;
+      for (uint32_t i = 0; i < out; ++i) {
+        already_selected |= selected[i] == static_cast<int32_t>(block_id);
+      }
+      if (already_selected) continue;
+
+      auto score = scores[block_id];
+      if (block_id == 0 || block_id + 1 == block_count) {
+        score = INFINITY;
+      }
+      if (score > local_best ||
+          (score == local_best && static_cast<int32_t>(block_id) < local_idx)) {
+        local_best = score;
+        local_idx = static_cast<int32_t>(block_id);
+      }
+    }
+    best_vals[tid] = local_best;
+    best_idxs[tid] = local_idx;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        const auto other_val = best_vals[tid + stride];
+        const auto other_idx = best_idxs[tid + stride];
+        if (other_val > best_vals[tid] ||
+            (other_val == best_vals[tid] &&
+             (best_idxs[tid] < 0 || (other_idx >= 0 && other_idx < best_idxs[tid])))) {
+          best_vals[tid] = other_val;
+          best_idxs[tid] = other_idx;
+        }
+      }
+      __syncthreads();
+    }
+    if (tid == 0) selected[out] = best_idxs[0];
+    __syncthreads();
+    write_hisa_block_tokens(
+        param.topk_indices, row, param.topk, out, selected[out], prefix_len);
+    __syncthreads();
+  }
+}
+
 template <typename IndicesT>
 __global__ void hisa_candidate_pages_indexer_cache_nvfp4(
     const __grid_constant__ NVFP4HISACandidatePagesParam param) {
@@ -978,6 +1134,8 @@ struct NVFP4IndexerQuantKernel {
       hisa_block_score_indexer_cache_nvfp4;
   static constexpr auto block_topk_kernel =
       hisa_block_topk_indexer_cache_nvfp4;
+  static constexpr auto block_topk_map_all_kernel =
+      hisa_block_topk_map_all_indexer_cache_nvfp4;
   static constexpr auto candidate_pages_kernel =
       hisa_candidate_pages_indexer_cache_nvfp4<IndicesT>;
   static constexpr auto candidate_mask_kernel =
@@ -1241,6 +1399,51 @@ struct NVFP4IndexerQuantKernel {
                             params.block_topk * sizeof(int32_t);
     LaunchKernel(params.q_rows, threads, device_.unwrap(), smem_bytes)(
         block_topk_kernel, params);
+  }
+
+  static void hisa_block_topk_map_all(
+      tvm::ffi::TensorView block_scores,
+      tvm::ffi::TensorView block_counts,
+      tvm::ffi::TensorView block_topk_counts,
+      tvm::ffi::TensorView prefix_lens,
+      tvm::ffi::TensorView topk_indices) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto MB = SymbolicSize{"max_blocks"};
+    auto K = SymbolicSize{"topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, MB}).with_dtype<float>().with_device(device_).verify(block_scores);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(block_counts);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(block_topk_counts);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(prefix_lens);
+    TensorMatcher({Q, K}).with_dtype<int32_t>().with_device(device_).verify(topk_indices);
+    const auto topk = static_cast<uint32_t>(K.unwrap());
+    if (topk % 128 != 0) {
+      throw std::runtime_error("hisa_block_topk_map_all requires topk divisible by 128");
+    }
+    const auto params = NVFP4HISABlockTopKMapAllParam{
+        .block_scores = block_scores.data_ptr(),
+        .block_counts = block_counts.data_ptr(),
+        .block_topk_counts = block_topk_counts.data_ptr(),
+        .prefix_lens = prefix_lens.data_ptr(),
+        .topk_indices = topk_indices.data_ptr(),
+        .q_rows = static_cast<uint32_t>(Q.unwrap()),
+        .max_blocks = static_cast<uint32_t>(MB.unwrap()),
+        .block_topk = topk / 128,
+        .topk = topk,
+    };
+    uint32_t threads = 32;
+    const auto required =
+        params.max_blocks > params.block_topk ? params.max_blocks : params.block_topk;
+    while (threads < required && threads < 1024) {
+      threads <<= 1;
+    }
+    const auto smem_bytes = threads * (sizeof(float) + sizeof(int32_t)) +
+                            params.block_topk * sizeof(int32_t);
+    LaunchKernel(params.q_rows, threads, device_.unwrap(), smem_bytes)(
+        block_topk_map_all_kernel, params);
   }
 
   static void hisa_candidate_pages(

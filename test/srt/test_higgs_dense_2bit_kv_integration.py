@@ -137,13 +137,15 @@ def test_higgs_auto_split_policy_from_b200_probe():
     assert select(1, 8, 1024) == 64
     assert select(1, 8, 2048) == 96
     assert select(1, 8, 4096) == 128
-    assert select(2, 8, 4096) == 96
+    assert select(2, 8, 4096) == 80
     assert select(4, 8, 1024) == 32
-    assert select(4, 8, 2048) == 48
-    assert select(4, 8, 4096) == 48
+    assert select(4, 8, 2048) == 56
+    assert select(4, 8, 4096) == 56
     assert select(8, 8, 1024) == 48
-    assert select(16, 8, 2048) == 48
-    assert select(32, 8, 4096) == 48
+    assert select(8, 8, 4096) == 72
+    assert select(16, 8, 2048) == 40
+    assert select(16, 8, 4096) == 64
+    assert select(32, 8, 4096) == 40
     assert select(64, 8, 4096) == 32
 
 

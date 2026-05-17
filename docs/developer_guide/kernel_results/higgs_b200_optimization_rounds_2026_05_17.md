@@ -290,3 +290,51 @@ single-row topk4096 corner.
 Decision: keep. The candidate improves several shapes left on the table by
 round 5, preserves fixed positive override deployability, and leaves the
 short/topk guardrails on the fixed-32 incumbent.
+
+New incumbent commit: `6eddf70cc`.
+
+## Restart Round 7: Split-Count Neighborhood
+
+Incumbent: round-6 commit `6eddf70cc`, fractional auto policy using
+32/48/64/96/128 splits.
+
+Hotspot/profile evidence: after the round-6 fractional policy, remaining
+headroom was constrained to split-count granularity. Stage1 parallelism and
+stage2 merge overhead were close enough that direct probes around each chosen
+split count were still plausible. The candidate tested `40/56/72` around
+48/64 and `80/112/160` around 96/128; parsing and source/doc work were done
+outside GPU locks, with `gpu_locked_any.sh` used only for CUDA benchmark
+processes.
+
+Direct HIGGS JIT neighborhood evidence:
+
+| Shape | Round-6 choice | Better neighbor | Decision |
+| --- | ---: | ---: | --- |
+| r1 h8 topk2048 | 96: 0.042376 ms | 80: 0.042146 ms | reject, pool did not confirm |
+| r2 h8 topk4096 | 96: 0.069542 ms | 80: 0.068143 ms | keep 80 |
+| r4 h8 topk2048 | 48: 0.061509 ms | 56: 0.060752 ms | keep 56 |
+| r4 h8 topk4096 | 48: 0.100616 ms | 56: 0.097726 ms | keep 56 |
+| r8 h8 topk4096 | 48: 0.167671 ms | 72: 0.166087 ms | keep 72 |
+| r16 h8 topk2048 | 48: 0.160723 ms | 40: 0.160091 ms | keep 40 |
+| r32 h8 topk4096 | 48: 0.550509 ms | 40: 0.550186 ms | keep 40 |
+
+Pool-level validation for the candidate deltas:
+
+| Shape | Round-6 auto | Candidate split | Candidate ms | Correctness |
+| --- | ---: | ---: | ---: | --- |
+| r1 h8 topk2048 | 0.042193 ms | 80 | 0.042568 ms | reject; keep 96 |
+| r2 h8 topk4096 | 0.069157 ms | 80 | 0.067762 ms | max_abs 3.81e-06, min_cos 0.99999988 |
+| r4 h8 topk2048 | 0.061558 ms | 56 | 0.061048 ms | max_abs 1.53e-05, min_cos 0.99999982 |
+| r4 h8 topk4096 | 0.100529 ms | 56 | 0.097878 ms | max_abs 3.05e-05, min_cos 0.99999988 |
+| r8 h8 topk4096 | 0.167815 ms | 72 | 0.166221 ms | max_abs 6.10e-05, min_cos 0.99999982 |
+| r16 h8 topk2048 | 0.160952 ms | 40 | 0.160153 ms | max_abs 1.22e-04, min_cos 0.99999982 |
+| r32 h8 topk4096 | 0.551107 ms | 40 | 0.550574 ms | max_abs 4.88e-04, min_cos 0.99999982 |
+
+Rejected sub-candidates: 80 splits for r1/topk2048 was rejected because the
+pool path stayed marginally better at the incumbent 96-split choice. 112 and
+160 splits regressed low-CTA topk4096. 40/56/72 are only applied where both
+direct and pool measurements indicated a win.
+
+Decision: keep the confirmed neighborhood refinements. Gains are smaller than
+rounds 5-6 but still measurable on shapes that remain relevant to long-topk
+decode, and the policy still preserves fixed positive split overrides.

@@ -291,6 +291,42 @@ def test_nvfp4_hisa_precomputed_deepgemm_matches_inline_deepgemm():
 
 
 @pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
+def test_nvfp4_hisa_deepgemm_matches_torch_with_small_head_count():
+    pytest.importorskip("deep_gemm")
+    _, weights, q_fp4, cache, page_table, seq_lens, token_to_batch_idx = _build_case(
+        8193, heads=8
+    )
+    torch_path = nvfp4_hisa_indexer_paged_torch(
+        q_fp4,
+        cache,
+        page_table,
+        seq_lens,
+        weights,
+        token_to_batch_idx,
+        topk_tokens=2048,
+    )
+    try:
+        deepgemm_path = nvfp4_hisa_indexer_paged_deepgemm(
+            q_fp4,
+            cache,
+            page_table,
+            seq_lens,
+            weights,
+            token_to_batch_idx,
+            topk_tokens=2048,
+        )
+    except RuntimeError as exc:
+        if "PyObjectSlot" in str(exc) or "no interpreter set" in str(exc):
+            pytest.skip(f"DeepGEMM ABI is not usable in this venv: {exc}")
+        raise
+    assert torch_path is not None and deepgemm_path is not None
+    torch.testing.assert_close(
+        _sorted_valid_indices(deepgemm_path.cpu()),
+        _sorted_valid_indices(torch_path.cpu()),
+    )
+
+
+@pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
 def test_nvfp4_hisa_map_all_candidates_matches_selected_blocks():
     top_blocks = torch.tensor([[0, 2, 63, -1]], device="cuda", dtype=torch.int32)
     prefix_lens = torch.tensor([8192], device="cuda", dtype=torch.int32)

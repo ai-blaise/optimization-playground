@@ -794,6 +794,19 @@ class Indexer(MultiPlatformOp):
                     metadata,
                 )
                 if result is None:
+                    _hisa_profile_end(
+                        "hisa_nvfp4_paged_skip",
+                        profile_start,
+                        q_tensor.device,
+                        layer_id=int(layer_id),
+                        forward_mode=str(forward_batch.forward_mode),
+                        q_offset=int(q_offset),
+                        q_tokens=int(q_tensor.shape[0]),
+                        max_seq_len=int(max_seq_len),
+                        batch_size=int(block_tables.shape[0]),
+                        page_size=int(page_size),
+                        reason="runtime_fallback",
+                    )
                     hisa_paged_ok = False
                 else:
                     _hisa_profile_end(
@@ -1095,7 +1108,14 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
     ) -> Optional[torch.Tensor]:
         q_values, _ = q_fp4
-        if q_values.shape[1] != 64:
+        if q_values.dim() != 3 or q_values.shape[-1] != 64:
+            _hisa_profile_end(
+                "hisa_nvfp4_paged_skip",
+                _hisa_profile_start(q_values.device),
+                q_values.device,
+                reason="unsupported_packed_q_shape",
+                q_shape=tuple(int(dim) for dim in q_values.shape),
+            )
             return None
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
         topk_result = torch.full(

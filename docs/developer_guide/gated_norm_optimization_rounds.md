@@ -340,6 +340,48 @@ Correctness verification: candidate output matched the Round 7 incumbent output 
 
 Decision: accept. New incumbent commit: this commit.
 
+## Round 9: exact rank 1 mid-batch GEMM dispatch
+
+Incumbent: `d302b17a8` (Round 8 rank 16-31 decode dispatch).
+
+Profiler/instrumentation: CUDA-event candidate comparison on B200 using `gpu_locked_any.sh` only around the CUDA-running benchmark process.
+
+Hotspot/result: the rank 1 sweep showed torch/cuBLAS is faster at 1024 and 2048 tokens, while 512 and 4096 tie. A broad rank 1-7 threshold was rejected because rank 2 and rank 4 regressed badly at the same threshold; rank 7 improved, but the mixed low-rank behavior does not justify a shared default.
+
+Candidate: special-case exact `rank == 1` to use torch/cuBLAS from 1024 tokens. Keep ranks 2-7 at the incumbent 4096-token threshold.
+
+Command and artifacts:
+
+```bash
+/root/agent-runs/gpu_locked_any.sh python <rank1-threshold candidate sweep>
+# /root/agent-runs/gatednorm-restart-round9-r1-accepted-bench.jsonl
+# /root/agent-runs/gatednorm-restart-round9-r2-r3-probe.jsonl
+```
+
+Measured broad candidate versus Round 8 incumbent, median of 5 same-device CUDA-event repeats for the rank 1 rows retained by the exact-rank candidate:
+
+| rank | tokens | incumbent ms | candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 1 | 512 | 0.034868 | 0.034868 | 1.00x | tie |
+| 1 | 1024 | 0.034915 | 0.030651 | 1.14x | keep |
+| 1 | 2048 | 0.045147 | 0.040781 | 1.11x | keep |
+| 1 | 4096 | 0.071832 | 0.071807 | 1.00x | tie |
+
+Rejected low-rank broad-threshold evidence:
+
+| rank | tokens | incumbent ms | broad candidate ms | speedup | decision |
+|---:|---:|---:|---:|---:|---|
+| 2 | 1024 | 0.039015 | 0.046888 | 0.83x | reject broad threshold |
+| 2 | 2048 | 0.055376 | 0.071694 | 0.77x | reject broad threshold |
+| 4 | 1024 | 0.030797 | 0.048511 | 0.63x | reject broad threshold |
+| 4 | 2048 | 0.052318 | 0.065549 | 0.80x | reject broad threshold |
+| 7 | 1024 | 0.081913 | 0.047176 | 1.74x | not accepted; shared threshold unsafe |
+| 7 | 2048 | 0.139905 | 0.093527 | 1.50x | not accepted; shared threshold unsafe |
+
+Correctness verification: candidate output matched the incumbent output with `torch.testing.assert_close(..., atol=2e-2, rtol=2e-2)` for every measured row.
+
+Decision: accept exact-rank-1 only; reject the broad rank 1-7 threshold. New incumbent commit: this commit.
+
 ## Pre-restart stop evidence (superseded)
 
 Accepted incumbent before the stricter restart: `fbfb08dc9`, merged into `11922dcd9`. Final pre-restart profile command:

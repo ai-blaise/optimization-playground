@@ -5,8 +5,9 @@
 - VM: Prime Intellect B200, `root@31.22.104.123`
 - GPU: NVIDIA B200, CUDA toolkit 12.8, PyTorch CUDA 12.8 runtime
 - Branch base: `origin/main` at `44a6d42a9101972191f5b5aca5c32b643922b572`
-- GPU isolation: commands run under `/root/agent-runs/gpu_locked.sh` with `CUDA_VISIBLE_DEVICES=0` unless noted
+- GPU isolation: benchmark/profile commands run under `/root/agent-runs/gpu_locked_any.sh` or an explicit per-GPU `/root/agent-runs/gpu_locked.sh` lock with `CUDA_VISIBLE_DEVICES=1`; temporary extension builds run outside GPU locks
 - Privacy: synthetic tensors only; no prompts, token IDs, or request payloads
+- AgentMemory: `http://127.0.0.1:3811` refused connections during the 2026-05-17 restart, and `~/.agentmemory/standalone.json` was absent, so durable results are recorded here and in `/root/agent-runs/kernel-layersplit.md`
 
 ## Round 0: Package Existing LayerSplit Stage Kernel
 
@@ -89,3 +90,52 @@ export LAYERSPLIT_EXT_BUILD_DIR=/tmp/layersplit_ext_round0
 - Result: accepted. On overlapping >128 KiB delegated cells, speedup vs direct Python `copy_` improved from roughly 0.80x to 0.89x-0.93x, and the 262 KiB active-prefix correctness cells measured 1.34x-1.43x when Python `copy_` copied the same active prefix. This path is still not faster than direct `copy_` for all large contiguous payloads, so the win is primarily reduced delegated-path overhead plus correct active-prefix semantics.
 - Correctness: every benchmark cell checks `torch.equal(src[:rows], dst[:rows])`; the `--padding-rows 1` run also verifies inactive rows remain zero.
 - Decision: accept. New incumbent: Round 3 direct-prefix memcpy commit.
+
+
+## Round 4: Extend Small-Copy Threshold To 512 KiB
+
+- Incumbent: `4ca0a955afec51d96763eeea1dc2505bc3f79120` (Round 3 direct-prefix memcpy commit).
+- Hotspot/profiler signal: CUDA-event sweeps against the Round 3 incumbent showed the direct-prefix `cudaMemcpyAsync` path is still a ~3.24-3.28 us launch/copy floor for 192-512 KiB staged prefixes, while the fixed 148-CTA SM copy remains around 2.85 us through 512 KiB. A back-to-back same-GPU comparison used prebuilt local extensions loaded by `.so` path so the GPU lock covered only timing, not NVCC builds.
+- Candidate: raise `kSmallByteThreshold` from 128 KiB to 512 KiB. Rejected threshold probes: 64 KiB lost the 96-128 KiB wins; 1 MiB regressed the 1 MiB cells; 2 MiB, 4 MiB, and 8 MiB were slower and confirmed the copy-engine path should own larger transfers.
+- Commands:
+
+```bash
+# Build outside the GPU lock.
+cd /root/work/op-kernel-layersplit
+source /root/work/optimization-playground/.venv/bin/activate
+export CUDA_HOME=/usr/local/cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+export MAX_JOBS=2
+python - <<'PY'
+from pathlib import Path
+from torch.utils.cpp_extension import load
+repo = Path("/root/work/op-kernel-layersplit")
+load(
+    name="layersplit_cute_round4_512_verify",
+    sources=[str(repo / "sgl-kernel/csrc/kvcacheio/layersplit_cute.cu")],
+    extra_include_paths=[str(repo / "sgl-kernel/include"), str(repo / "sgl-kernel/csrc")],
+    extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_100,code=sm_100"],
+    extra_cflags=["-O3"],
+    build_directory="/tmp/layersplit_ext_round4_512_verify",
+    is_python_module=False,
+)
+PY
+
+# Benchmark under the explicit GPU-1 lock with prebuilt libraries only.
+CUDA_VISIBLE_DEVICES=1 /root/agent-runs/gpu_locked.sh bash -lc '
+  cd /root/work/op-kernel-layersplit &&
+  source /root/work/optimization-playground/.venv/bin/activate &&
+  export CUDA_HOME=/usr/local/cuda &&
+  export PATH=$CUDA_HOME/bin:$PATH &&
+  export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-} &&
+  export PYTHONPATH=/root/work/op-kernel-layersplit/python:${PYTHONPATH:-} &&
+  python /root/agent-runs/layersplit_bench_stage_variant.py \
+    --library /tmp/layersplit_ext_round4_512_verify/layersplit_cute_round4_512_verify.so \
+    --rows 128,192,256,512,1024 --row-bytes 1024,2048 --warmup 100 --iters 2000
+'
+```
+
+- Result: accepted. In the back-to-back same-GPU comparison, the 512 KiB threshold improved the common matrix by 1.083x on average and up to 1.150x. The intended 192-512 KiB cells improved 1.132x-1.150x; the 128 KiB, 1 MiB, and 2 MiB boundary/delegated cells were ties within about 1%. Final verification log: `/root/agent-runs/layersplit_round4_stage_backtoback_512.jsonl`; incumbent bracketing logs: `/root/agent-runs/layersplit_round4_stage_backtoback_incumbent_a.jsonl` and `_b.jsonl`.
+- Correctness: every benchmark cell checks active-prefix equality. `/root/agent-runs/layersplit_round4_stage_512_padding.jsonl` also verified inactive padding rows remained zero for 256 KiB and 512 KiB active prefixes.
+- Decision: accept. New incumbent: Round 4 512 KiB threshold commit.

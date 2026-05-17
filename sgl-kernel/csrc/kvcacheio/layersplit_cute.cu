@@ -19,9 +19,8 @@ limitations under the License.
 //
 //   * `layersplit_stage_for_broadcast(src, dst, active_rows, row_bytes)`
 //     copies a single contiguous row block. Dispatches between a custom
-//     vectorized kernel for tiny payloads (<= 116 KB total) and PyTorch's
-//     `Tensor::copy_` for medium and large transfers (which routes through
-//     the tuned `cudaMemcpyAsync` Memcpy DtoD path).
+//     vectorized kernel for small payloads (<= 512 KiB total) and a direct
+//     current-stream `cudaMemcpyAsync` for larger active-row prefixes.
 //
 //   * `layersplit_fused_materialize(src_ptrs, dst_ptrs, num_layers,
 //     active_rows, row_bytes)` issues one kernel that broadcasts `num_layers`
@@ -78,9 +77,10 @@ static constexpr int kMaterializeThreadsLarge = kMaterializeWarpsLarge * WARP_SI
 static constexpr int kMaterializeWarps = kMaterializeWarpsSmall;
 static constexpr int kMaterializeThreads = kMaterializeWarps * WARP_SIZE;
 
-// small-data threshold. Below this, the 148x256 vectorized kernel
-// beats the cudaMemcpyAsync copy-engine path by 1.2-1.3x.
-static constexpr int64_t kSmallByteThreshold = 128 * 1024;
+// Small-data threshold. Below this, the 148x256 vectorized kernel beats the
+// direct cudaMemcpyAsync copy-engine path on B200's launch-latency-dominated
+// LayerSplit staging payloads; at 1 MiB the copy-engine path is better.
+static constexpr int64_t kSmallByteThreshold = 512 * 1024;
 
 namespace {
 
@@ -473,8 +473,7 @@ void layersplit_stage_for_broadcast(
         const int64_t total_bytes = active_rows * row_bytes;
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-        // path 1: tiny payloads use the custom 148x256 kernel.
-        // (KEPT from r2 — wins 1.20-1.30x at rows<=8.)
+        // path 1: small payloads use the custom 148x256 kernel.
         if (total_bytes <= kSmallByteThreshold && total_bytes >= kVecBytes &&
             (total_bytes % kVecBytes == 0)) {
             const int num_vecs = static_cast<int>(total_bytes / kVecBytes);

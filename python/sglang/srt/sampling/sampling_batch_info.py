@@ -70,6 +70,10 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    # Cached scalar/uniform temperature metadata for FlashSampling fast paths.
+    temperature_value: Optional[float] = None
+    temperature_is_uniform: bool = False
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args = get_global_server_args()
@@ -167,6 +171,11 @@ class SamplingBatchInfo:
             },
         )
 
+        temperature_is_uniform = bool(torch.all(temperatures == temperatures[0]).item())
+        temperature_value = (
+            float(temperatures.reshape(-1)[0].item()) if temperature_is_uniform else None
+        )
+
         ret = cls(
             temperatures=temperatures,
             top_ps=top_ps,
@@ -184,6 +193,8 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            temperature_value=temperature_value,
+            temperature_is_uniform=temperature_is_uniform,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret

@@ -3278,7 +3278,7 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
         *args,
         higgs_execution_mode: str = "fused_decode",
         higgs_skip_layers: Optional[set[int]] = None,
-        higgs_mla_decode_num_splits: int = 16,
+        higgs_mla_decode_num_splits: int = 32,
         **kwargs,
     ):
         self.higgs_execution_mode = higgs_execution_mode
@@ -3481,7 +3481,7 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
         topk loop is sharded across ``num_splits`` blocks per
         ``(row, head)`` with a merge-and-inverse-FWHT stage. This
         mirrors TurboQuant's ``decode_2p5_split_rotated`` two-stage
-        pipeline and recovers small-batch throughput on H200.
+        pipeline and recovers small-batch throughput on B200.
         Setting ``num_splits == 1`` selects the original single-pass
         kernel, useful when ``num_rows * num_heads`` already saturates
         the GPU.

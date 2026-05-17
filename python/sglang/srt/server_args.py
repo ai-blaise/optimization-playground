@@ -585,7 +585,7 @@ class ServerArgs:
     turboquant_execution_mode: str = "fused_decode"
     turboquant_mla_decode_num_splits: int = 16
     enable_higgs_dense_2bit_kv_cache: bool = False
-    higgs_mla_decode_num_splits: int = 16
+    higgs_mla_decode_num_splits: int = 32
     indexer_quantization_declared: Optional[Dict[str, Any]] = None
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
@@ -5746,8 +5746,8 @@ class ServerArgs:
             default=ServerArgs.higgs_mla_decode_num_splits,
             type=int,
             help="Number of sequence splits for the 2-bit HIGGS fused dense "
-            "MLA decode kernel. Default 16 matches the TurboQuant split-K "
-            "tuning and recovers small-batch throughput on H200. Set to 1 "
+            "MLA decode kernel. Default 32 matches B200 split-K tuning "
+            "for decode-like topk shapes. Set to 1 "
             "to fall back to the single-pass kernel.",
         )
         parser.set_defaults(

@@ -44,6 +44,8 @@ def _make_model_runner(
     swa_full_tokens_ratio=0.5,
     page_size=1,
     mambaish_config=None,
+    kv_lora_rank=512,
+    qk_rope_head_dim=64,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -72,14 +74,25 @@ def _make_model_runner(
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
     mc.get_num_kv_heads = lambda tp_size: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
+    mc.kv_lora_rank = kv_lora_rank
+    mc.qk_rope_head_dim = qk_rope_head_dim
+    mc.index_head_dim = 128
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mr.model_config = mc
+    mr.calculate_mla_kv_cache_dim = lambda: kv_lora_rank + qk_rope_head_dim
 
     mr.kv_cache_dtype = "fake_bf16"
 
     sa = SimpleNamespace()
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
+    sa.enable_turboquant_dense_kv_cache = False
+    sa.enable_higgs_dense_2bit_kv_cache = False
+    sa.turboquant_dense_kv_preset = "latent_2p5bit_nc"
+    sa.turboquant_execution_mode = "fused_decode"
+    sa.turboquant_skip_layers = None
+    sa.nsa_prefill_cp_kv_storage_mode = "none"
+    sa.nsa_prefill_cp_layersplit_layout = None
     mr.server_args = sa
 
     spec = MagicMock()
@@ -163,6 +176,61 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+
+
+class TestNSACompressedDenseKVConfigurator(unittest.TestCase):
+    def _nsa_cell_size(self, *, enable_higgs=False, enable_turboquant=False):
+        mr = _make_model_runner(
+            use_mla_backend=True,
+            num_layers=4,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
+        mr.server_args.enable_higgs_dense_2bit_kv_cache = enable_higgs
+        mr.server_args.enable_turboquant_dense_kv_cache = enable_turboquant
+        with (
+            mock_cpu_env(kv_size=2),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.is_deepseek_nsa",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_nsa_index_head_dim",
+                return_value=128,
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_nsa_indexer_quant_method",
+                return_value="bf16",
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_nsa_indexer_cache_layout",
+                return_value=SimpleNamespace(token_bytes=0),
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_attention_cp_size",
+                return_value=1,
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            return DefaultPoolConfigurator(mr)._cell_size
+
+    def test_higgs_uses_compressed_slot_bytes(self):
+        from sglang.srt.layers.quantization.higgs_dense_2bit_kv import (
+            HiggsDense2BitConfig,
+        )
+
+        expected = HiggsDense2BitConfig(latent_dim=512, rope_dim=64).slot_bytes * 4
+        self.assertEqual(self._nsa_cell_size(enable_higgs=True), expected)
+
+    def test_higgs_sizing_is_smaller_than_dense_bf16(self):
+        dense = self._nsa_cell_size()
+        higgs = self._nsa_cell_size(enable_higgs=True)
+        self.assertEqual(dense, (512 + 64) * 4 * KV_SIZE)
+        self.assertLess(higgs, dense)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):

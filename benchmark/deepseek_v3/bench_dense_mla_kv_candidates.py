@@ -27,11 +27,17 @@ PYTHON_ROOT = REPO_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
+from sglang.srt.layers.quantization.higgs_dense_2bit_kv import (
+    HiggsDense2BitConfig,
+)
 from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 from sglang.srt.layers.quantization.turboquant_dense_kv import (
     TurboQuantDenseKVConfig,
 )
-from sglang.srt.mem_cache.memory_pool import TurboQuantNSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    HiggsDense2BitNSATokenToKVPool,
+    TurboQuantNSATokenToKVPool,
+)
 from sglang.srt.utils import is_sm90_supported, is_sm100_supported
 
 
@@ -98,6 +104,23 @@ def _make_turboquant_pool(num_tokens: int) -> TurboQuantNSATokenToKVPool:
     )
 
 
+def _make_higgs_pool(num_tokens: int) -> HiggsDense2BitNSATokenToKVPool:
+    size = ((num_tokens + 63) // 64) * 64
+    return HiggsDense2BitNSATokenToKVPool(
+        size=size,
+        page_size=64,
+        kv_lora_rank=LATENT_DIM,
+        dtype=torch.bfloat16,
+        qk_rope_head_dim=ROPE_DIM,
+        layer_num=1,
+        device="cuda",
+        index_head_dim=128,
+        enable_memory_saver=False,
+        kv_cache_dim=KV_DIM,
+        higgs_execution_mode="fused_decode",
+    )
+
+
 def benchmark_nvfp4(
     kv: torch.Tensor,
     loc: torch.Tensor,
@@ -140,6 +163,47 @@ def benchmark_nvfp4(
         "selected_recover_ms": recover_ms,
         "selected_tokens": int(loc.numel()),
         **_candidate_accuracy(reference, recovered),
+    }
+
+
+def benchmark_higgs(
+    latent: torch.Tensor,
+    rope: torch.Tensor,
+    loc: torch.Tensor,
+    warmup: int,
+    iters: int,
+) -> dict:
+    pool = _make_higgs_pool(latent.shape[0])
+    all_loc = torch.arange(latent.shape[0], device="cuda", dtype=torch.int64)
+
+    def store_once() -> None:
+        pool.set_mla_kv_buffer(SimpleNamespace(layer_id=0), all_loc, latent, rope)
+
+    page_table = loc.reshape(1, -1).to(torch.int32).contiguous()
+
+    def recover_once() -> None:
+        holder["recovered"], holder["page_table"] = pool.get_higgs_selected_kv_buffer(
+            0,
+            page_table,
+        )
+
+    holder: dict[str, torch.Tensor] = {}
+    store_ms = _cuda_time_ms(store_once, warmup, iters)
+    recover_ms = _cuda_time_ms(recover_once, warmup, iters)
+    recover_once()
+    torch.cuda.synchronize()
+
+    reference = torch.cat((latent, rope), dim=-1)[loc]
+    return {
+        "candidate": "higgs_dense_mla_2bit",
+        "bytes_per_token_layer": HiggsDense2BitConfig(
+            latent_dim=LATENT_DIM,
+            rope_dim=ROPE_DIM,
+        ).slot_bytes,
+        "store_ms": store_ms,
+        "selected_recover_ms": recover_ms,
+        "selected_tokens": int(loc.numel()),
+        **_candidate_accuracy(reference, holder["recovered"]),
     }
 
 
@@ -210,6 +274,7 @@ def run(args: argparse.Namespace) -> dict:
     candidates = [
         benchmark_nvfp4(kv, loc, args.warmup, args.iters),
         benchmark_turboquant(latent, rope, loc, args.warmup, args.iters),
+        benchmark_higgs(latent, rope, loc, args.warmup, args.iters),
     ]
     bf16_bytes = KV_DIM * torch.tensor([], dtype=torch.bfloat16).element_size()
     for result in candidates:
@@ -217,6 +282,7 @@ def run(args: argparse.Namespace) -> dict:
     by_name = {result["candidate"]: result for result in candidates}
     nvfp4 = by_name["nvfp4_dense_mla"]
     turboquant = by_name["turboquant_dense_mla_2p5"]
+    higgs = by_name["higgs_dense_mla_2bit"]
 
     return {
         "shape": {
@@ -242,6 +308,22 @@ def run(args: argparse.Namespace) -> dict:
             ),
             "turboquant_store_speedup_vs_nvfp4": (
                 nvfp4["store_ms"] / turboquant["store_ms"]
+            ),
+            "higgs_bytes_saved_vs_turboquant_per_token_layer": (
+                turboquant["bytes_per_token_layer"]
+                - higgs["bytes_per_token_layer"]
+            ),
+            "higgs_percent_smaller_than_turboquant": (
+                1.0
+                - higgs["bytes_per_token_layer"]
+                / turboquant["bytes_per_token_layer"]
+            )
+            * 100.0,
+            "higgs_selected_recover_speedup_vs_turboquant": (
+                turboquant["selected_recover_ms"] / higgs["selected_recover_ms"]
+            ),
+            "higgs_store_speedup_vs_turboquant": (
+                turboquant["store_ms"] / higgs["store_ms"]
             ),
         },
     }

@@ -43,9 +43,11 @@ Other input dtypes are rejected by the inference wrapper.
 
 GatedNorm uses three BF16 execution paths:
 
-- a Blackwell `sgl_kernel.gated_norm_cute_forward` path when the local
-  `sgl-kernel` wheel includes the registered op and the shape is in the CuTe
-  kernel's supported range;
+- a Blackwell `sgl_kernel.gated_norm_cute_forward` tensor-op path when the
+  local `sgl-kernel` wheel includes the registered op and the shape is in the
+  kernel's supported range. The public name is historical: the current forward
+  implementation is hand-written CUDA using `mma.sync`, `ldmatrix`, and
+  `cp.async`, not a CuTe-generated source file;
 - a fused Triton per-token fallback for decode and small batches;
 - a torch/cuBLAS BF16 GEMM fallback for larger prefill batches.
 

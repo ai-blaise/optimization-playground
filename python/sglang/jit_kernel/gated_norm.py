@@ -48,10 +48,10 @@ def _parse_min_tokens(raw: str | None, default: int) -> int:
 def _default_torch_mm_min_tokens(rank: int) -> int:
     if rank >= 64:
         return 256
-    if rank >= 32:
-        return 512
+    if rank >= 16:
+        return 64
     if rank >= 8:
-        return 2048
+        return 512
     if rank >= 1:
         return 4096
     return _NEVER_USE_TORCH_MM
@@ -223,6 +223,7 @@ def _gated_norm_forward_kernel(
         gate = 1.0 / (1.0 + tl.exp(-logits))
         y = tl.load(y_ptr + token_idx * hidden_size + h, mask=h_mask, other=0.0)
         tl.store(output_ptr + token_idx * hidden_size + h, y * gate, mask=h_mask)
+
 
 
 def _gated_norm_torch_mm_forward(

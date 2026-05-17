@@ -340,10 +340,16 @@ SGL_DEVICE uint32_t clear_e2m1_signed_zero(uint32_t packed) {
   return packed & (0x77777777u | nonzero);
 }
 
+template <bool kBranchlessSign = false>
 SGL_DEVICE float decode_e2m1_nibble(uint32_t code, float scale) {
   constexpr float values[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
   const float magnitude = values[code & 0x7u] * scale;
-  return (code & 0x8u) ? -magnitude : magnitude;
+  if constexpr (kBranchlessSign) {
+    const auto sign = (code & 0x8u) << 28;
+    return __uint_as_float(__float_as_uint(magnitude) ^ sign);
+  } else {
+    return (code & 0x8u) ? -magnitude : magnitude;
+  }
 }
 
 SGL_DEVICE float load_nvfp4_value(
@@ -468,6 +474,7 @@ SGL_DEVICE void quantize_indexer_row_half_warp(
   }
 }
 
+template <bool kBranchlessSign>
 __global__ void dequantize_indexer_nvfp4(
     const __grid_constant__ NVFP4IndexerDequantParam param) {
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -491,7 +498,7 @@ __global__ void dequantize_indexer_nvfp4(
     float decoded[8];
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      decoded[i] = decode_e2m1_nibble((value_word >> (i * 4)) & 0xfu, scale);
+      decoded[i] = decode_e2m1_nibble<kBranchlessSign>((value_word >> (i * 4)) & 0xfu, scale);
     }
 
     output_vec[word_idx * 2] =
@@ -1010,7 +1017,8 @@ struct NVFP4IndexerQuantKernel {
   static constexpr auto store_kernel =
       fused_store_indexer_cache_nvfp4<KeyT, IndicesT, kLogSize, kUsePDL>;
   static constexpr auto q_kernel = quantize_indexer_q_nvfp4<KeyT>;
-  static constexpr auto dequant_kernel = dequantize_indexer_nvfp4;
+  static constexpr auto dequant_kernel = dequantize_indexer_nvfp4<false>;
+  static constexpr auto dequant_branchless_kernel = dequantize_indexer_nvfp4<true>;
   static constexpr auto mean_pool_kernel =
       hisa_mean_pool_indexer_cache_nvfp4<IndicesT, kPageSize>;
   static constexpr auto candidate_score_kernel =
@@ -1124,7 +1132,12 @@ struct NVFP4IndexerQuantKernel {
     };
     constexpr auto kBlockSize = 256;
     const auto num_blocks = div_ceil(num_rows * 8, kBlockSize);
-    LaunchKernel(num_blocks, kBlockSize, device_.unwrap())(dequant_kernel, params);
+    if (num_rows >= 262144) {
+      LaunchKernel(num_blocks, kBlockSize, device_.unwrap())(
+          dequant_branchless_kernel, params);
+    } else {
+      LaunchKernel(num_blocks, kBlockSize, device_.unwrap())(dequant_kernel, params);
+    }
   }
 
   static void hisa_mean_pool(

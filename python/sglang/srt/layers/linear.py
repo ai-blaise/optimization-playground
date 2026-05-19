@@ -1544,8 +1544,16 @@ class RowParallelLinear(LinearBase):
             symm_ctx = use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
-        with symm_ctx:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        try:
+            with symm_ctx:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_
+                )
+        finally:
+            if hasattr(self, "_g1_pending_fp4_gate"):
+                self._g1_pending_fp4_gate = None
+            if hasattr(self, "_g1_fp4_quantize"):
+                self._g1_fp4_quantize = None
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             if self.use_dp_attention_reduce:

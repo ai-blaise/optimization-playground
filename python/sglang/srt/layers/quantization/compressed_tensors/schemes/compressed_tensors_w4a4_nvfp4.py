@@ -141,8 +141,28 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         w_n, _ = layer.weight_packed.shape
         output_shape = [x.shape[0], w_n]
 
-        # quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
+        # Quantize BF16 or FP16 to (FP4 and interleaved block scale).  DeepSeek
+        # G1 can opt into a fused pre-o_proj path that avoids materializing the
+        # BF16 gated activation before this quantization step.
+        g1_gate = getattr(layer, "_g1_pending_fp4_gate", None)
+        g1_quantize = getattr(layer, "_g1_fp4_quantize", None)
+        fused_quant = (
+            g1_quantize(
+                x, g1_gate, layer.input_global_scale
+            )
+            if g1_quantize is not None
+            else None
+        )
+        if fused_quant is None:
+            if g1_gate is not None:
+                from sglang.srt.layers.quantization.g1_fp4_utils import (
+                    apply_g1_gate_for_fp4_fallback,
+                )
+
+                x = apply_g1_gate_for_fp4_fallback(x, g1_gate)
+            x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
+        else:
+            x_fp4, x_blockscale = fused_quant
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight_packed.dtype == torch.uint8

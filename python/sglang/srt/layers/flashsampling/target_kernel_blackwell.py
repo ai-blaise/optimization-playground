@@ -1,7 +1,8 @@
 """Non-persistent FlashSampling kernel for Blackwell (SM100, B200/GB200).
 
-Same CuTe non-persistent design as the H200 target kernel, with
-SM100-specific tuning: adaptive pipeline stages for 227 KB max SMEM.
+Same Triton non-persistent design as the H200 target kernel, with
+SM100-specific tuning: adaptive pipeline stages for 227 KB max SMEM. This is
+the Triton baseline, not a CuTe/CZS implementation.
 
 Validated on B200 (SM 10.0, Triton 3.4, driver 590.48):
 - Greedy: bit-exact vs torch reference at V=16160/D=7168 (REAP shape),
@@ -148,6 +149,18 @@ def _block_h_blackwell(
     return max(16, bsz_h(num_hidden_states))
 
 
+def _max_nonpersistent_tiles_blackwell(num_sms: int, greedy_sampling: bool) -> int:
+    if greedy_sampling:
+        return num_sms
+    return 2 * num_sms
+
+
+def _launch_num_stages_blackwell(block_h: int, two_wave_nongreedy: bool) -> int:
+    if two_wave_nongreedy:
+        return 2
+    return _num_stages_blackwell(block_h)
+
+
 def fused_mm_sample_blackwell(
     weights: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -166,8 +179,8 @@ def fused_mm_sample_blackwell(
 ):
     """FlashSampling for Blackwell (SM100) TP-sharded vocab shapes.
 
-    Same adaptive dispatch as the H200 variant: non-persistent when
-    tiles <= NUM_SMS, falls back to original FlashSampling otherwise.
+    Uses the non-persistent target kernel for production TP-sharded shapes and
+    falls back to the persistent FlashSampling kernel outside the target gate.
     """
     V_local, D = weights.shape
     V = valid_vocab_size if valid_vocab_size is not None else V_local
@@ -178,8 +191,17 @@ def fused_mm_sample_blackwell(
     BLOCK_H = _block_h_blackwell(H, greedy_sampling)
     num_pid_h = triton.cdiv(H, BLOCK_H)
     total_tiles = num_pid_v * num_pid_h
+    # Non-greedy sampling pays extra RNG/log cost in the persistent fallback on
+    # Blackwell. B200 measurements show the non-persistent target kernel is
+    # faster through two SM waves for H=72..128, while greedy regresses there.
+    max_nonpersistent_tiles = _max_nonpersistent_tiles_blackwell(
+        NUM_SMS, greedy_sampling
+    )
+    uses_two_wave_nongreedy = (
+        not greedy_sampling and NUM_SMS < total_tiles <= max_nonpersistent_tiles
+    )
 
-    if total_tiles > NUM_SMS or return_logits or tp.size > 1:
+    if total_tiles > max_nonpersistent_tiles or return_logits or tp.size > 1:
         return fused_mm_sample_triton(
             weights=weights,
             hidden_states=hidden_states,
@@ -231,7 +253,9 @@ def fused_mm_sample_blackwell(
         BLOCK_SIZE_D=_BLOCK_D_BLACKWELL,
         BLOCK_SIZE_H=BLOCK_H,
         num_warps=_NUM_WARPS_BLACKWELL,
-        num_stages=_num_stages_blackwell(BLOCK_H),
+        num_stages=_launch_num_stages_blackwell(
+            BLOCK_H, uses_two_wave_nongreedy
+        ),
     )
 
     if vocab_start_index is None:

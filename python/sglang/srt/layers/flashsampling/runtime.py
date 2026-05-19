@@ -76,6 +76,23 @@ def get_flashsampling_info(
         _handle_rejected_batch(server_args, "lm_head layout is unsupported")
         return None
     weight, vocab_start_index, valid_vocab_size = metadata
+    cc_major = 0
+    if weight.device.type == "cuda":
+        device_index = weight.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        cc_major = torch.cuda.get_device_capability(device_index)[0]
+    if _should_use_dense_greedy_path_on_blackwell(
+        batch_size=hidden_states.shape[0],
+        valid_vocab_size=valid_vocab_size,
+        hidden_size=weight.shape[1],
+        is_all_greedy=sampling_info.is_all_greedy,
+        cc_major=cc_major,
+    ):
+        _handle_rejected_batch(
+            server_args, "dense greedy path is faster for this Blackwell shape"
+        )
+        return None
 
     return FlashSamplingInfo(
         hidden_states=hidden_states,
@@ -113,11 +130,28 @@ def is_flashsampling_sampling_info_supported(
 
 def _temperature_is_uniform(sampling_info: SamplingBatchInfo) -> bool:
     temperature_is_uniform = getattr(sampling_info, "temperature_is_uniform", None)
-    if temperature_is_uniform is not None:
-        return temperature_is_uniform
+    if temperature_is_uniform:
+        return True
 
     temperatures = sampling_info.temperatures.reshape(-1)
     return bool(torch.all(temperatures == temperatures[0]).item())
+
+
+def _should_use_dense_greedy_path_on_blackwell(
+    *,
+    batch_size: int,
+    valid_vocab_size: int,
+    hidden_size: int,
+    is_all_greedy: bool,
+    cc_major: int,
+) -> bool:
+    return (
+        is_all_greedy
+        and cc_major >= 10
+        and batch_size > 64
+        and valid_vocab_size <= 32768
+        and hidden_size >= 4096
+    )
 
 
 def get_flashsampling_lm_head_metadata(

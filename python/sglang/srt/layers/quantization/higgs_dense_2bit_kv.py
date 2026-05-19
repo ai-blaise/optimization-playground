@@ -48,8 +48,9 @@ not algorithmic.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -82,12 +83,321 @@ HIGGS_CODEBOOK_SIZE = 16
 HIGGS_BITS_PER_INDEX = 4  # log2(16); each index covers two scalars
 HIGGS_HADAMARD_ORDER = 512  # block size for the rotation
 HIGGS_NORM_BYTES = 2  # fp16 scale per token
+HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV = "SGLANG_HIGGS_DENSE_2BIT_B200_CANDIDATE"
 
 
-def select_higgs_mla_decode_num_splits(
+@dataclass(frozen=True)
+class HiggsDense2BitB200Candidate:
+    """Opt-in HIGGS dense 2-bit B200 validation candidate."""
+
+    name: str
+    summary: str
+    category: str
+    store_variant: Optional[str] = None
+    split_policy: Optional[str] = None
+    dequant_variant: Optional[str] = None
+    page_table_dequant_variant: Optional[str] = None
+    hf_config_fields: Tuple[Tuple[str, object], ...] = ()
+    requires_b200: bool = True
+    requires_ikp: bool = True
+    requires_czs: bool = False
+    proof_modules: Tuple[str, ...] = ()
+    promotion_blockers: Tuple[str, ...] = ()
+    production_default: bool = False
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "summary": self.summary,
+            "category": self.category,
+            "store_variant": self.store_variant,
+            "split_policy": self.split_policy,
+            "dequant_variant": self.dequant_variant,
+            "page_table_dequant_variant": self.page_table_dequant_variant,
+            "hf_config_fields": dict(self.hf_config_fields),
+            "requires_b200": self.requires_b200,
+            "requires_ikp": self.requires_ikp,
+            "requires_czs": self.requires_czs,
+            "proof_modules": list(self.proof_modules),
+            "promotion_blockers": list(self.promotion_blockers),
+            "production_default": self.production_default,
+        }
+
+
+_COMMON_B200_PROMOTION_BLOCKERS = (
+    "B200 correctness sweep against eager HIGGS and incumbent kernels",
+    "B200 IKP profile covering decode, dequant, and page-table dequant",
+    "DeepSeek-V3.2-REAP end-to-end TTFT/throughput validation",
+)
+
+
+HIGGS_DENSE_2BIT_B200_CANDIDATES: Tuple[HiggsDense2BitB200Candidate, ...] = (
+    HiggsDense2BitB200Candidate(
+        name="production",
+        summary="Production behavior: incumbent B200 split table with the "
+        "accepted warp-pack store path.",
+        category="baseline",
+        store_variant="const_codebook_warp_pack",
+        requires_b200=False,
+        requires_ikp=False,
+        production_default=True,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="splitk_aggressive_small_batch",
+        summary="Increase split count for low row*head occupancy and long topk "
+        "to test whether B200 benefits from more concurrent CTAs.",
+        category="split-k policy",
+        split_policy="aggressive_small_batch",
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="splitk_scratch_capped",
+        summary="Cap split count to reduce mid-buffer traffic and scratch "
+        "footprint when the incumbent policy may become merge-bandwidth bound.",
+        category="split-k policy",
+        split_policy="scratch_capped",
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="splitk_ikp_stage1_balanced",
+        summary="IKP-derived B200 split table: reduce split count where stage2 "
+        "merge overhead dominates and add splits for very large row*head "
+        "occupancy where stage1 still dominates.",
+        category="split-k policy",
+        split_policy="ikp_stage1_balanced",
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="store_const_codebook",
+        summary="IKP/autoinfer continuation candidate for the HIGGS write "
+        "path: keep the fused BF16->FWHT->quantize->pack pipeline but read "
+        "the fixed EDEN2-16 table and squared norms from device constants "
+        "inside the nearest-neighbor loop.",
+        category="store codebook",
+        store_variant="const_codebook",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="store_const_codebook_rope_first",
+        summary="Follow-on store scheduling candidate from the accepted "
+        "const-codebook incumbent: copy independent rope bytes before the "
+        "FWHT/EDEN quantization work to test store-pipeline overlap.",
+        category="store scheduling",
+        store_variant="const_codebook_rope_first",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="store_const_codebook_rope_first_index_pack",
+        summary="Combined follow-on store candidate: copy rope first and pack "
+        "adjacent EDEN2 indices with warp shuffles while keeping the accepted "
+        "const-codebook nearest-neighbor loop.",
+        category="store scheduling",
+        store_variant="const_codebook_rope_first_index_pack",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="store_const_codebook_index_pack",
+        summary="Follow-on store candidate from the accepted const-codebook "
+        "incumbent: keep normalized values in SMEM but pack adjacent EDEN2 "
+        "indices with warp shuffles instead of a second SMEM handoff.",
+        category="store codebook",
+        store_variant="const_codebook_index_pack",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="store_const_codebook_warp_pack",
+        summary="Follow-on store candidate from the accepted const-codebook "
+        "incumbent: keep EDEN2 constants and replace the normalized-pair "
+        "and packed-index SMEM handoff with warp shuffles.",
+        category="store codebook",
+        store_variant="const_codebook_warp_pack",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="store_const_codebook_warp_pack_pre_norm",
+        summary="Profile-guided follow-on from warp-pack: compute the "
+        "per-token norm before FWHT so the post-FWHT path can normalize "
+        "without another block reduction.",
+        category="store codebook",
+        store_variant="const_codebook_warp_pack_pre_norm",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="store_const_codebook_warp_pack_fma_score",
+        summary="Profile-guided follow-on from warp-pack: score EDEN2 "
+        "nearest-neighbor candidates with pre-doubled constant codebook "
+        "coordinates and explicit FMA form.",
+        category="store codebook",
+        store_variant="const_codebook_warp_pack_fma_score",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="store_const_codebook_warp_pack_scale_broadcast",
+        summary="IKP/autoinfer follow-on from the warp-pack store incumbent: "
+        "compute the per-token scale and reciprocal once, then broadcast them "
+        "through shared memory before the EDEN2 nearest-neighbor loop.",
+        category="store codebook",
+        store_variant="const_codebook_warp_pack_scale_broadcast",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="store_const_codebook_warp_pack_rope_first",
+        summary="Follow-on from the corrected warp-pack store incumbent: copy "
+        "rope bytes before FWHT/EDEN work while keeping register pair exchange "
+        "and warp-shuffle index packing.",
+        category="store scheduling",
+        store_variant="const_codebook_warp_pack_rope_first",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="dequant_const_codebook",
+        summary="IKP-derived direct-loc dequant variant that reads the fixed "
+        "EDEN2-16 codebook from device constants instead of dynamic global "
+        "memory or shared-memory staging.",
+        category="decode vectorization",
+        dequant_variant="const_codebook",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="dequant_vec4_smem_codebook",
+        summary="Direct-loc dequant path loads each packed byte once per "
+        "four scalar lanes and stages the EDEN2-16 codebook in shared memory.",
+        category="decode vectorization",
+        dequant_variant="vec4_smem_codebook",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="dequant_vec4_ldg_codebook",
+        summary="IKP-derived direct-loc dequant variant: keep quartet "
+        "packed-byte broadcast but use read-only codebook loads, removing the "
+        "shared-codebook staging sync that regressed instruction count.",
+        category="decode vectorization",
+        dequant_variant="vec4_ldg_codebook",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="dequant_pair_lanes_scale_broadcast",
+        summary="IKP/autoinfer continuation candidate inspired by saw-int4 "
+        "pair packing and fast-hadamard XOR exchange: one even lane per "
+        "EDEN2 pair loads both codebook coordinates, shares the odd coordinate "
+        "with lane xor 1, and each warp broadcasts the per-slot scale.",
+        category="decode vectorization",
+        dequant_variant="pair_lanes_scale_broadcast",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="page_table_dequant_vec4_smem_codebook",
+        summary="Page-table dequant version of the packed-byte vec4 broadcast "
+        "and shared-codebook staging candidate.",
+        category="decode vectorization",
+        page_table_dequant_variant="vec4_smem_codebook",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="page_table_dequant_const_codebook",
+        summary="IKP-derived page-table dequant variant that reads the fixed "
+        "EDEN2-16 codebook from device constants instead of dynamic global "
+        "memory or shared-memory staging.",
+        category="decode vectorization",
+        page_table_dequant_variant="const_codebook",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="page_table_dequant_vec4_ldg_codebook",
+        summary="IKP-derived page-table dequant variant: keep quartet "
+        "packed-byte broadcast but avoid the shared-codebook table and its "
+        "CTA-wide sync.",
+        category="decode vectorization",
+        page_table_dequant_variant="vec4_ldg_codebook",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="page_table_dequant_pair_lanes_scale_broadcast",
+        summary="Page-table continuation candidate matching the direct "
+        "pair-lane codebook load and warp-scale-broadcast experiment.",
+        category="decode vectorization",
+        page_table_dequant_variant="pair_lanes_scale_broadcast",
+        proof_modules=("docs/proofs/higgs_dense_2bit_b200_optin_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
+        name="hf_config_fixed_split64",
+        summary="Allow a checkpoint quantization_config to opt into fixed "
+        "HIGGS split-K=64 for deployment testing without a CLI override.",
+        category="HF config deployability",
+        split_policy="fixed_64",
+        hf_config_fields=(
+            ("kv_cache_scheme.quant_method", "higgs_dense_2bit"),
+            ("kv_cache_scheme.mla_decode_num_splits", 64),
+        ),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+)
+
+_HIGGS_DENSE_2BIT_B200_CANDIDATE_BY_NAME = {
+    candidate.name: candidate for candidate in HIGGS_DENSE_2BIT_B200_CANDIDATES
+}
+
+
+def iter_higgs_dense_2bit_b200_candidates(
+    *, include_production: bool = True
+) -> Tuple[HiggsDense2BitB200Candidate, ...]:
+    if include_production:
+        return HIGGS_DENSE_2BIT_B200_CANDIDATES
+    return tuple(
+        candidate
+        for candidate in HIGGS_DENSE_2BIT_B200_CANDIDATES
+        if not candidate.production_default
+    )
+
+
+def get_higgs_dense_2bit_b200_candidate(
+    name: Optional[str] = None,
+) -> HiggsDense2BitB200Candidate:
+    selected = name
+    if selected is None:
+        selected = os.environ.get(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV)
+    if selected is None or selected == "":
+        selected = "production"
+    try:
+        return _HIGGS_DENSE_2BIT_B200_CANDIDATE_BY_NAME[selected]
+    except KeyError as exc:
+        valid = ", ".join(sorted(_HIGGS_DENSE_2BIT_B200_CANDIDATE_BY_NAME))
+        raise ValueError(
+            f"Unknown HIGGS dense 2-bit B200 candidate {selected!r}. "
+            f"Valid candidates: {valid}."
+        ) from exc
+
+
+def higgs_dense_2bit_b200_candidate_metadata() -> dict[str, object]:
+    return {
+        "selector_env": HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV,
+        "candidates": [
+            candidate.as_dict() for candidate in HIGGS_DENSE_2BIT_B200_CANDIDATES
+        ],
+    }
+
+
+def _select_higgs_mla_decode_num_splits_production(
     num_rows: int, num_heads: int, topk: int
 ) -> int:
-    """B200 auto policy for HIGGS fused MLA split-K decode."""
+    """Incumbent B200 auto policy for HIGGS fused MLA split-K decode."""
 
     row_head_ctas = int(num_rows) * int(num_heads)
     topk = int(topk)
@@ -124,6 +434,125 @@ def select_higgs_mla_decode_num_splits(
         if row_head_ctas == 64:
             return 48
     return 32
+
+
+def _select_higgs_mla_decode_num_splits_aggressive_small_batch(
+    num_rows: int, num_heads: int, topk: int
+) -> int:
+    row_head_ctas = int(num_rows) * int(num_heads)
+    topk = int(topk)
+
+    if topk >= 4096:
+        if row_head_ctas <= 8:
+            return 160
+        if row_head_ctas <= 16:
+            return 128
+        if row_head_ctas <= 32:
+            return 96
+        if row_head_ctas <= 64:
+            return 80
+        if row_head_ctas <= 128:
+            return 72
+        if row_head_ctas <= 256:
+            return 56
+        return 40
+    if topk >= 2048:
+        if row_head_ctas <= 8:
+            return 128
+        if row_head_ctas <= 16:
+            return 96
+        if row_head_ctas <= 32:
+            return 80
+        if row_head_ctas <= 64:
+            return 64
+        if row_head_ctas <= 128:
+            return 48
+        return 40
+    if topk >= 1024:
+        if row_head_ctas <= 8:
+            return 96
+        if row_head_ctas <= 16:
+            return 80
+        if row_head_ctas <= 32:
+            return 64
+        if row_head_ctas <= 64:
+            return 56
+    return 32
+
+
+def _select_higgs_mla_decode_num_splits_scratch_capped(
+    num_rows: int, num_heads: int, topk: int
+) -> int:
+    row_head_ctas = int(num_rows) * int(num_heads)
+    topk = int(topk)
+
+    if topk >= 4096:
+        if row_head_ctas <= 8:
+            return 64
+        if row_head_ctas <= 16:
+            return 56
+        if row_head_ctas <= 64:
+            return 48
+        if row_head_ctas <= 128:
+            return 40
+        return 32
+    if topk >= 2048:
+        if row_head_ctas <= 16:
+            return 48
+        if row_head_ctas <= 64:
+            return 40
+        return 32
+    if topk >= 1024 and row_head_ctas <= 16:
+        return 48
+    return 32
+
+
+def _select_higgs_mla_decode_num_splits_ikp_stage1_balanced(
+    num_rows: int, num_heads: int, topk: int
+) -> int:
+    row_head_ctas = int(num_rows) * int(num_heads)
+    topk = int(topk)
+
+    if topk >= 4096 and row_head_ctas >= 512:
+        return 48
+    if topk >= 2048 and topk < 4096 and row_head_ctas <= 8:
+        return 80
+    return _select_higgs_mla_decode_num_splits_production(
+        num_rows, num_heads, topk
+    )
+
+
+def select_higgs_mla_decode_num_splits(
+    num_rows: int,
+    num_heads: int,
+    topk: int,
+    candidate_name: Optional[str] = None,
+) -> int:
+    """B200 auto policy for HIGGS fused MLA split-K decode.
+
+    The default keeps the incumbent production table. Setting
+    ``SGLANG_HIGGS_DENSE_2BIT_B200_CANDIDATE`` to a split-policy
+    candidate selects an opt-in table for B200 measurement only.
+    """
+
+    candidate = get_higgs_dense_2bit_b200_candidate(candidate_name)
+    if candidate.split_policy == "aggressive_small_batch":
+        return _select_higgs_mla_decode_num_splits_aggressive_small_batch(
+            num_rows, num_heads, topk
+        )
+    if candidate.split_policy == "scratch_capped":
+        return _select_higgs_mla_decode_num_splits_scratch_capped(
+            num_rows, num_heads, topk
+        )
+    if candidate.split_policy == "ikp_stage1_balanced":
+        return _select_higgs_mla_decode_num_splits_ikp_stage1_balanced(
+            num_rows, num_heads, topk
+        )
+    if candidate.split_policy == "fixed_64":
+        return 64
+    return _select_higgs_mla_decode_num_splits_production(
+        num_rows, num_heads, topk
+    )
 
 
 def _fwht(x: torch.Tensor) -> torch.Tensor:

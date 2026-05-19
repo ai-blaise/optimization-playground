@@ -23,7 +23,14 @@ _TORCH_MM_RANK_MIN_TOKENS_ENV = {
 }
 _USE_TRITON_ENV = "SGLANG_GATED_NORM_USE_TRITON"
 _DISABLE_CUTE_ENV = "SGLANG_GATED_NORM_DISABLE_CUTE"
-_SIGMOID_MUL_FUSE_MIN_TOKENS = 1024
+_SIGMOID_MUL_FUSE_MIN_TOKENS_ENV = (
+    "SGLANG_GATED_NORM_SIGMOID_MUL_FUSE_MIN_TOKENS"
+)
+_DEFAULT_SIGMOID_MUL_FUSE_MIN_TOKENS = 480
+_DEFAULT_SIGMOID_MUL_BLOCK_SIZE = 1024
+_RANK64_SIGMOID_MUL_BLOCK_SIZE = 2048
+_RANK64_SIGMOID_MUL_BLOCK_MIN_TOKENS = 480
+_RANK64_SIGMOID_MUL_BLOCK_MAX_TOKENS = 528
 _gated_norm_cute_forward_op: Optional[Callable[..., torch.Tensor]] = None
 _gated_norm_cute_load_failed = False
 
@@ -69,11 +76,10 @@ def _torch_mm_min_tokens(rank: int) -> int:
 
     default = _default_torch_mm_min_tokens(rank)
     for rank_floor in (64, 32, 8, 1):
-        if rank >= rank_floor:
-            return _parse_min_tokens(
-                os.getenv(_TORCH_MM_RANK_MIN_TOKENS_ENV[rank_floor]),
-                default,
-            )
+        env_value = os.getenv(_TORCH_MM_RANK_MIN_TOKENS_ENV[rank_floor])
+        if rank >= rank_floor and env_value is not None:
+            return _parse_min_tokens(env_value, default)
+
     return default
 
 
@@ -85,6 +91,36 @@ def _cute_declines_shape(num_tokens: int, rank: int) -> bool:
     if rank > 48 and num_tokens >= 16:
         return True
     return rank > 16 and rank <= 48 and num_tokens >= 4096
+
+
+def _should_try_cute_before_torch_mm(num_tokens: int, rank: int) -> bool:
+    if rank <= 5:
+        return True
+    if rank <= 32:
+        return num_tokens <= 1024
+    if rank == 40:
+        return num_tokens <= 1024
+    if rank == 48:
+        return num_tokens <= 512
+    return rank == 64 and num_tokens < 16
+
+
+def _sigmoid_mul_fuse_min_tokens() -> int:
+    raw = os.getenv(_SIGMOID_MUL_FUSE_MIN_TOKENS_ENV)
+    if raw is not None:
+        return _parse_min_tokens(raw, _DEFAULT_SIGMOID_MUL_FUSE_MIN_TOKENS)
+
+    return _DEFAULT_SIGMOID_MUL_FUSE_MIN_TOKENS
+
+
+def _sigmoid_mul_block_size(num_tokens: int, rank: int) -> int:
+    if (
+        rank == 64
+        and num_tokens >= _RANK64_SIGMOID_MUL_BLOCK_MIN_TOKENS
+        and num_tokens <= _RANK64_SIGMOID_MUL_BLOCK_MAX_TOKENS
+    ):
+        return _RANK64_SIGMOID_MUL_BLOCK_SIZE
+    return _DEFAULT_SIGMOID_MUL_BLOCK_SIZE
 
 
 def _device_supports_cute(tensor: torch.Tensor) -> bool:
@@ -262,14 +298,14 @@ def _gated_norm_torch_mm_forward(
     F.silu(z, inplace=True)
     logits = torch.mm(z, w_up.t())
     flat_output = output.reshape(-1, hidden_size)
-    if flat_normed.shape[0] >= _SIGMOID_MUL_FUSE_MIN_TOKENS:
+    if flat_normed.shape[0] >= _sigmoid_mul_fuse_min_tokens():
         n_elements = flat_normed.numel()
         _sigmoid_mul_kernel[(triton.cdiv(n_elements, 1024),)](
             flat_normed,
             logits,
             flat_output,
             n_elements,
-            BLOCK=1024,
+            BLOCK=_sigmoid_mul_block_size(flat_normed.shape[0], w_down.shape[0]),
         )
     else:
         torch.sigmoid(logits, out=logits)
@@ -310,8 +346,17 @@ def gated_norm_forward(
     w_down = w_down.contiguous()
     w_up = w_up.contiguous()
     use_triton = os.getenv(_USE_TRITON_ENV) == "1"
+    if (
+        not use_triton
+        and _should_try_cute_before_torch_mm(num_tokens, rank)
+        and not _cute_declines_shape(num_tokens, rank)
+        and _gated_norm_cute_forward(flat_normed, w_down, w_up, output, hidden_size)
+    ):
+        return output
+
     if not use_triton and (
-        _should_use_torch_mm(num_tokens, rank) or _cute_declines_shape(num_tokens, rank)
+        _should_use_torch_mm(num_tokens, rank)
+        or _cute_declines_shape(num_tokens, rank)
     ):
         return _gated_norm_torch_mm_forward(
             flat_normed, w_down, w_up, output, hidden_size

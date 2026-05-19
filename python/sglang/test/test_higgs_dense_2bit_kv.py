@@ -5,10 +5,15 @@ import torch
 
 from sglang.srt.layers.quantization.higgs_dense_2bit_kv import (
     HIGGS_EDEN2_16,
+    HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV,
     HIGGS_PAIR_DIM,
     HiggsDense2BitCodec,
     HiggsDense2BitConfig,
+    get_higgs_dense_2bit_b200_candidate,
+    higgs_dense_2bit_b200_candidate_metadata,
+    iter_higgs_dense_2bit_b200_candidates,
     pack_higgs_2bit_indices,
+    select_higgs_mla_decode_num_splits,
     unpack_higgs_2bit_indices,
 )
 
@@ -38,7 +43,7 @@ def test_higgs_codebook_is_eden2_16():
         HiggsDense2BitConfig(latent_dim=512, rope_dim=64),
         torch.device("cpu"),
     )
-    assert codec.codebook.shape == (16, 2)
+    assert codec.codebook.shape == (16, HIGGS_PAIR_DIM)
     expected = torch.tensor(HIGGS_EDEN2_16, dtype=torch.float32)
     torch.testing.assert_close(codec.codebook, expected, rtol=0, atol=0)
     # Norms-squared agree with the kernel's expectation.
@@ -89,6 +94,216 @@ def test_higgs_codec_smaller_than_turboquant_2p5():
     assert higgs.slot_bytes < tq.slot_bytes
     assert higgs.slot_bytes == 258
     assert tq.slot_bytes == 274
+
+
+def test_higgs_b200_candidate_registry_has_opt_in_candidates():
+    candidates = iter_higgs_dense_2bit_b200_candidates(include_production=False)
+
+    assert len(candidates) >= 4
+    assert {
+        "splitk_aggressive_small_batch",
+        "splitk_scratch_capped",
+        "splitk_ikp_stage1_balanced",
+        "store_const_codebook",
+        "store_const_codebook_rope_first",
+        "store_const_codebook_index_pack",
+        "store_const_codebook_rope_first_index_pack",
+        "store_const_codebook_warp_pack",
+        "store_const_codebook_warp_pack_pre_norm",
+        "store_const_codebook_warp_pack_fma_score",
+        "store_const_codebook_warp_pack_scale_broadcast",
+        "store_const_codebook_warp_pack_rope_first",
+        "dequant_const_codebook",
+        "dequant_vec4_smem_codebook",
+        "dequant_vec4_ldg_codebook",
+        "dequant_pair_lanes_scale_broadcast",
+        "page_table_dequant_const_codebook",
+        "page_table_dequant_vec4_smem_codebook",
+        "page_table_dequant_vec4_ldg_codebook",
+        "page_table_dequant_pair_lanes_scale_broadcast",
+    }.issubset({candidate.name for candidate in candidates})
+    assert all(candidate.requires_b200 for candidate in candidates)
+    assert all(candidate.requires_ikp for candidate in candidates)
+
+
+def test_higgs_b200_candidate_selector_defaults_to_production(monkeypatch):
+    monkeypatch.delenv(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, raising=False)
+
+    candidate = get_higgs_dense_2bit_b200_candidate()
+    assert candidate.name == "production"
+    assert candidate.store_variant == "const_codebook_warp_pack"
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "dequant_vec4_smem_codebook"
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().dequant_variant
+        == "vec4_smem_codebook"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "store_const_codebook"
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().store_variant == "const_codebook"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "store_const_codebook_rope_first"
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().store_variant
+        == "const_codebook_rope_first"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "store_const_codebook_rope_first_index_pack"
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().store_variant
+        == "const_codebook_rope_first_index_pack"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "store_const_codebook_index_pack"
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().store_variant
+        == "const_codebook_index_pack"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "store_const_codebook_warp_pack"
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().store_variant
+        == "const_codebook_warp_pack"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV,
+        "store_const_codebook_warp_pack_pre_norm",
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().store_variant
+        == "const_codebook_warp_pack_pre_norm"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV,
+        "store_const_codebook_warp_pack_fma_score",
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().store_variant
+        == "const_codebook_warp_pack_fma_score"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV,
+        "store_const_codebook_warp_pack_scale_broadcast",
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().store_variant
+        == "const_codebook_warp_pack_scale_broadcast"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV,
+        "store_const_codebook_warp_pack_rope_first",
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().store_variant
+        == "const_codebook_warp_pack_rope_first"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "dequant_vec4_ldg_codebook"
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().dequant_variant
+        == "vec4_ldg_codebook"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV,
+        "dequant_pair_lanes_scale_broadcast",
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().dequant_variant
+        == "pair_lanes_scale_broadcast"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "page_table_dequant_const_codebook"
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().page_table_dequant_variant
+        == "const_codebook"
+    )
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV,
+        "page_table_dequant_pair_lanes_scale_broadcast",
+    )
+    assert (
+        get_higgs_dense_2bit_b200_candidate().page_table_dequant_variant
+        == "pair_lanes_scale_broadcast"
+    )
+
+
+def test_higgs_b200_candidate_selector_rejects_unknown(monkeypatch):
+    monkeypatch.setenv(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "not_a_candidate")
+
+    with pytest.raises(ValueError, match="Unknown HIGGS dense 2-bit B200"):
+        get_higgs_dense_2bit_b200_candidate()
+
+
+def test_higgs_split_policy_candidates_are_opt_in(monkeypatch):
+    monkeypatch.delenv(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, raising=False)
+    assert select_higgs_mla_decode_num_splits(1, 8, 4096) == 128
+    assert select_higgs_mla_decode_num_splits(16, 8, 4096) == 64
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "splitk_aggressive_small_batch"
+    )
+    assert select_higgs_mla_decode_num_splits(1, 8, 4096) == 160
+    assert select_higgs_mla_decode_num_splits(16, 8, 4096) == 72
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "splitk_scratch_capped"
+    )
+    assert select_higgs_mla_decode_num_splits(1, 8, 4096) == 64
+    assert select_higgs_mla_decode_num_splits(16, 8, 4096) == 40
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "hf_config_fixed_split64"
+    )
+    assert select_higgs_mla_decode_num_splits(1, 8, 512) == 64
+    assert select_higgs_mla_decode_num_splits(64, 8, 4096) == 64
+
+    monkeypatch.setenv(
+        HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "splitk_ikp_stage1_balanced"
+    )
+    assert select_higgs_mla_decode_num_splits(1, 8, 2048) == 80
+    assert select_higgs_mla_decode_num_splits(1, 8, 4096) == 128
+    assert select_higgs_mla_decode_num_splits(64, 8, 4096) == 48
+
+
+def test_higgs_b200_candidate_metadata_is_json_ready():
+    metadata = higgs_dense_2bit_b200_candidate_metadata()
+
+    assert metadata["selector_env"] == HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV
+    assert isinstance(metadata["candidates"], list)
+    assert any(
+        candidate["name"] == "production" and candidate["production_default"]
+        for candidate in metadata["candidates"]
+    )
+    assert any(
+        candidate["name"] == "hf_config_fixed_split64"
+        and candidate["hf_config_fields"]["kv_cache_scheme.mla_decode_num_splits"]
+        == 64
+        for candidate in metadata["candidates"]
+    )
 
 
 # ---------------------------------------------------------------------------

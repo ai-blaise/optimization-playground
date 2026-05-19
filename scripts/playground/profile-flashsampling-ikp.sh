@@ -20,8 +20,34 @@ cat >"${OUT_DIR}/flashsampling_kernel_bench.py" <<'PY'
 import json
 import os
 import pathlib
+import sys
+import types
 
 import torch
+
+
+def inject_flashsampling_package(repo_root: pathlib.Path) -> None:
+    packages = {
+        "sglang": repo_root / "python" / "sglang",
+        "sglang.srt": repo_root / "python" / "sglang" / "srt",
+        "sglang.srt.layers": repo_root / "python" / "sglang" / "srt" / "layers",
+        "sglang.srt.layers.flashsampling": repo_root / "python" / "sglang" / "srt" / "layers" / "flashsampling",
+    }
+    for name, path in packages.items():
+        package = sys.modules.get(name)
+        if package is None:
+            package = types.ModuleType(name)
+            package.__path__ = [str(path)]
+            package.__package__ = name
+            sys.modules[name] = package
+        if "." in name:
+            parent_name, child_name = name.rsplit(".", 1)
+            setattr(sys.modules[parent_name], child_name, package)
+
+
+inject_flashsampling_package(
+    pathlib.Path(os.environ.get("REPO_ROOT", pathlib.Path.cwd())).resolve()
+)
 
 provider = os.environ.get("FLASHSAMPLING_PROVIDER", "triton")
 if provider == "target":

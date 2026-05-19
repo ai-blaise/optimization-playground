@@ -63,6 +63,77 @@ constexpr float kInvSqrtLatentDim = 0.044194173824159216f;  // 1 / sqrt(512)
 static_assert(kPackedBytes == 128, "expected 128 packed bytes per slot");
 static_assert(kSlotBytes == 258, "expected slot bytes = 258");
 
+__device__ __constant__ float kEden2_16Codebook[kCodebookSize * kPairDim] = {
+    -0.8996632695198059f, -1.6360418796539307f,
+    -0.9611834883689880f,  1.5999565124511719f,
+    -1.8820261955261230f,  0.6787783503532410f,
+     0.3630079329013824f, -1.9667866230010986f,
+    -0.6814072728157043f, -0.5768185853958130f,
+     0.7270012497901917f,  0.6186859607696533f,
+     0.3359416127204895f,  1.8371193408966064f,
+     1.8599303960800171f,  0.0366685986518860f,
+     0.1720824837684631f, -0.9401724338531494f,
+    -1.7599700689315796f, -0.6244229674339294f,
+    -0.8993809223175049f,  0.3226782381534576f,
+     0.8394886851310730f, -0.3017036020755768f,
+     1.5314953327178955f,  1.2942044734954834f,
+    -0.0011779458727688f,  0.0002206907083746f,
+     1.4274526834487915f, -1.2078891992568970f,
+    -0.1612390577793121f,  0.8787511587142944f,
+};
+
+__device__ __constant__ float kEden2_16CodebookX2[kCodebookSize * kPairDim] = {
+    -1.7993265390396118f, -3.2720837593078613f,
+    -1.9223669767379761f,  3.1999130249023438f,
+    -3.7640523910522461f,  1.3575567007064819f,
+     0.7260158658027649f, -3.9335732460021973f,
+    -1.3628145456314087f, -1.1536371707916260f,
+     1.4540024995803833f,  1.2373719215393066f,
+     0.6718832254409790f,  3.6742386817932129f,
+     3.7198607921600342f,  0.0733371973037720f,
+     0.3441649675369263f, -1.8803448677062988f,
+    -3.5199401378631592f, -1.2488459348678589f,
+    -1.7987618446350098f,  0.6453564763069153f,
+     1.6789773702621460f, -0.6034072041511536f,
+     3.0629906654357910f,  2.5884089469909668f,
+    -0.0023558917455375f,  0.0004413814167492f,
+     2.8549053668975830f, -2.4157783985137939f,
+    -0.3224781155586243f,  1.7575023174285889f,
+};
+
+__device__ __constant__ float kEden2_16CodebookNormSq[kCodebookSize] = {
+    3.4860272407531738f,
+    3.4837346076965332f,
+    4.0027627944946289f,
+    4.0000243186950684f,
+    0.7970355749130249f,
+    0.9113031625747681f,
+    3.4878642559051514f,
+    3.4606857299804688f,
+    0.9135365486145020f,
+    3.4873986244201660f,
+    0.9130073189735413f,
+    0.7957662940025330f,
+    4.0204434394836426f,
+    0.0000014362608454f,
+    3.4966175556182861f,
+    0.7982016801834106f,
+};
+
+__device__ __forceinline__ float eden2_16_codebook_value(
+    uint32_t cb_idx, int coord) {
+  return kEden2_16Codebook[cb_idx * kPairDim + coord];
+}
+
+__device__ __forceinline__ float eden2_16_codebook_value_x2(
+    uint32_t cb_idx, int coord) {
+  return kEden2_16CodebookX2[cb_idx * kPairDim + coord];
+}
+
+__device__ __forceinline__ float eden2_16_codebook_norm_sq(uint32_t cb_idx) {
+  return kEden2_16CodebookNormSq[cb_idx];
+}
+
 // ─── Swizzled SMEM index (XOR-based bank-conflict-free FWHT) ────────────────
 // Mirrors the TurboQuant 2.5-bit kernel: 16 rows x 32 cols of float32; XOR
 // the low 3 bits of the row index into the low 3 bits of the column index
@@ -188,6 +259,15 @@ __device__ __forceinline__ uint32_t nearest_index(
 // Rope is copied as 8 × 16-byte vectorised stores (kRopeDim*2 = 128 bytes).
 // Scale is stored as fp16 at the end of the packed region.
 
+template <
+    bool UseConstCodebook,
+    bool UseWarpPack = false,
+    bool UseIndexWarpPack = false,
+    bool UseRopeFirst = false,
+    bool UseScaleBroadcast = false,
+    bool UsePreFwhtNorm = false,
+    bool UseFmaScore = false,
+    bool UseFmaTieGuard = false>
 __global__ void higgs_dense_2bit_store_kernel(
     uint8_t* __restrict__ compressed,
     const int64_t* __restrict__ locs,
@@ -204,9 +284,25 @@ __global__ void higgs_dense_2bit_store_kernel(
   const int64_t row = blockIdx.x;
   const int tid = threadIdx.x;
   if (row >= num_rows) return;
+  uint8_t* rope_first_slot = nullptr;
 
   __shared__ float buf[kLatentDim];
   __shared__ float reduce_scratch[32];  // dedicated reduction scratch
+
+  if constexpr (UseRopeFirst) {
+    const int64_t loc = locs[row];
+    rope_first_slot = compressed + loc * compressed_stride_0;
+    if (tid < 8) {
+      const bf16_t* rope_row = rope + row * rope_stride_0;
+      const uint8_t* src = reinterpret_cast<const uint8_t*>(rope_row) + tid * 16;
+      uint8_t* dst =
+          reinterpret_cast<uint8_t*>(rope_first_slot + kPackedBytes + kNormBytes) +
+          tid * 16;
+      uint4 tmp;
+      memcpy(&tmp, src, sizeof(uint4));
+      memcpy(dst, &tmp, sizeof(uint4));
+    }
+  }
 
   // 1. Load BF16 latent, cast to FP32. (No pre-scale here: the FWHT is
   //    orthonormal, so the per-token block scale ``s = ||FWHT(latent)|| /
@@ -215,8 +311,32 @@ __global__ void higgs_dense_2bit_store_kernel(
   const bf16_t* lat_row = latent + row * latent_stride_0;
   const float xin = __bfloat162float(lat_row[tid]);
 
-  // 2. Orthonormal FWHT (×1/sqrt(N) folded at the end).
-  const float xrot = fwht_512_swizzled(xin, buf) * kInvSqrtLatentDim;
+  float scale;
+  float inv_scale = 0.0f;
+  if constexpr (UsePreFwhtNorm) {
+    const float sum_sq = warp_reduce_sum(xin * xin);
+    if ((tid & 31) == 0) {
+      reduce_scratch[tid >> 5] = sum_sq;
+    }
+    __syncthreads();
+    if (tid < 32) {
+      float t = (tid < 16) ? reduce_scratch[tid] : 0.0f;
+      t = warp_reduce_sum(t);
+      if (tid == 0) {
+        const float norm = sqrtf(fmaxf(t, 1.0e-32f));
+        reduce_scratch[0] = norm * kInvSqrtLatentDim;
+        reduce_scratch[1] = 1.0f / fmaxf(norm, 1.0e-30f);
+      }
+    }
+    __syncthreads();
+    scale = reduce_scratch[0];
+    inv_scale = reduce_scratch[1];
+  }
+
+  // 2. Orthonormal FWHT (×1/sqrt(N) folded at the end unless the
+  //    candidate already computed the input norm before the transform).
+  const float xhad = fwht_512_swizzled(xin, buf);
+  const float xrot = xhad * kInvSqrtLatentDim;
 
   // 3. Block reduction: sum of squares -> L2 norm -> scale = ||xrot|| /
   //    sqrt(N). We use a *dedicated* 32-float reduction scratch buffer
@@ -224,72 +344,201 @@ __global__ void higgs_dense_2bit_store_kernel(
   //    still holds the un-normalized rotated value, which we'd like to
   //    keep so the codebook lookup can read from it after the per-token
   //    scale broadcasts across all threads.
-  const float sum_sq = warp_reduce_sum(xrot * xrot);
-  if ((tid & 31) == 0) {
-    reduce_scratch[tid >> 5] = sum_sq;
-  }
-  __syncthreads();
-  float scale;
-  if (tid < 32) {
-    float t = (tid < 16) ? reduce_scratch[tid] : 0.0f;
-    t = warp_reduce_sum(t);
-    if (tid == 0) {
-      reduce_scratch[0] = t;
+  if constexpr (!UsePreFwhtNorm) {
+    const float sum_sq = warp_reduce_sum(xrot * xrot);
+    if ((tid & 31) == 0) {
+      reduce_scratch[tid >> 5] = sum_sq;
+    }
+    __syncthreads();
+    if (tid < 32) {
+      float t = (tid < 16) ? reduce_scratch[tid] : 0.0f;
+      t = warp_reduce_sum(t);
+      if (tid == 0) {
+        reduce_scratch[0] = t;
+      }
+    }
+    __syncthreads();
+    if constexpr (UseScaleBroadcast) {
+      if (tid == 0) {
+        const float scale_once =
+            sqrtf(fmaxf(reduce_scratch[0], 1.0e-32f)) * kInvSqrtLatentDim;
+        reduce_scratch[0] = scale_once;
+        reduce_scratch[1] = 1.0f / fmaxf(scale_once, 1.0e-30f);
+      }
+      __syncthreads();
+      scale = reduce_scratch[0];
+      inv_scale = reduce_scratch[1];
+    } else {
+      scale = sqrtf(fmaxf(reduce_scratch[0], 1.0e-32f)) * kInvSqrtLatentDim;
     }
   }
-  __syncthreads();
-  scale = sqrtf(fmaxf(reduce_scratch[0], 1.0e-32f)) * kInvSqrtLatentDim;
+  uint8_t* slot = rope_first_slot;
+  if constexpr (!UseRopeFirst) {
+    const int64_t loc = locs[row];
+    slot = compressed + loc * compressed_stride_0;
+  }
 
-  // 4. Normalize and write to UNSWIZZLED SMEM positions so the EVEN-tid
-  //    thread can read both coordinates of its pair via simple SMEM
-  //    reads (the partner read is cross-warp for tid >= 32, which
-  //    __shfl_xor_sync cannot do).
-  const float xnorm = xrot / fmaxf(scale, 1.0e-30f);
-  __syncthreads();          // sync before reusing ``buf``
-  buf[tid] = xnorm;
-  __syncthreads();
-
-  // 5. Quantize: each EVEN thread owns one pair, looks up its partner
-  //    (buf[tid + 1]), and runs nearest-neighbor over the 16-entry
-  //    codebook. We inline the lookup so the compiler can keep the
-  //    codebook in registers without an explicit struct allocation
-  //    (which historically led to local-mem spills on Ampere when the
-  //    quant-side predicate was divergent across the warp).
+  // 4. Normalize and quantize. The warp-pack variant keeps the fixed
+  //    pair exchange and packed-nibble exchange in registers with shuffles;
+  //    the incumbent path keeps the original SMEM handoff for direct A/B
+  //    comparisons against the accepted const-codebook incumbent.
+  const float xnorm = UsePreFwhtNorm
+      ? (xhad * inv_scale)
+      : (UseScaleBroadcast ? (xrot * inv_scale)
+                           : (xrot / fmaxf(scale, 1.0e-30f)));
   uint32_t idx = 0;
-  if ((tid & 1) == 0) {
-    const float x0 = buf[tid];
-    const float x1 = buf[tid + 1];
-    float best = -3.4e38f;
-    uint32_t best_idx = 0;
+  if constexpr (UseWarpPack) {
+    const float x0 = xnorm;
+    const float x1 = __shfl_xor_sync(0xffffffff, xnorm, 1);
+    if ((tid & 1) == 0) {
+      float best = -3.4e38f;
+      float second_best = -3.4e38f;
+      uint32_t best_idx = 0;
 #pragma unroll
-    for (int i = 0; i < kCodebookSize; ++i) {
-      const float g0 = __ldg(&codebook[i * kPairDim + 0]);
-      const float g1 = __ldg(&codebook[i * kPairDim + 1]);
-      const float gn = __ldg(&codebook_norm_sq[i]);
-      const float score = 2.0f * (x0 * g0 + x1 * g1) - gn;
-      if (score > best) { best = score; best_idx = static_cast<uint32_t>(i); }
+      for (int i = 0; i < kCodebookSize; ++i) {
+        const float g0 = UseConstCodebook
+            ? eden2_16_codebook_value(i, 0)
+            : __ldg(&codebook[i * kPairDim + 0]);
+        const float g1 = UseConstCodebook
+            ? eden2_16_codebook_value(i, 1)
+            : __ldg(&codebook[i * kPairDim + 1]);
+        const float gn = UseConstCodebook
+            ? eden2_16_codebook_norm_sq(i)
+            : __ldg(&codebook_norm_sq[i]);
+        const float score = (UseFmaScore && UseConstCodebook)
+            ? fmaf(
+                  x1,
+                  eden2_16_codebook_value_x2(i, 1),
+                  fmaf(x0, eden2_16_codebook_value_x2(i, 0), -gn))
+            : (2.0f * (x0 * g0 + x1 * g1) - gn);
+        if (score > best) {
+          second_best = best;
+          best = score;
+          best_idx = static_cast<uint32_t>(i);
+        } else if (score > second_best) {
+          second_best = score;
+        }
+      }
+      if constexpr (UseFmaTieGuard) {
+        if (best - second_best <= 1.0e-4f) {
+          float exact_best = -3.4e38f;
+          uint32_t exact_idx = 0;
+#pragma unroll
+          for (int i = 0; i < kCodebookSize; ++i) {
+            const float g0 = UseConstCodebook
+                ? eden2_16_codebook_value(i, 0)
+                : __ldg(&codebook[i * kPairDim + 0]);
+            const float g1 = UseConstCodebook
+                ? eden2_16_codebook_value(i, 1)
+                : __ldg(&codebook[i * kPairDim + 1]);
+            const float gn = UseConstCodebook
+                ? eden2_16_codebook_norm_sq(i)
+                : __ldg(&codebook_norm_sq[i]);
+            const float exact_score = 2.0f * (x0 * g0 + x1 * g1) - gn;
+            if (exact_score > exact_best) {
+              exact_best = exact_score;
+              exact_idx = static_cast<uint32_t>(i);
+            }
+          }
+          best_idx = exact_idx;
+        }
+      }
+      idx = best_idx;
     }
-    idx = best_idx;
-  }
-  __syncthreads();
-  if ((tid & 1) == 0) {
-    // Stash the 4-bit index at SMEM slot (tid >> 1) = pair index.
-    reinterpret_cast<uint32_t*>(buf)[tid >> 1] = idx;
-  }
-  __syncthreads();
 
-  // 6. Pack two adjacent 4-bit indices into one byte. byte[k] holds
-  //    pair indices (2k, 2k+1). One writer thread per byte (tid 4k).
-  const int64_t loc = locs[row];
-  uint8_t* slot = compressed + loc * compressed_stride_0;
+    // Pack two adjacent pair indices per byte. All lanes participate in the
+    // shuffle; writer lanes are 0,4,...,28 in each warp.
+    const uint32_t hi = __shfl_xor_sync(0xffffffff, idx, 2);
+    if ((tid & 3) == 0) {
+      const int byte_idx = tid >> 2;  // 0..127
+      slot[byte_idx] = static_cast<uint8_t>((idx & 0x0F) | ((hi & 0x0F) << 4));
+    }
+  } else {
+    // Write to UNSWIZZLED SMEM positions so the EVEN-tid thread can read
+    // both coordinates of its pair via simple SMEM reads.
+    __syncthreads();  // sync before reusing ``buf``
+    buf[tid] = xnorm;
+    __syncthreads();
 
-  if ((tid & 3) == 0) {
-    const int pair0 = tid >> 1;     // pair index for the low nibble
-    const int pair1 = pair0 + 1;    // pair index for the high nibble
-    const uint32_t lo = reinterpret_cast<const uint32_t*>(buf)[pair0];
-    const uint32_t hi = reinterpret_cast<const uint32_t*>(buf)[pair1];
-    const int byte_idx = tid >> 2;  // 0..127
-    slot[byte_idx] = static_cast<uint8_t>((lo & 0x0F) | ((hi & 0x0F) << 4));
+    if ((tid & 1) == 0) {
+      const float x0 = buf[tid];
+      const float x1 = buf[tid + 1];
+      float best = -3.4e38f;
+      float second_best = -3.4e38f;
+      uint32_t best_idx = 0;
+#pragma unroll
+      for (int i = 0; i < kCodebookSize; ++i) {
+        const float g0 = UseConstCodebook
+            ? eden2_16_codebook_value(i, 0)
+            : __ldg(&codebook[i * kPairDim + 0]);
+        const float g1 = UseConstCodebook
+            ? eden2_16_codebook_value(i, 1)
+            : __ldg(&codebook[i * kPairDim + 1]);
+        const float gn = UseConstCodebook
+            ? eden2_16_codebook_norm_sq(i)
+            : __ldg(&codebook_norm_sq[i]);
+        const float score = (UseFmaScore && UseConstCodebook)
+            ? fmaf(
+                  x1,
+                  eden2_16_codebook_value_x2(i, 1),
+                  fmaf(x0, eden2_16_codebook_value_x2(i, 0), -gn))
+            : (2.0f * (x0 * g0 + x1 * g1) - gn);
+        if (score > best) {
+          second_best = best;
+          best = score;
+          best_idx = static_cast<uint32_t>(i);
+        } else if (score > second_best) {
+          second_best = score;
+        }
+      }
+      if constexpr (UseFmaTieGuard) {
+        if (best - second_best <= 1.0e-4f) {
+          float exact_best = -3.4e38f;
+          uint32_t exact_idx = 0;
+#pragma unroll
+          for (int i = 0; i < kCodebookSize; ++i) {
+            const float g0 = UseConstCodebook
+                ? eden2_16_codebook_value(i, 0)
+                : __ldg(&codebook[i * kPairDim + 0]);
+            const float g1 = UseConstCodebook
+                ? eden2_16_codebook_value(i, 1)
+                : __ldg(&codebook[i * kPairDim + 1]);
+            const float gn = UseConstCodebook
+                ? eden2_16_codebook_norm_sq(i)
+                : __ldg(&codebook_norm_sq[i]);
+            const float exact_score = 2.0f * (x0 * g0 + x1 * g1) - gn;
+            if (exact_score > exact_best) {
+              exact_best = exact_score;
+              exact_idx = static_cast<uint32_t>(i);
+            }
+          }
+          best_idx = exact_idx;
+        }
+      }
+      idx = best_idx;
+    }
+    if constexpr (UseIndexWarpPack) {
+      const uint32_t hi = __shfl_xor_sync(0xffffffff, idx, 2);
+      if ((tid & 3) == 0) {
+        const int byte_idx = tid >> 2;
+        slot[byte_idx] = static_cast<uint8_t>((idx & 0x0F) | ((hi & 0x0F) << 4));
+      }
+    } else {
+      __syncthreads();
+      if ((tid & 1) == 0) {
+        reinterpret_cast<uint32_t*>(buf)[tid >> 1] = idx;
+      }
+      __syncthreads();
+
+      if ((tid & 3) == 0) {
+        const int pair0 = tid >> 1;
+        const int pair1 = pair0 + 1;
+        const uint32_t lo = reinterpret_cast<const uint32_t*>(buf)[pair0];
+        const uint32_t hi = reinterpret_cast<const uint32_t*>(buf)[pair1];
+        const int byte_idx = tid >> 2;
+        slot[byte_idx] = static_cast<uint8_t>((lo & 0x0F) | ((hi & 0x0F) << 4));
+      }
+    }
   }
 
   // 7. Store fp16 scale at the end of the packed region.
@@ -300,15 +549,17 @@ __global__ void higgs_dense_2bit_store_kernel(
 
   // 8. Copy rope (kRopeDim*2 = 128 bytes) as 8 × 16-byte vectorised
   //    stores. Mirrors the TurboQuant rope copy.
-  if (tid < 8) {
-    const bf16_t* rope_row = rope + row * rope_stride_0;
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(rope_row) + tid * 16;
-    uint8_t* dst =
-        reinterpret_cast<uint8_t*>(slot + kPackedBytes + kNormBytes) +
-        tid * 16;
-    uint4 tmp;
-    memcpy(&tmp, src, sizeof(uint4));
-    memcpy(dst, &tmp, sizeof(uint4));
+  if constexpr (!UseRopeFirst) {
+    if (tid < 8) {
+      const bf16_t* rope_row = rope + row * rope_stride_0;
+      const uint8_t* src = reinterpret_cast<const uint8_t*>(rope_row) + tid * 16;
+      uint8_t* dst =
+          reinterpret_cast<uint8_t*>(slot + kPackedBytes + kNormBytes) +
+          tid * 16;
+      uint4 tmp;
+      memcpy(&tmp, src, sizeof(uint4));
+      memcpy(dst, &tmp, sizeof(uint4));
+    }
   }
 }
 
@@ -316,6 +567,48 @@ __global__ void higgs_dense_2bit_store_kernel(
 // Same launch shape as the TurboQuant 2.5-bit dequant: <num_rows, kLatentDim>.
 // Each thread owns one latent dim. Indices are unpacked from the packed byte
 // (two indices per byte; tid 2k and tid 2k+1 share byte k).
+
+__device__ __forceinline__ uint32_t load_packed_byte_vec4(
+    const uint8_t* __restrict__ slot, int tid) {
+  const int pair_idx = tid >> 1;
+  const int byte_idx = pair_idx >> 1;
+  uint32_t packed = 0;
+  if ((tid & 3) == 0) {
+    packed = __ldg(slot + byte_idx);
+  }
+  const int lane = tid & 31;
+  return __shfl_sync(0xffffffff, packed, lane & ~3);
+}
+
+__device__ __forceinline__ float load_pair_lane_codebook_value(
+    const uint8_t* __restrict__ slot,
+    const float* __restrict__ codebook,
+    int tid) {
+  float g0 = 0.0f;
+  float g1 = 0.0f;
+  if ((tid & 1) == 0) {
+    const int pair_idx = tid >> 1;
+    const int byte_idx = pair_idx >> 1;
+    const uint8_t packed = __ldg(slot + byte_idx);
+    const uint32_t cb_idx = static_cast<uint32_t>(
+        (pair_idx & 1) ? (packed >> 4) : (packed & 0x0F));
+    g0 = __ldg(&codebook[cb_idx * kPairDim + 0]);
+    g1 = __ldg(&codebook[cb_idx * kPairDim + 1]);
+  }
+  const float peer_g1 = __shfl_xor_sync(0xffffffff, g1, 1);
+  return (tid & 1) ? peer_g1 : g0;
+}
+
+__device__ __forceinline__ float load_scale_warp_broadcast(
+    const uint8_t* __restrict__ slot, int tid) {
+  float scale = 0.0f;
+  if ((tid & 31) == 0) {
+    const half scale_h =
+        *reinterpret_cast<const half*>(slot + kPackedBytes);
+    scale = __half2float(scale_h);
+  }
+  return __shfl_sync(0xffffffff, scale, 0);
+}
 
 __global__ void higgs_dense_2bit_dequant_kernel(
     const uint8_t* __restrict__ compressed,
@@ -376,6 +669,49 @@ __global__ void higgs_dense_2bit_dequant_kernel(
   row_out[tid] = __float2bfloat16(result);
 }
 
+__global__ void higgs_dense_2bit_dequant_const_codebook_kernel(
+    const uint8_t* __restrict__ compressed,
+    const int64_t* __restrict__ locs,
+    bf16_t* __restrict__ out,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0) {
+  (void)codebook;
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= num_rows) return;
+
+  const int64_t loc = locs[row];
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  bf16_t* row_out = out + row * out_stride_0;
+
+  __shared__ float buf[kLatentDim];
+
+  if (tid < 8) {
+    uint4 tmp;
+    memcpy(&tmp, slot + kPackedBytes + kNormBytes + tid * 16, sizeof(uint4));
+    memcpy(reinterpret_cast<uint8_t*>(row_out + kLatentDim) + tid * 16, &tmp,
+           sizeof(uint4));
+  }
+
+  const int pair_idx = tid >> 1;
+  const int byte_idx = pair_idx >> 1;
+  const uint8_t packed = slot[byte_idx];
+  const uint32_t cb_idx = static_cast<uint32_t>(
+      (pair_idx & 1) ? (packed >> 4) : (packed & 0x0F));
+
+  const int coord = tid & 1;
+  const float g = eden2_16_codebook_value(cb_idx, coord);
+  const half scale_h =
+      *reinterpret_cast<const half*>(slot + kPackedBytes);
+  const float scale = __half2float(scale_h);
+
+  const float rot_recon = scale * g;
+  const float result = fwht_512_swizzled(rot_recon, buf) * kInvSqrtLatentDim;
+  row_out[tid] = __float2bfloat16(result);
+}
+
 // ─── Page-table dequant variant ─────────────────────────────────────────────
 // Mirrors TurboQuant's ``dequantize_page_table_selected_2p5_kernel``. The
 // page table indexes flat slots; rows with page < 0 are masked.
@@ -423,6 +759,321 @@ __global__ void higgs_dense_2bit_dequant_page_table_kernel(
       *reinterpret_cast<const half*>(slot + kPackedBytes);
   const float scale = __half2float(scale_h);
 
+  const float rot_recon = scale * g;
+  const float result = fwht_512_swizzled(rot_recon, buf) * kInvSqrtLatentDim;
+  row_out[tid] = __float2bfloat16(result);
+}
+
+__global__ void higgs_dense_2bit_dequant_page_table_const_codebook_kernel(
+    const uint8_t* __restrict__ compressed,
+    const int32_t* __restrict__ page_table,
+    bf16_t* __restrict__ out,
+    int32_t* __restrict__ compact_page_table,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0) {
+  (void)codebook;
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= num_rows) return;
+
+  const int32_t page = page_table[row];
+  if (tid == 0) {
+    compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
+  }
+
+  const int64_t loc = page >= 0 ? static_cast<int64_t>(page) : 0;
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  bf16_t* row_out = out + row * out_stride_0;
+
+  __shared__ float buf[kLatentDim];
+
+  if (tid < 8) {
+    uint4 tmp;
+    memcpy(&tmp, slot + kPackedBytes + kNormBytes + tid * 16, sizeof(uint4));
+    memcpy(reinterpret_cast<uint8_t*>(row_out + kLatentDim) + tid * 16, &tmp,
+           sizeof(uint4));
+  }
+
+  const int pair_idx = tid >> 1;
+  const int byte_idx = pair_idx >> 1;
+  const uint8_t packed = slot[byte_idx];
+  const uint32_t cb_idx = static_cast<uint32_t>(
+      (pair_idx & 1) ? (packed >> 4) : (packed & 0x0F));
+
+  const int coord = tid & 1;
+  const float g = eden2_16_codebook_value(cb_idx, coord);
+  const half scale_h =
+      *reinterpret_cast<const half*>(slot + kPackedBytes);
+  const float scale = __half2float(scale_h);
+
+  const float rot_recon = scale * g;
+  const float result = fwht_512_swizzled(rot_recon, buf) * kInvSqrtLatentDim;
+  row_out[tid] = __float2bfloat16(result);
+}
+
+// ─── Opt-in vec4/shared-codebook dequant candidates ────────────────────────
+// B200 measurement variants only. These keep the incumbent slot layout and
+// output contract unchanged while reducing redundant packed-byte loads: one
+// lane per 4-scalar group loads the byte and broadcasts it to its quartet.
+// The EDEN2-16 codebook is staged in SMEM once per CTA instead of loaded from
+// global memory by every scalar lane.
+
+__global__ void higgs_dense_2bit_dequant_vec4_kernel(
+    const uint8_t* __restrict__ compressed,
+    const int64_t* __restrict__ locs,
+    bf16_t* __restrict__ out,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0) {
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= num_rows) return;
+
+  const int64_t loc = locs[row];
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  bf16_t* row_out = out + row * out_stride_0;
+
+  __shared__ float buf[kLatentDim];
+  __shared__ float cb_smem[kCodebookSize * kPairDim];
+
+  if (tid < kCodebookSize * kPairDim) {
+    cb_smem[tid] = __ldg(&codebook[tid]);
+  }
+
+  if (tid < 8) {
+    uint4 tmp;
+    memcpy(&tmp, slot + kPackedBytes + kNormBytes + tid * 16, sizeof(uint4));
+    memcpy(reinterpret_cast<uint8_t*>(row_out + kLatentDim) + tid * 16, &tmp,
+           sizeof(uint4));
+  }
+  __syncthreads();
+
+  const int pair_idx = tid >> 1;
+  const uint32_t packed = load_packed_byte_vec4(slot, tid);
+  const uint32_t cb_idx = static_cast<uint32_t>(
+      (pair_idx & 1) ? (packed >> 4) : (packed & 0x0F));
+
+  const int coord = tid & 1;
+  const float g = cb_smem[cb_idx * kPairDim + coord];
+  const half scale_h =
+      *reinterpret_cast<const half*>(slot + kPackedBytes);
+  const float scale = __half2float(scale_h);
+
+  const float rot_recon = scale * g;
+  const float result = fwht_512_swizzled(rot_recon, buf) * kInvSqrtLatentDim;
+  row_out[tid] = __float2bfloat16(result);
+}
+
+__global__ void higgs_dense_2bit_dequant_vec4_ldg_codebook_kernel(
+    const uint8_t* __restrict__ compressed,
+    const int64_t* __restrict__ locs,
+    bf16_t* __restrict__ out,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0) {
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= num_rows) return;
+
+  const int64_t loc = locs[row];
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  bf16_t* row_out = out + row * out_stride_0;
+
+  __shared__ float buf[kLatentDim];
+
+  if (tid < 8) {
+    uint4 tmp;
+    memcpy(&tmp, slot + kPackedBytes + kNormBytes + tid * 16, sizeof(uint4));
+    memcpy(reinterpret_cast<uint8_t*>(row_out + kLatentDim) + tid * 16, &tmp,
+           sizeof(uint4));
+  }
+
+  const int pair_idx = tid >> 1;
+  const uint32_t packed = load_packed_byte_vec4(slot, tid);
+  const uint32_t cb_idx = static_cast<uint32_t>(
+      (pair_idx & 1) ? (packed >> 4) : (packed & 0x0F));
+
+  const int coord = tid & 1;
+  const float g = __ldg(&codebook[cb_idx * kPairDim + coord]);
+  const half scale_h =
+      *reinterpret_cast<const half*>(slot + kPackedBytes);
+  const float scale = __half2float(scale_h);
+
+  const float rot_recon = scale * g;
+  const float result = fwht_512_swizzled(rot_recon, buf) * kInvSqrtLatentDim;
+  row_out[tid] = __float2bfloat16(result);
+}
+
+__global__ void higgs_dense_2bit_dequant_page_table_vec4_kernel(
+    const uint8_t* __restrict__ compressed,
+    const int32_t* __restrict__ page_table,
+    bf16_t* __restrict__ out,
+    int32_t* __restrict__ compact_page_table,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0) {
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= num_rows) return;
+
+  const int32_t page = page_table[row];
+  if (tid == 0) {
+    compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
+  }
+
+  const int64_t loc = page >= 0 ? static_cast<int64_t>(page) : 0;
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  bf16_t* row_out = out + row * out_stride_0;
+
+  __shared__ float buf[kLatentDim];
+  __shared__ float cb_smem[kCodebookSize * kPairDim];
+
+  if (tid < kCodebookSize * kPairDim) {
+    cb_smem[tid] = __ldg(&codebook[tid]);
+  }
+
+  if (tid < 8) {
+    uint4 tmp;
+    memcpy(&tmp, slot + kPackedBytes + kNormBytes + tid * 16, sizeof(uint4));
+    memcpy(reinterpret_cast<uint8_t*>(row_out + kLatentDim) + tid * 16, &tmp,
+           sizeof(uint4));
+  }
+  __syncthreads();
+
+  const int pair_idx = tid >> 1;
+  const uint32_t packed = load_packed_byte_vec4(slot, tid);
+  const uint32_t cb_idx = static_cast<uint32_t>(
+      (pair_idx & 1) ? (packed >> 4) : (packed & 0x0F));
+
+  const int coord = tid & 1;
+  const float g = cb_smem[cb_idx * kPairDim + coord];
+  const half scale_h =
+      *reinterpret_cast<const half*>(slot + kPackedBytes);
+  const float scale = __half2float(scale_h);
+
+  const float rot_recon = scale * g;
+  const float result = fwht_512_swizzled(rot_recon, buf) * kInvSqrtLatentDim;
+  row_out[tid] = __float2bfloat16(result);
+}
+
+__global__ void higgs_dense_2bit_dequant_page_table_vec4_ldg_codebook_kernel(
+    const uint8_t* __restrict__ compressed,
+    const int32_t* __restrict__ page_table,
+    bf16_t* __restrict__ out,
+    int32_t* __restrict__ compact_page_table,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0) {
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= num_rows) return;
+
+  const int32_t page = page_table[row];
+  if (tid == 0) {
+    compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
+  }
+
+  const int64_t loc = page >= 0 ? static_cast<int64_t>(page) : 0;
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  bf16_t* row_out = out + row * out_stride_0;
+
+  __shared__ float buf[kLatentDim];
+
+  if (tid < 8) {
+    uint4 tmp;
+    memcpy(&tmp, slot + kPackedBytes + kNormBytes + tid * 16, sizeof(uint4));
+    memcpy(reinterpret_cast<uint8_t*>(row_out + kLatentDim) + tid * 16, &tmp,
+           sizeof(uint4));
+  }
+
+  const int pair_idx = tid >> 1;
+  const uint32_t packed = load_packed_byte_vec4(slot, tid);
+  const uint32_t cb_idx = static_cast<uint32_t>(
+      (pair_idx & 1) ? (packed >> 4) : (packed & 0x0F));
+
+  const int coord = tid & 1;
+  const float g = __ldg(&codebook[cb_idx * kPairDim + coord]);
+  const half scale_h =
+      *reinterpret_cast<const half*>(slot + kPackedBytes);
+  const float scale = __half2float(scale_h);
+
+  const float rot_recon = scale * g;
+  const float result = fwht_512_swizzled(rot_recon, buf) * kInvSqrtLatentDim;
+  row_out[tid] = __float2bfloat16(result);
+}
+
+__global__ void higgs_dense_2bit_dequant_pair_lanes_scale_broadcast_kernel(
+    const uint8_t* __restrict__ compressed,
+    const int64_t* __restrict__ locs,
+    bf16_t* __restrict__ out,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0) {
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= num_rows) return;
+
+  const int64_t loc = locs[row];
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  bf16_t* row_out = out + row * out_stride_0;
+
+  __shared__ float buf[kLatentDim];
+
+  if (tid < 8) {
+    uint4 tmp;
+    memcpy(&tmp, slot + kPackedBytes + kNormBytes + tid * 16, sizeof(uint4));
+    memcpy(reinterpret_cast<uint8_t*>(row_out + kLatentDim) + tid * 16, &tmp,
+           sizeof(uint4));
+  }
+
+  const float g = load_pair_lane_codebook_value(slot, codebook, tid);
+  const float scale = load_scale_warp_broadcast(slot, tid);
+  const float rot_recon = scale * g;
+  const float result = fwht_512_swizzled(rot_recon, buf) * kInvSqrtLatentDim;
+  row_out[tid] = __float2bfloat16(result);
+}
+
+__global__ void
+higgs_dense_2bit_dequant_page_table_pair_lanes_scale_broadcast_kernel(
+    const uint8_t* __restrict__ compressed,
+    const int32_t* __restrict__ page_table,
+    bf16_t* __restrict__ out,
+    int32_t* __restrict__ compact_page_table,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0) {
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= num_rows) return;
+
+  const int32_t page = page_table[row];
+  if (tid == 0) {
+    compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
+  }
+
+  const int64_t loc = page >= 0 ? static_cast<int64_t>(page) : 0;
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  bf16_t* row_out = out + row * out_stride_0;
+
+  __shared__ float buf[kLatentDim];
+
+  if (tid < 8) {
+    uint4 tmp;
+    memcpy(&tmp, slot + kPackedBytes + kNormBytes + tid * 16, sizeof(uint4));
+    memcpy(reinterpret_cast<uint8_t*>(row_out + kLatentDim) + tid * 16, &tmp,
+           sizeof(uint4));
+  }
+
+  const float g = load_pair_lane_codebook_value(slot, codebook, tid);
+  const float scale = load_scale_warp_broadcast(slot, tid);
   const float rot_recon = scale * g;
   const float result = fwht_512_swizzled(rot_recon, buf) * kInvSqrtLatentDim;
   row_out[tid] = __float2bfloat16(result);
@@ -479,7 +1130,593 @@ struct HiggsDense2BitStoreKernel {
     if (num_rows == 0) return;
 
     LaunchKernel(num_rows, kLatentDim, device.unwrap())(
-        higgs_dense_2bit_store_kernel,
+        higgs_dense_2bit_store_kernel<false>,
+        static_cast<uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<const bf16_t*>(latent.data_ptr()),
+        static_cast<const bf16_t*>(rope.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        static_cast<const float*>(codebook_norm_sq.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        latent_stride_0.unwrap(),
+        latent_stride_1.unwrap(),
+        rope_stride_0.unwrap(),
+        rope_stride_1.unwrap());
+  }
+};
+
+struct HiggsDense2BitStoreConstCodebookKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView latent,
+      tvm::ffi::TensorView rope,
+      tvm::ffi::TensorView codebook,
+      tvm::ffi::TensorView codebook_norm_sq) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto latent_stride_0 = SymbolicSize{"latent_stride_0"};
+    auto latent_stride_1 = SymbolicSize{"latent_stride_1"};
+    auto rope_stride_0 = SymbolicSize{"rope_stride_0"};
+    auto rope_stride_1 = SymbolicSize{"rope_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kLatentDim})
+        .with_strides({latent_stride_0, latent_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(latent);
+    TensorMatcher({N, 1, kRopeDim})
+        .with_strides({rope_stride_0, rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(rope);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+    TensorMatcher({kCodebookSize})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook_norm_sq);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_store_kernel<true>,
+        static_cast<uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<const bf16_t*>(latent.data_ptr()),
+        static_cast<const bf16_t*>(rope.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        static_cast<const float*>(codebook_norm_sq.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        latent_stride_0.unwrap(),
+        latent_stride_1.unwrap(),
+        rope_stride_0.unwrap(),
+        rope_stride_1.unwrap());
+  }
+};
+
+struct HiggsDense2BitStoreConstCodebookRopeFirstIndexPackKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView latent,
+      tvm::ffi::TensorView rope,
+      tvm::ffi::TensorView codebook,
+      tvm::ffi::TensorView codebook_norm_sq) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto latent_stride_0 = SymbolicSize{"latent_stride_0"};
+    auto latent_stride_1 = SymbolicSize{"latent_stride_1"};
+    auto rope_stride_0 = SymbolicSize{"rope_stride_0"};
+    auto rope_stride_1 = SymbolicSize{"rope_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kLatentDim})
+        .with_strides({latent_stride_0, latent_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(latent);
+    TensorMatcher({N, 1, kRopeDim})
+        .with_strides({rope_stride_0, rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(rope);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+    TensorMatcher({kCodebookSize})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook_norm_sq);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_store_kernel<true, false, true, true>,
+        static_cast<uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<const bf16_t*>(latent.data_ptr()),
+        static_cast<const bf16_t*>(rope.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        static_cast<const float*>(codebook_norm_sq.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        latent_stride_0.unwrap(),
+        latent_stride_1.unwrap(),
+        rope_stride_0.unwrap(),
+        rope_stride_1.unwrap());
+  }
+};
+
+struct HiggsDense2BitStoreConstCodebookRopeFirstKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView latent,
+      tvm::ffi::TensorView rope,
+      tvm::ffi::TensorView codebook,
+      tvm::ffi::TensorView codebook_norm_sq) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto latent_stride_0 = SymbolicSize{"latent_stride_0"};
+    auto latent_stride_1 = SymbolicSize{"latent_stride_1"};
+    auto rope_stride_0 = SymbolicSize{"rope_stride_0"};
+    auto rope_stride_1 = SymbolicSize{"rope_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kLatentDim})
+        .with_strides({latent_stride_0, latent_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(latent);
+    TensorMatcher({N, 1, kRopeDim})
+        .with_strides({rope_stride_0, rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(rope);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+    TensorMatcher({kCodebookSize})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook_norm_sq);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_store_kernel<true, false, false, true>,
+        static_cast<uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<const bf16_t*>(latent.data_ptr()),
+        static_cast<const bf16_t*>(rope.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        static_cast<const float*>(codebook_norm_sq.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        latent_stride_0.unwrap(),
+        latent_stride_1.unwrap(),
+        rope_stride_0.unwrap(),
+        rope_stride_1.unwrap());
+  }
+};
+
+struct HiggsDense2BitStoreConstCodebookIndexPackKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView latent,
+      tvm::ffi::TensorView rope,
+      tvm::ffi::TensorView codebook,
+      tvm::ffi::TensorView codebook_norm_sq) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto latent_stride_0 = SymbolicSize{"latent_stride_0"};
+    auto latent_stride_1 = SymbolicSize{"latent_stride_1"};
+    auto rope_stride_0 = SymbolicSize{"rope_stride_0"};
+    auto rope_stride_1 = SymbolicSize{"rope_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kLatentDim})
+        .with_strides({latent_stride_0, latent_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(latent);
+    TensorMatcher({N, 1, kRopeDim})
+        .with_strides({rope_stride_0, rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(rope);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+    TensorMatcher({kCodebookSize})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook_norm_sq);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_store_kernel<true, false, true>,
+        static_cast<uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<const bf16_t*>(latent.data_ptr()),
+        static_cast<const bf16_t*>(rope.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        static_cast<const float*>(codebook_norm_sq.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        latent_stride_0.unwrap(),
+        latent_stride_1.unwrap(),
+        rope_stride_0.unwrap(),
+        rope_stride_1.unwrap());
+  }
+};
+
+struct HiggsDense2BitStoreConstCodebookWarpPackKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView latent,
+      tvm::ffi::TensorView rope,
+      tvm::ffi::TensorView codebook,
+      tvm::ffi::TensorView codebook_norm_sq) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto latent_stride_0 = SymbolicSize{"latent_stride_0"};
+    auto latent_stride_1 = SymbolicSize{"latent_stride_1"};
+    auto rope_stride_0 = SymbolicSize{"rope_stride_0"};
+    auto rope_stride_1 = SymbolicSize{"rope_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kLatentDim})
+        .with_strides({latent_stride_0, latent_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(latent);
+    TensorMatcher({N, 1, kRopeDim})
+        .with_strides({rope_stride_0, rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(rope);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+    TensorMatcher({kCodebookSize})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook_norm_sq);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_store_kernel<true, true>,
+        static_cast<uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<const bf16_t*>(latent.data_ptr()),
+        static_cast<const bf16_t*>(rope.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        static_cast<const float*>(codebook_norm_sq.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        latent_stride_0.unwrap(),
+        latent_stride_1.unwrap(),
+        rope_stride_0.unwrap(),
+        rope_stride_1.unwrap());
+  }
+};
+
+struct HiggsDense2BitStoreConstCodebookWarpPackPreNormKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView latent,
+      tvm::ffi::TensorView rope,
+      tvm::ffi::TensorView codebook,
+      tvm::ffi::TensorView codebook_norm_sq) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto latent_stride_0 = SymbolicSize{"latent_stride_0"};
+    auto latent_stride_1 = SymbolicSize{"latent_stride_1"};
+    auto rope_stride_0 = SymbolicSize{"rope_stride_0"};
+    auto rope_stride_1 = SymbolicSize{"rope_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kLatentDim})
+        .with_strides({latent_stride_0, latent_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(latent);
+    TensorMatcher({N, 1, kRopeDim})
+        .with_strides({rope_stride_0, rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(rope);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+    TensorMatcher({kCodebookSize})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook_norm_sq);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_store_kernel<true, true, false, false, false, true>,
+        static_cast<uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<const bf16_t*>(latent.data_ptr()),
+        static_cast<const bf16_t*>(rope.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        static_cast<const float*>(codebook_norm_sq.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        latent_stride_0.unwrap(),
+        latent_stride_1.unwrap(),
+        rope_stride_0.unwrap(),
+        rope_stride_1.unwrap());
+  }
+};
+
+struct HiggsDense2BitStoreConstCodebookWarpPackFmaScoreKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView latent,
+      tvm::ffi::TensorView rope,
+      tvm::ffi::TensorView codebook,
+      tvm::ffi::TensorView codebook_norm_sq) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto latent_stride_0 = SymbolicSize{"latent_stride_0"};
+    auto latent_stride_1 = SymbolicSize{"latent_stride_1"};
+    auto rope_stride_0 = SymbolicSize{"rope_stride_0"};
+    auto rope_stride_1 = SymbolicSize{"rope_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kLatentDim})
+        .with_strides({latent_stride_0, latent_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(latent);
+    TensorMatcher({N, 1, kRopeDim})
+        .with_strides({rope_stride_0, rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(rope);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+    TensorMatcher({kCodebookSize})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook_norm_sq);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_store_kernel<
+            true, true, false, false, false, false, true, true>,
+        static_cast<uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<const bf16_t*>(latent.data_ptr()),
+        static_cast<const bf16_t*>(rope.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        static_cast<const float*>(codebook_norm_sq.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        latent_stride_0.unwrap(),
+        latent_stride_1.unwrap(),
+        rope_stride_0.unwrap(),
+        rope_stride_1.unwrap());
+  }
+};
+
+struct HiggsDense2BitStoreConstCodebookWarpPackScaleBroadcastKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView latent,
+      tvm::ffi::TensorView rope,
+      tvm::ffi::TensorView codebook,
+      tvm::ffi::TensorView codebook_norm_sq) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto latent_stride_0 = SymbolicSize{"latent_stride_0"};
+    auto latent_stride_1 = SymbolicSize{"latent_stride_1"};
+    auto rope_stride_0 = SymbolicSize{"rope_stride_0"};
+    auto rope_stride_1 = SymbolicSize{"rope_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kLatentDim})
+        .with_strides({latent_stride_0, latent_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(latent);
+    TensorMatcher({N, 1, kRopeDim})
+        .with_strides({rope_stride_0, rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(rope);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+    TensorMatcher({kCodebookSize})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook_norm_sq);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_store_kernel<true, true, false, false, true>,
+        static_cast<uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<const bf16_t*>(latent.data_ptr()),
+        static_cast<const bf16_t*>(rope.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        static_cast<const float*>(codebook_norm_sq.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        latent_stride_0.unwrap(),
+        latent_stride_1.unwrap(),
+        rope_stride_0.unwrap(),
+        rope_stride_1.unwrap());
+  }
+};
+
+struct HiggsDense2BitStoreConstCodebookWarpPackRopeFirstKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView latent,
+      tvm::ffi::TensorView rope,
+      tvm::ffi::TensorView codebook,
+      tvm::ffi::TensorView codebook_norm_sq) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto latent_stride_0 = SymbolicSize{"latent_stride_0"};
+    auto latent_stride_1 = SymbolicSize{"latent_stride_1"};
+    auto rope_stride_0 = SymbolicSize{"rope_stride_0"};
+    auto rope_stride_1 = SymbolicSize{"rope_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kLatentDim})
+        .with_strides({latent_stride_0, latent_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(latent);
+    TensorMatcher({N, 1, kRopeDim})
+        .with_strides({rope_stride_0, rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(rope);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+    TensorMatcher({kCodebookSize})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook_norm_sq);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_store_kernel<true, true, false, true>,
         static_cast<uint8_t*>(compressed.data_ptr()),
         static_cast<const int64_t*>(locs.data_ptr()),
         static_cast<const bf16_t*>(latent.data_ptr()),
@@ -541,6 +1778,190 @@ struct HiggsDense2BitDequantKernel {
   }
 };
 
+struct HiggsDense2BitDequantConstCodebookKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView codebook) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_dequant_const_codebook_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap());
+  }
+};
+
+struct HiggsDense2BitDequantVec4Kernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView codebook) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_dequant_vec4_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap());
+  }
+};
+
+struct HiggsDense2BitDequantVec4LdgCodebookKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView codebook) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_dequant_vec4_ldg_codebook_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap());
+  }
+};
+
+struct HiggsDense2BitDequantPairLanesScaleBroadcastKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView codebook) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_dequant_pair_lanes_scale_broadcast_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap());
+  }
+};
+
 struct HiggsDense2BitDequantPageTableKernel {
   static void run(
       tvm::ffi::TensorView compressed,
@@ -589,6 +2010,242 @@ struct HiggsDense2BitDequantPageTableKernel {
 
     LaunchKernel(num_rows, kLatentDim, device.unwrap())(
         higgs_dense_2bit_dequant_page_table_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        static_cast<int32_t*>(compact_page_table.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap());
+  }
+};
+
+struct HiggsDense2BitDequantPageTableConstCodebookKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView compact_page_table,
+      tvm::ffi::TensorView codebook) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto B = SymbolicSize{"num_query_rows"};
+    auto K = SymbolicSize{"topk"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(compact_page_table);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = B.unwrap() * K.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_dequant_page_table_const_codebook_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        static_cast<int32_t*>(compact_page_table.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap());
+  }
+};
+
+struct HiggsDense2BitDequantPageTableVec4Kernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView compact_page_table,
+      tvm::ffi::TensorView codebook) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto B = SymbolicSize{"num_query_rows"};
+    auto K = SymbolicSize{"topk"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(compact_page_table);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = B.unwrap() * K.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_dequant_page_table_vec4_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        static_cast<int32_t*>(compact_page_table.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap());
+  }
+};
+
+struct HiggsDense2BitDequantPageTableVec4LdgCodebookKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView compact_page_table,
+      tvm::ffi::TensorView codebook) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto B = SymbolicSize{"num_query_rows"};
+    auto K = SymbolicSize{"topk"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(compact_page_table);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = B.unwrap() * K.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_dequant_page_table_vec4_ldg_codebook_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        static_cast<int32_t*>(compact_page_table.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap());
+  }
+};
+
+struct HiggsDense2BitDequantPageTablePairLanesScaleBroadcastKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView compact_page_table,
+      tvm::ffi::TensorView codebook) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto B = SymbolicSize{"num_query_rows"};
+    auto K = SymbolicSize{"topk"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(compact_page_table);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = B.unwrap() * K.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_dequant_page_table_pair_lanes_scale_broadcast_kernel,
         static_cast<const uint8_t*>(compressed.data_ptr()),
         static_cast<const int32_t*>(page_table.data_ptr()),
         static_cast<bf16_t*>(out.data_ptr()),

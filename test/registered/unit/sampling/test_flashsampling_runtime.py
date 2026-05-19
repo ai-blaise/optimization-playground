@@ -6,6 +6,7 @@ import torch
 from sglang.srt.layers.flashsampling.runtime import (
     FlashSamplingInfo,
     FlashSamplingRuntime,
+    _should_use_dense_greedy_path_on_blackwell,
     get_flashsampling_lm_head_metadata,
     get_flashsampling_info,
 )
@@ -140,6 +141,37 @@ def test_flashsampling_rejects_large_batch(monkeypatch):
     )
 
     assert info is None
+
+
+def test_blackwell_greedy_dense_dispatch_policy():
+    assert not _should_use_dense_greedy_path_on_blackwell(
+        batch_size=64,
+        valid_vocab_size=16160,
+        hidden_size=7168,
+        is_all_greedy=True,
+        cc_major=10,
+    )
+    assert _should_use_dense_greedy_path_on_blackwell(
+        batch_size=72,
+        valid_vocab_size=16160,
+        hidden_size=7168,
+        is_all_greedy=True,
+        cc_major=10,
+    )
+    assert not _should_use_dense_greedy_path_on_blackwell(
+        batch_size=72,
+        valid_vocab_size=16160,
+        hidden_size=7168,
+        is_all_greedy=False,
+        cc_major=10,
+    )
+    assert not _should_use_dense_greedy_path_on_blackwell(
+        batch_size=128,
+        valid_vocab_size=151936,
+        hidden_size=2048,
+        is_all_greedy=True,
+        cc_major=10,
+    )
 
 
 def test_flashsampling_rejects_extend_batch(monkeypatch):

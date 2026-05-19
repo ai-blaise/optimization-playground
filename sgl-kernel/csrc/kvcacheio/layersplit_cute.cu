@@ -14,22 +14,6 @@ limitations under the License.
 ==============================================================================*/
 
 // LayerSplit CP memory-pool kernels for B200 (SM100).
-//
-// Two entry points:
-//
-//   * `layersplit_stage_for_broadcast(src, dst, active_rows, row_bytes)`
-//     copies a single contiguous row block. Dispatches between a custom
-//     vectorized kernel for small payloads (<= 512 KiB total) and a direct
-//     current-stream `cudaMemcpyAsync` for larger active-row prefixes.
-//
-//   * `layersplit_fused_materialize(src_ptrs, dst_ptrs, num_layers,
-//     active_rows, row_bytes)` issues one kernel that broadcasts `num_layers`
-//     buffers in parallel via a 2D grid (`active_rows`, `num_layers`).
-//     Block geometry adapts to total CTA count: at low `(active_rows,
-//     num_layers)` products (`total_ctas_8 < 150`), the launcher uses a
-//     4-warp variant that doubles `grid_x` to give the scheduler more
-//     in-flight warps for HBM-latency hiding; otherwise it uses an 8-warp
-//     variant that is the same shape as the previous fixed grid.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -37,7 +21,10 @@ limitations under the License.
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <cerrno>
+#include <cstdlib>
 #include <cstdint>
+#include <cstring>
 
 #if !defined(USE_ROCM) && !defined(USE_MUSA)
 #define WARP_SIZE 32
@@ -81,12 +68,59 @@ static constexpr int kMaterializeThreads = kMaterializeWarps * WARP_SIZE;
 // direct cudaMemcpyAsync copy-engine path on B200's launch-latency-dominated
 // LayerSplit staging payloads; at 1 MiB the copy-engine path is better.
 static constexpr int64_t kSmallByteThreshold = 512 * 1024;
+static constexpr const char* kB200CandidateEnv =
+    "SGLANG_LAYERSPLIT_B200_CANDIDATE";
+static constexpr const char* kSmallByteThresholdEnv =
+    "SGLANG_LAYERSPLIT_STAGE_SMALL_BYTES";
 
 namespace {
 
 // ---------------------------------------------------------------------------
 // Vectorized copy primitives (used by fused_materialize)
 // ---------------------------------------------------------------------------
+
+int64_t resolve_small_byte_threshold() {
+    const char* env = std::getenv(kSmallByteThresholdEnv);
+    if (env == nullptr || env[0] == '\0') {
+        const char* candidate = std::getenv(kB200CandidateEnv);
+        if (candidate == nullptr || candidate[0] == '\0' ||
+            std::strcmp(candidate, "production") == 0 ||
+            std::strcmp(candidate, "cp2_descriptor_1b200") == 0 ||
+            std::strcmp(candidate, "cp4_descriptor_2b200") == 0 ||
+            std::strcmp(candidate, "producer_stage_fusion") == 0 ||
+            std::strcmp(candidate, "higgs_dense_kv_transfer_sizing") == 0 ||
+            std::strcmp(candidate, "owner_local_validation") == 0) {
+            return kSmallByteThreshold;
+        }
+        if (std::strcmp(candidate, "stage_copy_threshold_256k") == 0) {
+            return 256 * 1024;
+        }
+        if (std::strcmp(candidate, "stage_copy_threshold_768k") == 0) {
+            return 768 * 1024;
+        }
+        TORCH_CHECK(
+            false,
+            kB200CandidateEnv,
+            " has unknown LayerSplit candidate '",
+            candidate,
+            "'.");
+    }
+    if (env == nullptr || env[0] == '\0') {
+        return kSmallByteThreshold;
+    }
+
+    char* end = nullptr;
+    errno = 0;
+    const long long threshold = std::strtoll(env, &end, 10);
+    TORCH_CHECK(
+        errno == 0 && end != env && end != nullptr && *end == '\0' &&
+            threshold >= 0,
+        kSmallByteThresholdEnv,
+        " must be a non-negative integer byte count, got '",
+        env,
+        "'.");
+    return static_cast<int64_t>(threshold);
+}
 
 // 4-way ILP unrolled per-warp 16B vector copy.
 // Each iteration issues 4 ld.global.nc, then 4 st.global.cg, allowing
@@ -238,103 +272,38 @@ __global__ void __launch_bounds__(kThreads) layersplit_small_copy_v5_8b_kernel(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Kernel 1B: layersplit_stage_flat (fallback for non-contiguous case)
-// unchanged.
-// ---------------------------------------------------------------------------
-
-template<int kThreads>
-__global__ void __launch_bounds__(kThreads)
-layersplit_stage_flat_kernel(
-    const VecType* __restrict__ src,
-    VecType* __restrict__ dst,
-    int num_vecs) {
-
+template <int kThreads>
+__global__ void __launch_bounds__(kThreads) layersplit_small_copy_tail_kernel(
+    const char* __restrict__ src,
+    char* __restrict__ dst,
+    int64_t num_bytes) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
+    const int64_t vec_bytes = (num_bytes / kVecBytes) * kVecBytes;
+    const int64_t num_vecs = vec_bytes / kVecBytes;
 
-    int i = tid;
-    for (; i + 3 * stride < num_vecs; i += 4 * stride) {
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
-        VecType t0, t1, t2, t3;
-        asm volatile("ld.global.nc.v4.b32 {%0,%1,%2,%3}, [%4];"
-                     : "=r"(t0.x), "=r"(t0.y), "=r"(t0.z), "=r"(t0.w)
-                     : "l"(src + i) : "memory");
-        asm volatile("ld.global.nc.v4.b32 {%0,%1,%2,%3}, [%4];"
-                     : "=r"(t1.x), "=r"(t1.y), "=r"(t1.z), "=r"(t1.w)
-                     : "l"(src + i + stride) : "memory");
-        asm volatile("ld.global.nc.v4.b32 {%0,%1,%2,%3}, [%4];"
-                     : "=r"(t2.x), "=r"(t2.y), "=r"(t2.z), "=r"(t2.w)
-                     : "l"(src + i + 2*stride) : "memory");
-        asm volatile("ld.global.nc.v4.b32 {%0,%1,%2,%3}, [%4];"
-                     : "=r"(t3.x), "=r"(t3.y), "=r"(t3.z), "=r"(t3.w)
-                     : "l"(src + i + 3*stride) : "memory");
-        asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
-                     : : "l"(dst + i), "r"(t0.x), "r"(t0.y), "r"(t0.z), "r"(t0.w) : "memory");
-        asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
-                     : : "l"(dst + i + stride), "r"(t1.x), "r"(t1.y), "r"(t1.z), "r"(t1.w) : "memory");
-        asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
-                     : : "l"(dst + i + 2*stride), "r"(t2.x), "r"(t2.y), "r"(t2.z), "r"(t2.w) : "memory");
-        asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
-                     : : "l"(dst + i + 3*stride), "r"(t3.x), "r"(t3.y), "r"(t3.z), "r"(t3.w) : "memory");
-#else
-        dst[i] = src[i];
-        dst[i + stride] = src[i + stride];
-        dst[i + 2*stride] = src[i + 2*stride];
-        dst[i + 3*stride] = src[i + 3*stride];
-#endif
-    }
-    for (; i < num_vecs; i += stride) {
+    const auto* __restrict__ src_vec = reinterpret_cast<const VecType*>(src);
+    auto* __restrict__ dst_vec = reinterpret_cast<VecType*>(dst);
+    for (int64_t i = tid; i < num_vecs; i += stride) {
 #if !defined(USE_ROCM) && !defined(USE_MUSA)
         VecType tmp;
-        asm volatile("ld.global.nc.v4.b32 {%0,%1,%2,%3}, [%4];"
-                     : "=r"(tmp.x), "=r"(tmp.y), "=r"(tmp.z), "=r"(tmp.w)
-                     : "l"(src + i) : "memory");
-        asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
-                     : : "l"(dst + i), "r"(tmp.x), "r"(tmp.y), "r"(tmp.z), "r"(tmp.w) : "memory");
+        asm volatile(
+            "ld.global.nc.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(tmp.x), "=r"(tmp.y), "=r"(tmp.z), "=r"(tmp.w)
+            : "l"(src_vec + i)
+            : "memory");
+        asm volatile(
+            "st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
+            :
+            : "l"(dst_vec + i), "r"(tmp.x), "r"(tmp.y), "r"(tmp.z), "r"(tmp.w)
+            : "memory");
 #else
-        dst[i] = src[i];
+        dst_vec[i] = src_vec[i];
 #endif
     }
-}
 
-template<int kThreads>
-__global__ void __launch_bounds__(kThreads)
-layersplit_stage_flat_8b_kernel(
-    const uint64_t* __restrict__ src,
-    uint64_t* __restrict__ dst,
-    int num_u64) {
-
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int stride = gridDim.x * blockDim.x;
-
-    int i = tid;
-    for (; i + 3 * stride < num_u64; i += 4 * stride) {
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
-        uint64_t t0, t1, t2, t3;
-        asm volatile("ld.global.nc.b64 %0, [%1];" : "=l"(t0) : "l"(src + i) : "memory");
-        asm volatile("ld.global.nc.b64 %0, [%1];" : "=l"(t1) : "l"(src + i + stride) : "memory");
-        asm volatile("ld.global.nc.b64 %0, [%1];" : "=l"(t2) : "l"(src + i + 2*stride) : "memory");
-        asm volatile("ld.global.nc.b64 %0, [%1];" : "=l"(t3) : "l"(src + i + 3*stride) : "memory");
-        asm volatile("st.global.cg.b64 [%0], %1;" : : "l"(dst + i), "l"(t0) : "memory");
-        asm volatile("st.global.cg.b64 [%0], %1;" : : "l"(dst + i + stride), "l"(t1) : "memory");
-        asm volatile("st.global.cg.b64 [%0], %1;" : : "l"(dst + i + 2*stride), "l"(t2) : "memory");
-        asm volatile("st.global.cg.b64 [%0], %1;" : : "l"(dst + i + 3*stride), "l"(t3) : "memory");
-#else
+    for (int64_t i = vec_bytes + tid; i < num_bytes; i += stride) {
         dst[i] = src[i];
-        dst[i + stride] = src[i + stride];
-        dst[i + 2*stride] = src[i + 2*stride];
-        dst[i + 3*stride] = src[i + 3*stride];
-#endif
-    }
-    for (; i < num_u64; i += stride) {
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
-        uint64_t tmp;
-        asm volatile("ld.global.nc.b64 %0, [%1];" : "=l"(tmp) : "l"(src + i) : "memory");
-        asm volatile("st.global.cg.b64 [%0], %1;" : : "l"(dst + i), "l"(tmp) : "memory");
-#else
-        dst[i] = src[i];
-#endif
     }
 }
 
@@ -395,18 +364,27 @@ layersplit_fused_materialize_kernel(
 #endif
         }
     } else {
-        const auto* __restrict__ s = reinterpret_cast<const uint64_t*>(row_src);
-        auto* __restrict__ d = reinterpret_cast<uint64_t*>(row_dst);
-        const int num_u64 = row_bytes / sizeof(uint64_t);
+        const auto* __restrict__ s = reinterpret_cast<const VecType*>(row_src);
+        auto* __restrict__ d = reinterpret_cast<VecType*>(row_dst);
+        const int vec_bytes = (row_bytes / kVecBytes) * kVecBytes;
+        const int num_vecs = vec_bytes / kVecBytes;
 #pragma unroll 4
-        for (int i = lane_id; i < num_u64; i += WARP_SIZE) {
+        for (int i = lane_id; i < num_vecs; i += WARP_SIZE) {
 #if !defined(USE_ROCM) && !defined(USE_MUSA)
-            uint64_t tmp;
-            asm volatile("ld.global.nc.b64 %0, [%1];" : "=l"(tmp) : "l"(s + i) : "memory");
-            asm volatile("st.global.cg.b64 [%0], %1;" : : "l"(d + i), "l"(tmp) : "memory");
+            VecType tmp;
+            asm volatile("ld.global.nc.v4.b32 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(tmp.x), "=r"(tmp.y), "=r"(tmp.z), "=r"(tmp.w)
+                         : "l"(s + i) : "memory");
+            asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
+                         : : "l"(d + i),
+                             "r"(tmp.x), "r"(tmp.y), "r"(tmp.z), "r"(tmp.w)
+                         : "memory");
 #else
             d[i] = s[i];
 #endif
+        }
+        for (int i = vec_bytes + lane_id; i < row_bytes; i += WARP_SIZE) {
+            row_dst[i] = row_src[i];
         }
     }
 }
@@ -467,14 +445,15 @@ void layersplit_stage_for_broadcast(
 
     TORCH_CHECK(src.is_cuda(), "src must be a CUDA tensor");
     TORCH_CHECK(dst.is_cuda(), "dst must be a CUDA tensor");
-    TORCH_CHECK(row_bytes % 8 == 0, "row_bytes must be divisible by 8");
+    TORCH_CHECK(row_bytes > 0, "row_bytes must be positive");
 
     if (__builtin_expect(src.is_contiguous() && dst.is_contiguous(), 1)) {
         const int64_t total_bytes = active_rows * row_bytes;
+        const int64_t small_byte_threshold = resolve_small_byte_threshold();
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
         // path 1: small payloads use the custom 148x256 kernel.
-        if (total_bytes <= kSmallByteThreshold && total_bytes >= kVecBytes &&
+        if (total_bytes <= small_byte_threshold && total_bytes >= kVecBytes &&
             (total_bytes % kVecBytes == 0)) {
             const int num_vecs = static_cast<int>(total_bytes / kVecBytes);
             layersplit_small_copy_v5_kernel<256><<<148, 256, 0, stream>>>(
@@ -483,13 +462,21 @@ void layersplit_stage_for_broadcast(
                 num_vecs);
             return;
         }
-        if (total_bytes <= kSmallByteThreshold && total_bytes >= sizeof(uint64_t) &&
+        if (total_bytes <= small_byte_threshold &&
+            total_bytes >= sizeof(uint64_t) &&
             (total_bytes % sizeof(uint64_t) == 0)) {
             const int num_u64 = static_cast<int>(total_bytes / sizeof(uint64_t));
             layersplit_small_copy_v5_8b_kernel<256><<<148, 256, 0, stream>>>(
                 reinterpret_cast<const uint64_t*>(src.data_ptr()),
                 reinterpret_cast<uint64_t*>(dst.data_ptr()),
                 num_u64);
+            return;
+        }
+        if (total_bytes <= small_byte_threshold && total_bytes >= kVecBytes) {
+            layersplit_small_copy_tail_kernel<256><<<148, 256, 0, stream>>>(
+                reinterpret_cast<const char*>(src.data_ptr()),
+                reinterpret_cast<char*>(dst.data_ptr()),
+                total_bytes);
             return;
         }
 
@@ -500,57 +487,9 @@ void layersplit_stage_for_broadcast(
         return;
     }
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    // Fallback: row-strided staging (same as before)
-    if (row_bytes % kVecBytes == 0) {
-        const int64_t total_bytes = active_rows * row_bytes;
-        const int num_vecs = static_cast<int>(total_bytes / kVecBytes);
-        const auto* src_vec = reinterpret_cast<const VecType*>(src.data_ptr());
-        auto* dst_vec = reinterpret_cast<VecType*>(dst.data_ptr());
-
-        int threads, blocks;
-        if (num_vecs <= 32) {
-            threads = 64;
-            blocks = 1;
-        } else if (num_vecs <= 1024) {
-            threads = 256;
-            blocks = 1;
-        } else if (num_vecs <= 8192) {
-            threads = 256;
-            blocks = 8;
-        } else if (num_vecs <= 32768) {
-            threads = 256;
-            blocks = 32;
-        } else if (num_vecs <= 131072) {
-            threads = 256;
-            blocks = 128;
-        } else {
-            threads = 256;
-            blocks = 148;
-        }
-
-        if (threads == 64) {
-            layersplit_stage_flat_kernel<64><<<blocks, 64, 0, stream>>>(
-                src_vec, dst_vec, num_vecs);
-        } else {
-            layersplit_stage_flat_kernel<256><<<blocks, 256, 0, stream>>>(
-                src_vec, dst_vec, num_vecs);
-        }
-    } else {
-        const int64_t total_bytes = active_rows * row_bytes;
-        const int num_u64 = static_cast<int>(total_bytes / sizeof(uint64_t));
-        const auto* src_p = reinterpret_cast<const uint64_t*>(src.data_ptr());
-        auto* dst_p = reinterpret_cast<uint64_t*>(dst.data_ptr());
-
-        int threads = 256;
-        int blocks = (num_u64 + 2047) / 2048;
-        if (blocks < 1) blocks = 1;
-        if (blocks > 148) blocks = 148;
-        layersplit_stage_flat_8b_kernel<256><<<blocks, 256, 0, stream>>>(
-            src_p, dst_p, num_u64);
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    at::Tensor src_active = src.narrow(0, 0, active_rows);
+    at::Tensor dst_active = dst.narrow(0, 0, active_rows);
+    dst_active.copy_(src_active, true);
 }
 
 void layersplit_fused_materialize(
@@ -566,7 +505,7 @@ void layersplit_fused_materialize(
     TORCH_CHECK(dst_ptrs.is_cuda(), "dst_ptrs must be a CUDA tensor");
     TORCH_CHECK(src_ptrs.scalar_type() == at::kLong, "src_ptrs must be uint64");
     TORCH_CHECK(dst_ptrs.scalar_type() == at::kLong, "dst_ptrs must be uint64");
-    TORCH_CHECK(row_bytes % 8 == 0, "row_bytes must be divisible by 8");
+    TORCH_CHECK(row_bytes > 0, "row_bytes must be positive");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 

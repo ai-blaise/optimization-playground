@@ -6,8 +6,12 @@ import torch
 import torch.nn.functional as F
 
 from sglang.jit_kernel.gated_norm import (
+    _SIGMOID_MUL_FUSE_MIN_TOKENS_ENV,
     _cute_declines_shape,
+    _should_try_cute_before_torch_mm,
     _should_use_torch_mm,
+    _sigmoid_mul_block_size,
+    _sigmoid_mul_fuse_min_tokens,
     gated_norm_forward,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -76,6 +80,42 @@ def test_gated_norm_cute_documented_shape_fallbacks() -> None:
     assert _cute_declines_shape(4096, 32)
     assert not _cute_declines_shape(15, 64)
     assert not _cute_declines_shape(4095, 32)
+
+
+def test_gated_norm_cute_first_guard() -> None:
+    assert _should_try_cute_before_torch_mm(1, 1)
+    assert _should_try_cute_before_torch_mm(4096, 5)
+    assert _should_try_cute_before_torch_mm(1024, 32)
+    assert _should_try_cute_before_torch_mm(256, 48)
+    assert _should_try_cute_before_torch_mm(512, 48)
+    assert _should_try_cute_before_torch_mm(512, 40)
+    assert _should_try_cute_before_torch_mm(1024, 40)
+    assert not _should_try_cute_before_torch_mm(8, 33)
+    assert _should_try_cute_before_torch_mm(1, 64)
+    assert _should_try_cute_before_torch_mm(8, 64)
+    assert not _should_try_cute_before_torch_mm(2048, 8)
+    assert not _should_try_cute_before_torch_mm(2048, 32)
+    assert not _should_try_cute_before_torch_mm(1024, 48)
+    assert not _should_try_cute_before_torch_mm(16, 64)
+
+
+def test_gated_norm_sigmoid_mul_fuse_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(_SIGMOID_MUL_FUSE_MIN_TOKENS_ENV, raising=False)
+    assert _sigmoid_mul_fuse_min_tokens() == 480
+
+    monkeypatch.setenv(_SIGMOID_MUL_FUSE_MIN_TOKENS_ENV, "2048")
+    assert _sigmoid_mul_fuse_min_tokens() == 2048
+
+    monkeypatch.setenv(_SIGMOID_MUL_FUSE_MIN_TOKENS_ENV, "-1")
+    assert _sigmoid_mul_fuse_min_tokens() > 10**12
+
+
+def test_gated_norm_sigmoid_mul_block_size() -> None:
+    assert _sigmoid_mul_block_size(480, 64) == 2048
+    assert _sigmoid_mul_block_size(528, 64) == 2048
+    assert _sigmoid_mul_block_size(479, 64) == 1024
+    assert _sigmoid_mul_block_size(529, 64) == 1024
+    assert _sigmoid_mul_block_size(512, 48) == 1024
 
 
 def test_gated_norm_decode_gemm_thresholds() -> None:

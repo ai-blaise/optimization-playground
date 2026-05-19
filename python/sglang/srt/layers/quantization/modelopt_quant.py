@@ -999,8 +999,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
             from sglang.srt.layers.moe.utils import RoutingMethodType
 
-            topk_config = topk_output.topk_config
-
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 get_activation_type,
             )
@@ -1232,9 +1230,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if not quant_method in ["FP8", "NVFP4"]:
+        if quant_method not in ["FP8", "NVFP4"]:
             raise ValueError(
-                f"ModelOpt currently only supports: FP8, NVFP4"
+                "ModelOpt currently only supports: FP8, NVFP4"
                 " quantizations in sglang. Please check the "
                 "quantization config for your model's configuration."
             )
@@ -1474,8 +1472,28 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         w_n, _ = layer.weight.shape
         output_shape = [x_m, output_size]
 
-        # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
+        # Quantize BF16 or FP16 to (FP4 and interleaved block scale).  DeepSeek
+        # G1 can opt into a fused pre-o_proj path that avoids materializing the
+        # BF16 gated activation before this quantization step.
+        g1_gate = getattr(layer, "_g1_pending_fp4_gate", None)
+        g1_quantize = getattr(layer, "_g1_fp4_quantize", None)
+        fused_quant = (
+            g1_quantize(
+                x, g1_gate, layer.input_scale_inv
+            )
+            if g1_quantize is not None
+            else None
+        )
+        if fused_quant is None:
+            if g1_gate is not None:
+                from sglang.srt.layers.quantization.g1_fp4_utils import (
+                    apply_g1_gate_for_fp4_fallback,
+                )
+
+                x = apply_g1_gate_for_fp4_fallback(x, g1_gate)
+            x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
+        else:
+            x_fp4, x_scale_interleaved = fused_quant
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight.dtype == torch.uint8

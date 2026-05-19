@@ -1,0 +1,93 @@
+{
+  "name": "higgs_dense_2bit_b200_optin_vec4_dequant",
+  "status": "unproved",
+  "intended_czs_use": "static_layout_input_only",
+  "promotion_blocker": "Run CZS on any future CuTe tensor-op HIGGS candidate and record a Proved result before enabling that CuTe path.",
+  "layouts": [
+    {
+      "label": "packed_slot_bytes_258",
+      "shape": [{"is_static": true, "value": 258}],
+      "stride": [{"is_static": true, "value": 1}]
+    },
+    {
+      "label": "eden2_16_codebook",
+      "shape": [
+        {"is_static": true, "value": 16},
+        {"is_static": true, "value": 2}
+      ],
+      "stride": [
+        {"is_static": true, "value": 2},
+        {"is_static": true, "value": 1}
+      ]
+    },
+    {
+      "label": "eden2_16_codebook_x2",
+      "shape": [
+        {"is_static": true, "value": 16},
+        {"is_static": true, "value": 2}
+      ],
+      "stride": [
+        {"is_static": true, "value": 2},
+        {"is_static": true, "value": 1}
+      ]
+    },
+    {
+      "label": "bf16_latent_rope_output",
+      "shape": [{"is_static": true, "value": 576}],
+      "stride": [{"is_static": true, "value": 1}]
+    }
+  ],
+  "swizzles": [
+    {
+      "label": "fwht_512_xor_smem_swizzle",
+      "formula": "col ^ (row & 7)",
+      "bank_width_bytes": 4
+    }
+  ],
+  "swizzled_layouts": [
+    {
+      "label": "fwht_512_float_smem",
+      "layout_idx": 3,
+      "swizzle_idx": 0
+    }
+  ],
+  "tma_descriptors": [],
+  "mma_atoms": [],
+  "ldmatrix_ops": [],
+  "vectorization_ops": [
+    {
+      "label": "packed_byte_vec4_quartet_broadcast",
+      "layout_idx": 0,
+      "element_bytes": 1,
+      "vector_width": 4,
+      "base_address": {"is_static": true, "value": 0}
+    },
+    {
+      "label": "rope_copy_uint4_8x16B",
+      "layout_idx": 0,
+      "element_bytes": 1,
+      "vector_width": 16,
+      "base_address": {"is_static": true, "value": 130}
+    },
+    {
+      "label": "codebook_smem_stage_fp32_16x2",
+      "layout_idx": 1,
+      "element_bytes": 4,
+      "vector_width": 32,
+      "base_address": {"is_static": true, "value": 0}
+    },
+    {
+      "label": "codebook_x2_const_fp32_16x2",
+      "layout_idx": 2,
+      "element_bytes": 4,
+      "vector_width": 32,
+      "base_address": {"is_static": true, "value": 0}
+    }
+  ],
+  "mbarrier_sites": [],
+  "tmem_traces": [],
+  "dsmem_sites": [],
+  "barrier_elision_sites": [],
+  "mma_overlap_sites": [],
+  "clc_sites": []
+}

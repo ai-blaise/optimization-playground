@@ -5,7 +5,7 @@ When the total number of (V, H) tiles fits within a single SM wave
 adds scheduling overhead that dominates execution time. This module provides
 a non-persistent grid-launch variant that eliminates that overhead.
 
-CuTe design principles applied:
+Triton non-persistent design principles applied:
 - 1 block per (V-tile, H-tile): simple 2D grid, no persistent loop
 - No warp specialization: all warps do both TMA loads and compute.
   WS producer warps have nothing to prefetch when each SM processes

@@ -89,6 +89,76 @@ class TestFlashSamplingKernel(unittest.TestCase):
         self.assertEqual(_block_h_blackwell(32), 32)
         self.assertEqual(_block_h_blackwell(64), 64)
 
+    def test_blackwell_non_greedy_allows_two_nonpersistent_waves(self):
+        from sglang.srt.layers.flashsampling.target_kernel_blackwell import (
+            _max_nonpersistent_tiles_blackwell,
+        )
+
+        self.assertEqual(_max_nonpersistent_tiles_blackwell(148, True), 148)
+        self.assertEqual(_max_nonpersistent_tiles_blackwell(148, False), 296)
+
+    def test_blackwell_two_wave_non_greedy_uses_shallow_pipeline(self):
+        from sglang.srt.layers.flashsampling.target_kernel_blackwell import (
+            _launch_num_stages_blackwell,
+            _num_stages_blackwell,
+        )
+
+        self.assertEqual(_launch_num_stages_blackwell(32, True), 2)
+        self.assertEqual(
+            _launch_num_stages_blackwell(32, False), _num_stages_blackwell(32)
+        )
+
+    def test_flashsampling_warp_specialization_policy(self):
+        from sglang.srt.layers.flashsampling.core import (
+            _supports_warp_specialization_for_cc,
+        )
+
+        self.assertFalse(_supports_warp_specialization_for_cc(8))
+        self.assertTrue(_supports_warp_specialization_for_cc(9))
+        self.assertFalse(_supports_warp_specialization_for_cc(10))
+
+    def test_blackwell_greedy_dense_dispatch_policy(self):
+        from sglang.srt.layers.flashsampling.runtime import (
+            _should_use_dense_greedy_path_on_blackwell,
+        )
+
+        self.assertFalse(
+            _should_use_dense_greedy_path_on_blackwell(
+                batch_size=64,
+                valid_vocab_size=16160,
+                hidden_size=7168,
+                is_all_greedy=True,
+                cc_major=10,
+            )
+        )
+        self.assertTrue(
+            _should_use_dense_greedy_path_on_blackwell(
+                batch_size=72,
+                valid_vocab_size=16160,
+                hidden_size=7168,
+                is_all_greedy=True,
+                cc_major=10,
+            )
+        )
+        self.assertFalse(
+            _should_use_dense_greedy_path_on_blackwell(
+                batch_size=72,
+                valid_vocab_size=16160,
+                hidden_size=7168,
+                is_all_greedy=False,
+                cc_major=10,
+            )
+        )
+        self.assertFalse(
+            _should_use_dense_greedy_path_on_blackwell(
+                batch_size=128,
+                valid_vocab_size=151936,
+                hidden_size=2048,
+                is_all_greedy=True,
+                cc_major=10,
+            )
+        )
+
     def test_debug_logits_match_dense_matmul(self):
         torch.cuda.set_device(0)
         torch.manual_seed(1)

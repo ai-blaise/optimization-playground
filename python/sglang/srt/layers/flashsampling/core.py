@@ -226,11 +226,19 @@ def _check_workspace(
         raise ValueError(f"{name} must be contiguous")
 
 
+def _supports_warp_specialization_for_cc(cc_major: int) -> bool:
+    # Triton 3.7 FlashSampling warp-specialized persistent kernels fail the
+    # PassManager on Blackwell serving and fallback shapes. Keep the optimization
+    # on Hopper while SM100 uses the compile-safe non-warp-specialized path.
+    return cc_major == 9
+
+
 @lru_cache(maxsize=1)
 def supports_warp_specialization_cached():
     is_cuda = triton.runtime.driver.active.get_current_target().backend == "cuda"
-    supports_ws = is_cuda and torch.cuda.get_device_capability()[0] >= 9
-    return supports_ws
+    return is_cuda and _supports_warp_specialization_for_cc(
+        torch.cuda.get_device_capability()[0]
+    )
 
 
 @torch.compile(fullgraph=True)

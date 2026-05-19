@@ -336,12 +336,13 @@ warp_decode_gate_up_cute_kernel(
       out_row[n_idx] = __float2bfloat16(FastSilu(g) * up_acc);
     }
   }
+#if defined(WD_PDL_ENABLED) && WD_PDL_ENABLED
   // Signal the dependent down kernel that intermediate is ready. The
-  // threadfence orders the store above before the trigger PTX. No-op when
-  // WD_PDL_ENABLED is unset.
+  // threadfence orders the store above before the trigger PTX.
   __syncthreads();
   __threadfence();
   WD_PDL_TRIGGER();
+#endif
 }
 
 // ===========================================================================
@@ -477,10 +478,13 @@ warp_decode_gate_up_packed_cute_kernel(
       out_row[n_idx] = __float2bfloat16(FastSilu(g) * up_acc);
     }
   }
-  // PDL trigger — signal dependent (down) kernel that intermediate is ready.
+#if defined(WD_PDL_ENABLED) && WD_PDL_ENABLED
+  // Signal the dependent down kernel that intermediate is ready. The
+  // threadfence orders the store above before the trigger PTX.
   __syncthreads();
   __threadfence();
   WD_PDL_TRIGGER();
+#endif
 }
 
 // ===========================================================================

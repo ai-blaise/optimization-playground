@@ -1,0 +1,70 @@
+{
+  "name": "g1_nvfp4_o_proj_input_prologue",
+  "status": "proved",
+  "intended_czs_use": "module_input_only",
+  "proof_result": "8 Proved | 0 Disproved | 0 Unknown",
+  "proof_log": "/root/b200-run-20260518/workers/g1_gate/logs/czs_g1_nvfp4_prologue_final_20260519T0027Z.log",
+  "layouts": [
+    {
+      "label": "attn_contiguous_bf16x16",
+      "shape": [{"is_static": true, "value": 16}],
+      "stride": [{"is_static": true, "value": 1}]
+    },
+    {
+      "label": "gate_contiguous_bf16x16",
+      "shape": [{"is_static": true, "value": 16}],
+      "stride": [{"is_static": true, "value": 1}]
+    },
+    {
+      "label": "packed_fp4_output_u8x8",
+      "shape": [{"is_static": true, "value": 8}],
+      "stride": [{"is_static": true, "value": 1}]
+    },
+    {
+      "label": "scale_swizzled_u8x1",
+      "shape": [{"is_static": true, "value": 1}],
+      "stride": [{"is_static": true, "value": 1}]
+    }
+  ],
+  "swizzles": [],
+  "swizzled_layouts": [],
+  "tma_descriptors": [],
+  "mma_atoms": [],
+  "ldmatrix_ops": [],
+  "vectorization_ops": [
+    {
+      "label": "g1_nvfp4_attn_load_16_bf16_aligned",
+      "layout_idx": 0,
+      "element_bytes": 2,
+      "vector_width": 16,
+      "base_address": {"is_static": true, "value": 0}
+    },
+    {
+      "label": "g1_nvfp4_gate_load_16_bf16_aligned",
+      "layout_idx": 1,
+      "element_bytes": 2,
+      "vector_width": 16,
+      "base_address": {"is_static": true, "value": 0}
+    },
+    {
+      "label": "g1_nvfp4_packed_output_store_8_u8_aligned",
+      "layout_idx": 2,
+      "element_bytes": 1,
+      "vector_width": 8,
+      "base_address": {"is_static": true, "value": 0}
+    },
+    {
+      "label": "g1_nvfp4_scale_store_1_u8",
+      "layout_idx": 3,
+      "element_bytes": 1,
+      "vector_width": 1,
+      "base_address": {"is_static": true, "value": 0}
+    }
+  ],
+  "mbarrier_sites": [],
+  "tmem_traces": [],
+  "dsmem_sites": [],
+  "barrier_elision_sites": [],
+  "mma_overlap_sites": [],
+  "clc_sites": []
+}

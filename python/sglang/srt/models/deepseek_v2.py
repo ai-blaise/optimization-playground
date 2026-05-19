@@ -1359,6 +1359,42 @@ def _apply_g1_gate(attn_output: torch.Tensor, gate: torch.Tensor) -> torch.Tenso
     return x.to(attn_output.dtype)
 
 
+def _stage_g1_fp4_gate_for_o_proj(
+    module: nn.Module, attn_output: torch.Tensor, gate: torch.Tensor
+) -> bool:
+    """Stage G1 for an opt-in NVFP4 o_proj input-quantization fusion."""
+    if not get_bool_env_var("SGLANG_DEEPSEEK_V2_G1_FUSED_FP4_O_PROJ"):
+        return False
+    if not getattr(module, "input_is_parallel", False):
+        return False
+    if attn_output.dim() != 2 or attn_output.shape[0] < 1024:
+        return False
+    quant_method = getattr(module, "quant_method", None)
+    if quant_method is None:
+        return False
+    if quant_method.__class__.__name__ not in {
+        "CompressedTensorsW4A4Fp4",
+        "ModelOptFp4LinearMethod",
+    }:
+        return False
+    if (
+        not attn_output.is_cuda
+        or not gate.is_cuda
+        or attn_output.dtype != torch.bfloat16
+        or gate.dtype != torch.bfloat16
+    ):
+        return False
+    try:
+        from sglang.srt.layers.quantization.g1_fp4_utils import (
+            maybe_g1_nvfp4_quantize as _maybe_g1_nvfp4_quantize,
+        )
+    except (ImportError, OSError, AttributeError):
+        return False
+    module._g1_pending_fp4_gate = gate.contiguous().view(*attn_output.shape)
+    module._g1_fp4_quantize = _maybe_g1_nvfp4_quantize
+    return True
+
+
 def _g1_gate_pre_hook(module, args, kwargs):
     """forward_pre_hook installed on ``o_proj`` to apply the G1 gate.
 
@@ -1390,6 +1426,8 @@ def _g1_gate_pre_hook(module, args, kwargs):
         return None
     owner._g1_pending_gate = None
     if not args:
+        return None
+    if _stage_g1_fp4_gate_for_o_proj(module, args[0], gate):
         return None
     new_args = (_apply_g1_gate(args[0], gate),) + tuple(args[1:])
     return new_args, kwargs

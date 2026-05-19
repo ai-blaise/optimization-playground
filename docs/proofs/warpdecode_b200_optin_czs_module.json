@@ -1,0 +1,165 @@
+{
+  "name": "warpdecode_b200_optin_layout_vector_probes",
+  "status": "unproved",
+  "intended_czs_use": "module_input_only",
+  "promotion_blocker": "Run CZS on concrete CuTe/tensor-op modules and record a Proved result before any fast-path promotion.",
+  "layouts": [
+    {
+      "label": "packed_w13_canonical_gate_then_up_bf16",
+      "shape": [
+        {
+          "is_static": false,
+          "symbol": "num_experts"
+        },
+        {
+          "is_static": false,
+          "symbol": "2_intermediate_size"
+        },
+        {
+          "is_static": false,
+          "symbol": "hidden_size"
+        }
+      ],
+      "stride": [
+        {
+          "is_static": false,
+          "symbol": "2_intermediate_size_hidden_size"
+        },
+        {
+          "is_static": false,
+          "symbol": "hidden_size"
+        },
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    },
+    {
+      "label": "packed_w13_interleaved_gate_up_bf16",
+      "shape": [
+        {
+          "is_static": false,
+          "symbol": "num_experts"
+        },
+        {
+          "is_static": false,
+          "symbol": "interleaved_2_intermediate_size"
+        },
+        {
+          "is_static": false,
+          "symbol": "hidden_size"
+        }
+      ],
+      "stride": [
+        {
+          "is_static": false,
+          "symbol": "2_intermediate_size_hidden_size"
+        },
+        {
+          "is_static": false,
+          "symbol": "hidden_size"
+        },
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    },
+    {
+      "label": "down_intermediate_full_tile_bf16x2048",
+      "shape": [
+        {
+          "is_static": true,
+          "value": 2048
+        }
+      ],
+      "stride": [
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    },
+    {
+      "label": "down_intermediate_half_tile_bf16x1024",
+      "shape": [
+        {
+          "is_static": true,
+          "value": 1024
+        }
+      ],
+      "stride": [
+        {
+          "is_static": true,
+          "value": 1
+        }
+      ]
+    }
+  ],
+  "swizzles": [],
+  "swizzled_layouts": [],
+  "tma_descriptors": [],
+  "mma_atoms": [
+    {
+      "label": "fp4_grouped_block_scaled_tensorop_placeholder",
+      "status": "proposal_only",
+      "promotion_blocker": "Replace with concrete CuTe MMA atom and CZS proof before implementing or promoting the grouped block-scaled tensor-op path."
+    }
+  ],
+  "ldmatrix_ops": [],
+  "vectorization_ops": [
+    {
+      "label": "gate_up_cp_async_bf16x8_aligned",
+      "layout_idx": 0,
+      "element_bytes": 2,
+      "vector_width": 8,
+      "base_address": {
+        "is_static": true,
+        "value": 0
+      }
+    },
+    {
+      "label": "interleaved_w13_cp_async_bf16x8_aligned",
+      "layout_idx": 1,
+      "element_bytes": 2,
+      "vector_width": 8,
+      "base_address": {
+        "is_static": true,
+        "value": 0
+      }
+    },
+    {
+      "label": "down_tile2048_cp_async_bf16x8_aligned",
+      "layout_idx": 2,
+      "element_bytes": 2,
+      "vector_width": 8,
+      "base_address": {
+        "is_static": true,
+        "value": 0
+      }
+    },
+    {
+      "label": "down_tile1024_cp_async_bf16x8_aligned",
+      "layout_idx": 3,
+      "element_bytes": 2,
+      "vector_width": 8,
+      "base_address": {
+        "is_static": true,
+        "value": 0
+      }
+    }
+  ],
+  "mbarrier_sites": [],
+  "tmem_traces": [],
+  "dsmem_sites": [],
+  "barrier_elision_sites": [],
+  "mma_overlap_sites": [],
+  "clc_sites": [
+    {
+      "label": "down_tile1024_tail_wave_probe",
+      "status": "unproved",
+      "promotion_blocker": "Collect B200 IKP evidence that the smaller down tile improves tail/launch-wave behavior."
+    }
+  ]
+}

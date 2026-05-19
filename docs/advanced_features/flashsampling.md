@@ -33,12 +33,21 @@ batch is not eligible.
 ```
 
 The `target` provider uses a non-persistent grid-launch kernel optimized for
-shapes where the total number of `(V, H)` tiles fits in a single SM wave
-(`tiles <= NUM_SMS`). This is the typical TP-sharded DeepSeek-V3.2-REAP shape
-with `V=16160` on TP=8. On Blackwell (`sm100`/B200), `target` dispatches to the
-Blackwell-tuned variant with adaptive pipeline stages; older CUDA devices use
-the generic target kernel. When tiles exceed `NUM_SMS`, the target provider
-falls back to the persistent kernel automatically.
+shapes where the total number of `(V, H)` tiles fits in the target provider gate.
+This is the typical TP-sharded DeepSeek-V3.2-REAP shape with `V=16160` on TP=8.
+On Blackwell (`sm100`/B200), non-greedy sampling keeps the non-persistent target
+kernel through two SM waves and uses a 2-stage pipeline for that two-wave path.
+In the accepted 2026-05-18 B200 run, stage-2 non-greedy H=72/80/96/112/128
+measured 0.1030/0.0983/0.0955/0.0945/0.0945 ms, improving 3.4%-6.5% over the
+previous stage-auto target. Greedy sampling stays at the single-wave gate because
+the same two-wave policy regressed greedy H=72..128 by at least 20%. Older CUDA
+devices use the generic target kernel. When tiles exceed the provider gate, the
+target provider falls back to the persistent kernel automatically. The Blackwell
+persistent path disables Triton warp specialization because the warp-specialized
+FlashSampling kernel currently hits Triton `PassManager::run` failures on
+serving and fallback shapes. For Blackwell greedy batches with small TP-sharded
+vocabs and large hidden size, FlashSampling falls back to the normal logits path
+above batch 64 because dense greedy sampling is faster for those shapes.
 
 ## Supported Batches
 

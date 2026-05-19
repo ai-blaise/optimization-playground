@@ -44,8 +44,9 @@ def prepare_direct_import():
     import sglang.srt.layers as layers_package
 
     package = types.ModuleType(package_name)
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
     package.__path__ = [
-        "/root/work/op-kernel-flashsampling/python/sglang/srt/layers/flashsampling"
+        str(repo_root / "python" / "sglang" / "srt" / "layers" / "flashsampling")
     ]
     sys.modules[package_name] = package
     setattr(layers_package, "flashsampling", package)

@@ -14,6 +14,9 @@ import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.layers.quantization.higgs_dense_2bit_kv import (
+    get_higgs_dense_2bit_b200_candidate,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -31,13 +34,97 @@ def _jit_higgs_dense_2bit_module() -> "Module":
                 "higgs_dense_2bit_detail::HiggsDense2BitStoreKernel::run",
             ),
             (
+                "store_higgs_dense_2bit_const_codebook",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitStoreConstCodebookKernel::run",
+            ),
+            (
+                "store_higgs_dense_2bit_const_codebook_rope_first",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitStoreConstCodebookRopeFirstKernel::run",
+            ),
+            (
+                "store_higgs_dense_2bit_const_codebook_rope_first_index_pack",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitStoreConstCodebookRopeFirstIndexPackKernel::run",
+            ),
+            (
+                "store_higgs_dense_2bit_const_codebook_index_pack",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitStoreConstCodebookIndexPackKernel::run",
+            ),
+            (
+                "store_higgs_dense_2bit_const_codebook_warp_pack",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitStoreConstCodebookWarpPackKernel::run",
+            ),
+            (
+                "store_higgs_dense_2bit_const_codebook_warp_pack_pre_norm",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitStoreConstCodebookWarpPackPreNormKernel::run",
+            ),
+            (
+                "store_higgs_dense_2bit_const_codebook_warp_pack_fma_score",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitStoreConstCodebookWarpPackFmaScoreKernel::run",
+            ),
+            (
+                "store_higgs_dense_2bit_const_codebook_warp_pack_scale_broadcast",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitStoreConstCodebookWarpPackScaleBroadcastKernel::run",
+            ),
+            (
+                "store_higgs_dense_2bit_const_codebook_warp_pack_rope_first",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitStoreConstCodebookWarpPackRopeFirstKernel::run",
+            ),
+            (
                 "dequantize_higgs_dense_2bit",
                 "higgs_dense_2bit_detail::HiggsDense2BitDequantKernel::run",
+            ),
+            (
+                "dequantize_higgs_dense_2bit_const_codebook",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitDequantConstCodebookKernel::run",
+            ),
+            (
+                "dequantize_higgs_dense_2bit_vec4",
+                "higgs_dense_2bit_detail::HiggsDense2BitDequantVec4Kernel::run",
+            ),
+            (
+                "dequantize_higgs_dense_2bit_vec4_ldg_codebook",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitDequantVec4LdgCodebookKernel::run",
+            ),
+            (
+                "dequantize_higgs_dense_2bit_pair_lanes_scale_broadcast",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitDequantPairLanesScaleBroadcastKernel::run",
             ),
             (
                 "dequantize_higgs_dense_2bit_page_table",
                 "higgs_dense_2bit_detail::"
                 "HiggsDense2BitDequantPageTableKernel::run",
+            ),
+            (
+                "dequantize_higgs_dense_2bit_page_table_const_codebook",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitDequantPageTableConstCodebookKernel::run",
+            ),
+            (
+                "dequantize_higgs_dense_2bit_page_table_vec4",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitDequantPageTableVec4Kernel::run",
+            ),
+            (
+                "dequantize_higgs_dense_2bit_page_table_vec4_ldg_codebook",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitDequantPageTableVec4LdgCodebookKernel::run",
+            ),
+            (
+                "dequantize_higgs_dense_2bit_page_table_pair_lanes_scale_broadcast",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitDequantPageTablePairLanesScaleBroadcastKernel::run",
             ),
         ],
     )
@@ -74,7 +161,28 @@ def store_higgs_dense_2bit(
     assert codebook_norm_sq.dtype == torch.float32
 
     module = _jit_higgs_dense_2bit_module()
-    module.store_higgs_dense_2bit(
+    candidate = get_higgs_dense_2bit_b200_candidate()
+    if candidate.store_variant == "const_codebook_warp_pack_pre_norm":
+        kernel = module.store_higgs_dense_2bit_const_codebook_warp_pack_pre_norm
+    elif candidate.store_variant == "const_codebook_warp_pack_fma_score":
+        kernel = module.store_higgs_dense_2bit_const_codebook_warp_pack_fma_score
+    elif candidate.store_variant == "const_codebook_warp_pack_scale_broadcast":
+        kernel = module.store_higgs_dense_2bit_const_codebook_warp_pack_scale_broadcast
+    elif candidate.store_variant == "const_codebook_warp_pack_rope_first":
+        kernel = module.store_higgs_dense_2bit_const_codebook_warp_pack_rope_first
+    elif candidate.store_variant == "const_codebook_warp_pack":
+        kernel = module.store_higgs_dense_2bit_const_codebook_warp_pack
+    elif candidate.store_variant == "const_codebook_index_pack":
+        kernel = module.store_higgs_dense_2bit_const_codebook_index_pack
+    elif candidate.store_variant == "const_codebook_rope_first_index_pack":
+        kernel = module.store_higgs_dense_2bit_const_codebook_rope_first_index_pack
+    elif candidate.store_variant == "const_codebook_rope_first":
+        kernel = module.store_higgs_dense_2bit_const_codebook_rope_first
+    elif candidate.store_variant == "const_codebook":
+        kernel = module.store_higgs_dense_2bit_const_codebook
+    else:
+        kernel = module.store_higgs_dense_2bit
+    kernel(
         compressed,
         locs.contiguous(),
         latent.contiguous() if not latent.is_contiguous() else latent,
@@ -108,7 +216,118 @@ def dequantize_higgs_dense_2bit(
     assert codebook.dtype == torch.float32
 
     module = _jit_higgs_dense_2bit_module()
-    module.dequantize_higgs_dense_2bit(
+    candidate = get_higgs_dense_2bit_b200_candidate()
+    if candidate.dequant_variant == "const_codebook":
+        kernel = module.dequantize_higgs_dense_2bit_const_codebook
+    elif candidate.dequant_variant == "vec4_smem_codebook":
+        kernel = module.dequantize_higgs_dense_2bit_vec4
+    elif candidate.dequant_variant == "vec4_ldg_codebook":
+        kernel = module.dequantize_higgs_dense_2bit_vec4_ldg_codebook
+    elif candidate.dequant_variant == "pair_lanes_scale_broadcast":
+        kernel = module.dequantize_higgs_dense_2bit_pair_lanes_scale_broadcast
+    else:
+        kernel = module.dequantize_higgs_dense_2bit
+    kernel(
+        compressed.contiguous(),
+        locs.contiguous(),
+        out,
+        codebook.contiguous(),
+    )
+
+
+@debug_kernel_api
+def dequantize_higgs_dense_2bit_vec4(
+    compressed: torch.Tensor,
+    locs: torch.Tensor,
+    out: torch.Tensor,
+    codebook: torch.Tensor,
+) -> None:
+    """Opt-in packed-byte vec4/shared-codebook dequant candidate."""
+    assert compressed.is_cuda
+    assert locs.is_cuda
+    assert out.is_cuda
+    assert compressed.dtype == torch.uint8
+    assert locs.dtype == torch.int64
+    assert out.dtype == torch.bfloat16
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_module()
+    module.dequantize_higgs_dense_2bit_vec4(
+        compressed.contiguous(),
+        locs.contiguous(),
+        out,
+        codebook.contiguous(),
+    )
+
+
+@debug_kernel_api
+def dequantize_higgs_dense_2bit_const_codebook(
+    compressed: torch.Tensor,
+    locs: torch.Tensor,
+    out: torch.Tensor,
+    codebook: torch.Tensor,
+) -> None:
+    """Opt-in dequant candidate using fixed EDEN2-16 constant memory."""
+    assert compressed.is_cuda
+    assert locs.is_cuda
+    assert out.is_cuda
+    assert compressed.dtype == torch.uint8
+    assert locs.dtype == torch.int64
+    assert out.dtype == torch.bfloat16
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_module()
+    module.dequantize_higgs_dense_2bit_const_codebook(
+        compressed.contiguous(),
+        locs.contiguous(),
+        out,
+        codebook.contiguous(),
+    )
+
+
+@debug_kernel_api
+def dequantize_higgs_dense_2bit_vec4_ldg_codebook(
+    compressed: torch.Tensor,
+    locs: torch.Tensor,
+    out: torch.Tensor,
+    codebook: torch.Tensor,
+) -> None:
+    """Opt-in packed-byte vec4/read-only-codebook dequant candidate."""
+    assert compressed.is_cuda
+    assert locs.is_cuda
+    assert out.is_cuda
+    assert compressed.dtype == torch.uint8
+    assert locs.dtype == torch.int64
+    assert out.dtype == torch.bfloat16
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_module()
+    module.dequantize_higgs_dense_2bit_vec4_ldg_codebook(
+        compressed.contiguous(),
+        locs.contiguous(),
+        out,
+        codebook.contiguous(),
+    )
+
+
+@debug_kernel_api
+def dequantize_higgs_dense_2bit_pair_lanes_scale_broadcast(
+    compressed: torch.Tensor,
+    locs: torch.Tensor,
+    out: torch.Tensor,
+    codebook: torch.Tensor,
+) -> None:
+    """Opt-in pair-lane codebook + warp-scale-broadcast dequant candidate."""
+    assert compressed.is_cuda
+    assert locs.is_cuda
+    assert out.is_cuda
+    assert compressed.dtype == torch.uint8
+    assert locs.dtype == torch.int64
+    assert out.dtype == torch.bfloat16
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_module()
+    module.dequantize_higgs_dense_2bit_pair_lanes_scale_broadcast(
         compressed.contiguous(),
         locs.contiguous(),
         out,
@@ -146,7 +365,136 @@ def dequantize_higgs_dense_2bit_page_table(
     assert codebook.dtype == torch.float32
 
     module = _jit_higgs_dense_2bit_module()
-    module.dequantize_higgs_dense_2bit_page_table(
+    candidate = get_higgs_dense_2bit_b200_candidate()
+    if candidate.page_table_dequant_variant == "const_codebook":
+        kernel = module.dequantize_higgs_dense_2bit_page_table_const_codebook
+    elif candidate.page_table_dequant_variant == "vec4_smem_codebook":
+        kernel = module.dequantize_higgs_dense_2bit_page_table_vec4
+    elif candidate.page_table_dequant_variant == "vec4_ldg_codebook":
+        kernel = module.dequantize_higgs_dense_2bit_page_table_vec4_ldg_codebook
+    elif candidate.page_table_dequant_variant == "pair_lanes_scale_broadcast":
+        kernel = (
+            module.dequantize_higgs_dense_2bit_page_table_pair_lanes_scale_broadcast
+        )
+    else:
+        kernel = module.dequantize_higgs_dense_2bit_page_table
+    kernel(
+        compressed.contiguous(),
+        page_table,
+        out,
+        compact_page_table,
+        codebook.contiguous(),
+    )
+
+
+@debug_kernel_api
+def dequantize_higgs_dense_2bit_page_table_vec4(
+    compressed: torch.Tensor,
+    page_table: torch.Tensor,
+    out: torch.Tensor,
+    compact_page_table: torch.Tensor,
+    codebook: torch.Tensor,
+) -> None:
+    """Opt-in page-table vec4/shared-codebook dequant candidate."""
+    assert compressed.is_cuda
+    assert page_table.is_cuda
+    assert out.is_cuda
+    assert compact_page_table.is_cuda
+    assert compressed.dtype == torch.uint8
+    assert page_table.dtype == torch.int32
+    assert compact_page_table.dtype == torch.int32
+    assert out.dtype == torch.bfloat16
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_module()
+    module.dequantize_higgs_dense_2bit_page_table_vec4(
+        compressed.contiguous(),
+        page_table,
+        out,
+        compact_page_table,
+        codebook.contiguous(),
+    )
+
+
+@debug_kernel_api
+def dequantize_higgs_dense_2bit_page_table_const_codebook(
+    compressed: torch.Tensor,
+    page_table: torch.Tensor,
+    out: torch.Tensor,
+    compact_page_table: torch.Tensor,
+    codebook: torch.Tensor,
+) -> None:
+    """Opt-in page-table dequant candidate using fixed EDEN2-16 constants."""
+    assert compressed.is_cuda
+    assert page_table.is_cuda
+    assert out.is_cuda
+    assert compact_page_table.is_cuda
+    assert compressed.dtype == torch.uint8
+    assert page_table.dtype == torch.int32
+    assert compact_page_table.dtype == torch.int32
+    assert out.dtype == torch.bfloat16
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_module()
+    module.dequantize_higgs_dense_2bit_page_table_const_codebook(
+        compressed.contiguous(),
+        page_table,
+        out,
+        compact_page_table,
+        codebook.contiguous(),
+    )
+
+
+@debug_kernel_api
+def dequantize_higgs_dense_2bit_page_table_vec4_ldg_codebook(
+    compressed: torch.Tensor,
+    page_table: torch.Tensor,
+    out: torch.Tensor,
+    compact_page_table: torch.Tensor,
+    codebook: torch.Tensor,
+) -> None:
+    """Opt-in page-table vec4/read-only-codebook dequant candidate."""
+    assert compressed.is_cuda
+    assert page_table.is_cuda
+    assert out.is_cuda
+    assert compact_page_table.is_cuda
+    assert compressed.dtype == torch.uint8
+    assert page_table.dtype == torch.int32
+    assert compact_page_table.dtype == torch.int32
+    assert out.dtype == torch.bfloat16
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_module()
+    module.dequantize_higgs_dense_2bit_page_table_vec4_ldg_codebook(
+        compressed.contiguous(),
+        page_table,
+        out,
+        compact_page_table,
+        codebook.contiguous(),
+    )
+
+
+@debug_kernel_api
+def dequantize_higgs_dense_2bit_page_table_pair_lanes_scale_broadcast(
+    compressed: torch.Tensor,
+    page_table: torch.Tensor,
+    out: torch.Tensor,
+    compact_page_table: torch.Tensor,
+    codebook: torch.Tensor,
+) -> None:
+    """Opt-in page-table pair-lane + warp-scale-broadcast dequant candidate."""
+    assert compressed.is_cuda
+    assert page_table.is_cuda
+    assert out.is_cuda
+    assert compact_page_table.is_cuda
+    assert compressed.dtype == torch.uint8
+    assert page_table.dtype == torch.int32
+    assert compact_page_table.dtype == torch.int32
+    assert out.dtype == torch.bfloat16
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_module()
+    module.dequantize_higgs_dense_2bit_page_table_pair_lanes_scale_broadcast(
         compressed.contiguous(),
         page_table,
         out,

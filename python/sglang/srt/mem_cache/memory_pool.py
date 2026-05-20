@@ -62,16 +62,16 @@ from sglang.jit_kernel.higgs_dense_2bit_mla_decode import (
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa import index_buf_accessor
-from sglang.srt.layers.attention.nsa.indexer_quantization import (
+from sglang.srt.layers.attention.dsa import index_buf_accessor
+from sglang.srt.layers.attention.dsa.indexer_quantization import (
     INDEXER_FP8_QUANT_METHOD,
-    get_nsa_indexer_cache_layout,
+    get_dsa_indexer_cache_layout,
 )
-from sglang.srt.layers.attention.nsa.quant_k_cache import (
+from sglang.srt.layers.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.quantization.turboquant_dense_kv import (
     TurboQuantDenseKVCodec,
@@ -418,20 +418,22 @@ class MambaPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        # clear at alloc time — expand a scalar GPU zero to the right shape, no CPU-GPU sync
+        return select_index
+
+    def clear_slots(self, indices: torch.Tensor):
+        """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        need_size = len(indices)
         for i in range(len(self.mamba_cache.conv)):
             t = self.mamba_cache.conv[i]
             z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
                 t.shape[0], need_size, *t.shape[2:]
             )
-            t[:, select_index] = z
+            t[:, indices] = z
         t = self.mamba_cache.temporal
         z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
             t.shape[0], need_size, *t.shape[2:]
         )
-        t[:, select_index] = z
-
-        return select_index
+        t[:, indices] = z
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -443,22 +445,14 @@ class MambaPool:
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
 
-    def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
+    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
-            self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
-                :, src_index
+            self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
+                :, src_indices
             ]
-        self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
-            :, src_index
+        self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
+            :, src_indices
         ]
-        return
-
-    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
-        dst_index = self.alloc(1)
-        if dst_index is None:
-            return None
-        self.copy_from(src_index, dst_index)
-        return dst_index
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -602,8 +596,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
-        # Indexed by req_pool_idx, so size from the req pool buffer
-        # (self.req_to_token.shape[0]), not from the mamba state pool size.
         req_pool_size = self.req_to_token.shape[0]
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
@@ -612,7 +604,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
                     (req_pool_size, self.mamba_ping_pong_track_buffer_size),
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=self.device,
                 )
             )
@@ -632,17 +624,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
-            mid = None
-            if req.mamba_pool_idx is not None:  # for radix cache
-                mid = req.mamba_pool_idx
+            if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
+                pass
             else:
                 mid = self.mamba_pool.alloc(1)
                 assert (
                     mid is not None
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
-                mid = mid[0]
-                req.mamba_pool_idx = mid
-            mamba_indices.append(mid)
+                req.mamba_pool_idx = mid[0]
+                req.mamba_needs_clear = True
+            mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
                     req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
@@ -663,9 +654,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers).to(
-                dtype=torch.int32
-            )
+            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
                 ping_pong_tensor
             )
@@ -1709,7 +1698,7 @@ class MLATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        use_nsa: bool = False,
+        use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
     ):
         super().__init__(
@@ -1725,20 +1714,20 @@ class MLATokenToKVPool(KVCache):
 
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.use_nsa = use_nsa
-        self.nsa_kv_cache_store_fp8 = (
-            use_nsa
+        self.use_dsa = use_dsa
+        self.dsa_kv_cache_store_fp8 = (
+            use_dsa
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
-        # When override_kv_cache_dim is provided with nsa model, we assume the
+        # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.nsa_kv_cache_store_fp8
+            if self.dsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
-        self.layersplit_policy = self._build_layersplit_policy() if use_nsa else None
+        self.layersplit_policy = self._build_layersplit_policy() if use_dsa else None
         self.layersplit_kv_buffer = None
         self._layersplit_kv_prefetch_layer_id = None
         self._layersplit_kv_prefetch_buffer = None
@@ -1755,8 +1744,8 @@ class MLATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        if not use_nsa:
-            # NSA will allocate indexer KV cache later and then log the total size
+        if not use_dsa:
+            # DSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
 
     def _create_buffers(self):
@@ -1816,7 +1805,7 @@ class MLATokenToKVPool(KVCache):
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def _build_layersplit_policy(self):
-        from sglang.srt.layers.attention.nsa.layersplit import LayerSplitPolicy
+        from sglang.srt.layers.attention.dsa.layersplit import LayerSplitPolicy
         from sglang.srt.layers.dp_attention import (
             get_attention_cp_rank,
             get_attention_cp_size,
@@ -1828,7 +1817,7 @@ class MLATokenToKVPool(KVCache):
         except ValueError:
             return None
         if (
-            getattr(server_args, "nsa_prefill_cp_kv_storage_mode", "replicated")
+            getattr(server_args, "dsa_prefill_cp_kv_storage_mode", "replicated")
             != "layersplit"
         ):
             return None
@@ -1840,7 +1829,7 @@ class MLATokenToKVPool(KVCache):
             cp_size=cp_size,
             start_layer=self.start_layer,
             end_layer=self.start_layer + self.layer_num,
-            layout=server_args.nsa_prefill_cp_layersplit_layout,
+            layout=server_args.dsa_prefill_cp_layersplit_layout,
         )
 
     def layersplit_owns_layer(self, layer_id: int) -> bool:
@@ -2065,7 +2054,7 @@ class MLATokenToKVPool(KVCache):
         if not self.layersplit_owns_layer(layer_id):
             self.prefetch_layersplit_kv_buffer(layer_id, active_rows=active_rows)
             return
-        assert not self.nsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -2085,7 +2074,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if _is_hip and self.use_nsa and self.dtype == fp8_dtype:
+        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             set_mla_kv_buffer_triton_fp8_quant(
                 kv_buffer,
                 loc,
@@ -2093,7 +2082,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_rope,
                 fp8_dtype,
             )
-        elif self.nsa_kv_cache_store_fp8:
+        elif self.dsa_kv_cache_store_fp8:
             cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
                 cache_k_nope, cache_k_rope
             )
@@ -2264,7 +2253,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        assert not self.nsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
@@ -2289,7 +2278,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     ):
         layer_id = layer.layer_id
 
-        if self.nsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
             # TODO no need to cat
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
@@ -2327,7 +2316,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
 
 
-class NSATokenToKVPool(MLATokenToKVPool):
+class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
@@ -2365,7 +2354,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
-            use_nsa=True,
+            use_dsa=True,
             override_kv_cache_dim=override_dim,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
@@ -2373,9 +2362,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
             index_buf_size = size
-        # num head == 1 and head dim == 128 for index_k in NSA
+        # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
-        self.indexer_cache_layout = get_nsa_indexer_cache_layout(
+        self.indexer_cache_layout = get_dsa_indexer_cache_layout(
             indexer_quantization, index_head_dim
         )
         self.indexer_quantization = self.indexer_cache_layout.quant_method
@@ -2389,7 +2378,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             else:
                 assert (
                     self.page_size == 1
-                ), f"HIP legacy NSA path requires page_size == 1, got {self.page_size}"
+                ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
             assert self.page_size == 64
         index_rows = (index_buf_size + page_size + 1) // self.page_size
@@ -2648,11 +2637,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
         return kv_buffer, kv_buffer[..., : self.kv_lora_rank]
 
     def get_cpu_copy(self, indices):
-        # NSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
+        # DSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
         # set_index_k_scale_buffer, so we must offload it here too -- otherwise
         # resume restores kv_buffer but leaves foreign index/scale in place and
-        # NSA attention reads garbage at those token positions.
+        # DSA attention reads garbage at those token positions.
         kv_cache_cpu = super().get_cpu_copy(indices)
 
         page_indices = indices[:: self.page_size] // self.page_size
@@ -2714,13 +2703,13 @@ class NSATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
 
-class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
-    """NSA KV pool with compressed dense MLA storage.
+class TurboQuantDSATokenToKVPool(DSATokenToKVPool):
+    """DSA KV pool with compressed dense MLA storage.
 
     PD disaggregation transfers raw contiguous pool buffers. Like the NVFP4 MLA
-    pool, TurboQuant keeps the dense KV bytes in ``kv_buffer`` and exposes NSA
+    pool, TurboQuant keeps the dense KV bytes in ``kv_buffer`` and exposes DSA
     indexer state separately through ``get_state_buf_infos`` inherited from
-    ``NSATokenToKVPool``. This lets prefill send compressed dense KV bytes plus
+    ``DSATokenToKVPool``. This lets prefill send compressed dense KV bytes plus
     indexer state to decode without materializing BF16 dense KV during transfer.
     """
 
@@ -3261,16 +3250,16 @@ class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
         return kv[..., : self.kv_lora_rank], kv[..., self.kv_lora_rank :]
 
 
-class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
-    """NSA KV pool with 2-bit HIGGS compressed dense MLA storage.
+class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
+    """DSA KV pool with 2-bit HIGGS compressed dense MLA storage.
 
-    Mirrors :class:`TurboQuantNSATokenToKVPool` 1:1 but stores 258 B/token/layer
+    Mirrors :class:`TurboQuantDSATokenToKVPool` 1:1 but stores 258 B/token/layer
     instead of TurboQuant's 274 B/token/layer (-5.84%) using EDEN2-16 lattice
     quantization (Pletka et al. arXiv 2501.19392 + AquaKV reference).
 
     Two-attribute compatibility shim with the TurboQuant dispatch:
       * ``turboquant_execution_mode`` mirrors as ``"fused_decode"`` so the
-        existing decode-dispatch gate at ``nsa_backend.py`` recognizes this
+        existing decode-dispatch gate at ``dsa_backend.py`` recognizes this
         pool as a compressed-dense pool through a single field, while the
         ``higgs_execution_mode`` field provides the dedicated HIGGS view.
     """
@@ -3287,7 +3276,7 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
         # Compatibility alias: backends gate on `turboquant_execution_mode`
         # to decide "this pool stores compressed-dense KV"; we surface the
         # same field so any future backend that checks the alias works
-        # uniformly. The actual dispatch in `nsa_backend.py` also checks
+        # uniformly. The actual dispatch in `dsa_backend.py` also checks
         # the pool type / `higgs_dense_2bit_preset` to disambiguate paths.
         self.turboquant_execution_mode = higgs_execution_mode
         self.higgs_dense_2bit_preset = "eden2_16"
@@ -3477,7 +3466,7 @@ class HiggsDense2BitNSATokenToKVPool(NSATokenToKVPool):
     ) -> torch.Tensor:
         """Fused dense MLA decode on the 2-bit HIGGS packed slots.
 
-        Mirrors :meth:`TurboQuantNSATokenToKVPool.forward_turboquant_dense_mla_decode`.
+        Mirrors :meth:`TurboQuantDSATokenToKVPool.forward_turboquant_dense_mla_decode`.
         When ``higgs_mla_decode_num_splits > 1`` the split-K path runs:
         FWHT_512 of ``q_nope`` into a ``q_rotated`` scratch, then the
         topk loop is sharded across ``num_splits`` blocks per
@@ -3716,3 +3705,8 @@ def copy_all_layer_kv_cache_tiled(
     mask = mask_loc[:, None] & mask_byte[None, :]
     vals = tl.load(src_ptr, mask=mask)
     tl.store(tgt_ptr, vals, mask=mask)
+
+# Backward-compatible NSA class names for existing ai-blaise tests and scripts.
+NSATokenToKVPool = DSATokenToKVPool
+TurboQuantNSATokenToKVPool = TurboQuantDSATokenToKVPool
+HiggsDense2BitNSATokenToKVPool = HiggsDense2BitDSATokenToKVPool

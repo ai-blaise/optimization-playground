@@ -1,4 +1,4 @@
-"""Fused bf16->fp8 quantize-and-scatter JIT kernel for NSA IndexCache.
+"""Fused bf16->fp8 quantize-and-scatter JIT kernel for DSA IndexCache.
 
 JIT-compiled via TVM FFI. Optimized Python dispatch path caches the
 TVM module reference to minimize per-call overhead.
@@ -31,7 +31,7 @@ _cached_key = None
 
 
 @cache_once
-def _jit_nsa_fused_store_module(
+def _jit_dsa_fused_store_module(
     key_dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
 ) -> Module:
     """
@@ -42,10 +42,13 @@ def _jit_nsa_fused_store_module(
     return load_jit(
         "fused_store_index_k_cache",
         *args,
-        cuda_files=["nsa/fused_store_index_cache.cuh"],
+        cuda_files=["dsa/fused_store_index_cache.cuh"],
         cuda_wrappers=[
             (
                 "fused_store_index_k_cache",
+                # - Float  = bf16_t (sgl_kernel/type.cuh)
+                # - IndicesT = int64_t (out_cache_loc is int64 in SGLang SetKAndS)
+                # - kPageSize = 64 (CUDA DSA)
                 f"FusedStoreCacheIndexerKernel<{args}>::run",
             )
         ],
@@ -53,15 +56,18 @@ def _jit_nsa_fused_store_module(
 
 
 @cache_once
-def can_use_nsa_fused_store(
+def can_use_dsa_fused_store(
     key_dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
 ) -> bool:
     try:
-        _jit_nsa_fused_store_module(key_dtype, indices_dtype, page_size)
+        _jit_dsa_fused_store_module(key_dtype, indices_dtype, page_size)
         return True
     except Exception as e:
-        logger.warning(f"Failed to load nsa fused store JIT kernel: {e}")
+        logger.warning(f"Failed to load dsa fused store JIT kernel: {e}")
         return False
+
+
+can_use_nsa_fused_store = can_use_dsa_fused_store
 
 
 def _get_module_fast(key_dtype, indices_dtype, page_size):
@@ -70,7 +76,7 @@ def _get_module_fast(key_dtype, indices_dtype, page_size):
     cache_key = (key_dtype, indices_dtype, page_size)
     if _cached_key == cache_key:
         return _cached_module
-    mod = _jit_nsa_fused_store_module(key_dtype, indices_dtype, page_size)
+    mod = _jit_dsa_fused_store_module(key_dtype, indices_dtype, page_size)
     _cached_module = mod
     _cached_key = cache_key
     return mod
@@ -85,7 +91,7 @@ def fused_store_index_k_cache(
 ) -> None:
     """
     Fused: quantize bf16 key (N,128) -> fp8 + fp32 scale and write into
-    NSATokenToKVPool.index_k_with_scale_buffer.
+    DSATokenToKVPool.index_k_with_scale_buffer.
 
     key:                (num_tokens, 128) bf16 (or reshapeable to it)
     index_k_with_scale: (num_pages, page_size*(128+4)) uint8

@@ -235,19 +235,11 @@ class CommonKVManager(BaseKVManager):
 
         # Sanity checks
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
-            if self.server_args.enable_hisparse:
-                # HiSparse: decode host pool page_size=1, prefill device pool page_size >= 1.
-                # Transfer will use send_kvcache_hisparse with per-token item_lens.
-                logger.info(
-                    f"HiSparse PD transfer mode: prefill page_size={info.page_size}, "
-                    f"decode host page_size={self.kv_args.page_size}"
-                )
-            else:
-                raise RuntimeError(
-                    f"Page size mismatch: prefill server has page_size={info.page_size}, "
-                    f"but decode server has page_size={self.kv_args.page_size}. "
-                    f"Both servers must use the same --page-size value."
-                )
+            raise RuntimeError(
+                f"Page size mismatch: prefill server has page_size={info.page_size}, "
+                f"but decode server has page_size={self.kv_args.page_size}. "
+                f"Both servers must use the same --page-size value."
+            )
 
         if (
             info.kv_cache_dtype is not None
@@ -608,8 +600,8 @@ class CommonKVManager(BaseKVManager):
             and self.is_mla_backend
             and getattr(
                 self.server_args,
-                "nsa_prefill_cp_kv_storage_mode",
-                "replicated",
+                "dsa_prefill_cp_kv_storage_mode",
+                getattr(self.server_args, "nsa_prefill_cp_kv_storage_mode", "replicated"),
             )
             == "layersplit"
         )
@@ -633,7 +625,7 @@ class CommonKVManager(BaseKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
 
-        from sglang.srt.layers.attention.nsa.layersplit import (
+        from sglang.srt.layers.attention.dsa.layersplit import (
             LayerSplitPolicy,
             build_layersplit_mla_transfer_params,
         )
@@ -645,7 +637,11 @@ class CommonKVManager(BaseKVManager):
             cp_size=self.attn_cp_size,
             start_layer=start_layer,
             end_layer=start_layer + layer_count,
-            layout=self.server_args.nsa_prefill_cp_layersplit_layout,
+            layout=getattr(
+                self.server_args,
+                "dsa_prefill_cp_layersplit_layout",
+                getattr(self.server_args, "nsa_prefill_cp_layersplit_layout", "interleaved"),
+            ),
         )
 
         return build_layersplit_mla_transfer_params(

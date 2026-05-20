@@ -33,6 +33,7 @@ _PACKAGE_PATHS = {
     "sglang.srt": ROOT / "python/sglang/srt",
     "sglang.srt.layers": ROOT / "python/sglang/srt/layers",
     "sglang.srt.layers.attention": ROOT / "python/sglang/srt/layers/attention",
+    "sglang.srt.layers.attention.dsa": ROOT / "python/sglang/srt/layers/attention/dsa",
     "sglang.srt.layers.attention.nsa": ROOT / "python/sglang/srt/layers/attention/nsa",
     "sglang.srt.layers.quantization": ROOT / "python/sglang/srt/layers/quantization",
 }
@@ -40,6 +41,10 @@ for module_name, package_path in _PACKAGE_PATHS.items():
     module = sys.modules.setdefault(module_name, types.ModuleType(module_name))
     module.__path__ = [str(package_path)]
 
+_load_module(
+    "sglang.srt.layers.attention.dsa.indexer_quantization",
+    ROOT / "python/sglang/srt/layers/attention/dsa/indexer_quantization.py",
+)
 _load_module(
     "sglang.srt.layers.attention.nsa.indexer_quantization",
     ROOT / "python/sglang/srt/layers/attention/nsa/indexer_quantization.py",

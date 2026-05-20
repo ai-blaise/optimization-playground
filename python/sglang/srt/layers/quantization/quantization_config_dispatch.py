@@ -3,7 +3,7 @@
 Reads optional declarative fields from a model's ``quantization_config``
 (typically ``hf_config.quantization_config``) and promotes them onto
 ``server_args``, so that a checkpoint can opt into TurboQuant 2.5-bit
-dense KV, HIGGS 2-bit dense KV, NSA IndexCache, NSA indexer cache formats,
+dense KV, HIGGS 2-bit dense KV, DSA IndexCache, DSA indexer cache formats,
 or a supported MoE runner without requiring the operator to pass CLI flags.
 
 Three fields are recognized:
@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, Optional
 
-from sglang.srt.layers.attention.nsa.indexer_quantization import (
+from sglang.srt.layers.attention.dsa.indexer_quantization import (
     INDEXER_DISABLED_QUANT_METHOD,
     INDEXER_FP8_QUANT_METHOD,
     INDEXER_NVFP4_QUANT_METHOD,
@@ -54,7 +54,8 @@ logger = logging.getLogger(__name__)
 TURBOQUANT_DENSE_QUANT_METHOD = "turboquant_dense"
 DEFAULT_TURBOQUANT_DENSE_KV_PRESET = "latent_2p5bit_nc"
 HIGGS_DENSE_2BIT_QUANT_METHOD = "higgs_dense_2bit"
-DEFAULT_NSA_INDEXCACHE_FREQ = 4
+DEFAULT_DSA_INDEXCACHE_FREQ = 4
+DEFAULT_NSA_INDEXCACHE_FREQ = DEFAULT_DSA_INDEXCACHE_FREQ
 SUPPORTED_CONFIG_INDEXER_MODES = ("vanilla", "indexcache")
 SUPPORTED_CONFIG_MOE_RUNNER_BACKENDS = ("warp_decode",)
 
@@ -168,7 +169,7 @@ def _maybe_apply_indexer_quantization(
     if method is not None and method not in SUPPORTED_INDEXER_QUANT_METHODS:
         logger.info(
             "quantization_config.indexer_quantization.quant_method=%r is "
-            "not supported by the NSA Indexer quantization path; "
+            "not supported by the DSA Indexer quantization path; "
             "ignoring config-side dispatch.",
             method,
         )
@@ -198,6 +199,7 @@ def _maybe_apply_indexer_quantization(
     if not hisa_enabled:
         return
 
+    server_args.enable_dsa_nvfp4_hisa = True
     server_args.enable_nsa_nvfp4_hisa = True
     mode = str(hisa_cfg.get("mode", "indexcache-hisa"))
     if indexcache_enabled and mode == "hisa":
@@ -210,10 +212,18 @@ def _maybe_apply_indexer_quantization(
     if mode not in ("hisa", "indexcache-hisa"):
         logger.info(
             "quantization_config.indexer_quantization.hisa.mode=%r is not "
-            "supported; keeping the existing NSA indexer mode.",
+            "supported; keeping the existing DSA indexer mode.",
             mode,
         )
-    elif getattr(server_args, "nsa_indexer_mode", "vanilla") == "vanilla":
+    elif (
+        getattr(
+            server_args,
+            "dsa_indexer_mode",
+            getattr(server_args, "nsa_indexer_mode", "vanilla"),
+        )
+        == "vanilla"
+    ):
+        server_args.dsa_indexer_mode = mode
         server_args.nsa_indexer_mode = mode
     if "block_size" in hisa_cfg and getattr(server_args, "hisa_block_size", 128) == 128:
         server_args.hisa_block_size = int(hisa_cfg["block_size"])
@@ -260,10 +270,15 @@ def _maybe_apply_indexcache(
             logger.info(
                 "quantization_config.indexer_quantization.indexer_mode=%r is "
                 "not supported for config-side dispatch; keeping the existing "
-                "NSA indexer mode.",
+                "DSA indexer mode.",
                 mode,
             )
-        elif getattr(server_args, "nsa_indexer_mode", "vanilla") == "vanilla":
+        elif getattr(
+            server_args,
+            "dsa_indexer_mode",
+            getattr(server_args, "nsa_indexer_mode", "vanilla"),
+        ) == "vanilla":
+            server_args.dsa_indexer_mode = mode
             server_args.nsa_indexer_mode = mode
 
     if indexcache_cfg is None:
@@ -272,16 +287,31 @@ def _maybe_apply_indexcache(
     freq = indexcache_cfg.get("freq", indexcache_cfg.get("index_topk_freq"))
     if (
         freq is not None
-        and getattr(server_args, "nsa_indexcache_freq", DEFAULT_NSA_INDEXCACHE_FREQ)
-        == DEFAULT_NSA_INDEXCACHE_FREQ
+        and getattr(
+            server_args,
+            "dsa_indexcache_freq",
+            getattr(
+                server_args,
+                "nsa_indexcache_freq",
+                DEFAULT_DSA_INDEXCACHE_FREQ,
+            ),
+        )
+        == DEFAULT_DSA_INDEXCACHE_FREQ
     ):
+        server_args.dsa_indexcache_freq = int(freq)
         server_args.nsa_indexcache_freq = int(freq)
 
     pattern = indexcache_cfg.get("pattern", indexcache_cfg.get("index_topk_pattern"))
     if (
         pattern is not None
-        and getattr(server_args, "nsa_indexcache_pattern", None) is None
+        and getattr(
+            server_args,
+            "dsa_indexcache_pattern",
+            getattr(server_args, "nsa_indexcache_pattern", None),
+        )
+        is None
     ):
+        server_args.dsa_indexcache_pattern = str(pattern)
         server_args.nsa_indexcache_pattern = str(pattern)
 
 def _maybe_apply_moe_runner_backend(
@@ -325,7 +355,7 @@ def apply_quantization_config_dispatch(
     _maybe_apply_moe_runner_backend(server_args, quant_cfg)
 
 
-def should_use_nsa_fused_store(
+def should_use_dsa_fused_store(
     server_args: Any,
     key_dtype: Any,
     indices_dtype: Any,
@@ -334,7 +364,7 @@ def should_use_nsa_fused_store(
     auto_compat_check: Callable[..., bool],
     auto_platform_ok: bool = True,
 ) -> bool:
-    """Decide whether to dispatch to the NSA IndexCache FP8 fused-store kernel.
+    """Decide whether to dispatch to the DSA IndexCache FP8 fused-store kernel.
 
     Precedence, high to low:
 
@@ -356,11 +386,15 @@ def should_use_nsa_fused_store(
         ``auto_compat_check`` rejects the runtime ``(key_dtype,
         indices_dtype, page_size)`` triple.
     """
-    cli_method = getattr(server_args, "nsa_indexer_quantization", None)
+    cli_method = getattr(
+        server_args,
+        "dsa_indexer_quantization",
+        getattr(server_args, "nsa_indexer_quantization", None),
+    )
     if cli_method == INDEXER_FP8_QUANT_METHOD:
         if not auto_compat_check(key_dtype, indices_dtype, page_size):
             raise RuntimeError(
-                "--nsa-indexer-quantization=fp8_e4m3 was set but the NSA "
+                "--dsa-indexer-quantization=fp8_e4m3 was set but the DSA "
                 "fused-store kernel rejected the runtime tensor shapes "
                 f"(key_dtype={key_dtype}, indices_dtype={indices_dtype}, "
                 f"page_size={page_size})."
@@ -376,7 +410,7 @@ def should_use_nsa_fused_store(
             if not auto_compat_check(key_dtype, indices_dtype, page_size):
                 raise RuntimeError(
                     "quantization_config.indexer_quantization declared "
-                    f"quant_method={INDEXER_FP8_QUANT_METHOD!r} but the NSA "
+                    f"quant_method={INDEXER_FP8_QUANT_METHOD!r} but the DSA "
                     "fused-store kernel rejected the runtime tensor shapes "
                     f"(key_dtype={key_dtype}, indices_dtype={indices_dtype}, "
                     f"page_size={page_size}). Either remove the declaration "
@@ -388,3 +422,6 @@ def should_use_nsa_fused_store(
         if method == INDEXER_NVFP4_QUANT_METHOD:
             return False
     return auto_platform_ok and auto_compat_check(key_dtype, indices_dtype, page_size)
+
+
+should_use_nsa_fused_store = should_use_dsa_fused_store

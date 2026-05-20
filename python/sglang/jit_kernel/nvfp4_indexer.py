@@ -72,7 +72,7 @@ def _jit_nvfp4_indexer_module(
         return load_jit(
             "nvfp4_indexer_quant",
             *args,
-            cuda_files=["nsa/nvfp4_indexer_quant.cuh"],
+            cuda_files=["dsa/nvfp4_indexer_quant.cuh"],
             cuda_wrappers=[
                 (
                     "fused_store_index_k_cache_nvfp4",
@@ -1640,3 +1640,6 @@ def nvfp4_hisa_indexer_paged_deepgemm(
         topk_tokens=topk_tokens,
     )
     return topk_indices.to(torch.int32)
+
+# DSA is the upstream canonical name; keep NSA aliases for deployment/config compatibility.
+can_use_dsa_nvfp4_indexer = can_use_nsa_nvfp4_indexer

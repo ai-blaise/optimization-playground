@@ -16,14 +16,15 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     HiSparseC4DevicePool,
 )
-from sglang.srt.mem_cache.memory_pool import (
-    HiggsDense2BitNSATokenToKVPool,
-    NSATokenToKVPool,
-    TurboQuantNSATokenToKVPool,
-)
-from sglang.srt.layers.attention.nsa.indexer_quantization import (
+from sglang.srt.layers.attention.dsa.indexer_quantization import (
     INDEXER_FP8_QUANT_METHOD,
 )
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    HiggsDense2BitDSATokenToKVPool,
+    TurboQuantDSATokenToKVPool,
+)
+from sglang.srt.mem_cache.memory_pool_host import HiSparseHostPoolMixin
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -43,7 +44,7 @@ else:
         )
 
 
-class HiSparseNSATokenToKVPool(NSATokenToKVPool):
+class HiSparseDSATokenToKVPool(DSATokenToKVPool):
     def __init__(
         self,
         size: int,
@@ -144,7 +145,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")
 
 
-class HiSparseTurboQuantNSATokenToKVPool(TurboQuantNSATokenToKVPool):
+class HiSparseTurboQuantDSATokenToKVPool(TurboQuantDSATokenToKVPool):
     def __init__(
         self,
         size: int,
@@ -254,10 +255,10 @@ class HiSparseTurboQuantNSATokenToKVPool(TurboQuantNSATokenToKVPool):
         raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")
 
 
-class HiSparseHiggsDense2BitNSATokenToKVPool(HiggsDense2BitNSATokenToKVPool):
-    """HiSparse variant of :class:`HiggsDense2BitNSATokenToKVPool`.
+class HiSparseHiggsDense2BitDSATokenToKVPool(HiggsDense2BitDSATokenToKVPool):
+    """HiSparse variant of :class:`HiggsDense2BitDSATokenToKVPool`.
 
-    Mirrors :class:`HiSparseTurboQuantNSATokenToKVPool` for the 2-bit
+    Mirrors :class:`HiSparseTurboQuantDSATokenToKVPool` for the 2-bit
     HIGGS path: enforces a uniform compressed MLA row width across
     layers (HiSparse's device/host transfer path requires uniform stride),
     and translates host-virtualized ``loc`` indices to the HiSparse
@@ -385,7 +386,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        kvcache: HiSparseNSATokenToKVPool,
+        kvcache: HiSparseDSATokenToKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
     ):
@@ -631,7 +632,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
 
-class DeepSeekV4SingleKVPoolHost:
+class DeepSeekV4SingleKVPoolHost(HiSparseHostPoolMixin):
 
     def __init__(
         self,
@@ -643,12 +644,12 @@ class DeepSeekV4SingleKVPoolHost:
     ):
 
         assert host_size > 0, "Host size must be specified and greater than 0"
-        assert page_size == 1, "Host page size must be 1 for DeepSeekV4SingleKVPoolHost"
 
         self.device_pool = device_pool
         self.size = host_size
         self.page_size = page_size
         self.num_pages = (self.size + self.page_size - 1) // self.page_size
+        self.size = self.num_pages * self.page_size
         self.pin_memory = pin_memory
         self.device = device
 
@@ -667,7 +668,7 @@ class DeepSeekV4SingleKVPoolHost:
 
     def clear(self):
         self.free_slots = torch.arange(
-            1, self.num_pages + 1, dtype=torch.int64, device="cpu"
+            1, self.size + 1, dtype=torch.int64, device="cpu"
         )
 
     def init_kv_buffer(self):
@@ -1022,3 +1023,8 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size()
             <= self.hisparse_attn_allocator.size
         )
+
+# Backward-compatible NSA class names for existing ai-blaise tests and scripts.
+HiSparseNSATokenToKVPool = HiSparseDSATokenToKVPool
+HiSparseTurboQuantNSATokenToKVPool = HiSparseTurboQuantDSATokenToKVPool
+HiSparseHiggsDense2BitNSATokenToKVPool = HiSparseHiggsDense2BitDSATokenToKVPool

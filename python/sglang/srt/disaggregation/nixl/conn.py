@@ -731,8 +731,8 @@ class NixlKVManager(CommonKVManager):
                         add_handles(kv_xfer_handle)
 
                     if kv_chunk.is_last:
+                        dst_info = self.decode_kv_args_table[req.agent_name]
                         if kv_chunk.state_indices:
-                            dst_info = self.decode_kv_args_table[req.agent_name]
                             state_xfer_handles = self.maybe_send_extra(
                                 req.agent_name,
                                 kv_chunk.state_indices,
@@ -1655,7 +1655,7 @@ class NixlKVManager(CommonKVManager):
                         dst_gpu_id,
                         comp_notif,
                     )
-            elif st in (StateType.SWA, StateType.NSA):
+            elif st in (StateType.SWA, StateType.DSA):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
@@ -2113,8 +2113,11 @@ class NixlKVReceiver(CommonKVReceiver):
                     ]
                 )
 
-        # Mark that we expect state data if state_indices was provided
-        if state_indices is not None:
+        # Mark that we expect state data if state_indices was provided.
+        # Match the prefill-side truthy check: an empty list means the
+        # model has no state types (e.g. dense LLaMA/Qwen), and prefill
+        # won't send state notifs, so we must not expect them.
+        if state_indices:
             self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
 
         self.started_transfer = True

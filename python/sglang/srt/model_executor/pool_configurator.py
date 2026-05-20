@@ -20,16 +20,16 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import (
-    get_nsa_index_head_dim,
-    is_deepseek_nsa,
+    get_dsa_index_head_dim,
+    is_deepseek_dsa,
     is_deepseek_v4,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.indexer_quantization import (
-    get_nsa_indexer_cache_layout,
-    get_nsa_indexer_quant_method,
+from sglang.srt.layers.attention.dsa.indexer_quantization import (
+    get_dsa_indexer_cache_layout,
+    get_dsa_indexer_quant_method,
 )
-from sglang.srt.layers.attention.nsa.layersplit import LayerSplitPolicy
+from sglang.srt.layers.attention.dsa.layersplit import LayerSplitPolicy
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -38,7 +38,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.quantization.higgs_dense_2bit_kv import HiggsDense2BitConfig
 from sglang.srt.layers.quantization.turboquant_dense_kv import TurboQuantDenseKVConfig
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
 
@@ -95,7 +95,7 @@ class MemoryPoolConfigurator:
 
 
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
-    """Configurator for standard models: MHA, MLA, NSA, FP4.
+    """Configurator for standard models: MHA, MLA, DSA, FP4.
 
     coeff = cell_size (bytes per token across all layers)
     bias = 0
@@ -143,8 +143,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if mr.use_mla_backend:
-            if is_deepseek_nsa(model_config.hf_config):
-                cell_size = self._compute_nsa_cell_size(mr, num_layers, kv_size)
+            if is_deepseek_dsa(model_config.hf_config):
+                cell_size = self._compute_dsa_cell_size(mr, num_layers, kv_size)
             else:
                 cell_size = (
                     (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
@@ -181,18 +181,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         return cell_size
 
-    def _compute_nsa_cell_size(
+    def _compute_dsa_cell_size(
         self, mr: ModelRunner, num_layers: int, kv_size: int
     ) -> int:
         model_config = mr.model_config
-        storage_layers = self._nsa_storage_layer_count(mr, num_layers)
-        index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
-        indexer_layout = get_nsa_indexer_cache_layout(
-            get_nsa_indexer_quant_method(mr.server_args), index_head_dim
+        storage_layers = self._dsa_storage_layer_count(mr, num_layers)
+        index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
+        indexer_layout = get_dsa_indexer_cache_layout(
+            get_dsa_indexer_quant_method(mr.server_args), index_head_dim
         )
         indexer_size_per_token = indexer_layout.token_bytes
         indexer_element_size = torch._utils._element_size(
-            NSATokenToKVPool.index_k_with_scale_buffer_dtype
+            DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         indexer_cell_size = (
             indexer_size_per_token * storage_layers * indexer_element_size
@@ -235,7 +235,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         ).slot_bytes
         dense_cache_bytes = mr.calculate_mla_kv_cache_dim() * kv_size
         dense_cell_size = 0
-        storage_layer_ids = self._nsa_storage_layer_ids(mr, num_layers)
+        storage_layer_ids = self._dsa_storage_layer_ids(mr, num_layers)
         for layer_id in storage_layer_ids:
             dense_cell_size += (
                 dense_cache_bytes
@@ -247,10 +247,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         return dense_cell_size + indexer_cell_size
 
-    def _nsa_storage_layer_ids(
+    def _dsa_storage_layer_ids(
         self, mr: ModelRunner, _num_layers: int
     ) -> tuple[int, ...]:
-        if mr.server_args.nsa_prefill_cp_kv_storage_mode != "layersplit":
+        if mr.server_args.dsa_prefill_cp_kv_storage_mode != "layersplit":
             return tuple(range(mr.start_layer, mr.end_layer))
         cp_size = get_attention_cp_size()
         if cp_size <= 1:
@@ -260,7 +260,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             cp_size=cp_size,
             start_layer=mr.start_layer,
             end_layer=mr.end_layer,
-            layout=mr.server_args.nsa_prefill_cp_layersplit_layout,
+            layout=mr.server_args.dsa_prefill_cp_layersplit_layout,
         )
         owned_layers = policy.owned_layer_ids()
         scratch_layers = tuple(
@@ -270,8 +270,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )[:1]
         return owned_layers + scratch_layers
 
-    def _nsa_storage_layer_count(self, mr: ModelRunner, num_layers: int) -> int:
-        return len(self._nsa_storage_layer_ids(mr, num_layers))
+    def _dsa_storage_layer_count(self, mr: ModelRunner, num_layers: int) -> int:
+        return len(self._dsa_storage_layer_ids(mr, num_layers))
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
@@ -413,10 +413,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
-        self.indexer_cache_layout = get_nsa_indexer_cache_layout(
-            get_nsa_indexer_quant_method(mr.server_args), self.indexer_head_dim
+        self.indexer_cache_layout = get_dsa_indexer_cache_layout(
+            get_dsa_indexer_quant_method(mr.server_args), self.indexer_head_dim
         )
-        self.compression_ratios = cfg.compress_ratios
+        # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
+        self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]
+        if mr.pp_size > 1:
+            logger.info(
+                f"DSV4 pool PP slice: rank={mr.pp_group.rank_in_group} "
+                f"layers=[{mr.start_layer},{mr.end_layer}) "
+                f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
+            )
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None

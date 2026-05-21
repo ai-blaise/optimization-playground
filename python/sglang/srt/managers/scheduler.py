@@ -22,6 +22,7 @@ import sys
 import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -150,6 +151,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -845,7 +847,14 @@ class Scheduler(
             self.model_config.hf_config, "text_config", self.model_config.hf_config
         )
 
-        if hasattr(config_to_check, "num_experts_per_tok"):
+        # Different MoE architectures expose the per-token expert count under
+        # different attribute names (e.g. Gemma4 uses ``top_k_experts``).
+        moe_topk_attrs = (
+            "num_experts_per_tok",
+            "num_experts_per_token",
+            "top_k_experts",
+        )
+        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config(self.server_args)
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
@@ -1303,10 +1312,8 @@ class Scheduler(
             return
 
         self.future_map = self.spec_algorithm.create_future_map(
-            self.max_running_requests,
-            self.chunked_prefill_size,
-            self.model_config.context_len,
             self.device,
+            self.req_to_token_pool,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -3107,23 +3114,41 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                # Refresh BEFORE _overlap_forward_isolation so snapshot
-                # captures fresh values and restore preserves them.
-                batch.refresh_seq_lens_cpu()
+                if self.spec_algorithm.is_smc():
+                    batch.refresh_seq_lens_cpu()
+                elif batch.is_spec_v2:
+                    # FIXME: make this optional to different backends.
+                    self.future_map.resolve_seq_lens_cpu(batch)
 
                 with self._overlap_forward_isolation(batch):
-                    bs = len(batch.seq_lens)
                     future_indices = (
                         None
                         if self.spec_algorithm.is_smc()
-                        else self.future_map.alloc_future_indices(bs)
+                        else FutureIndices(indices=batch.req_pool_indices)
+                    )
+
+                    # Spec_v2 worker fires this between sample-end and
+                    # draft_extend; publish moves the fence to verify-end so
+                    # schedule prep can overlap with draft_extend. SMCWorker
+                    # has its own direct verified-id handoff and does not accept
+                    # this callback.
+                    fwd_kwargs = (
+                        {
+                            "on_verify_complete": partial(
+                                self.future_map.publish, future_indices
+                            )
+                        }
+                        if batch.is_spec_v2 and future_indices is not None
+                        else {}
                     )
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
                         self.future_map.resolve_future(batch)
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(batch)
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, **fwd_kwargs
+                        )
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
@@ -3135,9 +3160,12 @@ class Scheduler(
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
                             if future_indices is not None:
-                                self.future_map.store_to_map(
-                                    future_indices, batch_result
+                                stash_payload = (
+                                    batch_result.next_draft_input
+                                    if batch.is_spec_v2
+                                    else batch_result.next_token_ids
                                 )
+                                self.future_map.stash(future_indices, stash_payload)
                             batch_result.copy_to_cpu(
                                 return_logprob=batch.return_logprob,
                                 return_hidden_states=batch.return_hidden_states,
@@ -3159,25 +3187,14 @@ class Scheduler(
 
                 if batch.spec_algorithm.is_smc():
                     # SMC: store spec_info for overlap, but don't overwrite
-                    # seq_lens — it was already advanced in prepare_for_decode.
+                    # seq_lens; prepare_for_decode already advanced it.
                     batch.spec_info = batch_result.next_draft_input
-                    if future_indices is not None:
-                        batch.spec_info.future_indices = future_indices
                 elif batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
                     batch.spec_info = batch_result.next_draft_input
-                    # SMC-SD draft path can return None future_indices when
-                    # the speculation window is empty; the None guard
-                    # prevents a downstream crash on .gather(). Upstream
-                    # removed the guard but the SMC code in this fork still
-                    # needs it.
-                    if future_indices is not None:
-                        batch.spec_info.future_indices = future_indices
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                    batch.spec_info.future_indices = future_indices
+                    # Schedule-stream sentinel between iters; next iter's
+                    # resolve_future reassigns batch.seq_lens from new_seq_lens_buf.
+                    batch.seq_lens = -future_indices.indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
@@ -3261,7 +3278,10 @@ class Scheduler(
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            # Delay-sample is non-spec only; stash takes next_token_ids tensor.
+            self.future_map.stash(
+                batch_result.future_indices, batch_result.next_token_ids
+            )
             batch_result.copy_to_cpu(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,

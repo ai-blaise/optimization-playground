@@ -147,6 +147,10 @@ def get_request_headers() -> Dict[str, str]:
     return headers
 
 
+def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
+    return (message.get("reasoning_content") or "") + (message.get("content") or "")
+
+
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
     """Wait for the server to become ready by polling the given URL."""
     print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
@@ -456,9 +460,8 @@ async def async_request_openai_chat_completions(
                     if args.disable_stream:
                         # Non-streaming response
                         response_json = await response.json()
-                        output.generated_text = response_json["choices"][0]["message"][
-                            "content"
-                        ]
+                        message = response_json["choices"][0]["message"]
+                        output.generated_text = _combine_openai_chat_content(message)
                         output.success = True
                         output.latency = time.perf_counter() - st
                         output.ttft = (
@@ -493,9 +496,7 @@ async def async_request_openai_chat_completions(
                                 # Reasoning models stream thoughts via
                                 # `reasoning_content`; count them like content.
                                 delta = choices[0].get("delta") or {}
-                                content = (delta.get("reasoning_content") or "") + (
-                                    delta.get("content") or ""
-                                )
+                                content = _combine_openai_chat_content(delta)
 
                                 if content:
                                     timestamp = time.perf_counter()

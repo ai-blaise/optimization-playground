@@ -8,6 +8,7 @@ except ModuleNotFoundError:
 if torch is not None:
     try:
         from sglang.jit_kernel.nvfp4_indexer import (
+            _deepgemm_has_fp4_mqa_logits,
             _hisa_block_topk_counts,
             dequantize_indexer_nvfp4,
             fused_store_index_k_cache_nvfp4,
@@ -23,6 +24,7 @@ if torch is not None:
             quantize_indexer_q_nvfp4,
         )
     except ModuleNotFoundError:
+        _deepgemm_has_fp4_mqa_logits = None
         _hisa_block_topk_counts = None
         dequantize_indexer_nvfp4 = None
         fused_store_index_k_cache_nvfp4 = None
@@ -37,6 +39,7 @@ if torch is not None:
         nvfp4_hisa_indexer_paged_torch = None
         quantize_indexer_q_nvfp4 = None
 else:
+    _deepgemm_has_fp4_mqa_logits = None
     _hisa_block_topk_counts = None
     dequantize_indexer_nvfp4 = None
     fused_store_index_k_cache_nvfp4 = None
@@ -259,6 +262,8 @@ def test_nvfp4_hisa_precomputed_reps_match_dequantized_mean_pool():
 @pytest.mark.skipif(not _nvfp4_supported(), reason="NVFP4 requires Blackwell.")
 def test_nvfp4_hisa_precomputed_deepgemm_matches_inline_deepgemm():
     pytest.importorskip("deep_gemm")
+    if not _deepgemm_has_fp4_mqa_logits():
+        pytest.skip("DeepGEMM FP4 MQA kernel is not available.")
     _, weights, q_fp4, cache, page_table, seq_lens, token_to_batch_idx = _build_case(
         8193, heads=64
     )

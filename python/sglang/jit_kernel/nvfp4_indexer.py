@@ -53,9 +53,18 @@ _NVFP4_E2M1_CODEBOOK = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _DEEPGEMM_FP4_MQA_HEAD_COUNTS = (64,)
 
 
+def _deepgemm_has_fp4_mqa_logits() -> bool:
+    try:
+        import deep_gemm
+    except (ImportError, ModuleNotFoundError):
+        return False
+    return hasattr(deep_gemm, "fp8_fp4_mqa_logits")
+
+
 def _deepgemm_fp4_mqa_supports(q_values: torch.Tensor) -> bool:
     return (
-        q_values.dim() == 3
+        _deepgemm_has_fp4_mqa_logits()
+        and q_values.dim() == 3
         and q_values.shape[1] in _DEEPGEMM_FP4_MQA_HEAD_COUNTS
         and q_values.shape[-1] == 64
     )

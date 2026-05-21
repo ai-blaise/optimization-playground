@@ -20,6 +20,7 @@ from sglang.jit_kernel.nvfp4_indexer import (
     can_use_dsa_nvfp4_indexer,
     fused_store_index_k_cache_nvfp4,
     nvfp4_hisa_indexer_paged_deepgemm,
+    nvfp4_hisa_indexer_paged_torch,
     quantize_indexer_q_nvfp4,
 )
 from sglang.srt.environ import envs
@@ -112,6 +113,11 @@ def _require_deep_gemm_kernel(name: str):
     if not _is_cuda or isinstance(module, Exception) or not hasattr(module, name):
         raise RuntimeError(f"DeepGEMM kernel {name} is required for this DSA path.")
     return getattr(module, name)
+
+
+def _has_deep_gemm_kernel(name: str) -> bool:
+    module = globals().get("deep_gemm")
+    return _is_cuda and not isinstance(module, Exception) and hasattr(module, name)
 
 
 def _pad_first_dim(tensor: torch.Tensor, pad_len: int) -> torch.Tensor:
@@ -527,11 +533,12 @@ class Indexer(MultiPlatformOp):
                 "DSA Indexer NVFP4 was requested but the Blackwell NVFP4 "
                 "JIT kernels are not available for this runtime."
             )
-        return quantize_indexer_q_nvfp4(
+        q_values, q_scales = quantize_indexer_q_nvfp4(
             query,
             indices_dtype=forward_batch.out_cache_loc.dtype,
             page_size=forward_batch.token_to_kv_pool.page_size,
         )
+        return (q_values, q_scales), None
 
     def _get_logits_head_gate_for_indexer(
         self,
@@ -1014,7 +1021,12 @@ class Indexer(MultiPlatformOp):
             return False
         if self.hisa_execution_mode != "optimized":
             return False
-        if not _is_cuda or not forward_batch.forward_mode.is_decode_or_idle():
+        is_decode_like = (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        )
+        if not _is_cuda or not is_decode_like:
             return False
         if self.index_topk not in (1024, 2048):
             return False
@@ -1029,9 +1041,11 @@ class Indexer(MultiPlatformOp):
             return False
         if self.hisa_block_size != 128:
             return False
-        if metadata.get_token_to_batch_idx() is None:
-            return False
-        if sum(metadata.get_dsa_extend_len_cpu()) < _hisa_paged_min_query_len:
+        has_dense_nvfp4_kernel = _has_deep_gemm_kernel("fp8_fp4_paged_mqa_logits")
+        if (
+            has_dense_nvfp4_kernel
+            and sum(metadata.get_dsa_extend_len_cpu()) < _hisa_paged_min_query_len
+        ):
             return False
         seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         max_seq_len = (
@@ -1040,6 +1054,8 @@ class Indexer(MultiPlatformOp):
             else int(seqlens_32.max().item())
         )
         if self.hisa_compression_ratio > 0:
+            if not has_dense_nvfp4_kernel:
+                return max_seq_len > 0
             return max_seq_len > self.index_topk
         min_seq_len = max(
             self.hisa_min_seq_len,
@@ -1152,7 +1168,12 @@ class Indexer(MultiPlatformOp):
         hisa_weights = weights[:q_offset]
         if hisa_weights.dim() == 3:
             hisa_weights = hisa_weights.squeeze(2)
-        topk_relative = nvfp4_hisa_indexer_paged_deepgemm(
+        if _has_deep_gemm_kernel("fp8_fp4_mqa_logits"):
+            nvfp4_hisa_indexer_paged = nvfp4_hisa_indexer_paged_deepgemm
+        else:
+            nvfp4_hisa_indexer_paged = nvfp4_hisa_indexer_paged_torch
+
+        topk_relative = nvfp4_hisa_indexer_paged(
             (q_fp4[0][:q_offset], q_fp4[1][:q_offset]),
             index_k_with_scale_buffer,
             page_table,
@@ -1166,7 +1187,14 @@ class Indexer(MultiPlatformOp):
             fallback_to_dense_if_short=True,
         )
         if topk_relative is None:
-            return None
+            topk_relative = self._get_dense_short_relative_topk(
+                seqlens_32,
+                token_to_batch_idx,
+                q_offset,
+                q_values.device,
+            )
+            if topk_relative is None:
+                return None
 
         block_tables = metadata.get_page_table_1()
         safe_topk_relative = torch.where(topk_relative < 0, 0, topk_relative)
@@ -1176,6 +1204,28 @@ class Indexer(MultiPlatformOp):
             torch.gather(block_tables[:q_offset], dim=1, index=safe_topk_relative.long()),
         )
         return topk_result
+
+    def _get_dense_short_relative_topk(
+        self,
+        seqlens_32: torch.Tensor,
+        token_to_batch_idx: torch.Tensor,
+        q_offset: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if q_offset == 0:
+            return torch.empty((0, self.index_topk), dtype=torch.int32, device=device)
+
+        seq_lens = seqlens_32.reshape(-1).to(device=device, dtype=torch.int32)
+        batch_idx = token_to_batch_idx.reshape(-1)[:q_offset].to(
+            device=device, dtype=torch.long
+        )
+        prefix_lens = seq_lens.index_select(0, batch_idx)
+        if not bool(torch.all(prefix_lens <= self.index_topk).item()):
+            return None
+
+        relative = torch.arange(self.index_topk, device=device, dtype=torch.int32)
+        relative = relative.unsqueeze(0).expand(q_offset, -1)
+        return torch.where(relative < prefix_lens.unsqueeze(1), relative, -1)
 
     def _get_hisa_token_to_batch_idx(
         self,

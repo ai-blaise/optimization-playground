@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.utils.network import NetworkAddress
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
+_COUNT_EMPTY_TEXT_CHUNKS_ENV = "SGLANG_BENCH_COUNT_EMPTY_TEXT_CHUNKS"
 
 _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
 
@@ -64,6 +65,21 @@ global args
 def _get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
+
+
+def _count_empty_text_stream_chunks() -> bool:
+    return _get_bool_env_var(_COUNT_EMPTY_TEXT_CHUNKS_ENV)
+
+
+def _completion_choice_has_token(choice: Dict[str, Any]) -> bool:
+    text = choice.get("text")
+    if text:
+        return True
+    return (
+        _count_empty_text_stream_chunks()
+        and text == ""
+        and choice.get("finish_reason") is None
+    )
 
 
 def _create_bench_client_session():
@@ -300,7 +316,9 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            choice = data["choices"][0]
+                            if _completion_choice_has_token(choice):
+                                text = choice.get("text", "")
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -309,13 +327,11 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
-                                    output.text_chunks.append(
-                                        data["choices"][0]["text"]
-                                    )
+                                    output.text_chunks.append(text)
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
+                                generated_text += text
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
@@ -573,7 +589,9 @@ async def async_request_truss(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            choice = data["choices"][0]
+                            if _completion_choice_has_token(choice):
+                                text = choice.get("text", "")
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -585,7 +603,7 @@ async def async_request_truss(
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
+                                generated_text += text
 
                     output.generated_text = generated_text
                     output.success = True

@@ -935,6 +935,10 @@ class CudaGraphRunner:
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
 
+        lora_variants = [(None, False)]
+        if getattr(self, "record_nolora_graph", False):
+            lora_variants = [("lora", True), ("nolora", False)]
+
         def _capture_one_stream(stream_idx: Optional[int] = None):
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
@@ -958,7 +962,7 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
-                for variant_label, variant_has_lora in lora_variants:
+                for variant_label, _variant_has_lora in lora_variants:
                     _set_capture_lora_variant(variant_label)
                     with patch_model(
                         self.model_runner.model,

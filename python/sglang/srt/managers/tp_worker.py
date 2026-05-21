@@ -446,14 +446,18 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_generation(
         self,
-        batch: Optional[ScheduleBatch],
+        batch: Optional[ScheduleBatch] = None,
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
+        model_worker_batch=None,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
+
+        if model_worker_batch is not None:
+            batch = model_worker_batch
 
         # Get forward batch from schedule batch
         if batch is not None:

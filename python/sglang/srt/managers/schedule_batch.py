@@ -2709,6 +2709,110 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
+    def get_model_worker_batch(
+        self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
+    ) -> "ModelWorkerBatch":
+        capture_hidden_mode = self.capture_hidden_mode
+        self.capture_hidden_mode = None
+        cached_seq_lens_cpu = self.seq_lens_cpu_cache
+        self.seq_lens_cpu_cache = None
+        return_hidden_states_before_norm = self.return_hidden_states_before_norm
+        self.return_hidden_states_before_norm = False
+
+        if seq_lens_cpu_cache is None:
+            seq_lens_cpu_cache = cached_seq_lens_cpu
+
+        if self.forward_mode.is_decode_or_idle():
+            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+        else:
+            extend_seq_lens = self.extend_lens
+            extend_prefix_lens = self.prefix_lens
+            extend_logprob_start_lens = self.extend_logprob_start_lens
+
+        if self.sampling_info is not None:
+            if self.has_grammar:
+                self.sampling_info.grammars = [req.grammar for req in self.reqs]
+            else:
+                self.sampling_info.grammars = None
+
+        seq_lens_cpu = (
+            seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
+        )
+        if self.seq_lens_sum is None:
+            self.refresh_seq_lens_cpu(sync=False)
+
+        return ModelWorkerBatch(
+            forward_mode=self.forward_mode,
+            input_ids=self.input_ids,
+            req_pool_indices=self.req_pool_indices,
+            seq_lens=self.seq_lens,
+            orig_seq_lens=self.orig_seq_lens,
+            out_cache_loc=self.out_cache_loc,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=self.seq_lens_sum,
+            return_logprob=self.return_logprob,
+            top_logprobs_nums=self.top_logprobs_nums,
+            token_ids_logprobs=self.token_ids_logprobs,
+            global_num_tokens=self.global_num_tokens,
+            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            is_extend_in_batch=self.is_extend_in_batch,
+            all_extend_in_batch=self.all_extend_in_batch,
+            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            tbo_split_seq_index=self.tbo_split_seq_index,
+            global_forward_mode=self.global_forward_mode,
+            extend_num_tokens=self.extend_num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_logprob_start_lens=extend_logprob_start_lens,
+            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            multimodal_inputs=self.multimodal_inputs,
+            encoder_cached=self.encoder_cached,
+            encoder_lens=self.encoder_lens,
+            encoder_lens_cpu=self.encoder_lens_cpu,
+            encoder_out_cache_loc=self.encoder_out_cache_loc,
+            lora_ids=[req.lora_id for req in self.reqs],
+            sampling_info=self.sampling_info,
+            input_embeds=self.input_embeds,
+            replace_embeds=self.replace_embeds,
+            replace_positions=self.replace_positions,
+            ne_token_table=self.ne_token_table,
+            token_type_ids=self.token_type_ids,
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
+            capture_hidden_mode=(
+                capture_hidden_mode
+                if capture_hidden_mode is not None
+                else (
+                    CaptureHiddenMode.FULL
+                    if self.return_hidden_states
+                    else (
+                        getattr(
+                            self.spec_info,
+                            "capture_hidden_mode",
+                            CaptureHiddenMode.NULL,
+                        )
+                        if self.spec_info is not None
+                        else CaptureHiddenMode.NULL
+                    )
+                )
+            ),
+            hicache_consumer_index=self.hicache_consumer_index,
+            dimensions=self.dimensions,
+            return_pooled_hidden_states=self.return_pooled_hidden_states,
+            is_prefill_only=self.is_prefill_only,
+            multi_item_delimiter_indices=self.multi_item_delimiter_indices,
+            dllm_config=self.dllm_config,
+            reqs=self.reqs,
+            has_grammar=self.has_grammar,
+            return_hidden_states_before_norm=return_hidden_states_before_norm,
+            mamba_track_indices=self.mamba_track_indices,
+            mamba_track_mask=self.mamba_track_mask,
+            mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_cow_src_indices=self.mamba_cow_src_indices,
+            mamba_cow_dst_indices=self.mamba_cow_dst_indices,
+            mamba_clear_indices=self.mamba_clear_indices,
+        )
+
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
         # Shallow-copy the reqs list so that in-place mutations (filter_batch,
@@ -2857,3 +2961,70 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
         )
+
+
+@dataclasses.dataclass
+class ModelWorkerBatch:
+    forward_mode: ForwardMode
+    input_ids: torch.Tensor
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    out_cache_loc: torch.Tensor
+    seq_lens_cpu: Optional[torch.Tensor]
+    seq_lens_sum: int
+    return_logprob: bool
+    top_logprobs_nums: Optional[List[int]]
+    token_ids_logprobs: Optional[List[List[int]]]
+    global_num_tokens: Optional[List[int]]
+    global_num_tokens_for_logprob: Optional[List[int]]
+    is_extend_in_batch: bool
+    all_extend_in_batch: bool
+    can_run_dp_cuda_graph: bool
+    tbo_split_seq_index: Optional[int]
+    global_forward_mode: Optional[ForwardMode]
+    extend_num_tokens: Optional[int]
+    extend_seq_lens: Optional[List[int]]
+    extend_prefix_lens: Optional[List[int]]
+    extend_logprob_start_lens: Optional[List[int]]
+    extend_input_logprob_token_ids: Optional[torch.Tensor]
+    multimodal_inputs: Optional[List[MultimodalInputs]]
+    encoder_cached: Optional[List[bool]]
+    encoder_lens: Optional[torch.Tensor]
+    encoder_lens_cpu: Optional[List[int]]
+    encoder_out_cache_loc: Optional[torch.Tensor]
+    lora_ids: Optional[List[str]]
+    sampling_info: SamplingBatchInfo
+    orig_seq_lens: Optional[torch.Tensor] = None
+    input_embeds: Optional[torch.Tensor] = None
+    replace_embeds: Optional[torch.Tensor] = None
+    replace_positions: Optional[torch.Tensor] = None
+    ne_token_table: Optional[torch.Tensor] = None
+    token_type_ids: Optional[torch.Tensor] = None
+    spec_algorithm: SpeculativeAlgorithm = None
+    spec_info: Optional[SpecInput] = None
+    capture_hidden_mode: CaptureHiddenMode = None
+    hicache_consumer_index: int = -1
+    dimensions: Optional[list[int]] = None
+    return_pooled_hidden_states: bool = False
+    is_prefill_only: bool = False
+    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
+    dllm_config: Optional[DllmConfig] = None
+    reqs: Optional[List[Req]] = None
+    has_grammar: bool = False
+    return_hidden_states_before_norm: bool = False
+    seq_lens_cpu_cache: Optional[torch.Tensor] = None
+    return_hidden_states: bool = False
+    mamba_track_indices: Optional[torch.Tensor] = None
+    mamba_track_mask: Optional[torch.Tensor] = None
+    mamba_track_seqlens: Optional[torch.Tensor] = None
+    mamba_cow_src_indices: Optional[torch.Tensor] = None
+    mamba_cow_dst_indices: Optional[torch.Tensor] = None
+    mamba_clear_indices: Optional[torch.Tensor] = None
+
+    @property
+    def extend_lens(self) -> Optional[List[int]]:
+        return self.extend_seq_lens
+
+    @property
+    def prefix_lens(self) -> Optional[List[int]]:
+        return self.extend_prefix_lens

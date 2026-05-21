@@ -333,6 +333,14 @@ class HiSparseHiggsDense2BitDSATokenToKVPool(HiggsDense2BitDSATokenToKVPool):
     def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
         return self.full_to_hisparse_device_index_mapping[compressed_indices]
 
+    def translate_loc_from_full_to_compressed(self, full_indices: torch.Tensor):
+        return full_indices
+
+    def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):
+        return self._translate_loc_to_hisparse_device(
+            self.translate_loc_from_full_to_compressed(full_indices)
+        )
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,

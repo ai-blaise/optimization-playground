@@ -87,6 +87,50 @@ SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
 
 
+def _is_nvfp4_w4a4_args(args: Any) -> bool:
+    return (
+        isinstance(args, dict)
+        and args.get("type") == QuantizationType.FLOAT.value
+        and args.get("num_bits") == 4
+        and args.get("strategy") == QuantizationStrategy.TENSOR_GROUP.value
+        and args.get("group_size") == 16
+        and bool(args.get("symmetric"))
+    )
+
+
+_NVFP4_INDEXER_LINEAR_TARGETS = (
+    "re:.*self_attn\\.indexer\\.wq_b$",
+    "re:.*self_attn\\.indexer\\.wk$",
+)
+
+
+def _extend_nvfp4_indexer_targets(targets: List[str], weights: Any) -> List[str]:
+    if weights is None or not any("self_attn" in target for target in targets):
+        return targets
+    for target in _NVFP4_INDEXER_LINEAR_TARGETS:
+        if target not in targets:
+            targets.append(target)
+    return targets
+
+
+def _infer_nvfp4_weight_args(
+    config: Dict[str, Any], quant_config: Dict[str, Any]
+) -> Any:
+    weights = quant_config.get("weights")
+    if weights is not None:
+        return weights
+    input_activations = quant_config.get("input_activations")
+    if (
+        config.get("format") != "dense"
+        or config.get("quantization_status") != "compressed"
+        or not _is_nvfp4_w4a4_args(input_activations)
+    ):
+        return None
+    inferred = dict(input_activations)
+    inferred["dynamic"] = False
+    return inferred
+
+
 class DeviceCapability(NamedTuple):
     major: int
     minor: int
@@ -296,25 +340,35 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         config_groups = config.get("config_groups", dict())
         for _, quant_config in config_groups.items():
-            targets = quant_config.get("targets")
+            weights = _infer_nvfp4_weight_args(config, quant_config)
+            targets = _extend_nvfp4_indexer_targets(
+                list(quant_config.get("targets") or ()), weights
+            )
             for target in targets:
                 target_scheme_map[target] = {}
-                target_scheme_map[target]["weights"] = QuantizationArgs.model_validate(
-                    quant_config.get("weights")
+                target_scheme_map[target]["weights"] = (
+                    QuantizationArgs.model_validate(weights)
+                    if weights is not None
+                    else None
                 )
 
                 target_scheme_map[target]["input_activations"] = None
-                if is_activation_quantization_format(quant_format):
-                    input_activations = quant_config.get("input_activations")
+                input_activations = quant_config.get("input_activations")
+                parse_input_activations = is_activation_quantization_format(
+                    quant_format
+                ) or (
+                    target_scheme_map[target]["weights"] is not None
+                    and _is_nvfp4_w4a4_args(input_activations)
+                )
+                if parse_input_activations:
                     # The only case where we have activation quant supported
                     # but no input_activations provided in the config
                     # should be w8a16fp8 w8a16fp8 can also run for cases where
                     # there is an input_quant but it is ignored
                     if not input_activations:
-                        assert (
-                            target_scheme_map[target]["weights"].type
-                            == QuantizationType.FLOAT
-                        )
+                        weights = target_scheme_map[target]["weights"]
+                        if weights is not None:
+                            assert weights.type == QuantizationType.FLOAT
                     else:
                         target_scheme_map[target]["input_activations"] = (
                             QuantizationArgs.model_validate(  # noqa: E501
@@ -570,8 +624,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                     "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
                 )
 
-        if is_activation_quantization_format(self.quant_format):
-            if self._is_fp4a4_nvfp4(weight_quant, input_quant):
+        is_fp4a4_nvfp4 = self._is_fp4a4_nvfp4(weight_quant, input_quant)
+        if is_activation_quantization_format(self.quant_format) or is_fp4a4_nvfp4:
+            if is_fp4a4_nvfp4:
                 is_fp4a4_nvfp4_supported = self._check_scheme_supported(
                     CompressedTensorsW4A4Fp4.get_min_capability(), error=False
                 )
@@ -678,6 +733,14 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
+
+        if weight_quant is None:
+            logger.warning_once(
+                "Acceleration for non-quantized MoE schemes is "
+                "not supported by Compressed Tensors. "
+                "Falling back to UnquantizedFusedMoEMethod"
+            )
+            return None
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:

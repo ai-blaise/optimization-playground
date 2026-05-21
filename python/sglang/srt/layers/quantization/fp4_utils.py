@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
@@ -20,6 +21,12 @@ try:
     from flashinfer import fp4_quantize as _flashinfer_fp4_quantize
 
     _flashinfer_fp4_quantize_backend = "cute-dsl" if is_sm100_supported() else "cuda"
+    try:
+        _flashinfer_fp4_quantize_params = set(
+            inspect.signature(_flashinfer_fp4_quantize).parameters
+        )
+    except (TypeError, ValueError):
+        _flashinfer_fp4_quantize_params = set()
 
     def _round_up(x: int, y: int) -> int:
         return ((x + y - 1) // y) * y
@@ -33,16 +40,20 @@ try:
         is_sf_8x4_layout: bool = False,
         enable_pdl: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return _flashinfer_fp4_quantize(
-            input=input,
-            global_scale=global_scale,
-            sf_vec_size=sf_vec_size,
-            sf_use_ue8m0=sf_use_ue8m0,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            is_sf_8x4_layout=is_sf_8x4_layout,
-            enable_pdl=enable_pdl,
-            backend=_flashinfer_fp4_quantize_backend,
-        )
+        kwargs = {
+            "input": input,
+            "global_scale": global_scale,
+            "sf_vec_size": sf_vec_size,
+            "sf_use_ue8m0": sf_use_ue8m0,
+            "is_sf_swizzled_layout": is_sf_swizzled_layout,
+            "is_sf_8x4_layout": is_sf_8x4_layout,
+            "enable_pdl": enable_pdl,
+        }
+        if "backend" in _flashinfer_fp4_quantize_params:
+            kwargs["backend"] = _flashinfer_fp4_quantize_backend
+        if "enable_pdl" not in _flashinfer_fp4_quantize_params:
+            kwargs.pop("enable_pdl")
+        return _flashinfer_fp4_quantize(**kwargs)
 
     def _flashinfer_fp4_quantize_fake(
         input: torch.Tensor,

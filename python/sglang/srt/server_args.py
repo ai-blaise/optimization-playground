@@ -2072,7 +2072,7 @@ class ServerArgs:
                 quant_cfg = getattr(hf_config, "quantization_config", None) or {}
                 config_groups = quant_cfg.get("config_groups", {})
                 group0 = config_groups.get("group_0", {})
-                weights_cfg = group0.get("weights", {})
+                weights_cfg = group0.get("weights") or {}
                 # this also apply to kimi k2.5
                 # since it follow the compressed tensor int4 recipe
                 # but not kimi k2 instruct or 0905 instruct.
@@ -7745,11 +7745,6 @@ class ServerArgs:
             if not is_deepseek_dsa(hf_config):
                 raise ValueError(
                     "--dsa-indexer-mode is only supported for DeepSeek Sparse Attention models."
-                )
-            if self.enable_hisparse and self.dsa_indexer_mode == "indexcache-hisa":
-                raise ValueError(
-                    "--dsa-indexer-mode=indexcache-hisa is not compatible with HiSparse. "
-                    "Use --dsa-indexer-mode=indexcache for the HiSparse combined path."
                 )
             if (
                 self.hisa_compression_ratio <= 0

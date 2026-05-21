@@ -520,7 +520,19 @@ class DeepseekV2WeightLoaderMixin:
                                         "fused_qkv_a_proj_with_mqa",
                                     )
                                 )
+                                if param_name not in params_dict:
+                                    cached_a_proj.pop(q_a_proj_name)
+                                    cached_a_proj.pop(kv_a_proj_name)
+                                    continue
                                 param = params_dict[param_name]
+                                if (
+                                    param_name.endswith(".input_global_scale")
+                                    and fused_weight.numel() != param.numel()
+                                    and param.numel() == 1
+                                ):
+                                    fused_weight = fused_weight.reshape(-1).max().reshape(
+                                        param.shape
+                                    )
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )

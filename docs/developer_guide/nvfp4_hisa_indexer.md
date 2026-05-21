@@ -158,6 +158,31 @@ python benchmark/nsa/bench_nvfp4_hisa_indexer.py \
   --iters 20
 ```
 
+## Runtime NIXL Validation
+
+The production disaggregated path can route NVFP4 IndexCache+HISA through
+HiSparse KV transfer. In that shape, a per-rank HiSparse page slice may be empty
+even when the overall request has KV pages. The NIXL sender must not build an
+RDMA descriptor list for the empty slice; instead it sends the normal KV arrival
+notification without data so the decode-side transfer status can advance.
+
+B200 validation after this guard:
+
+```bash
+AUTOINFER_CANDIDATE=setup1_full_custom_r27_nixl_empty_notification_fix_c32 \
+AUTOINFER_CELLS=e2e_1k_128_c32:1024:128 \
+AUTOINFER_BENCH_SHORT_PROMPTS=32 \
+AUTOINFER_MAX_RUNNING_REQUESTS=32 \
+/home/spencergarnets/dynamo-reap-production-bundle-20260520-233425/infrastructure/scripts/sglang-reap/run-b200-six-cell-bench.sh
+```
+
+Artifact:
+`/home/spencergarnets/inference-opt/e2e-merge-full-custom-r27-nixl-empty-notif-fix-20260521T210707Z/summary.json`.
+The run completed 32/32 exact-token requests with 32,768 input tokens and 4,096
+output tokens. Output throughput was 22.976 tok/s, mean TTFT was 166,248.7 ms,
+and mean TPOT was 85.279 ms. This is a functional correctness and transfer
+stability gate only; it is not a production throughput result.
+
 ## Acceptance
 
 The 4:1 path must beat ordinary NVFP4 IndexCache on the paper-shaped

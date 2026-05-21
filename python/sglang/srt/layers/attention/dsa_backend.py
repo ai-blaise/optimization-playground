@@ -2180,7 +2180,10 @@ class DeepseekSparseAttnBackend(
         )
 
         seq_lens = valid.sum(dim=1).to(torch.int32)
-        max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() else 0
+        if seq_lens.is_cuda and torch.cuda.is_current_stream_capturing():
+            max_seq_len = pages_per_query * page_size
+        else:
+            max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() else 0
         return selected_kv, self._tokenspeed_block_tables, seq_lens, max_seq_len
 
     def _forward_tokenspeed_mla_selected(

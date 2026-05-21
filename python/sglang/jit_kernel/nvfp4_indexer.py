@@ -70,6 +70,26 @@ def _deepgemm_fp4_mqa_supports(q_values: torch.Tensor) -> bool:
     )
 
 
+def _is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
+    return tensor.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
+def _should_fallback_to_dense_short(
+    fallback_to_dense_if_short: bool, prefix_lens: torch.Tensor, topk_tokens: int
+) -> bool:
+    if not fallback_to_dense_if_short or _is_cuda_graph_capturing(prefix_lens):
+        return False
+    return bool(torch.all(prefix_lens <= topk_tokens).item())
+
+
+def _hisa_max_blocks(
+    seq_lens_flat: torch.Tensor, page_table: torch.Tensor, block_size: int
+) -> int:
+    if _is_cuda_graph_capturing(seq_lens_flat):
+        return int(page_table.shape[1])
+    return int(((seq_lens_flat.max().item() + block_size - 1) // block_size))
+
+
 @cache_once
 def _jit_nvfp4_indexer_module(
     key_dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
@@ -581,7 +601,7 @@ def hisa_precompute_block_reps_indexer_cache_nvfp4(
     if block_size != 128:
         raise ValueError("NVFP4 HISA precomputed reps require block_size=128.")
     seq_lens_flat = seq_lens.reshape(-1).to(device=page_table.device, dtype=torch.int32)
-    max_blocks = int(((seq_lens_flat.max().item() + block_size - 1) // block_size))
+    max_blocks = _hisa_max_blocks(seq_lens_flat, page_table, block_size)
     reps = hisa_mean_pool_indexer_cache_nvfp4(
         index_k_with_scale_buffer,
         page_table,
@@ -738,6 +758,7 @@ def _hisa_block_topk_counts(
     block_size: int,
     topk_tokens: int,
     compression_ratio: Optional[float],
+    max_block_topk: Optional[int] = None,
 ) -> tuple[torch.Tensor, int]:
     if compression_ratio is None or compression_ratio <= 0:
         raise ValueError("compression_ratio must be positive for dynamic HISA budgets.")
@@ -748,6 +769,12 @@ def _hisa_block_topk_counts(
         selected = torch.ceil(block_counts.float() / compression_ratio).to(torch.int32)
     selected = torch.minimum(selected, block_counts)
     selected = torch.where(block_counts > 0, selected, torch.zeros_like(selected))
+    if max_block_topk is not None:
+        selected = torch.minimum(selected, torch.full_like(selected, max_block_topk))
+    if _is_cuda_graph_capturing(block_counts):
+        if max_block_topk is None:
+            raise RuntimeError("CUDA graph HISA block top-k requires a static upper bound.")
+        return selected.to(torch.int32), max(1, max_block_topk)
     max_selected = int(selected.max().item()) if selected.numel() else 0
     return selected.to(torch.int32), max(1, max_selected)
 
@@ -845,7 +872,9 @@ def nvfp4_hisa_indexer_from_dequant(
     token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
         device=q.device, dtype=torch.long
     )
-    if fallback_to_dense_if_short and bool(torch.all(prefix_lens <= topk_tokens).item()):
+    if _should_fallback_to_dense_short(
+        fallback_to_dense_if_short, prefix_lens, topk_tokens
+    ):
         return None
 
     q = q.float()
@@ -980,10 +1009,12 @@ def nvfp4_hisa_indexer_paged_torch(
     )
     seq_lens_flat = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
     prefix_lens = seq_lens_flat.index_select(0, token_to_batch_idx)
-    if fallback_to_dense_if_short and bool(torch.all(prefix_lens <= topk_tokens).item()):
+    if _should_fallback_to_dense_short(
+        fallback_to_dense_if_short, prefix_lens, topk_tokens
+    ):
         return None
 
-    max_blocks = int(((seq_lens_flat.max().item() + block_size - 1) // block_size))
+    max_blocks = _hisa_max_blocks(seq_lens_flat, page_table, block_size)
 
     stage = _profile_start(q_values.device)
     reps = hisa_mean_pool_indexer_cache_nvfp4(
@@ -1036,6 +1067,9 @@ def nvfp4_hisa_indexer_paged_torch(
             block_size=block_size,
             topk_tokens=topk_tokens,
             compression_ratio=compression_ratio,
+            max_block_topk=(
+                block_topk if _is_cuda_graph_capturing(block_counts) else None
+            ),
         )
     candidate_len = effective_block_topk * block_size
     if candidate_len == topk_tokens:
@@ -1177,7 +1211,9 @@ def nvfp4_hisa_indexer_paged_deepgemm_precomputed(
         prefix_lens = seq_lens_flat.index_select(0, token_to_batch_idx.long())
     else:
         prefix_lens = prepared_prefix_lens.to(device=q_values.device, dtype=torch.int32)
-    if fallback_to_dense_if_short and bool(torch.all(prefix_lens <= topk_tokens).item()):
+    if _should_fallback_to_dense_short(
+        fallback_to_dense_if_short, prefix_lens, topk_tokens
+    ):
         return None
 
     if prepared_block_counts is None:
@@ -1426,10 +1462,12 @@ def nvfp4_hisa_indexer_paged_deepgemm(
     )
     seq_lens_flat = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
     prefix_lens = seq_lens_flat.index_select(0, token_to_batch_idx.long())
-    if fallback_to_dense_if_short and bool(torch.all(prefix_lens <= topk_tokens).item()):
+    if _should_fallback_to_dense_short(
+        fallback_to_dense_if_short, prefix_lens, topk_tokens
+    ):
         return None
 
-    max_blocks = int(((seq_lens_flat.max().item() + block_size - 1) // block_size))
+    max_blocks = _hisa_max_blocks(seq_lens_flat, page_table, block_size)
     stage = _profile_start(q_values.device)
     reps = hisa_mean_pool_indexer_cache_nvfp4(
         index_k_with_scale_buffer,

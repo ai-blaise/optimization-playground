@@ -614,8 +614,9 @@ class NixlKVManager(CommonKVManager):
                 def add_handles(new_handles):
                     if new_handles is None:
                         return
-                    if isinstance(new_handles, list):
-                        handles.extend(new_handles)
+                    if isinstance(new_handles, (list, tuple)):
+                        for handle in new_handles:
+                            add_handles(handle)
                     else:
                         handles.append(new_handles)
 
@@ -745,9 +746,7 @@ class NixlKVManager(CommonKVManager):
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
                             )
-                            handles.extend(
-                                h for h in state_xfer_handles if h is not None
-                            )
+                            add_handles(state_xfer_handles)
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
@@ -873,6 +872,11 @@ class NixlKVManager(CommonKVManager):
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
 
+    def _send_transfer_notif(self, peer_name: str, notif: str):
+        state = self.agent.send_notif(peer_name, notif.encode("ascii"))
+        if state == "ERR":
+            raise Exception("KVSender failed to post notification")
+
     def _send_kvcache_generic(
         self,
         peer_name: str,
@@ -896,10 +900,30 @@ class NixlKVManager(CommonKVManager):
         dst_data_ptrs = np.array(dst_data_ptrs, dtype=np.uint64)
         item_lens = np.array(item_lens, dtype=np.uint64)
 
+        if len(prefill_data_indices) == 0 or len(dst_data_indices) == 0:
+            logger.debug(
+                "send empty kvcache notification to %s with notif %s: %d -> %d",
+                peer_name,
+                notif,
+                len(prefill_data_indices),
+                len(dst_data_indices),
+            )
+            self._send_transfer_notif(peer_name, notif)
+            return None
+
         # group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices
         )
+
+        if not prefill_kv_blocks or not dst_kv_blocks:
+            logger.debug(
+                "send empty grouped kvcache notification to %s with notif %s",
+                peer_name,
+                notif,
+            )
+            self._send_transfer_notif(peer_name, notif)
+            return None
 
         logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs

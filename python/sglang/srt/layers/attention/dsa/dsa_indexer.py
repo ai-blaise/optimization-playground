@@ -611,7 +611,6 @@ class Indexer(MultiPlatformOp):
             return weights
         return weights.float()
 
-    @torch.compile(dynamic=True)
     def _project_and_scale_head_gates(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
     ):
@@ -619,7 +618,6 @@ class Indexer(MultiPlatformOp):
         weights = weights * self.n_heads**-0.5
         return weights
 
-    @torch.compile(dynamic=True)
     def _get_logits_head_gate(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
     ):
@@ -1003,7 +1001,7 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
         seqlens_32: torch.Tensor,
     ) -> bool:
-        if not (uses_hisa(self.dsa_indexer_mode) or self.enable_hisparse):
+        if not uses_hisa(self.dsa_indexer_mode):
             return False
         if self.hisa_execution_mode != "optimized":
             return False
@@ -1036,7 +1034,7 @@ class Indexer(MultiPlatformOp):
     ) -> bool:
         if not self.enable_dsa_nvfp4_hisa:
             return False
-        if not (uses_hisa(self.dsa_indexer_mode) or self.enable_hisparse):
+        if not uses_hisa(self.dsa_indexer_mode):
             return False
         if self.hisa_execution_mode != "optimized":
             return False
@@ -1080,6 +1078,52 @@ class Indexer(MultiPlatformOp):
             self._hisa_boundary_len(),
             _hisa_paged_min_seq_len,
             _hisa_paged_decode_min_seq_len,
+        )
+        return max_seq_len >= min_seq_len
+
+    def _should_use_hisa_nvfp4_extend(
+        self,
+        forward_batch: ForwardBatch,
+        metadata: BaseIndexerMetadata,
+        seqlens_32: torch.Tensor,
+    ) -> bool:
+        if not self.enable_dsa_nvfp4_hisa:
+            return False
+        if not uses_hisa(self.dsa_indexer_mode):
+            return False
+        if self.hisa_execution_mode != "optimized":
+            return False
+        if (
+            not _is_cuda
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return False
+        if self.index_topk not in (1024, 2048):
+            return False
+        if self.hisa_block_size != _hisa_nvfp4_block_size:
+            return False
+        if self.hisa_compression_ratio != _hisa_nvfp4_compression_ratio:
+            return False
+        if (
+            self.hisa_compression_ratio <= 0
+            and self.hisa_block_topk != _hisa_nvfp4_block_topk
+        ):
+            return False
+        if self.hisa_block_size != 128:
+            return False
+        max_seq_len = _get_hisa_decision_max_seq_len(
+            forward_batch, metadata, seqlens_32
+        )
+        if max_seq_len is None:
+            return False
+        if self.hisa_compression_ratio > 0:
+            if not _has_deep_gemm_kernel("fp8_fp4_mqa_logits"):
+                return max_seq_len > 0
+            return max_seq_len > self.index_topk
+        min_seq_len = max(
+            self.hisa_min_seq_len,
+            self._hisa_boundary_len(),
+            _hisa_paged_min_seq_len,
         )
         return max_seq_len >= min_seq_len
 
@@ -1214,12 +1258,33 @@ class Indexer(MultiPlatformOp):
             if topk_relative is None:
                 return None
 
+        topk_offset = metadata.attn_metadata.topk_indices_offset
+        if topk_offset is not None:
+            topk_offset = topk_offset[:q_offset].to(
+                device=q_values.device, dtype=torch.int32
+            )
+            if topk_offset.ndim == 1:
+                topk_offset = topk_offset.unsqueeze(1)
+            topk_result[:q_offset] = torch.where(
+                topk_relative < 0,
+                torch.full_like(topk_relative, -1),
+                topk_relative.to(torch.int32) + topk_offset,
+            )
+            return topk_result
+
         block_tables = metadata.get_page_table_1()
+        token_block_tables = block_tables.index_select(
+            0, token_to_batch_idx.to(dtype=torch.long)
+        )
         safe_topk_relative = torch.where(topk_relative < 0, 0, topk_relative)
         topk_result[:q_offset] = torch.where(
             topk_relative < 0,
             -1,
-            torch.gather(block_tables[:q_offset], dim=1, index=safe_topk_relative.long()),
+            torch.gather(
+                token_block_tables,
+                dim=1,
+                index=safe_topk_relative.long(),
+            ),
         )
         return topk_result
 
@@ -1269,7 +1334,7 @@ class Indexer(MultiPlatformOp):
     def _should_use_hisa_extend(
         self, forward_batch: ForwardBatch, metadata: BaseIndexerMetadata
     ) -> bool:
-        if not (uses_hisa(self.dsa_indexer_mode) or self.enable_hisparse):
+        if not uses_hisa(self.dsa_indexer_mode):
             return False
         if self.hisa_execution_mode != "optimized":
             return False
@@ -1481,6 +1546,9 @@ class Indexer(MultiPlatformOp):
         hisa_extend_ok = (not is_nvfp4) and self._should_use_hisa_extend(
             forward_batch, metadata
         )
+        hisa_nvfp4_extend_ok = is_nvfp4 and self._should_use_hisa_nvfp4_extend(
+            forward_batch, metadata, metadata.get_indexer_seq_len()
+        )
         hisa_boundary_q = self.hisa_block_size * 16
 
         if hisa_extend_ok and q_offset >= hisa_boundary_q:
@@ -1513,6 +1581,50 @@ class Indexer(MultiPlatformOp):
                 hisa_boundary_q=int(hisa_boundary_q),
             )
             return result
+
+        if hisa_nvfp4_extend_ok:
+            index_k_with_scale_buffer = (
+                forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                    layer_id=layer_id
+                )
+            )
+            profile_start = _hisa_profile_start(device)
+            result = self._get_topk_hisa_nvfp4_paged(
+                q_fp8,
+                index_k_with_scale_buffer,
+                block_tables,
+                metadata.get_indexer_seq_len(),
+                weights,
+                metadata,
+            )
+            if result is not None:
+                _hisa_profile_end(
+                    "hisa_nvfp4_extend",
+                    profile_start,
+                    device,
+                    layer_id=int(layer_id),
+                    forward_mode=str(forward_batch.forward_mode),
+                    q_offset=int(q_offset),
+                    q_tokens=int(token_nums),
+                    batch_size=int(batch_size),
+                    page_size=int(page_size),
+                    has_dense_nvfp4_kernel=bool(
+                        _has_deep_gemm_kernel("fp8_fp4_mqa_logits")
+                    ),
+                )
+                return result
+            _hisa_profile_end(
+                "hisa_nvfp4_extend_skip",
+                profile_start,
+                device,
+                layer_id=int(layer_id),
+                forward_mode=str(forward_batch.forward_mode),
+                q_offset=int(q_offset),
+                q_tokens=int(token_nums),
+                batch_size=int(batch_size),
+                page_size=int(page_size),
+                reason="runtime_fallback",
+            )
 
         profile_start = _hisa_profile_start(device)
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
@@ -1592,7 +1704,7 @@ class Indexer(MultiPlatformOp):
                 page_size=int(page_size),
                 max_seq_len=int(max_seq_len),
                 seq_len_sum=int(seq_len_sum),
-                hisa_eligible=bool(hisa_extend_ok),
+                hisa_eligible=bool(hisa_extend_ok or hisa_nvfp4_extend_ok),
                 hisa_boundary_q=int(hisa_boundary_q),
                 chunked=False,
             )
@@ -1690,7 +1802,7 @@ class Indexer(MultiPlatformOp):
             page_size=int(page_size),
             max_seq_len=int(max_seq_len),
             seq_len_sum=int(seq_len_sum),
-            hisa_eligible=bool(hisa_extend_ok),
+            hisa_eligible=bool(hisa_extend_ok or hisa_nvfp4_extend_ok),
             hisa_boundary_q=int(hisa_boundary_q),
             chunked=True,
             max_rows=int(max_rows),

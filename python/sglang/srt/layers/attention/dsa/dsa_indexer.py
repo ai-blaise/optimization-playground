@@ -399,6 +399,22 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def _get_hisa_decision_max_seq_len(
+    forward_batch: ForwardBatch,
+    metadata: BaseIndexerMetadata,
+    seqlens_32: torch.Tensor,
+) -> Optional[int]:
+    seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+    if seq_lens_cpu is not None and len(seq_lens_cpu) != 0:
+        return int(seq_lens_cpu.max().item())
+    forward_seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if forward_seq_lens_cpu is not None and len(forward_seq_lens_cpu) != 0:
+        return int(forward_seq_lens_cpu.max().item())
+    if seqlens_32.is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
+    return int(seqlens_32.max().item())
+
+
 class Indexer(MultiPlatformOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
@@ -981,22 +997,6 @@ class Indexer(MultiPlatformOp):
     def _hisa_boundary_len(self) -> int:
         return self.hisa_block_size * self.hisa_block_topk
 
-    def _get_hisa_decision_max_seq_len(
-        self,
-        forward_batch: ForwardBatch,
-        metadata: BaseIndexerMetadata,
-        seqlens_32: torch.Tensor,
-    ) -> Optional[int]:
-        seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
-        if seq_lens_cpu is not None and len(seq_lens_cpu) != 0:
-            return int(seq_lens_cpu.max().item())
-        forward_seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-        if forward_seq_lens_cpu is not None and len(forward_seq_lens_cpu) != 0:
-            return int(forward_seq_lens_cpu.max().item())
-        if seqlens_32.is_cuda and torch.cuda.is_current_stream_capturing():
-            return None
-        return int(seqlens_32.max().item())
-
     def _should_use_hisa_paged(
         self,
         forward_batch: ForwardBatch,
@@ -1023,7 +1023,7 @@ class Indexer(MultiPlatformOp):
             _hisa_paged_min_seq_len,
             _hisa_paged_decode_min_seq_len,
         )
-        max_seq_len = self._get_hisa_decision_max_seq_len(
+        max_seq_len = _get_hisa_decision_max_seq_len(
             forward_batch, metadata, seqlens_32
         )
         return max_seq_len is not None and max_seq_len > min_seq_len
@@ -1066,7 +1066,7 @@ class Indexer(MultiPlatformOp):
             and sum(metadata.get_dsa_extend_len_cpu()) < _hisa_paged_min_query_len
         ):
             return False
-        max_seq_len = self._get_hisa_decision_max_seq_len(
+        max_seq_len = _get_hisa_decision_max_seq_len(
             forward_batch, metadata, seqlens_32
         )
         if max_seq_len is None:

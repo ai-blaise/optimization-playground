@@ -392,7 +392,15 @@ class SMCResampler:
     def _abort_pending_parent_group(self, req: Req, scheduler, error: str) -> None:
         req.finished_reason = FINISH_ABORT(error)
         req.finished_len = len(req.output_ids)
-        scheduler.maybe_collect_routed_experts(req)
+        # `maybe_collect_routed_experts` is only bound on the Scheduler when
+        # its output-processor mixin is applied (the disaggregated PD path).
+        # On the aggregated path the method is absent — calling it raises
+        # AttributeError which then cascades into a PyGILState_Release fatal
+        # and kills the decode pod (exit code 139, "1-token-then-EOS" symptom).
+        # `getattr` it defensively so the abort cleanup completes regardless.
+        collector = getattr(scheduler, "maybe_collect_routed_experts", None)
+        if collector is not None:
+            collector(req)
         release_kv_cache(req, scheduler.tree_cache)
         req.time_stats.set_completion_time()
         scheduler.stream_output([req], False)

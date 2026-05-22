@@ -460,7 +460,10 @@ class SchedulerOutputProcessorMixin:
 
         for i, req in smc_parent_group_jobs:
             assert self.smc_resampler is not None
-            if hasattr(self.smc_resampler, "enqueue_parent_group"):
+            if (
+                self.disaggregation_mode == DisaggregationMode.NULL
+                and hasattr(self.smc_resampler, "enqueue_parent_group")
+            ):
                 self.smc_resampler.enqueue_parent_group(req)
             else:
                 self.model_worker.materialize_smc_parent_draft_prefix(req)

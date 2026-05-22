@@ -430,6 +430,19 @@ class SMCResampler:
                 ) / 1_000_000
             except Exception as exc:
                 error = f"SMC parent draft prefill failed: {exc}"
+                # Diagnostic: always log the full traceback for SMC parent
+                # prefill failures. Without this the error is silently swallowed
+                # and only surfaces as `FINISH_ABORT` in the client stream,
+                # which made it impossible to identify the aggregated-mode
+                # SMC-on-agg incompat on a4-us-002-rl9.
+                import logging
+                import traceback
+                logging.getLogger("sglang.smc.resampler").error(
+                    "SMC parent draft prefill exception for rid=%s: %s\n%s",
+                    getattr(req, "rid", "<unknown>"),
+                    exc,
+                    traceback.format_exc(),
+                )
 
             if error is not None:
                 if smc_probe_enabled:

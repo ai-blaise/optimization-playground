@@ -52,7 +52,18 @@ def clone_req_for_smc_particle(
 
     particle_req = Req(
         rid=f"{parent_req.rid}_smc_p{particle_idx}_particle",
-        origin_input_text=parent_req.origin_input_text,
+        # parent_req lacks `origin_input_text` when the request arrived via the
+        # raw-token-ids path (e.g. `--dataset-name random-ids` in the bench
+        # client, or any OpenAI-completions request that submits `prompt` as a
+        # list of token ids rather than a string). Reading the attribute
+        # directly raises AttributeError, which propagates out of
+        # `smc_manager.create_group` -> caught by `_drain_pending_parent_groups`
+        # -> request aborted via `FINISH_ABORT`. On the aggregated topology
+        # that abort path crashed the pod via PyGILState_Release (fixed in
+        # 4999d3d8). The defensive `getattr` here lets the SMC particles
+        # inherit None for the original text — the particles never need the
+        # raw text, only the token ids passed below.
+        origin_input_text=getattr(parent_req, "origin_input_text", None),
         origin_input_ids=list(parent_req.origin_input_ids),
         sampling_params=sampling_params,
         return_logprob=return_logprob,

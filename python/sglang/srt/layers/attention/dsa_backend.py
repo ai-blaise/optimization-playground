@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
+import os
+import sys
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
 
 import torch
@@ -102,6 +104,19 @@ _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is
 def _require_tokenspeed_mla():
     try:
         import tokenspeed_mla
+    except ModuleNotFoundError as exc:
+        if exc.name != "tokenspeed_mla":
+            raise ImportError(_TOKENSPEED_INSTALL_HINT) from exc
+        deps_path = os.environ.get(
+            "SGLANG_TOKENSPEED_MLA_PATH",
+            "/opt/optimization-playground/python-deps",
+        )
+        if deps_path and deps_path not in sys.path:
+            sys.path.append(deps_path)
+        try:
+            import tokenspeed_mla
+        except ImportError as retry_exc:
+            raise ImportError(_TOKENSPEED_INSTALL_HINT) from retry_exc
     except ImportError as exc:
         raise ImportError(_TOKENSPEED_INSTALL_HINT) from exc
     return tokenspeed_mla

@@ -443,6 +443,7 @@ class SchedulerOutputProcessorMixin:
                         "duration_ms": stream_duration_ms,
                     }
                 )
+            time.sleep(envs.SGLANG_SMC_PREFILL_STREAM_YIELD_MS.get() / 1000.0)
             for req in smc_prefill_stream_candidates:
                 streamed = req.send_token_offset > before_offsets[req.rid]
                 if smc_probe_enabled:

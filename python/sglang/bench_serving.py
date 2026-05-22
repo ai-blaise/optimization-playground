@@ -209,7 +209,11 @@ async def async_request_trt_llm(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data:")
+                        chunk = remove_prefix(
+                            chunk_bytes.decode("utf-8"), "data:"
+                        ).strip()
+                        if not chunk:
+                            continue
 
                         data = json.loads(chunk)
                         output.generated_text += data["text_output"]
@@ -310,7 +314,11 @@ async def async_request_openai_completions(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        chunk = remove_prefix(
+                            chunk_bytes.decode("utf-8"), "data: "
+                        ).strip()
+                        if not chunk:
+                            continue
                         latency = time.perf_counter() - st
                         if chunk == "[DONE]":
                             pass
@@ -477,7 +485,11 @@ async def async_request_openai_chat_completions(
                             if not chunk_bytes:
                                 continue
 
-                            chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                            chunk = remove_prefix(
+                                chunk_bytes.decode("utf-8"), "data: "
+                            ).strip()
+                            if not chunk:
+                                continue
                             latency = time.perf_counter() - st
                             if chunk == "[DONE]":
                                 pass
@@ -580,7 +592,11 @@ async def async_request_truss(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        chunk = remove_prefix(
+                            chunk_bytes.decode("utf-8"), "data: "
+                        ).strip()
+                        if not chunk:
+                            continue
                         latency = time.perf_counter() - st
                         if chunk == "[DONE]":
                             pass
@@ -679,7 +695,11 @@ async def async_request_sglang_generate(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        chunk = remove_prefix(
+                            chunk_bytes.decode("utf-8"), "data: "
+                        ).strip()
+                        if not chunk:
+                            continue
                         latency = time.perf_counter() - st
                         if chunk == "[DONE]":
                             pass

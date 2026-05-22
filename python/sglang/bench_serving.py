@@ -701,13 +701,15 @@ async def async_request_sglang_generate(
             ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
+                        chunk = chunk_bytes.decode("utf-8").strip()
+                        if not chunk or chunk.startswith(":"):
                             continue
-
-                        chunk = remove_prefix(
-                            chunk_bytes.decode("utf-8"), "data: "
-                        ).strip()
+                        if chunk.startswith("data: "):
+                            chunk = chunk[len("data: "):].strip()
+                        elif chunk.startswith("data:"):
+                            chunk = chunk[len("data:"):].strip()
+                        else:
+                            continue
                         if not chunk:
                             continue
                         latency = time.perf_counter() - st

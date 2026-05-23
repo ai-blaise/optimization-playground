@@ -144,7 +144,15 @@ def create_triton_backend(runner):
         "Please use `--attention-backend flashinfer`."
     )
     from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+    from sglang.srt.mem_cache.memory_pool import HiggsMHA2BitTokenToKVPool
 
+    pool = getattr(runner, "token_to_kv_pool", None)
+    if isinstance(pool, HiggsMHA2BitTokenToKVPool):
+        from sglang.srt.layers.attention.higgs_triton_backend import (
+            HiggsTritonAttnBackend,
+        )
+
+        return HiggsTritonAttnBackend(runner)
     return TritonAttnBackend(runner)
 
 

@@ -1514,12 +1514,30 @@ class HiggsMHA2BitTokenToKVPool(MHATokenToKVPool):
         )
 
     def _get_key_buffer(self, layer_id: int):
+        # Legacy path: materialize the full packed cache back to BF16.
+        # This is O(layer_cache_size) per call and adds 200-600x to
+        # decode latency vs FP8 baseline; only the fused
+        # ``HiggsTritonAttnBackend`` is correct for production. Kept
+        # for backends that don't yet have a fused HIGGS-aware path
+        # (e.g. CPU-only correctness oracles).
         packed = self.k_buffer[layer_id - self.start_layer]
         return self._higgs_k_codec.decompress(packed, self.dtype)
 
     def _get_value_buffer(self, layer_id: int):
         packed = self.v_buffer[layer_id - self.start_layer]
         return self._higgs_v_codec.decompress(packed, self.dtype)
+
+    def get_packed_key_buffer(self, layer_id: int) -> torch.Tensor:
+        """Return the packed (uint8) K buffer for the fused decode path."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_packed_value_buffer(self, layer_id: int) -> torch.Tensor:
+        """Return the packed (uint8) V buffer for the fused decode path."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.v_buffer[layer_id - self.start_layer]
 
     def set_kv_buffer(
         self,

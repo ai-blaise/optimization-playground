@@ -1,10 +1,15 @@
-"""2-bit HIGGS MHA KV codec for the SMC-SD draft model.
+"""2-bit HIGGS MHA-family KV codec for the SMC-SD draft model.
 
 Companion to ``higgs_dense_2bit_kv.py``. Reuses the EDEN2-16 lattice
 codebook, the orthonormal FWHT primitive, and the 4-bit-pair packing
-helpers, but targets standard multi-head attention K/V caches (the
-SMC-SD draft model GLM-4-9B-FP8-OMP, ``head_dim=128``) instead of the
-DeepSeek MLA latent (``latent_dim=512`` + rope split).
+helpers, but targets MHA-family K/V caches (both MHA and GQA — the
+SMC-SD draft model GLM-4-9B-FP8-OMP has ``head_dim=128`` with GQA:
+``num_attention_heads=32`` Q heads paired with ``num_key_value_heads=2``
+KV heads) instead of the DeepSeek MLA latent (``latent_dim=512`` +
+rope split). The codec operates per-KV-head on
+``(N, num_kv_heads, head_dim)`` tensors and is oblivious to the
+Q-to-KV fan-in; the pool subclass passes ``num_kv_heads`` (per rank,
+already accounting for TP) as ``head_num`` per SGLang convention.
 
 Format (per K-head or V-head, per token)
 ----------------------------------------

@@ -1531,14 +1531,19 @@ class HiggsMHA2BitTokenToKVPool(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        # The codec computes its own per-row FP16 scale (||rotated|| /
+        # sqrt(head_dim)). External per-tensor k_scale / v_scale are
+        # redundant — applying them at store time without an equivalent
+        # multiply on decompress would shift the recovered K/V by
+        # 1/scale, biasing attention. The codec's per-row scale already
+        # carries the magnitude information needed for accurate
+        # reconstruction. k_scale / v_scale are accepted for API parity
+        # with MHATokenToKVPool and silently dropped.
+        del k_scale, v_scale
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
-        if k_scale is not None:
-            cache_k = cache_k.float() / k_scale
-        if v_scale is not None:
-            cache_v = cache_v.float() / v_scale
         packed_k = self._higgs_k_codec.compress(cache_k)
         packed_v = self._higgs_v_codec.compress(cache_v)
         self.k_buffer[layer_id - self.start_layer][loc] = packed_k

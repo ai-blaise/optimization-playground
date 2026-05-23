@@ -46,6 +46,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.wina import (
+    WinaConfig,
+    apply_wina_mask,
+    load_wina_assets,
+    parse_wina_config,
+    projection_norm_key,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -107,6 +114,7 @@ class Glm4MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         reduce_results: bool = True,
+        wina_sparsity: float = 0.0,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -129,6 +137,15 @@ class Glm4MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.wina_sparsity = wina_sparsity
+        if wina_sparsity > 0.0:
+            self.register_buffer(
+                "wina_in_norm",
+                torch.zeros(hidden_size, dtype=torch.bfloat16),
+                persistent=False,
+            )
+        else:
+            self.wina_in_norm = None
 
     def forward(
         self,
@@ -136,8 +153,12 @@ class Glm4MLP(nn.Module):
         forward_batch=None,
         use_reduce_scatter: bool = False,
     ):
+        if self.wina_sparsity > 0.0:
+            x = apply_wina_mask(x, self.wina_in_norm, self.wina_sparsity)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        if self.wina_sparsity > 0.0:
+            x = apply_wina_mask(x, None, self.wina_sparsity)
         x, _ = self.down_proj(
             x,
             skip_all_reduce=use_reduce_scatter,
@@ -161,6 +182,7 @@ class Glm4Attention(nn.Module):
         partial_rotary_factor: float = 0.5,
         bias: bool = True,
         prefix: str = "",
+        wina_sparsity: float = 0.0,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -225,6 +247,15 @@ class Glm4Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+        self.wina_sparsity = wina_sparsity
+        if wina_sparsity > 0.0:
+            self.register_buffer(
+                "wina_in_norm",
+                torch.zeros(hidden_size, dtype=torch.bfloat16),
+                persistent=False,
+            )
+        else:
+            self.wina_in_norm = None
 
     def forward(
         self,
@@ -232,10 +263,16 @@ class Glm4Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if self.wina_sparsity > 0.0:
+            hidden_states = apply_wina_mask(
+                hidden_states, self.wina_in_norm, self.wina_sparsity
+            )
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
+        if self.wina_sparsity > 0.0:
+            attn_output = apply_wina_mask(attn_output, None, self.wina_sparsity)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -254,6 +291,7 @@ class Glm4DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        wina_sparsity: float = 0.0,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -281,6 +319,7 @@ class Glm4DecoderLayer(nn.Module):
             partial_rotary_factor=partial_rotary_factor,
             bias=bias,
             prefix=add_prefix("self_attn", prefix),
+            wina_sparsity=wina_sparsity,
         )
 
         # MLP
@@ -290,6 +329,7 @@ class Glm4DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            wina_sparsity=wina_sparsity,
         )
 
         self.input_layernorm = Glm4RMSNorm(
@@ -341,12 +381,14 @@ class Glm4Model(nn.Module):
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = Glm4DecoderLayer,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        wina_config: Optional[WinaConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        self.wina_config = wina_config
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -359,6 +401,8 @@ class Glm4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        wina_sparsity = wina_config.sparsity if wina_config is not None else 0.0
+
         # Use the provided decoder layer type or default to Glm4DecoderLayer
         decoder_layer_type = decoder_layer_type or Glm4DecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
@@ -369,6 +413,7 @@ class Glm4Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
+                wina_sparsity=wina_sparsity,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
@@ -466,13 +511,19 @@ class Glm4ForCausalLM(nn.Module):
         config: Glm4Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        model_path: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        self.model_path = model_path
+        self.wina_config = parse_wina_config(config)
         self.model = Glm4Model(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+            wina_config=self.wina_config,
         )
 
         # handle the lm head on different pp ranks
@@ -661,6 +712,50 @@ class Glm4ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+        if self.wina_config is not None:
+            self._load_wina_norms()
+
+    def _load_wina_norms(self) -> None:
+        if self.model_path is None:
+            raise RuntimeError(
+                "Glm4ForCausalLM has wina_config but model_path was not "
+                "passed; check the model loader's WINA gate."
+            )
+        norms = load_wina_assets(self.model_path, self.wina_config)
+        attn_proj = next(
+            (p["name"] for p in self.wina_config.projections
+             if p["name"] == "k_proj" and p["applies_column_norm"]),
+            None,
+        )
+        mlp_proj = next(
+            (p["name"] for p in self.wina_config.projections
+             if p["name"] == "gate_up_proj" and p["applies_column_norm"]),
+            None,
+        )
+        if attn_proj is None or mlp_proj is None:
+            raise RuntimeError(
+                "wina_config does not list k_proj + gate_up_proj as the "
+                "norm-bearing projections; this loader assumes the GLM-4 "
+                "QKV+gate_up fused layout."
+            )
+        for layer_idx in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[layer_idx]
+            attn_key = projection_norm_key(layer_idx, attn_proj)
+            mlp_key = projection_norm_key(layer_idx, mlp_proj)
+            attn_norm = norms.get(attn_key)
+            mlp_norm = norms.get(mlp_key)
+            if attn_norm is None or mlp_norm is None:
+                raise RuntimeError(
+                    f"WINA norms missing for layer {layer_idx}: "
+                    f"{attn_key!r} or {mlp_key!r} not in norms file."
+                )
+            layer.self_attn.wina_in_norm.copy_(
+                attn_norm.to(layer.self_attn.wina_in_norm.device)
+            )
+            layer.mlp.wina_in_norm.copy_(
+                mlp_norm.to(layer.mlp.wina_in_norm.device)
+            )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

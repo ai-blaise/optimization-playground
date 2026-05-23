@@ -24,11 +24,13 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.attention.triton_backend import (
+    TritonAttnBackend,
+    logit_capping_mod,
+)
 from sglang.srt.layers.attention.triton_ops.higgs_decode_attention import (
     decode_attention_fwd_higgs,
 )
-from sglang.srt.layers.attention.utils import logit_capping_mod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HiggsMHA2BitTokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch

@@ -2211,6 +2211,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
+        elif self.server_args.kv_cache_dtype == "higgs_2bit":
+            # HIGGS 2-bit MHA pool stores packed slots as uint8; the
+            # logical decompressed dtype stays the model dtype (BF16).
+            self.kv_cache_dtype = self.dtype
+            self.use_higgs_mha_2bit_kv_cache = True
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."

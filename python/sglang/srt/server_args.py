@@ -6104,12 +6104,21 @@ class ServerArgs:
         parser.add_argument(
             "--smc-draft-kv-cache-dtype",
             type=str,
-            choices=("auto", "bfloat16", "bf16", "fp8_e4m3", "fp8_e5m2"),
+            choices=(
+                "auto",
+                "bfloat16",
+                "bf16",
+                "fp8_e4m3",
+                "fp8_e5m2",
+                "higgs_2bit",
+            ),
             default=ServerArgs.smc_draft_kv_cache_dtype,
             help=(
                 "SMC-only draft-model KV cache dtype override. This keeps the "
                 "target model's --kv-cache-dtype unchanged, which is required "
-                "when the target uses dense TurboQuant KV."
+                "when the target uses dense TurboQuant KV. ``higgs_2bit`` "
+                "stores each K/V row as a HIGGS 2-bit packed slot, 3.76x "
+                "smaller than fp8_e4m3."
             ),
         )
         parser.add_argument(

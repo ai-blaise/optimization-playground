@@ -314,11 +314,11 @@ def _handle_smc(server_args: "ServerArgs") -> None:
         server_args.smc_draft_kv_cache_dtype = "bfloat16"
     if server_args.smc_draft_kv_cache_dtype is not None and (
         server_args.smc_draft_kv_cache_dtype
-        not in ("auto", "bfloat16", "fp8_e4m3", "fp8_e5m2")
+        not in ("auto", "bfloat16", "fp8_e4m3", "fp8_e5m2", "higgs_2bit")
     ):
         raise ValueError(
             "--smc-draft-kv-cache-dtype must be one of auto, bfloat16, "
-            "fp8_e4m3, or fp8_e5m2."
+            "fp8_e4m3, fp8_e5m2, or higgs_2bit."
         )
 
     server_args.enable_mixed_chunk = False

@@ -36,6 +36,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
 )
 from sglang.srt.layers.quantization.higgs_dense_2bit_kv import HiggsDense2BitConfig
+from sglang.srt.layers.quantization.higgs_mha_2bit_kv import HiggsMHA2BitConfig
 from sglang.srt.layers.quantization.turboquant_dense_kv import TurboQuantDenseKVConfig
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -177,6 +178,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 k = model_config.head_dim
                 cell_size = (cell_size // 2) + (
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
+                )
+
+            if getattr(mr, "use_higgs_mha_2bit_kv_cache", False):
+                num_kv_heads_local = model_config.get_num_kv_heads(tp_size)
+                k_slot = HiggsMHA2BitConfig(head_dim=model_config.head_dim).slot_bytes
+                v_slot = HiggsMHA2BitConfig(head_dim=model_config.v_head_dim).slot_bytes
+                cell_size = (
+                    num_kv_heads_local * (k_slot + v_slot) * num_layers
                 )
 
         return cell_size

@@ -1437,6 +1437,114 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class HiggsMHA2BitTokenToKVPool(MHATokenToKVPool):
+    """MHA KV pool that stores K/V rows as 2-bit HIGGS packed slots.
+
+    Used by the SMC-SD draft model to compress the per-head KV footprint
+    by 3.76x vs FP8 and 7.53x vs BF16. The codec lives in
+    ``sglang.srt.layers.quantization.higgs_mha_2bit_kv``.
+
+    The decode path materializes the packed buffer back to the requested
+    dtype (BF16 by default) on demand inside ``_get_key_buffer`` /
+    ``_get_value_buffer``. This keeps the existing dense Triton decode
+    kernel unchanged; a fused dequant-inside-attention kernel is a
+    follow-on optimization.
+    """
+
+    def _create_buffers(self):
+        from sglang.srt.layers.quantization.higgs_mha_2bit_kv import (
+            HiggsMHA2BitCodec,
+            HiggsMHA2BitConfig,
+        )
+
+        self._higgs_k_config = HiggsMHA2BitConfig(head_dim=self.head_dim)
+        self._higgs_v_config = HiggsMHA2BitConfig(head_dim=self.v_head_dim)
+        self._higgs_k_codec = HiggsMHA2BitCodec(
+            self._higgs_k_config, torch.device(self.device)
+        )
+        self._higgs_v_codec = HiggsMHA2BitCodec(
+            self._higgs_v_config, torch.device(self.device)
+        )
+        # Force uint8 storage so ``index_put_`` works on the packed rows.
+        self.store_dtype = torch.uint8
+
+        k_slot_bytes = self._higgs_k_config.slot_bytes
+        v_slot_bytes = self._higgs_v_config.slot_bytes
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                self.k_buffer = [
+                    torch.zeros(
+                        (m, self.head_num, k_slot_bytes),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (m, self.head_num, v_slot_bytes),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+    def _get_key_buffer(self, layer_id: int):
+        packed = self.k_buffer[layer_id - self.start_layer]
+        return self._higgs_k_codec.decompress(packed, self.dtype)
+
+    def _get_value_buffer(self, layer_id: int):
+        packed = self.v_buffer[layer_id - self.start_layer]
+        return self._higgs_v_codec.decompress(packed, self.dtype)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        if k_scale is not None:
+            cache_k = cache_k.float() / k_scale
+        if v_scale is not None:
+            cache_v = cache_v.float() / v_scale
+        packed_k = self._higgs_k_codec.compress(cache_k)
+        packed_v = self._higgs_v_codec.compress(cache_v)
+        self.k_buffer[layer_id - self.start_layer][loc] = packed_k
+        self.v_buffer[layer_id - self.start_layer][loc] = packed_v
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 

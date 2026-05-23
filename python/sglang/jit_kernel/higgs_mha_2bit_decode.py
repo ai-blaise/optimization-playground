@@ -48,15 +48,33 @@ def _jit_higgs_mha_2bit_decode_module() -> "Module":
     )
 
 
-def _choose_num_splits(kv_len_hint: int) -> int:
-    """Heuristic: target chunk_size = 128 tokens per split, capped at 16."""
-    if kv_len_hint <= 0:
+_NUM_SMS_B200 = 148
+_TARGET_BLOCKS_PER_SM = 8
+_MIN_TOKENS_PER_SPLIT = 32  # one BLOCK_N tile
+
+
+def _choose_num_splits(kv_len_hint: int, num_rows: int, num_kv_heads: int) -> int:
+    """Pick num_splits to fill the GPU.
+
+    Goal: ``num_rows * num_kv_heads * num_splits >= num_sms * target`` so
+    the stage-1 grid yields ~``_TARGET_BLOCKS_PER_SM`` blocks per SM,
+    while keeping at least one BLOCK_N=32 tile per split.
+
+    Empirical sweep on B200 (B=12, kv=2) showed monotonic speedup with
+    num_splits all the way to 128 at S=131k; the ceiling at small S is
+    set by the kv_len / tile-size budget.
+    """
+    if kv_len_hint <= 0 or num_rows <= 0 or num_kv_heads <= 0:
         return 1
-    s = (kv_len_hint + 127) // 128
+    base_blocks = num_rows * num_kv_heads
+    target_total = _NUM_SMS_B200 * _TARGET_BLOCKS_PER_SM
+    splits_needed = (target_total + base_blocks - 1) // base_blocks
+    splits_cap_by_len = max(kv_len_hint // _MIN_TOKENS_PER_SPLIT, 1)
+    s = min(splits_needed, splits_cap_by_len)
     if s < 1:
         return 1
-    if s > 16:
-        return 16
+    if s > 128:
+        return 128
     return s
 
 
@@ -110,7 +128,7 @@ def higgs_mha_2bit_decode(
 
     # Average kv_len drives the split count.
     kv_len_hint = total_kv // max(num_rows, 1)
-    num_splits = _choose_num_splits(kv_len_hint)
+    num_splits = _choose_num_splits(kv_len_hint, num_rows, num_kv_heads)
 
     # Scratch shape matches the kernel TensorMatcher: (R, K_kv, P, H, 2+D).
     mid = torch.empty(

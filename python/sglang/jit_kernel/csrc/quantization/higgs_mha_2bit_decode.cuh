@@ -63,6 +63,17 @@ constexpr int kWarpSize = 32;
 constexpr int kNumWarps = kBlockThreads / kWarpSize;  // 4
 constexpr int kHeadsPerWarp = kBlockH / kNumWarps;    // 4
 
+// SMEM row stride for `[row][kHeadDim]` BF16 layouts. With raw 128-BF16
+// stride the bank offset between rows is 64 four-byte words = 0 mod 32,
+// so all 32 lanes reading row=lane hit the same bank (32-way conflict).
+// Padding by 2 BF16 (4 bytes = 1 word) makes bank stride 65 mod 32 = 1
+// (coprime to 32) -> conflict free.
+constexpr int kSmemRowStrideBF16 = kHeadDim + 2;      // 130 BF16 = 260 B
+// FP32 acc_smem: stride 128 fp32 = 128 words mod 32 = 0 (32-way conflict
+// when lane reads acc[h][lane]). Pad +1 fp32 -> stride 129 mod 32 = 1
+// (coprime) -> conflict free.
+constexpr int kSmemRowStrideF32 = kHeadDim + 1;       // 129 fp32 = 516 B
+
 // Per-(row, kv_head, split, Q-head) partial: 2 floats (m, l) + 128
 // floats (acc). Layout in the mid tensor:
 //   mid[row, kv_head, split, Q-head_in_block, 0]      = m
@@ -162,12 +173,12 @@ higgs_mha_2bit_decode_stage1_split_kernel(
 
   __shared__ float smem128[kBlockThreads];
   __shared__ float cb_smem[kCodebookSize * kPairDim];
-  __shared__ bf16_t q_smem[kBlockH][kHeadDim];           // 4 KB
-  __shared__ bf16_t k_tile_smem[kBlockN][kHeadDim];      // 8 KB
-  __shared__ bf16_t v_tile_smem[kBlockN][kHeadDim];      // 8 KB
-  __shared__ float  qk_smem[kBlockH][kBlockN];           // 2 KB
-  __shared__ float  softmax_state[kBlockH][3];           // m, l, alpha
-  __shared__ float  acc_smem[kBlockH][kHeadDim];         // 8 KB
+  __shared__ bf16_t q_smem[kBlockH][kSmemRowStrideBF16];           // 4.2 KB
+  __shared__ bf16_t k_tile_smem[kBlockN][kSmemRowStrideBF16];      // 8.3 KB
+  __shared__ bf16_t v_tile_smem[kBlockN][kSmemRowStrideBF16];      // 8.3 KB
+  __shared__ float  qk_smem[kBlockH][kBlockN];                     // 2 KB
+  __shared__ float  softmax_state[kBlockH][3];                     // m, l, alpha
+  __shared__ float  acc_smem[kBlockH][kSmemRowStrideF32];          // 8.25 KB
 
   if (tid < kCodebookSize * kPairDim) {
     cb_smem[tid] = __ldg(&codebook[tid]);

@@ -49,32 +49,45 @@ def _jit_higgs_mha_2bit_decode_module() -> "Module":
 
 
 _NUM_SMS_B200 = 148
-_TARGET_BLOCKS_PER_SM = 8
-_MIN_TOKENS_PER_SPLIT = 32  # one BLOCK_N tile
+_TILE_TOKENS = 32  # BLOCK_N
+_MAX_SPLITS = 256
 
 
 def _choose_num_splits(kv_len_hint: int, num_rows: int, num_kv_heads: int) -> int:
     """Pick num_splits to fill the GPU.
 
-    Goal: ``num_rows * num_kv_heads * num_splits >= num_sms * target`` so
-    the stage-1 grid yields ~``_TARGET_BLOCKS_PER_SM`` blocks per SM,
-    while keeping at least one BLOCK_N=32 tile per split.
+    Split count tracks two competing goals:
+    * Enough stage-1 blocks to fill ~``num_sms * BPSM`` slots, where BPSM
+      scales with kv_len: at small S the per-block setup cost dominates,
+      so we want fewer-but-larger blocks (BPSM=4); at long S each tile
+      iter is cheap relative to stage-2 merge cost, so we want more
+      blocks (BPSM=16).
+    * Each split must process at least one BLOCK_N tile.
 
-    Empirical sweep on B200 (B=12, kv=2) showed monotonic speedup with
-    num_splits all the way to 128 at S=131k; the ceiling at small S is
-    set by the kv_len / tile-size budget.
+    Empirical sweep on B200 (B=12, num_kv=2): optimal splits 24 at
+    S=1024, 128 at S=8192, 256 at S=131k.
     """
     if kv_len_hint <= 0 or num_rows <= 0 or num_kv_heads <= 0:
         return 1
     base_blocks = num_rows * num_kv_heads
-    target_total = _NUM_SMS_B200 * _TARGET_BLOCKS_PER_SM
-    splits_needed = (target_total + base_blocks - 1) // base_blocks
-    splits_cap_by_len = max(kv_len_hint // _MIN_TOKENS_PER_SPLIT, 1)
-    s = min(splits_needed, splits_cap_by_len)
+    # Two regimes:
+    # * Small S (per-block FWHT setup dominates): pick splits so each
+    #   block lands ~5 tile-iters of work (kv_len / 5 tokens/split).
+    # * Long S (inner loop dominates): cap at _MAX_SPLITS, gated by
+    #   stage-2 merge cost which is O(num_splits) per output Q-head.
+    # Empirically at B=12, num_kv=2 the optimum is ~24 splits at
+    # S=1024 and ~256 splits at S>=131k.
+    # Empirically tuned on B200 (B=12, num_kv=2):
+    #   S=1024  -> 24 splits, S=8192 -> 128, S=131072 -> 256.
+    # Roughly splits = min(_MAX_SPLITS, kv_len / 64), bounded below by
+    # the fill heuristic so small-B cases don't starve SMs.
+    splits_for_amort = max(1, kv_len_hint // 64)
+    splits_for_fill = max(1, (_NUM_SMS_B200 * 4 + base_blocks - 1) // base_blocks)
+    splits_cap_by_len = max(kv_len_hint // _TILE_TOKENS, 1)
+    s = min(max(splits_for_amort, splits_for_fill),
+            splits_cap_by_len, _MAX_SPLITS)
     if s < 1:
         return 1
-    if s > 128:
-        return 128
     return s
 
 

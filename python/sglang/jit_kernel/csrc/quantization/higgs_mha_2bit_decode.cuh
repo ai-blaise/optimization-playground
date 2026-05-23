@@ -215,15 +215,17 @@ higgs_mha_2bit_decode_stage1_split_kernel(
   __shared__ bf16_t v_tile_smem[kBlockN][kSmemRowStrideBF16];      // 8.3 KB
   __shared__ float  qk_smem[kBlockH][kBlockN];                     // 2 KB
   __shared__ float  softmax_state[kBlockH][3];                     // m, l, alpha
-  __shared__ float  acc_smem[kBlockH][kSmemRowStrideF32];          // 8.25 KB
 
   if (tid < kCodebookSize * kPairDim) {
     cb_smem[tid] = __ldg(&codebook[tid]);
   }
 
-  // Initialize accumulator + softmax state.
+  // Per-thread accumulator in registers: each thread owns dim=tid for
+  // all kBlockH Q heads (16 floats = 64 B/thread, 8 KB across block).
+  // Keeping it out of SMEM saves one SMEM RW per inner-loop fma.
+  float acc[kBlockH];
 #pragma unroll
-  for (int h = 0; h < kBlockH; ++h) acc_smem[h][tid] = 0.0f;
+  for (int h = 0; h < kBlockH; ++h) acc[h] = 0.0f;
   if (tid < kBlockH) {
     softmax_state[tid][0] = kNegInf;
     softmax_state[tid][1] = 0.0f;
@@ -279,8 +281,10 @@ higgs_mha_2bit_decode_stage1_split_kernel(
     }
     __syncthreads();
 
-    // q @ K^T: warp w owns rows h_base..h_base+kHeadsPerWarp.
-    // Lane l owns col n = lane.
+    // q @ K^T + per-head softmax + V_tile dequant, all in one fused pass.
+    // Warp w owns rows h_base..h_base+kHeadsPerWarp. Lane l owns col
+    // n=lane. qk[i] register-resident through softmax; then p[i] written
+    // to qk_smem for p@V (which has different per-thread layout).
     {
       const int h_base = warp_id * kHeadsPerWarp;
       const int n = lane;
@@ -296,79 +300,85 @@ higgs_mha_2bit_decode_stage1_split_kernel(
           qk[i] += qv * kv;
         }
       }
+
+      // Per-head online softmax via warp-reduce. Each warp folds 4 heads
+      // in parallel; lane l holds the n=l score for each head.
+      // Threads with n >= tile_n contribute -inf so they're masked out.
+      const bool n_in = (n < tile_n);
+#pragma unroll
+      for (int i = 0; i < kHeadsPerWarp; ++i) {
+        const int h = h_base + i;
+        const bool h_in = (h < active_h);
+        float s = qk[i] * sm_scale;
+        if (!n_in || !h_in) s = kNegInf;
+        // Per-warp reduce max over n.
+        float m_new = s;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          m_new = fmaxf(m_new, __shfl_xor_sync(0xffffffff, m_new, off));
+        }
+        const float m_old = softmax_state[h][0];
+        const float m_combined = fmaxf(m_old, m_new);
+        const float alpha = __expf(m_old - m_combined);
+        const float p = (s > kNegInf) ? __expf(s - m_combined) : 0.0f;
+        // Per-warp reduce sum over n.
+        float p_sum = p;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          p_sum += __shfl_xor_sync(0xffffffff, p_sum, off);
+        }
+        if (lane == 0) {
+          const float l_old = softmax_state[h][1];
+          softmax_state[h][0] = m_combined;
+          softmax_state[h][1] = l_old * alpha + p_sum;
+          softmax_state[h][2] = alpha;
+        }
+        qk[i] = p;
+      }
+
+      // Stage p[] in qk_smem so p@V (which uses a thread-per-dim layout)
+      // can read it. Lane l writes its (h, n=l) cell.
 #pragma unroll
       for (int i = 0; i < kHeadsPerWarp; ++i) {
         qk_smem[h_base + i][n] = qk[i];
       }
-    }
-    __syncthreads();
 
-    // Per-head online softmax + V_tile dequant interleaved. The softmax
-    // only uses 16 threads (4 per warp); the other 112 spin on the V
-    // dequant gmem loads so memory latency is masked.
-    {
-      const int h_base = warp_id * kHeadsPerWarp;
-      if (lane < kHeadsPerWarp) {
-        const int h = h_base + lane;
-        if (h < active_h) {
-          const float m_old = softmax_state[h][0];
-          const float l_old = softmax_state[h][1];
-          float m_new = m_old;
-          for (int n = 0; n < tile_n; ++n) {
-            const float s = qk_smem[h][n] * sm_scale;
-            qk_smem[h][n] = s;
-            if (s > m_new) m_new = s;
-          }
-          const float alpha = __expf(m_old - m_new);
-          float l_new = l_old * alpha;
-          for (int n = 0; n < tile_n; ++n) {
-            const float p = __expf(qk_smem[h][n] - m_new);
-            qk_smem[h][n] = p;
-            l_new += p;
-          }
-          softmax_state[h][0] = m_new;
-          softmax_state[h][1] = l_new;
-          softmax_state[h][2] = alpha;
-        } else {
-          softmax_state[h][2] = 1.0f;
-          for (int n = 0; n < tile_n; ++n) qk_smem[h][n] = 0.0f;
-        }
-      }
-      // All 128 threads do V_tile dequant in parallel with the softmax.
-      // Each thread owns dim=tid across BLOCK_N tokens.
+      // V_tile dequant in parallel with the softmax+writeback. Each
+      // thread owns dim=tid across BLOCK_N tokens.
 #pragma unroll 4
-      for (int n = 0; n < kBlockN; ++n) {
+      for (int nv = 0; nv < kBlockN; ++nv) {
         float vv = 0.0f;
-        if (n < tile_n) {
-          const int32_t loc = __ldg(kv_indices + kv_start_row + tile_off + n);
+        if (nv < tile_n) {
+          const int32_t loc = __ldg(kv_indices + kv_start_row + tile_off + nv);
           const uint8_t* v_slot =
               v_packed + static_cast<int64_t>(loc) * v_stride_0
                        + static_cast<int64_t>(kv_head) * v_stride_1;
           vv = dequant_slot_dim(v_slot, cb_smem, tid);
         }
-        v_tile_smem[n][tid] = __float2bfloat16(vv);
+        v_tile_smem[nv][tid] = __float2bfloat16(vv);
       }
     }
     __syncthreads();
 
     // acc += p @ V. Thread d owns dim=d=tid across all 16 Q heads.
+    // acc lives in registers (acc[h]).
     {
       const int d = tid;
 #pragma unroll
       for (int h = 0; h < kBlockH; ++h) {
         const float alpha = softmax_state[h][2];
-        float acc_h = acc_smem[h][d] * alpha;
+        float acc_h = acc[h] * alpha;
 #pragma unroll 4
         for (int n = 0; n < tile_n; ++n) {
           acc_h += qk_smem[h][n] * bf16_to_float(v_tile_smem[n][d]);
         }
-        acc_smem[h][d] = acc_h;
+        acc[h] = acc_h;
       }
     }
     __syncthreads();
   }
 
-  // Emit partials.
+  // Emit partials. acc[h] lives in register space; write straight to gmem.
   if (tid < kBlockH) {
     float* p = mid_split + tid * mid_stride_3;
     p[0] = softmax_state[tid][0];
@@ -377,7 +387,7 @@ higgs_mha_2bit_decode_stage1_split_kernel(
 #pragma unroll
   for (int h = 0; h < kBlockH; ++h) {
     float* p = mid_split + h * mid_stride_3;
-    p[2 + tid] = acc_smem[h][tid];
+    p[2 + tid] = acc[h];
   }
 }
 

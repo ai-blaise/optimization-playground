@@ -107,6 +107,42 @@ __device__ __forceinline__ float fwht_128elem(
   return val;
 }
 
+// FWHT_128 on 4 vectors per thread. Same syncs as the scalar
+// fwht_128elem (3 __syncthreads) but processes 4x the data per call
+// via ILP. Used for prologue when we have multiple Q heads to rotate.
+__device__ __forceinline__ void fwht_128elem_x4(
+    float* __restrict__ v,  // 4 input vals, replaced in-place
+    int tid,
+    float* __restrict__ smem512  // [4][128] fp32 scratch
+) {
+  const int lane = tid & 31;
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    v[b] = fwht_lane_levels_under32(v[b], lane);
+  }
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    smem512[b * kBlockThreads + tid] = v[b];
+  }
+  __syncthreads();
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    const float other = smem512[b * kBlockThreads + (tid ^ 32)];
+    v[b] = (tid & 32) ? (other - v[b]) : (v[b] + other);
+  }
+  __syncthreads();   // matches scalar fwht_128elem level-5 -> level-6 sync
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    smem512[b * kBlockThreads + tid] = v[b];
+  }
+  __syncthreads();
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    const float other = smem512[b * kBlockThreads + (tid ^ 64)];
+    v[b] = (tid & 64) ? (other - v[b]) : (v[b] + other);
+  }
+}
+
 __device__ __forceinline__ float dequant_slot_dim(
     const uint8_t* __restrict__ slot,
     const float* __restrict__ cb_smem,
@@ -172,6 +208,7 @@ higgs_mha_2bit_decode_stage1_split_kernel(
                          + split * mid_stride_2;
 
   __shared__ float smem128[kBlockThreads];
+  __shared__ float smem512[4 * kBlockThreads];                     // 4-way FWHT scratch (2 KB)
   __shared__ float cb_smem[kCodebookSize * kPairDim];
   __shared__ bf16_t q_smem[kBlockH][kSmemRowStrideBF16];           // 4.2 KB
   __shared__ bf16_t k_tile_smem[kBlockN][kSmemRowStrideBF16];      // 8.3 KB
@@ -206,7 +243,7 @@ higgs_mha_2bit_decode_stage1_split_kernel(
     return;
   }
 
-  // Pre-FWHT all kBlockH Q heads into q_smem.
+  // Pre-FWHT all kBlockH Q heads into q_smem (scalar one at a time).
   __syncthreads();
   for (int h = 0; h < kBlockH; ++h) {
     const int q_head = q_head_base + h;
@@ -266,7 +303,9 @@ higgs_mha_2bit_decode_stage1_split_kernel(
     }
     __syncthreads();
 
-    // Per-head online softmax. Warp w handles heads w*kHeadsPerWarp.
+    // Per-head online softmax + V_tile dequant interleaved. The softmax
+    // only uses 16 threads (4 per warp); the other 112 spin on the V
+    // dequant gmem loads so memory latency is masked.
     {
       const int h_base = warp_id * kHeadsPerWarp;
       if (lane < kHeadsPerWarp) {
@@ -295,21 +334,20 @@ higgs_mha_2bit_decode_stage1_split_kernel(
           for (int n = 0; n < tile_n; ++n) qk_smem[h][n] = 0.0f;
         }
       }
-    }
-    __syncthreads();
-
-    // Cooperative dequant V_tile.
+      // All 128 threads do V_tile dequant in parallel with the softmax.
+      // Each thread owns dim=tid across BLOCK_N tokens.
 #pragma unroll 4
-    for (int n = 0; n < kBlockN; ++n) {
-      float vv = 0.0f;
-      if (n < tile_n) {
-        const int32_t loc = __ldg(kv_indices + kv_start_row + tile_off + n);
-        const uint8_t* v_slot =
-            v_packed + static_cast<int64_t>(loc) * v_stride_0
-                     + static_cast<int64_t>(kv_head) * v_stride_1;
-        vv = dequant_slot_dim(v_slot, cb_smem, tid);
+      for (int n = 0; n < kBlockN; ++n) {
+        float vv = 0.0f;
+        if (n < tile_n) {
+          const int32_t loc = __ldg(kv_indices + kv_start_row + tile_off + n);
+          const uint8_t* v_slot =
+              v_packed + static_cast<int64_t>(loc) * v_stride_0
+                       + static_cast<int64_t>(kv_head) * v_stride_1;
+          vv = dequant_slot_dim(v_slot, cb_smem, tid);
+        }
+        v_tile_smem[n][tid] = __float2bfloat16(vv);
       }
-      v_tile_smem[n][tid] = __float2bfloat16(vv);
     }
     __syncthreads();
 

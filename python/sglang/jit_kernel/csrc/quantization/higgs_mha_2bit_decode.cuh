@@ -10,45 +10,35 @@
 // (32 bytes of 4-bit indices into the EDEN2-16 codebook + 2-byte FP16
 // per-row scale). Same EDEN2-16 lattice + orthonormal FWHT factorization
 // as ``higgs_dense_2bit_mla_decode.cuh``, but specialized for
-// ``head_dim=128`` MHA (one register slot per thread; no top-of-tree
-// register FWHT) and with K/V quantized independently (the codec lays
-// them in separate slot buffers, not one combined latent+rope slot).
+// ``head_dim=128`` MHA and with K/V quantized independently.
 //
-// Two launchers are provided:
-//
-//   1. ``HiggsMHA2BitDecodeKernel`` — single-pass kernel that handles
-//      the full (forward FWHT, online softmax over all KV tokens,
-//      normalize, inverse FWHT) chain inside one block per
-//      (batch_row, q_head). Saturates the GPU when
-//      ``num_rows * num_q_heads >= ~num_sms`` (true for batch=12 +
-//      32 Q heads on B200 == 384 blocks vs 148 SMs).
-//
-//   2. ``HiggsMHA2BitDecodeSplitKernel`` (+ ``...MergeKernel``) —
-//      split-K decode mirroring TurboQuant's ``decode_2p5_split_rotated``
-//      and HIGGS MLA's ``higgs_dense_2bit_mla_decode_stage1_split``.
-//      The kv-token loop is sharded across ``num_splits`` blocks per
-//      (batch_row, q_head); a merge kernel combines partial
-//      ``(m, l, acc)`` tuples and runs the inverse FWHT. Reserved for
-//      the small-batch case (b=1) where the single-pass kernel
-//      starves SMs.
-//
-// Optimization pattern (mirrors MLA HIGGS):
-//   * 128 threads / block, one block per (batch_row, q_head).
-//     Thread ``tid`` holds element ``q[tid]`` of the head_dim-128
-//     query (and the matching ``acc[tid]`` accumulator).
-//   * Pre-FWHT Q in registers (single FWHT_128: 5 levels of warp
-//     shuffle + 2 levels of SMEM exchange).
-//   * Per KV token: dequant K -> dot(q_rot, k_rot) via block-reduce
-//     -> online softmax -> dequant V -> acc += p * v_rot.
-//   * After the loop: acc /= sum_exp; InvFWHT(acc); store.
+// v2 design (BLOCK_N=32 token tile):
+// - 128 threads / block, one block per (batch_row, q_head).
+// - Thread ``tid`` holds element ``q[tid]`` of the head_dim-128 query
+//   and the matching ``acc[tid]`` accumulator.
+// - Pre-FWHT Q in registers (single FWHT_128: 5 levels of warp shuffle
+//   + 2 levels of SMEM exchange).
+// - Per BLOCK_N=32-token tile:
+//   * Stream-dequant K[0..tile_n) per token; accumulate per-token
+//     qk_partial[n] = q_rot * k_rot[tid] in registers.
+//   * One block-reduce_sum over qk_partial[0..32) -> qk_smem[0..32)
+//     (3 syncs: 1 in the warp_partials write, 1 after warp-0 reduce,
+//     and 1 trailing for the broadcast).
+//   * Single-thread online softmax: update m, l; compute p[0..tile_n)
+//     in qk_smem; stash alpha in a dedicated slot.
+//   * Sync to broadcast alpha + p[].
+//   * Stream-dequant V[0..tile_n) per token; acc += p[n] * v_rot[tid].
+//   * No trailing sync; next tile's block_reduce serializes
+//     softmax_state writes for us.
+// - After last tile: acc /= l; InvFWHT_128(acc); store.
 //
 // Mathematical trick (orthonormal FWHT is self-inverse): the codec
 // stores rotated K/V (FWHT was applied at compress time before
-// quantization). Dot products in the rotated basis equal dot
-// products in the original basis (Parseval). We rotate Q ONCE up
-// front, accumulate acc in the rotated basis, and apply ONE final
-// InvFWHT to bring the output back to the original basis -- matches
-// the MLA HIGGS / TurboQuant split-rotated fast path.
+// quantization). Dot products in the rotated basis equal dot products
+// in the original basis (Parseval). We rotate Q once up front,
+// accumulate acc in the rotated basis, and apply one final InvFWHT
+// to bring the output back to the original basis -- matches the
+// MLA HIGGS dense fast path.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -63,22 +53,18 @@
 
 namespace higgs_mha_2bit_detail {
 
-// Architectural constants (match HiggsMHA2BitCodec / GLM-4-9B draft).
-
 constexpr int kHeadDim = 128;
 constexpr int kPairDim = 2;
 constexpr int kCodebookSize = 16;
 constexpr int kNumPairs = kHeadDim / kPairDim;        // 64
 constexpr int kPackedBytes = kNumPairs / 2;           // 32
-constexpr int kNormBytes = 2;                         // fp16 scale
+constexpr int kNormBytes = 2;
 constexpr int kSlotBytes = kPackedBytes + kNormBytes; // 34
 constexpr float kInvSqrtHeadDim = 0.08838834764831845f;  // 1/sqrt(128)
 constexpr float kNegInf = -3.4028234663852886e38f;
 constexpr int kBlockThreads = kHeadDim;               // 128
-
-// ---------------------------------------------------------------------------
-// Helpers (same shape as MLA HIGGS; reused, not shared, to keep the
-// kernel translation unit standalone for the JIT loader).
+constexpr int kBlockN = 32;                           // KV tokens per tile
+constexpr int kWarpSize = 32;
 
 __device__ __forceinline__ float bf16_to_float(const bf16_t value) {
   return __bfloat162float(value);
@@ -103,8 +89,6 @@ __device__ __forceinline__ float fwht_lane_levels_under32(float val, int lane) {
 }
 
 // FWHT_128: warp shuffle (levels 0..4) + 2x SMEM exchange (levels 5..6).
-// Caller is responsible for surrounding ``__syncthreads()`` so back-to-back
-// invocations on different registers can reuse the same ``smem128`` buffer.
 __device__ __forceinline__ float fwht_128elem(
     float val, int tid, float* __restrict__ smem128) {
   val = fwht_lane_levels_under32(val, tid & 31);
@@ -118,62 +102,51 @@ __device__ __forceinline__ float fwht_128elem(
   return val;
 }
 
-// Block-reduce a per-thread scalar to a single value broadcast to all
-// threads via ``warp_partials[0]``. ``warp_partials`` is a 4-fp32 SMEM
-// buffer (one slot per warp in a 128-thread block).
-__device__ __forceinline__ float block_reduce_sum_128(
-    float v, float* __restrict__ warp_partials) {
-  const int tid = threadIdx.x;
+// Block-reduce kBlockN per-thread fp32 vectors into shmem.
+// Each of the 4 warps does warp-reduce on each of the kBlockN slots,
+// then a single warp folds the 4 partials.
+__device__ __forceinline__ void block_reduce_sum_n_into(
+    const float partial[kBlockN], int tid,
+    float* __restrict__ warp_partials,  // [4 * kBlockN] fp32
+    float* __restrict__ result          // [kBlockN] fp32
+) {
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  v = warp_reduce_sum(v);
-  if (lane == 0) warp_partials[warp] = v;
+#pragma unroll
+  for (int n = 0; n < kBlockN; ++n) {
+    float v = warp_reduce_sum(partial[n]);
+    if (lane == 0) warp_partials[warp * kBlockN + n] = v;
+  }
   __syncthreads();
-  float total = 0.0f;
-  if (tid < 4) total = warp_partials[tid];
-  if (warp == 0) total = warp_reduce_sum(total);
-  if (tid == 0) warp_partials[0] = total;
+  if (warp == 0) {
+    for (int n = lane; n < kBlockN; n += kWarpSize) {
+      const float s = warp_partials[0 * kBlockN + n]
+                    + warp_partials[1 * kBlockN + n]
+                    + warp_partials[2 * kBlockN + n]
+                    + warp_partials[3 * kBlockN + n];
+      result[n] = s;
+    }
+  }
   __syncthreads();
-  return warp_partials[0];
 }
 
-// Dequantize one HIGGS slot at lane ``tid`` (one dim per thread).
-//
-// For tid ``d`` in [0, 128):
-//   pair_idx     = d >> 1               // 0..63
-//   coord        = d & 1                // 0=x, 1=y in the codeword
-//   byte_idx     = pair_idx >> 1        // 0..31
-//   in_hi_nibble = pair_idx & 1         // 0=lo nibble, 1=hi nibble
-//
-// The codec stores byte k = (idx[2k+1] << 4) | idx[2k], so the lo
-// nibble of byte k holds pair-index 2k and the hi nibble holds
-// 2k+1 -- matches ``pack_higgs_2bit_indices`` in
-// ``higgs_dense_2bit_kv.py``. Returns the dequantized rotated value
-// (codebook lookup, scaled by the slot's fp16 norm). The caller
-// supplies the slot pointer and ``cb_smem`` (codebook in SMEM, 32
-// fp32 = 128 B).
-__device__ __forceinline__ float higgs_mha_dequant_dim(
+// Dequant one HIGGS slot at lane ``tid`` -> rotated value for dim tid.
+// Codec layout: byte k holds idx[2k] in low nibble, idx[2k+1] in high
+// nibble. Flat layout: dim 2j+0 = pair[j].x, dim 2j+1 = pair[j].y.
+__device__ __forceinline__ float dequant_slot_dim(
     const uint8_t* __restrict__ slot,
     const float* __restrict__ cb_smem,
     int tid) {
   const int pair_idx = tid >> 1;
   const int coord = tid & 1;
   const int byte_idx = pair_idx >> 1;
-  const int in_hi_nibble = pair_idx & 1;
+  const int in_hi = pair_idx & 1;
   const uint8_t byte = __ldg(slot + byte_idx);
-  const uint32_t idx = in_hi_nibble ? (byte >> 4) & 0x0F : byte & 0x0F;
-  const float cb_val = cb_smem[idx * kPairDim + coord];
+  const uint32_t idx = in_hi ? (byte >> 4) & 0x0F : byte & 0x0F;
   const half norm_h = *reinterpret_cast<const half*>(slot + kPackedBytes);
   const float scale = __half2float(norm_h);
-  return scale * cb_val;
+  return scale * cb_smem[idx * kPairDim + coord];
 }
-
-// ---------------------------------------------------------------------------
-// Single-pass kernel: grid (num_rows, num_q_heads), block 128 threads.
-//
-// Iterates over the full kv-token range for the batch row (page table
-// indexed via kv_indptr + kv_indices), running an online softmax with
-// per-token K + V dequant fused inline.
 
 __global__ void __launch_bounds__(kBlockThreads, 8)
 higgs_mha_2bit_decode_kernel(
@@ -203,16 +176,17 @@ higgs_mha_2bit_decode_kernel(
 
   const int kv_head = q_head * num_kv_heads / num_q_heads;
 
-  __shared__ float smem128[kBlockThreads];
-  __shared__ float softmax_state[4];  // [m, l, alpha, beta]
-  __shared__ float warp_partials[4];
-  __shared__ float cb_smem[kCodebookSize * kPairDim];  // 32 fp32
+  __shared__ float smem128[kBlockThreads];                   // FWHT scratch
+  __shared__ float qk_smem[kBlockN];                         // [n] -> qk then p
+  __shared__ float warp_partials_n[4 * kBlockN];             // block-reduce
+  __shared__ float cb_smem[kCodebookSize * kPairDim];        // codebook
+  __shared__ float softmax_state[3];                         // [m, l, alpha]
 
   if (tid < kCodebookSize * kPairDim) {
     cb_smem[tid] = __ldg(&codebook[tid]);
   }
 
-  // Pre-FWHT Q (single FWHT_128 in register).
+  // Pre-FWHT Q in registers.
   const bf16_t* q_row = q + row * q_stride_0 + q_head * q_stride_1;
   float q_rot = bf16_to_float(q_row[tid]);
   __syncthreads();
@@ -225,62 +199,76 @@ higgs_mha_2bit_decode_kernel(
     softmax_state[1] = 0.0f;
   }
 
-  // KV-token range for this batch row.
   const int32_t kv_start = __ldg(kv_indptr + row);
   const int32_t kv_end = __ldg(kv_indptr + row + 1);
+  const int32_t kv_len = kv_end - kv_start;
 
   float acc = 0.0f;
 
-  for (int32_t col = kv_start; col < kv_end; ++col) {
-    const int32_t kv_loc = __ldg(kv_indices + col);
-    const uint8_t* k_slot =
-        k_packed + static_cast<int64_t>(kv_loc) * k_stride_0 +
-        static_cast<int64_t>(kv_head) * k_stride_1;
-    const uint8_t* v_slot =
-        v_packed + static_cast<int64_t>(kv_loc) * v_stride_0 +
-        static_cast<int64_t>(kv_head) * v_stride_1;
+  for (int32_t tile_off = 0; tile_off < kv_len; tile_off += kBlockN) {
+    const int tile_n = min(kBlockN, kv_len - tile_off);
 
-    // Dequant K[kv_loc, kv_head][tid] -> rotated value.
-    const float k_rot = higgs_mha_dequant_dim(k_slot, cb_smem, tid);
+    // Stream-dequant K[0..tile_n) and accumulate per-token qk_partial[n]
+    // in registers. No cross-token sync; each thread sees its own dim.
+    float qk_partial[kBlockN];
+#pragma unroll
+    for (int n = 0; n < kBlockN; ++n) qk_partial[n] = 0.0f;
 
-    // qk_partial = q_rot * k_rot; block-reduce + online softmax.
-    const float qk_partial = q_rot * k_rot;
-    const float qk = block_reduce_sum_128(qk_partial, warp_partials);
+    for (int n = 0; n < tile_n; ++n) {
+      const int32_t loc = __ldg(kv_indices + kv_start + tile_off + n);
+      const uint8_t* k_slot =
+          k_packed + static_cast<int64_t>(loc) * k_stride_0
+                   + static_cast<int64_t>(kv_head) * k_stride_1;
+      const float k_rot = dequant_slot_dim(k_slot, cb_smem, tid);
+      qk_partial[n] = q_rot * k_rot;
+    }
 
-    // V dequant has no data dependency on the softmax-state update —
-    // run it on all 128 threads in parallel with tid==0's softmax math
-    // so the wait for the next __syncthreads hides the V load latency.
-    const float v_rot = higgs_mha_dequant_dim(v_slot, cb_smem, tid);
+    // Block-reduce qk_partial -> qk_smem[n] for each n in tile.
+    block_reduce_sum_n_into(qk_partial, tid, warp_partials_n, qk_smem);
 
+    // Single-thread online softmax. Updates m, l, computes p[0..tile_n)
+    // in qk_smem; stashes alpha in softmax_state[2].
     if (tid == 0) {
-      const float score = qk * sm_scale;
-      const float old_m = softmax_state[0];
-      const float old_l = softmax_state[1];
-      const float new_m = fmaxf(old_m, score);
-      const float alpha = __expf(old_m - new_m);
-      const float beta = __expf(score - new_m);
-      softmax_state[0] = new_m;
-      softmax_state[1] = old_l * alpha + beta;
+      const float m_old = softmax_state[0];
+      const float l_old = softmax_state[1];
+      float m_new = m_old;
+      for (int n = 0; n < tile_n; ++n) {
+        const float s = qk_smem[n] * sm_scale;
+        qk_smem[n] = s;
+        if (s > m_new) m_new = s;
+      }
+      const float alpha = __expf(m_old - m_new);
+      float l_new = l_old * alpha;
+      for (int n = 0; n < tile_n; ++n) {
+        const float p = __expf(qk_smem[n] - m_new);
+        qk_smem[n] = p;
+        l_new += p;
+      }
+      softmax_state[0] = m_new;
+      softmax_state[1] = l_new;
       softmax_state[2] = alpha;
-      softmax_state[3] = beta;
     }
     __syncthreads();
 
     const float alpha = softmax_state[2];
-    const float beta = softmax_state[3];
+    acc *= alpha;
 
-    acc = acc * alpha + beta * v_rot;
-    // The end-of-iter __syncthreads in the prior revision was
-    // redundant: the next iter's block_reduce_sum_128 has its own
-    // pair of syncs that serialize block-wide before tid==0
-    // re-writes softmax_state, and acc lives in registers so there
-    // is no cross-iter shmem write/read race.
+    // Stream-dequant V[0..tile_n) and accumulate acc += p[n] * v_rot.
+    for (int n = 0; n < tile_n; ++n) {
+      const int32_t loc = __ldg(kv_indices + kv_start + tile_off + n);
+      const uint8_t* v_slot =
+          v_packed + static_cast<int64_t>(loc) * v_stride_0
+                   + static_cast<int64_t>(kv_head) * v_stride_1;
+      const float v_rot = dequant_slot_dim(v_slot, cb_smem, tid);
+      acc += qk_smem[n] * v_rot;
+    }
+    // No trailing sync: the next tile's block_reduce has its own syncs
+    // that serialize before the next softmax_state update.
   }
 
   const float denom = softmax_state[1];
   float o_rot = denom > 0.0f ? acc / denom : 0.0f;
 
-  // Inverse FWHT (orthonormal: same as forward).
   __syncthreads();
   o_rot = fwht_128elem(o_rot, tid, smem128);
   __syncthreads();
@@ -289,9 +277,6 @@ higgs_mha_2bit_decode_kernel(
   bf16_t* out_row = out + row * out_stride_0 + q_head * out_stride_1;
   out_row[tid] = __float2bfloat16(o_rot);
 }
-
-// ---------------------------------------------------------------------------
-// Launcher.
 
 struct HiggsMHA2BitDecodeKernel {
   static void run(
@@ -324,36 +309,20 @@ struct HiggsMHA2BitDecodeKernel {
 
     TensorMatcher({R, H, kHeadDim})
         .with_strides({q_stride_0, q_stride_1, 1})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(q);
+        .with_dtype<bf16_t>().with_device(device).verify(q);
     TensorMatcher({S, K, kSlotBytes})
         .with_strides({k_stride_0, k_stride_1, 1})
-        .with_dtype<uint8_t>()
-        .with_device(device)
-        .verify(k_packed);
+        .with_dtype<uint8_t>().with_device(device).verify(k_packed);
     TensorMatcher({S, K, kSlotBytes})
         .with_strides({v_stride_0, v_stride_1, 1})
-        .with_dtype<uint8_t>()
-        .with_device(device)
-        .verify(v_packed);
-    TensorMatcher({R_plus_1})
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(kv_indptr);
-    TensorMatcher({T})
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(kv_indices);
+        .with_dtype<uint8_t>().with_device(device).verify(v_packed);
+    TensorMatcher({R_plus_1}).with_dtype<int32_t>().with_device(device).verify(kv_indptr);
+    TensorMatcher({T}).with_dtype<int32_t>().with_device(device).verify(kv_indices);
     TensorMatcher({R, H, kHeadDim})
         .with_strides({out_stride_0, out_stride_1, 1})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(out);
+        .with_dtype<bf16_t>().with_device(device).verify(out);
     TensorMatcher({kCodebookSize, kPairDim})
-        .with_dtype<float>()
-        .with_device(device)
-        .verify(codebook);
+        .with_dtype<float>().with_device(device).verify(codebook);
 
     if (R.unwrap() == 0 || H.unwrap() == 0) return;
 
@@ -367,17 +336,11 @@ struct HiggsMHA2BitDecodeKernel {
         static_cast<const int32_t*>(kv_indices.data_ptr()),
         static_cast<bf16_t*>(out.data_ptr()),
         static_cast<const float*>(codebook.data_ptr()),
-        R.unwrap(),
-        H.unwrap(),
-        K.unwrap(),
-        q_stride_0.unwrap(),
-        q_stride_1.unwrap(),
-        k_stride_0.unwrap(),
-        k_stride_1.unwrap(),
-        v_stride_0.unwrap(),
-        v_stride_1.unwrap(),
-        out_stride_0.unwrap(),
-        out_stride_1.unwrap(),
+        R.unwrap(), H.unwrap(), K.unwrap(),
+        q_stride_0.unwrap(), q_stride_1.unwrap(),
+        k_stride_0.unwrap(), k_stride_1.unwrap(),
+        v_stride_0.unwrap(), v_stride_1.unwrap(),
+        out_stride_0.unwrap(), out_stride_1.unwrap(),
         static_cast<float>(sm_scale));
   }
 };

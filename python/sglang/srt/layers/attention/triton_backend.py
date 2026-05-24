@@ -1412,10 +1412,26 @@ class TritonMultiStepDraftBackend:
             dtype=torch.int32,
             device=model_runner.device,
         )
+        # SMC-SD draft uses HiggsMHA2BitTokenToKVPool when
+        # --smc-draft-kv-cache-dtype higgs_2bit is set; in that case
+        # we switch the per-step decode backend to the fused HIGGS
+        # variant so the multi-step decode path also avoids the
+        # eager dequant on _get_key/_get_value_buffer.
+        from sglang.srt.mem_cache.memory_pool import HiggsMHA2BitTokenToKVPool
+
+        if isinstance(model_runner.token_to_kv_pool, HiggsMHA2BitTokenToKVPool):
+            from sglang.srt.layers.attention.higgs_triton_backend import (
+                HiggsTritonAttnBackend,
+            )
+
+            backend_cls = HiggsTritonAttnBackend
+        else:
+            backend_cls = TritonAttnBackend
+
         self.attn_backends: List[TritonAttnBackend] = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
-                TritonAttnBackend(
+                backend_cls(
                     model_runner,
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],

@@ -37,6 +37,14 @@ _PACKAGE_PATHS = {
     "sglang.srt.layers.attention.nsa": ROOT / "python/sglang/srt/layers/attention/nsa",
     "sglang.srt.layers.quantization": ROOT / "python/sglang/srt/layers/quantization",
 }
+_STUB_MODULE_NAMES = tuple(_PACKAGE_PATHS) + (
+    "sglang.srt.layers.attention.dsa.indexer_quantization",
+    "sglang.srt.layers.attention.nsa.indexer_quantization",
+    "sglang.srt.layers.quantization.turboquant_dense_kv",
+    "sglang.srt.layers.quantization.quantization_config_dispatch",
+)
+_PREVIOUS_MODULES = {name: sys.modules.get(name) for name in _STUB_MODULE_NAMES}
+
 for module_name, package_path in _PACKAGE_PATHS.items():
     module = sys.modules.setdefault(module_name, types.ModuleType(module_name))
     module.__path__ = [str(package_path)]
@@ -63,6 +71,12 @@ dispatcher = _load_module(
     "sglang.srt.layers.quantization.quantization_config_dispatch",
     ROOT / "python/sglang/srt/layers/quantization/quantization_config_dispatch.py",
 )
+
+for _module_name, _previous_module in _PREVIOUS_MODULES.items():
+    if _previous_module is None:
+        sys.modules.pop(_module_name, None)
+    else:
+        sys.modules[_module_name] = _previous_module
 
 
 @dataclass

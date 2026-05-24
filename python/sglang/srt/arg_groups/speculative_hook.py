@@ -306,13 +306,15 @@ def _handle_smc(server_args: "ServerArgs") -> None:
         )
     smc_supported_target_backends = {"triton", "fa3"}
     smc_supported_draft_backends = {"triton", "fa3", "trtllm_mha"}
-    from sglang.srt.configs.model_config import is_deepseek_dsa
 
     target_supported_backends = set(smc_supported_target_backends)
     if server_args.model_path.lower() in ["none", "dummy"]:
         pass
-    elif is_deepseek_dsa(server_args.get_model_config().hf_config):
-        target_supported_backends.update({"dsa", "nsa"})
+    else:
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        if is_deepseek_dsa(server_args.get_model_config().hf_config):
+            target_supported_backends.update({"dsa", "nsa"})
     unsupported_attention_backends = {}
     for name, backend in {
         "attention_backend": server_args.attention_backend,

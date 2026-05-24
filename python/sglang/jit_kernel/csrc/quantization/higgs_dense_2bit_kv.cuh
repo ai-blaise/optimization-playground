@@ -58,6 +58,7 @@ constexpr int kNumPairs = kLatentDim / kPairDim;  // 256
 constexpr int kPackedBytes = kNumPairs / 2;       // 128 bytes
 constexpr int kNormBytes = 2;
 constexpr int kSlotBytes = kPackedBytes + kNormBytes + kRopeDim * 2;  // 258
+constexpr int kSawScalar2LargeRowThreshold = 16384;
 constexpr float kInvSqrtLatentDim = 0.044194173824159216f;  // 1 / sqrt(512)
 
 static_assert(kPackedBytes == 128, "expected 128 packed bytes per slot");
@@ -1090,8 +1091,11 @@ __device__ __forceinline__ uint32_t saw_scalar2_quant_bf16_bits(
 }
 
 __device__ __forceinline__ uint32_t saw_scalar2_bf16_bits(uint32_t code) {
-  const uint32_t magnitude = (code == 0 || code == 3) ? 0x3fc1u : 0x3ee8u;
-  const uint32_t sign = code < 2 ? 0x8000u : 0u;
+  // Codes 0/3 map to the high-magnitude lattice points, 1/2 to low.
+  code &= 0x3u;
+  const uint32_t high_magnitude = ((code ^ (code >> 1) ^ 1u) & 1u);
+  const uint32_t magnitude = 0x3ee8u + high_magnitude * 0x00d9u;
+  const uint32_t sign = ((code >> 1) ^ 1u) << 15;
   return magnitude | sign;
 }
 
@@ -1120,7 +1124,9 @@ higgs_dense_2bit_store_saw_scalar2_coalesced_kernel(
   (void)codebook_norm_sq;
   (void)latent_stride_1;
   (void)rope_stride_1;
-  static_assert(kWarpsPerBlock == 4, "only the four-row block shape is wired");
+  static_assert(
+      kWarpsPerBlock == 4 || kWarpsPerBlock == 8,
+      "only four-row and eight-row block shapes are wired");
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -1180,7 +1186,9 @@ higgs_dense_2bit_dequant_saw_scalar2_coalesced_kernel(
     int64_t compressed_stride_0,
     int64_t out_stride_0) {
   (void)codebook;
-  static_assert(kWarpsPerBlock == 4, "only the four-row block shape is wired");
+  static_assert(
+      kWarpsPerBlock == 4 || kWarpsPerBlock == 8,
+      "only four-row and eight-row block shapes are wired");
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -1918,6 +1926,24 @@ struct HiggsDense2BitStoreSawScalar2Kernel {
     const int64_t num_rows = N.unwrap();
     if (num_rows == 0) return;
 
+    if (num_rows >= kSawScalar2LargeRowThreshold) {
+      LaunchKernel((num_rows + 7) / 8, 256, device.unwrap())(
+          higgs_dense_2bit_store_saw_scalar2_coalesced_kernel<8>,
+          static_cast<uint8_t*>(compressed.data_ptr()),
+          static_cast<const int64_t*>(locs.data_ptr()),
+          static_cast<const bf16_t*>(latent.data_ptr()),
+          static_cast<const bf16_t*>(rope.data_ptr()),
+          static_cast<const float*>(codebook.data_ptr()),
+          static_cast<const float*>(codebook_norm_sq.data_ptr()),
+          num_rows,
+          compressed_stride_0.unwrap(),
+          latent_stride_0.unwrap(),
+          latent_stride_1.unwrap(),
+          rope_stride_0.unwrap(),
+          rope_stride_1.unwrap());
+      return;
+    }
+
     LaunchKernel((num_rows + 3) / 4, 128, device.unwrap())(
         higgs_dense_2bit_store_saw_scalar2_coalesced_kernel<4>,
         static_cast<uint8_t*>(compressed.data_ptr()),
@@ -1968,6 +1994,20 @@ struct HiggsDense2BitDequantSawScalar2Kernel {
 
     const int64_t num_rows = N.unwrap();
     if (num_rows == 0) return;
+
+    if (num_rows >= kSawScalar2LargeRowThreshold) {
+      LaunchKernel((num_rows + 7) / 8, 256, device.unwrap())(
+          higgs_dense_2bit_dequant_saw_scalar2_coalesced_kernel<8, int64_t>,
+          static_cast<const uint8_t*>(compressed.data_ptr()),
+          static_cast<const int64_t*>(locs.data_ptr()),
+          static_cast<bf16_t*>(out.data_ptr()),
+          static_cast<int32_t*>(nullptr),
+          static_cast<const float*>(codebook.data_ptr()),
+          num_rows,
+          compressed_stride_0.unwrap(),
+          out_stride_0.unwrap());
+      return;
+    }
 
     LaunchKernel((num_rows + 3) / 4, 128, device.unwrap())(
         higgs_dense_2bit_dequant_saw_scalar2_coalesced_kernel<4, int64_t>,
@@ -2027,6 +2067,20 @@ struct HiggsDense2BitDequantPageTableSawScalar2Kernel {
 
     const int64_t num_rows = B.unwrap() * K.unwrap();
     if (num_rows == 0) return;
+
+    if (num_rows >= kSawScalar2LargeRowThreshold) {
+      LaunchKernel((num_rows + 7) / 8, 256, device.unwrap())(
+          higgs_dense_2bit_dequant_saw_scalar2_coalesced_kernel<8, int32_t>,
+          static_cast<const uint8_t*>(compressed.data_ptr()),
+          static_cast<const int32_t*>(page_table.data_ptr()),
+          static_cast<bf16_t*>(out.data_ptr()),
+          static_cast<int32_t*>(compact_page_table.data_ptr()),
+          static_cast<const float*>(codebook.data_ptr()),
+          num_rows,
+          compressed_stride_0.unwrap(),
+          out_stride_0.unwrap());
+      return;
+    }
 
     LaunchKernel((num_rows + 3) / 4, 128, device.unwrap())(
         higgs_dense_2bit_dequant_saw_scalar2_coalesced_kernel<4, int32_t>,

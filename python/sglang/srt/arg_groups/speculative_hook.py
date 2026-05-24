@@ -245,12 +245,19 @@ def _maybe_apply_smc_draft_kv_cache_config(server_args: "ServerArgs") -> None:
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     model_override_args = json.loads(server_args.json_model_override_args)
-    draft_hf_config = get_config(
-        server_args.speculative_draft_model_path,
-        trust_remote_code=server_args.trust_remote_code,
-        revision=server_args.speculative_draft_model_revision,
-        model_override_args=model_override_args,
-    )
+    try:
+        draft_hf_config = get_config(
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.speculative_draft_model_revision,
+            model_override_args=model_override_args,
+        )
+    except OSError:
+        logger.debug(
+            "Unable to read SMC draft model config for KV cache auto-detect."
+        )
+        return
+
     kv_cache_dtype = get_smc_draft_kv_cache_dtype_from_config(draft_hf_config)
     if kv_cache_dtype is None:
         return

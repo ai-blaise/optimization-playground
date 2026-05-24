@@ -111,6 +111,27 @@ class TestSMCDisaggregationArgs(unittest.TestCase):
                 speculative_draft_model_path="dummy",
             )
 
+    def test_smc_draft_kv_dtype_uses_draft_hf_config(self):
+        hf_config = SimpleNamespace(
+            quantization_config={
+                "kv_cache_scheme": {
+                    "quant_method": "higgs_mha_2bit",
+                    "scope": "smc_draft",
+                },
+            }
+        )
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.get_config",
+            return_value=hf_config,
+        ):
+            server_args = ServerArgs(
+                model_path="dummy",
+                speculative_algorithm="SMC",
+                speculative_draft_model_path="dummy-draft",
+            )
+
+        self.assertEqual(server_args.smc_draft_kv_cache_dtype, "higgs_2bit")
+
 
 class TestFlashSamplingArgs(unittest.TestCase):
     def test_flashsampling_dp_attention_uses_dp_lm_head(self):

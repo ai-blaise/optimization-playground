@@ -98,3 +98,82 @@ GEMM-like tensor-core kernel.
 - Clean-worktree large-row perf sweep passed against TokenSpeed MLA KV at
   32768, 65536, 131072, and 262144 rows.
 - CZS proof passed: 7 proved, 0 disproved, 0 unknown.
+
+
+# HIGGS MHA/GQA Draft KV
+
+## Scope
+
+SMC-SD draft-model MHA/GQA KV cache for
+`BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP`. The model shape is
+`head_dim=128`, `num_attention_heads=32`, and `num_key_value_heads=2`.
+Each K or V row uses the existing 34-byte HIGGS slot:
+32 packed EDEN2/FWHT index bytes plus one FP16 scale.
+
+## Result
+
+Accepted implementation:
+
+- Store: Triton packer `store_higgs_mha_2bit_triton`, using the same
+  FWHT layout as the fused HIGGS draft decode kernel.
+- Materialize fallback: CUDA `dequantize_higgs_mha_2bit` for backends
+  that still need BF16 K/V tensors.
+- Production decode remains the existing fused HIGGS Triton backend,
+  selected when the draft pool is `HiggsMHA2BitTokenToKVPool`.
+
+The lower-level CUDA store candidate was rejected: it was fast, but its
+FWHT orientation produced lower reconstruction quality at large row counts.
+It is not wired or exported.
+
+## Deployment
+
+The draft model can request this path from its Hugging Face config:
+
+```json
+{
+  "quantization_config": {
+    "kv_cache_scheme": {
+      "quant_method": "higgs_mha_2bit",
+      "scope": "smc_draft",
+      "head_dim": 128,
+      "num_key_value_heads": 2,
+      "slot_bytes": 34,
+      "store_backend": "triton_fwht_eden2",
+      "decode_backend": "triton_fused_higgs_mha_2bit"
+    }
+  }
+}
+```
+
+When SMC is enabled and the operator leaves `--smc-draft-kv-cache-dtype`
+at `auto` or unset, SGLang reads the draft config and sets the draft KV
+dtype to `higgs_2bit`. Explicit CLI values still win.
+
+## Performance
+
+Artifact: `artifacts/higgs_gqa_kv_perf_20260524.json` from pod
+`higgs-kv-cute` on `a4-us-001-rl9`.
+
+| Rows | Triton store | Eager store | Store speedup | CUDA dequant | Eager dequant | Dequant speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 0.0188 ms | 0.411 ms | 21.8x | 0.00536 ms | 0.356 ms | 66.6x |
+| 2048 | 0.0238 ms | 0.408 ms | 17.1x | 0.00571 ms | 0.359 ms | 63.0x |
+| 8192 | 0.0182 ms | 0.594 ms | 32.6x | 0.0124 ms | 0.357 ms | 28.9x |
+| 32768 | 0.0352 ms | 1.80 ms | 51.3x | 0.0370 ms | 0.483 ms | 13.1x |
+| 65536 | 0.0639 ms | 3.53 ms | 55.3x | 0.0698 ms | 0.926 ms | 13.3x |
+| 131072 | 0.122 ms | 7.06 ms | 57.6x | 0.137 ms | 1.86 ms | 13.5x |
+
+Tile sweep: `BLOCK_N=16` had the best aggregate store latency across
+512, 2048, 8192, 32768, and 65536 rows; `BLOCK_N=8` was nearly tied and
+`BLOCK_N=32` regressed large rows.
+
+## Correctness
+
+- Full fused decode test file passed on B200: `5 passed`.
+- Config-dispatch tests passed on B200 pod: `39 passed`.
+- Store path is byte-exact against the eager codec in the focused unit
+  test. Larger benchmark rows showed rare tie differences, but dequantized
+  output stayed effectively identical to the eager codec
+  (`dequant_cos_min >= 0.9944`).
+- CZS proof: `docs/proofs/higgs_mha_2bit_kv_czs_module.json`, 7 proved,
+  0 disproved, 0 unknown.

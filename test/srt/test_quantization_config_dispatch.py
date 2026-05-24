@@ -89,6 +89,32 @@ class FakeHfConfig:
     quantization_config: Optional[Dict[str, Any]] = field(default=None)
 
 
+def test_smc_draft_higgs_mha_kv_cache_scheme_selects_higgs_2bit():
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "kv_cache_scheme": {
+                "quant_method": "higgs_mha_2bit",
+                "scope": "smc_draft",
+                "head_dim": 128,
+                "slot_bytes": 34,
+            },
+        }
+    )
+    assert (
+        dispatcher.get_smc_draft_kv_cache_dtype_from_config(hf_config)
+        == "higgs_2bit"
+    )
+
+
+def test_unknown_smc_draft_kv_cache_scheme_is_ignored():
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "kv_cache_scheme": {"quant_method": "fp8"},
+        }
+    )
+    assert dispatcher.get_smc_draft_kv_cache_dtype_from_config(hf_config) is None
+
+
 def test_no_quantization_config_is_noop():
     server_args = FakeServerArgs()
     dispatcher.apply_quantization_config_dispatch(server_args, FakeHfConfig())

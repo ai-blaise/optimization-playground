@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 TURBOQUANT_DENSE_QUANT_METHOD = "turboquant_dense"
 DEFAULT_TURBOQUANT_DENSE_KV_PRESET = "latent_2p5bit_nc"
 HIGGS_DENSE_2BIT_QUANT_METHOD = "higgs_dense_2bit"
+HIGGS_MHA_2BIT_QUANT_METHOD = "higgs_mha_2bit"
 DEFAULT_DSA_INDEXCACHE_FREQ = 4
 DEFAULT_NSA_INDEXCACHE_FREQ = DEFAULT_DSA_INDEXCACHE_FREQ
 SUPPORTED_CONFIG_INDEXER_MODES = ("vanilla", "indexcache")
@@ -188,6 +189,21 @@ def _maybe_apply_higgs_dense_2bit(server_args: Any, quant_cfg: Dict[str, Any]) -
         "quantization_config.kv_cache_scheme.",
         candidate.name,
     )
+
+
+def get_smc_draft_kv_cache_dtype_from_config(hf_config: Any) -> Optional[str]:
+    """Return the SMC draft KV dtype requested by a draft model config."""
+    quant_cfg = _get_quantization_config(hf_config)
+    if quant_cfg is None:
+        return None
+    kv_cache_scheme = _coerce_dict(
+        quant_cfg.get("smc_draft_kv_cache_scheme")
+    ) or _coerce_dict(quant_cfg.get("kv_cache_scheme"))
+    if kv_cache_scheme is None:
+        return None
+    if kv_cache_scheme.get("quant_method") == HIGGS_MHA_2BIT_QUANT_METHOD:
+        return "higgs_2bit"
+    return None
 
 
 def _maybe_apply_indexer_quantization(

@@ -1513,19 +1513,37 @@ class HiggsMHA2BitTokenToKVPool(MHATokenToKVPool):
             device=self.device,
         )
 
+    def _dequant_packed_buffer(
+        self,
+        packed: torch.Tensor,
+        codec: Any,
+        head_dim: int,
+    ) -> torch.Tensor:
+        if packed.is_cuda and self.dtype == torch.bfloat16:
+            from sglang.jit_kernel.higgs_mha_2bit_kv import (
+                dequantize_higgs_mha_2bit,
+            )
+
+            out = torch.empty(
+                (*packed.shape[:2], head_dim),
+                dtype=self.dtype,
+                device=packed.device,
+            )
+            dequantize_higgs_mha_2bit(packed, out, codec.codebook)
+            return out
+        return codec.decompress(packed, self.dtype)
+
     def _get_key_buffer(self, layer_id: int):
-        # Legacy path: materialize the full packed cache back to BF16.
-        # This is O(layer_cache_size) per call and adds 200-600x to
-        # decode latency vs FP8 baseline; only the fused
-        # ``HiggsTritonAttnBackend`` is correct for production. Kept
-        # for backends that don't yet have a fused HIGGS-aware path
-        # (e.g. CPU-only correctness oracles).
+        # Fused HIGGS decode reads packed slots directly. This materialization
+        # path remains for extend/prefill and non-fused fallback backends.
         packed = self.k_buffer[layer_id - self.start_layer]
-        return self._higgs_k_codec.decompress(packed, self.dtype)
+        return self._dequant_packed_buffer(packed, self._higgs_k_codec, self.head_dim)
 
     def _get_value_buffer(self, layer_id: int):
         packed = self.v_buffer[layer_id - self.start_layer]
-        return self._higgs_v_codec.decompress(packed, self.dtype)
+        return self._dequant_packed_buffer(
+            packed, self._higgs_v_codec, self.v_head_dim
+        )
 
     def get_packed_key_buffer(self, layer_id: int) -> torch.Tensor:
         """Return the packed (uint8) K buffer for the fused decode path."""
@@ -1562,10 +1580,26 @@ class HiggsMHA2BitTokenToKVPool(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        k_buffer = self.k_buffer[layer_id - self.start_layer]
+        v_buffer = self.v_buffer[layer_id - self.start_layer]
+        if (
+            cache_k.is_cuda
+            and cache_v.is_cuda
+            and cache_k.dtype == torch.bfloat16
+            and cache_v.dtype == torch.bfloat16
+        ):
+            from sglang.srt.layers.attention.triton_ops.higgs_mha_kv_pack import (
+                store_higgs_mha_2bit_triton,
+            )
+
+            store_higgs_mha_2bit_triton(k_buffer, loc, cache_k)
+            store_higgs_mha_2bit_triton(v_buffer, loc, cache_v)
+            return
+
         packed_k = self._higgs_k_codec.compress(cache_k)
         packed_v = self._higgs_v_codec.compress(cache_v)
-        self.k_buffer[layer_id - self.start_layer][loc] = packed_k
-        self.v_buffer[layer_id - self.start_layer][loc] = packed_v
+        k_buffer[loc] = packed_k
+        v_buffer[loc] = packed_v
 
 
 class HybridLinearKVPool(KVCache):

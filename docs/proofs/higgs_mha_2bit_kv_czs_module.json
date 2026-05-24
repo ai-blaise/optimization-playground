@@ -1,0 +1,27 @@
+{
+  "name": "higgs_mha_2bit_kv",
+  "status": "candidate",
+  "intended_czs_use": "static_layout_input_only",
+  "layouts": [
+    {"label":"packed_gqa_slot_bytes_34","shape":[{"is_static":true,"value":34}],"stride":[{"is_static":true,"value":1}]},
+    {"label":"bf16_gqa_head_row","shape":[{"is_static":true,"value":128}],"stride":[{"is_static":true,"value":1}]},
+    {"label":"packed_index_bytes_32","shape":[{"is_static":true,"value":32}],"stride":[{"is_static":true,"value":1}]},
+    {"label":"bf16_gqa_output_row","shape":[{"is_static":true,"value":128}],"stride":[{"is_static":true,"value":1}]}
+  ],
+  "swizzles": [],
+  "swizzled_layouts": [],
+  "tma_descriptors": [],
+  "mma_atoms": [],
+  "ldmatrix_ops": [],
+  "vectorization_ops": [
+    {"label":"packed_index_byte_store","layout_idx":2,"element_bytes":1,"vector_width":4,"base_address":{"is_static":true,"value":0}},
+    {"label":"bf16_gqa_row_load_4xbf16","layout_idx":1,"element_bytes":2,"vector_width":4,"base_address":{"is_static":true,"value":0}},
+    {"label":"bf16_gqa_output_store_4xbf16","layout_idx":3,"element_bytes":2,"vector_width":4,"base_address":{"is_static":true,"value":0}}
+  ],
+  "mbarrier_sites": [],
+  "tmem_traces": [],
+  "dsmem_sites": [],
+  "barrier_elision_sites": [],
+  "mma_overlap_sites": [],
+  "clc_sites": []
+}

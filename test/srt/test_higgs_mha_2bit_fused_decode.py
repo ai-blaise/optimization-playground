@@ -231,5 +231,67 @@ class TestFusedHiggsDecode(unittest.TestCase):
         self._run_case(batch=8, seq_len=2048)
 
 
+class TestHiggsMHAKVKernels(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        if not cuda_available:
+            raise unittest.SkipTest("CUDA required for HIGGS MHA KV kernels")
+        cls.device = torch.device("cuda")
+        torch.manual_seed(0x2B17)
+
+    def test_triton_store_and_cuda_dequant_match_codec(self):
+        from sglang.jit_kernel.higgs_mha_2bit_kv import dequantize_higgs_mha_2bit
+        from sglang.srt.layers.attention.triton_ops.higgs_mha_kv_pack import (
+            store_higgs_mha_2bit_triton,
+        )
+
+        head_dim = 128
+        num_rows = 257
+        num_slots = 300
+        num_kv_heads = 2
+        codec = HiggsMHA2BitCodec(
+            HiggsMHA2BitConfig(head_dim=head_dim), device=self.device
+        )
+        cache = torch.randn(
+            num_rows,
+            num_kv_heads,
+            head_dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        locs = torch.randperm(num_slots, device=self.device, dtype=torch.int64)[
+            :num_rows
+        ]
+        packed = torch.zeros(
+            num_slots,
+            num_kv_heads,
+            codec.slot_bytes,
+            device=self.device,
+            dtype=torch.uint8,
+        )
+        store_higgs_mha_2bit_triton(packed, locs, cache)
+
+        expected = torch.zeros_like(packed)
+        expected[locs] = codec.compress(cache)
+        torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+        out = torch.empty(
+            num_slots,
+            num_kv_heads,
+            head_dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        dequantize_higgs_mha_2bit(packed, out, codec.codebook)
+        ref = codec.decompress(expected, torch.bfloat16)
+        selected = out[locs].reshape(num_rows * num_kv_heads, head_dim)
+        selected_ref = ref[locs].reshape(num_rows * num_kv_heads, head_dim)
+        cos = torch.nn.functional.cosine_similarity(
+            selected.float(), selected_ref.float(), dim=-1
+        )
+        self.assertGreater(cos.min().item(), 0.99)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
 if __name__ == "__main__":
     unittest.main()

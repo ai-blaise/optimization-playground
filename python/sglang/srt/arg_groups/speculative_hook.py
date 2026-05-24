@@ -235,6 +235,34 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
         )
 
 
+def _maybe_apply_smc_draft_kv_cache_config(server_args: "ServerArgs") -> None:
+    if server_args.smc_draft_kv_cache_dtype not in (None, "auto"):
+        return
+
+    from sglang.srt.layers.quantization.quantization_config_dispatch import (
+        get_smc_draft_kv_cache_dtype_from_config,
+    )
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    model_override_args = json.loads(server_args.json_model_override_args)
+    draft_hf_config = get_config(
+        server_args.speculative_draft_model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.speculative_draft_model_revision,
+        model_override_args=model_override_args,
+    )
+    kv_cache_dtype = get_smc_draft_kv_cache_dtype_from_config(draft_hf_config)
+    if kv_cache_dtype is None:
+        return
+
+    server_args.smc_draft_kv_cache_dtype = kv_cache_dtype
+    logger.info(
+        "Selecting --smc-draft-kv-cache-dtype=%s from draft model "
+        "quantization_config.",
+        kv_cache_dtype,
+    )
+
+
 def _handle_smc(server_args: "ServerArgs") -> None:
     if server_args.disaggregation_mode == "prefill":
         raise ValueError(
@@ -310,6 +338,12 @@ def _handle_smc(server_args: "ServerArgs") -> None:
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
+    if server_args.speculative_draft_model_path is None:
+        raise ValueError(
+            "SMC speculative decoding requires --speculative-draft-model-path."
+        )
+    _maybe_apply_smc_draft_kv_cache_config(server_args)
+
     if server_args.smc_draft_kv_cache_dtype == "bf16":
         server_args.smc_draft_kv_cache_dtype = "bfloat16"
     if server_args.smc_draft_kv_cache_dtype is not None and (
@@ -326,10 +360,6 @@ def _handle_smc(server_args: "ServerArgs") -> None:
     server_args.speculative_num_steps = server_args.smc_gamma
     server_args.speculative_num_draft_tokens = server_args.smc_gamma + 1
     server_args.disable_overlap_schedule = True
-    if server_args.speculative_draft_model_path is None:
-        raise ValueError(
-            "SMC speculative decoding requires --speculative-draft-model-path."
-        )
 
 
 def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:

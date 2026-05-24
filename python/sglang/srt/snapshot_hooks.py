@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 from typing import Any
 
@@ -64,9 +65,15 @@ def _drain_kv_router(timeout_s: float) -> None:
 
 
 def _drain_inflight(deadline_s: float) -> None:
-    from sglang.srt.managers import scheduler  # noqa: WPS433
-
-    scheduler.drain_inflight(deadline_s=deadline_s)
+    scheduler = sys.modules.get("sglang.srt.managers.scheduler")
+    if scheduler is None:
+        logger.info("scheduler module is not loaded; relying on controller-side drain")
+        return
+    drain = getattr(scheduler, "drain_inflight", None)
+    if drain is None:
+        logger.info("scheduler.drain_inflight is not registered; relying on controller-side drain")
+        return
+    drain(deadline_s=deadline_s)
 
 
 def _destroy_nccl() -> dict[str, Any] | None:

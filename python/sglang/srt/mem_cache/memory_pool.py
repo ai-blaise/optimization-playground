@@ -56,6 +56,8 @@ from sglang.jit_kernel.higgs_dense_2bit import (
 )
 from sglang.jit_kernel.higgs_dense_2bit_mla_decode import (
     higgs_dense_2bit_mla_decode,
+    higgs_dense_2bit_mla_decode_saw_scalar2,
+    higgs_dense_2bit_mla_decode_saw_scalar2_split,
     higgs_dense_2bit_mla_decode_split,
     higgs_dense_2bit_mla_rotate_query,
 )
@@ -80,6 +82,7 @@ from sglang.srt.layers.quantization.turboquant_dense_kv import (
 from sglang.srt.layers.quantization.higgs_dense_2bit_kv import (
     HiggsDense2BitCodec,
     HiggsDense2BitConfig,
+    get_higgs_dense_2bit_b200_candidate,
     select_higgs_mla_decode_num_splits,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -3655,9 +3658,51 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
             dtype=self.dtype,
             device=q_nope.device,
         )
+        candidate = get_higgs_dense_2bit_b200_candidate()
         num_splits = self._select_higgs_mla_decode_num_splits(
             q_nope.shape[0], q_nope.shape[1], page_table.shape[1]
         )
+        if candidate.name == "store_saw_scalar2":
+            if page_table.shape[1] >= 1024:
+                num_splits = max(num_splits, 16)
+            if num_splits <= 1:
+                higgs_dense_2bit_mla_decode_saw_scalar2(
+                    q_nope,
+                    q_rope,
+                    layer_buffer,
+                    page_table,
+                    out,
+                    self.higgs_codec.codebook,
+                    sm_scale,
+                )
+                return out
+            mid_shape = (
+                q_nope.shape[0],
+                q_nope.shape[1],
+                num_splits,
+                self.kv_lora_rank + 2,
+            )
+            if (
+                self._higgs_mla_decode_mid is None
+                or self._higgs_mla_decode_mid.shape != mid_shape
+            ):
+                self._higgs_mla_decode_mid = torch.empty(
+                    mid_shape,
+                    dtype=torch.float32,
+                    device=q_nope.device,
+                )
+            higgs_dense_2bit_mla_decode_saw_scalar2_split(
+                q_nope,
+                q_rope,
+                layer_buffer,
+                page_table,
+                self._higgs_mla_decode_mid,
+                out,
+                self.higgs_codec.codebook,
+                sm_scale,
+            )
+            return out
+
         if num_splits <= 1:
             higgs_dense_2bit_mla_decode(
                 q_nope,

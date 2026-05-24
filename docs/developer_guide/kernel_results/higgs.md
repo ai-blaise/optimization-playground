@@ -2,8 +2,9 @@
 
 ## Scope
 
-Dense MLA HIGGS 2-bit KV cache store, direct dequant, and page-table dequant on
-B200 for the DeepSeek-V3.2-REAP SpinQuant lane. The accepted candidate is
+Dense MLA HIGGS 2-bit KV cache store, direct dequant, page-table dequant,
+and fused MLA decode compatibility on B200 for the DeepSeek-V3.2-REAP
+SpinQuant lane. The accepted candidate is
 opt-in through the model `quantization_config.kv_cache_scheme` and does not
 change the default EDEN2/Hadamard production path.
 
@@ -16,6 +17,12 @@ activations. It keeps the 258-byte HIGGS slot, removes the online Hadamard from
 this opt-in path, thresholds BF16 bits directly into a 2-bit scalar lattice,
 uses 64-bit latent load/store groups, and moves rope as 16-bit values to avoid
 the byte-granular copy that IKP/SASS exposed.
+
+The matching fused MLA decode path is required for this candidate. The default
+EDEN2/Hadamard fused decode interprets the 128 packed bytes as EDEN pair
+indices, so it is not correct for SAW scalar2 slots. The SAW path now uses a
+SAW-aware split-K decode with pair-lane unpack, branchless lattice value
+materialization, and at least 16 splits for top-k 1024 requests.
 
 The candidate is selected by either:
 
@@ -44,8 +51,27 @@ Comparator: `lightseekorg/tokenspeed` `origin/main` MLA-KV set/get kernels.
 | 131072 | 0.737 ms | 0.0410 ms | 0.0489 ms | 18.0x | 1.19x | 0.0471 ms | 0.0493 ms | 1.04x |
 | 262144 | n/a | 0.0767 ms | 0.0925 ms | n/a | 1.21x | 0.0901 ms | 0.0929 ms | 1.03x |
 
-Full sweep on the experimental worktree also covered 512, 2048, 8192, and
-16384 rows; every measured row count beat TokenSpeed for both store and get.
+Fresh B200 verification after the fused decode fix used the same store path and
+measured 512 through 262144 rows. The accepted store stayed ahead of both
+comparators: 512 rows was 0.00552 ms vs 0.00621 ms OP HIGGS and 0.0253 ms
+TokenSpeed; 262144 rows was 0.0766 ms vs 1.470 ms OP HIGGS and 0.0870 ms
+TokenSpeed.
+
+Fused MLA decode top-k 1024 results, including the SAW-aware split-K repair:
+
+| Rows | Heads | OP EDEN split | SAW split | SAW vs OP |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 16 | 0.0943 ms | 0.0439 ms | 2.15x |
+| 4 | 16 | 0.0984 ms | 0.0574 ms | 1.71x |
+| 16 | 16 | 0.1985 ms | 0.1639 ms | 1.21x |
+| 32 | 16 | 0.3150 ms | 0.3006 ms | 1.05x |
+| 1 | 32 | 0.0959 ms | 0.0472 ms | 2.03x |
+| 16 | 32 | 0.3153 ms | 0.3008 ms | 1.05x |
+| 32 | 32 | 0.5637 ms | 0.5684 ms | 0.99x |
+
+The 32x32 row is within noise but does not clear the win gate; the opt-in SAW
+path remains accepted for the target small-batch decode lane and store/get
+contract, not as a universal replacement for the default EDEN2/Hadamard path.
 
 ## Flashtraining
 
@@ -79,6 +105,15 @@ IKP/SASS findings drove the accepted changes:
   limiting cost once EDEN2 scoring/packing was included.
 - Constant-memory dequant LUT was rejected because divergent constant indexing
   regressed large-row recovery.
+- SAW fused decode single-pass was correctness-ready but too slow: about
+  1.34 ms on the 1x16x1024 gate.
+- SAW split-K direct scalar-byte unpack improved that gate to about 0.180 ms,
+  but still trailed OP EDEN split.
+- Quad-lane byte broadcast was rejected after it regressed the same gate to
+  about 0.191 ms.
+- Pair-lane unpack plus branchless BF16-bit lattice values was accepted for the
+  SAW fused decode path, reaching about 0.074 ms at eight splits and 0.044 ms
+  at the selected 16-split setting on the 1x16x1024 gate.
 - Single-warp multi-row tiles were rejected because they removed too much
   parallelism for quantization.
 - SASS on the accepted shape showed scalar BF16 loads and byte rope copies; the
@@ -87,14 +122,20 @@ IKP/SASS findings drove the accepted changes:
 
 CZS proof: `docs/proofs/higgs_dense_2bit_saw_scalar2_czs_module.json`.
 Result: 7 proved, 0 disproved, 0 unknown. The proof covers static row layouts
-and the vectorized 4xbf16 latent, 8xbf16 rope, and 4xbf16 output moves. This
-path has no MMA/TMA obligations; it is a memory/bit-pack kernel rather than a
-GEMM-like tensor-core kernel.
+and the vectorized 4xbf16 latent, 8xbf16 rope, and 4xbf16 output moves. The
+accepted store/get path has no MMA/TMA obligations; it is a memory/bit-pack
+kernel rather than a GEMM-like tensor-core kernel. The separate CuTe/tensor-core
+MLA decode prototypes remain WIP and are not promoted because they do not yet
+beat the split-K decode baseline.
 
 ## Verification
 
 - `SGLANG_HIGGS_DENSE_2BIT_B200_CANDIDATE=store_saw_scalar2` CUDA correctness
   smoke passed in pod `higgs-kv-cute` on `a4-us-001-rl9`.
+- Full `python/sglang/test/test_higgs_dense_2bit_kv.py` passed on the B200 pod
+  with production defaults: 16 passed, 2 warnings.
+- SAW fused MLA decode now matches a dequantized SAW reference for both
+  single-pass and split-K kernels.
 - Clean-worktree large-row perf sweep passed against TokenSpeed MLA KV at
   32768, 65536, 131072, and 262144 rows.
 - CZS proof passed: 7 proved, 0 disproved, 0 unknown.

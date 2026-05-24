@@ -471,3 +471,74 @@ def test_higgs_mla_decode_matches_dequantized_reference():
     weights = torch.softmax(scores, dim=-1)
     expected = torch.einsum("rhk,rkd->rhd", weights, ref_latent[rows])
     torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_higgs_mla_decode_saw_scalar2_matches_dequantized_reference():
+    """The SAW scalar2 fused decode matches its own packed-slot semantics."""
+    from sglang.jit_kernel.higgs_dense_2bit import (
+        dequantize_higgs_dense_2bit,
+        store_higgs_dense_2bit,
+    )
+    from sglang.jit_kernel.higgs_dense_2bit_mla_decode import (
+        higgs_dense_2bit_mla_decode_saw_scalar2,
+        higgs_dense_2bit_mla_decode_saw_scalar2_split,
+    )
+
+    device = torch.device("cuda")
+    cfg = HiggsDense2BitConfig(latent_dim=512, rope_dim=64)
+    codec = HiggsDense2BitCodec(cfg, device)
+    torch.manual_seed(0x5A17)
+    num_slots = 64
+    locs = torch.arange(num_slots, device=device, dtype=torch.int64)
+    latent = torch.randn(num_slots, 1, 512, device=device, dtype=torch.bfloat16)
+    rope = torch.randn(num_slots, 1, 64, device=device, dtype=torch.bfloat16)
+    compressed = torch.empty(
+        (num_slots, 1, cfg.slot_bytes), device=device, dtype=torch.uint8
+    )
+    old_candidate = os.environ.get(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV)
+    os.environ[HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV] = "store_saw_scalar2"
+    try:
+        store_higgs_dense_2bit(
+            compressed, locs, latent, rope, codec.codebook, codec.codebook_norm_sq
+        )
+        dequant = torch.empty((num_slots, 1, 576), device=device, dtype=torch.bfloat16)
+        dequantize_higgs_dense_2bit(compressed, locs, dequant, codec.codebook)
+    finally:
+        if old_candidate is None:
+            os.environ.pop(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, None)
+        else:
+            os.environ[HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV] = old_candidate
+
+    num_rows = 2
+    num_heads = 3
+    topk = 32
+    page_table = torch.arange(
+        num_rows * topk, device=device, dtype=torch.int32
+    ).reshape(num_rows, topk)
+    q_nope = torch.randn(num_rows, num_heads, 512, device=device, dtype=torch.bfloat16)
+    q_rope = torch.randn(num_rows, num_heads, 64, device=device, dtype=torch.bfloat16)
+    out = torch.empty(
+        (num_rows, num_heads, 512), device=device, dtype=torch.bfloat16
+    )
+    out_split = torch.empty_like(out)
+    mid = torch.empty((num_rows, num_heads, 4, 514), device=device, dtype=torch.float32)
+    sm_scale = 1.0 / (512 ** 0.5)
+    higgs_dense_2bit_mla_decode_saw_scalar2(
+        q_nope, q_rope, compressed, page_table, out, codec.codebook, sm_scale
+    )
+    higgs_dense_2bit_mla_decode_saw_scalar2_split(
+        q_nope, q_rope, compressed, page_table, mid, out_split, codec.codebook, sm_scale
+    )
+
+    ref_latent = dequant[..., :512].squeeze(1).float()
+    ref_rope = dequant[..., 512:].squeeze(1).float()
+    rows = page_table.long()
+    scores = (
+        torch.einsum("rhd,rkd->rhk", q_nope.float(), ref_latent[rows])
+        + torch.einsum("rhe,rke->rhk", q_rope.float(), ref_rope[rows])
+    ) * sm_scale
+    weights = torch.softmax(scores, dim=-1)
+    expected = torch.einsum("rhk,rkd->rhd", weights, ref_latent[rows])
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out_split.float(), expected, rtol=2e-2, atol=2e-2)

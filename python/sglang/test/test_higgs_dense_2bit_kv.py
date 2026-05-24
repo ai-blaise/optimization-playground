@@ -1,5 +1,8 @@
 """Tests for the 2-bit HIGGS dense MLA KV codec + CUDA kernel."""
 
+import os
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -113,6 +116,7 @@ def test_higgs_b200_candidate_registry_has_opt_in_candidates():
         "store_const_codebook_warp_pack_fma_score",
         "store_const_codebook_warp_pack_scale_broadcast",
         "store_const_codebook_warp_pack_rope_first",
+        "store_saw_scalar2",
         "dequant_const_codebook",
         "dequant_vec4_smem_codebook",
         "dequant_vec4_ldg_codebook",
@@ -216,6 +220,12 @@ def test_higgs_b200_candidate_selector_defaults_to_production(monkeypatch):
         == "const_codebook_warp_pack_rope_first"
     )
 
+    monkeypatch.setenv(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "store_saw_scalar2")
+    candidate = get_higgs_dense_2bit_b200_candidate()
+    assert candidate.store_variant == "saw_scalar2"
+    assert candidate.dequant_variant == "saw_scalar2"
+    assert candidate.page_table_dequant_variant == "saw_scalar2"
+
     monkeypatch.setenv(
         HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "dequant_vec4_ldg_codebook"
     )
@@ -287,6 +297,32 @@ def test_higgs_split_policy_candidates_are_opt_in(monkeypatch):
     assert select_higgs_mla_decode_num_splits(1, 8, 2048) == 80
     assert select_higgs_mla_decode_num_splits(1, 8, 4096) == 128
     assert select_higgs_mla_decode_num_splits(64, 8, 4096) == 48
+
+
+def test_higgs_candidate_can_be_selected_from_hf_config(monkeypatch):
+    from sglang.srt.layers.quantization.quantization_config_dispatch import (
+        apply_quantization_config_dispatch,
+    )
+
+    monkeypatch.delenv(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, raising=False)
+    server_args = SimpleNamespace(
+        enable_higgs_dense_2bit_kv_cache=False,
+        enable_turboquant_dense_kv_cache=False,
+    )
+    hf_config = SimpleNamespace(
+        quantization_config={
+            "kv_cache_scheme": {
+                "quant_method": "higgs_dense_2bit",
+                "b200_candidate": "store_saw_scalar2",
+            }
+        }
+    )
+
+    apply_quantization_config_dispatch(server_args, hf_config)
+
+    assert server_args.enable_higgs_dense_2bit_kv_cache
+    assert get_higgs_dense_2bit_b200_candidate().name == "store_saw_scalar2"
+    os.environ.pop(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, None)
 
 
 def test_higgs_b200_candidate_metadata_is_json_ready():

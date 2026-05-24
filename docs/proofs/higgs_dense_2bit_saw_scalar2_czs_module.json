@@ -1,0 +1,27 @@
+{
+  "name": "higgs_dense_2bit_saw_scalar2",
+  "status": "candidate",
+  "intended_czs_use": "static_layout_input_only",
+  "layouts": [
+    {"label":"packed_slot_bytes_258","shape":[{"is_static":true,"value":258}],"stride":[{"is_static":true,"value":1}]},
+    {"label":"bf16_latent_row","shape":[{"is_static":true,"value":512}],"stride":[{"is_static":true,"value":1}]},
+    {"label":"bf16_rope_row","shape":[{"is_static":true,"value":64}],"stride":[{"is_static":true,"value":1}]},
+    {"label":"bf16_output_row","shape":[{"is_static":true,"value":576}],"stride":[{"is_static":true,"value":1}]}
+  ],
+  "swizzles": [],
+  "swizzled_layouts": [],
+  "tma_descriptors": [],
+  "mma_atoms": [],
+  "ldmatrix_ops": [],
+  "vectorization_ops": [
+    {"label":"latent_u64_load_4xbf16","layout_idx":1,"element_bytes":2,"vector_width":4,"base_address":{"is_static":true,"value":0}},
+    {"label":"rope_u16_copy","layout_idx":2,"element_bytes":2,"vector_width":8,"base_address":{"is_static":true,"value":0}},
+    {"label":"latent_u64_output_store","layout_idx":3,"element_bytes":2,"vector_width":4,"base_address":{"is_static":true,"value":0}}
+  ],
+  "mbarrier_sites": [],
+  "tmem_traces": [],
+  "dsmem_sites": [],
+  "barrier_elision_sites": [],
+  "mma_overlap_sites": [],
+  "clc_sites": []
+}

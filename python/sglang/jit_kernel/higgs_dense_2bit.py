@@ -79,6 +79,10 @@ def _jit_higgs_dense_2bit_module() -> "Module":
                 "HiggsDense2BitStoreConstCodebookWarpPackRopeFirstKernel::run",
             ),
             (
+                "store_higgs_dense_2bit_saw_scalar2",
+                "higgs_dense_2bit_detail::HiggsDense2BitStoreSawScalar2Kernel::run",
+            ),
+            (
                 "dequantize_higgs_dense_2bit",
                 "higgs_dense_2bit_detail::HiggsDense2BitDequantKernel::run",
             ),
@@ -86,6 +90,10 @@ def _jit_higgs_dense_2bit_module() -> "Module":
                 "dequantize_higgs_dense_2bit_const_codebook",
                 "higgs_dense_2bit_detail::"
                 "HiggsDense2BitDequantConstCodebookKernel::run",
+            ),
+            (
+                "dequantize_higgs_dense_2bit_saw_scalar2",
+                "higgs_dense_2bit_detail::HiggsDense2BitDequantSawScalar2Kernel::run",
             ),
             (
                 "dequantize_higgs_dense_2bit_vec4",
@@ -110,6 +118,11 @@ def _jit_higgs_dense_2bit_module() -> "Module":
                 "dequantize_higgs_dense_2bit_page_table_const_codebook",
                 "higgs_dense_2bit_detail::"
                 "HiggsDense2BitDequantPageTableConstCodebookKernel::run",
+            ),
+            (
+                "dequantize_higgs_dense_2bit_page_table_saw_scalar2",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitDequantPageTableSawScalar2Kernel::run",
             ),
             (
                 "dequantize_higgs_dense_2bit_page_table_vec4",
@@ -162,7 +175,9 @@ def store_higgs_dense_2bit(
 
     module = _jit_higgs_dense_2bit_module()
     candidate = get_higgs_dense_2bit_b200_candidate()
-    if candidate.store_variant == "const_codebook_warp_pack_pre_norm":
+    if candidate.store_variant == "saw_scalar2":
+        kernel = module.store_higgs_dense_2bit_saw_scalar2
+    elif candidate.store_variant == "const_codebook_warp_pack_pre_norm":
         kernel = module.store_higgs_dense_2bit_const_codebook_warp_pack_pre_norm
     elif candidate.store_variant == "const_codebook_warp_pack_fma_score":
         kernel = module.store_higgs_dense_2bit_const_codebook_warp_pack_fma_score
@@ -217,7 +232,9 @@ def dequantize_higgs_dense_2bit(
 
     module = _jit_higgs_dense_2bit_module()
     candidate = get_higgs_dense_2bit_b200_candidate()
-    if candidate.dequant_variant == "const_codebook":
+    if candidate.dequant_variant == "saw_scalar2":
+        kernel = module.dequantize_higgs_dense_2bit_saw_scalar2
+    elif candidate.dequant_variant == "const_codebook":
         kernel = module.dequantize_higgs_dense_2bit_const_codebook
     elif candidate.dequant_variant == "vec4_smem_codebook":
         kernel = module.dequantize_higgs_dense_2bit_vec4
@@ -366,7 +383,9 @@ def dequantize_higgs_dense_2bit_page_table(
 
     module = _jit_higgs_dense_2bit_module()
     candidate = get_higgs_dense_2bit_b200_candidate()
-    if candidate.page_table_dequant_variant == "const_codebook":
+    if candidate.page_table_dequant_variant == "saw_scalar2":
+        kernel = module.dequantize_higgs_dense_2bit_page_table_saw_scalar2
+    elif candidate.page_table_dequant_variant == "const_codebook":
         kernel = module.dequantize_higgs_dense_2bit_page_table_const_codebook
     elif candidate.page_table_dequant_variant == "vec4_smem_codebook":
         kernel = module.dequantize_higgs_dense_2bit_page_table_vec4

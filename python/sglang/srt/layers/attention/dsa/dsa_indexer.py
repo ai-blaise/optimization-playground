@@ -19,6 +19,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
 from sglang.jit_kernel.nvfp4_indexer import (
     can_use_dsa_nvfp4_indexer,
     fused_store_index_k_cache_nvfp4,
+    nvfp4_hisa_indexer_paged_collective_key,
     nvfp4_hisa_indexer_paged_deepgemm,
     nvfp4_hisa_indexer_paged_torch,
     quantize_indexer_q_nvfp4,
@@ -78,6 +79,9 @@ _hisa_nvfp4_block_size = get_int_env_var("SGLANG_NSA_NVFP4_HISA_BLOCK_SIZE", 128
 _hisa_nvfp4_block_topk = get_int_env_var("SGLANG_NSA_NVFP4_HISA_BLOCK_TOPK", 64)
 _hisa_nvfp4_compression_ratio = float(
     os.environ.get("SGLANG_NSA_NVFP4_HISA_COMPRESSION_RATIO", "4.0")
+)
+_hisa_nvfp4_collective_key = get_bool_env_var(
+    "SGLANG_NSA_NVFP4_HISA_COLLECTIVE_KEY", "false"
 )
 _deep_gemm_mqa_q_alignment = get_int_env_var("SGLANG_DEEP_GEMM_MQA_Q_ALIGNMENT", 128)
 _torch_mqa_fallback_max_elements = get_int_env_var(
@@ -413,6 +417,20 @@ def _get_hisa_decision_max_seq_len(
     if seqlens_32.is_cuda and torch.cuda.is_current_stream_capturing():
         return None
     return int(seqlens_32.max().item())
+
+
+def _get_hisa_host_max_seq_len_hint(
+    forward_batch: Optional[ForwardBatch],
+    metadata: BaseIndexerMetadata,
+) -> Optional[int]:
+    seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+    if seq_lens_cpu is not None and len(seq_lens_cpu) != 0:
+        return int(seq_lens_cpu.max().item())
+    if forward_batch is not None:
+        forward_seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if forward_seq_lens_cpu is not None and len(forward_seq_lens_cpu) != 0:
+            return int(forward_seq_lens_cpu.max().item())
+    return None
 
 
 class Indexer(MultiPlatformOp):
@@ -826,6 +844,10 @@ class Indexer(MultiPlatformOp):
                     seqlens_32,
                     weights,
                     metadata,
+                    max_seq_len_hint=(
+                        _get_hisa_host_max_seq_len_hint(forward_batch, metadata)
+                        or int(max_seq_len)
+                    ),
                 )
                 if result is None:
                     _hisa_profile_end(
@@ -1194,6 +1216,7 @@ class Indexer(MultiPlatformOp):
         seqlens_32: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
+        max_seq_len_hint: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         q_values, _ = q_fp4
         if q_values.dim() != 3 or q_values.shape[-1] != 64:
@@ -1224,30 +1247,49 @@ class Indexer(MultiPlatformOp):
         if q_offset == 0:
             return topk_result
 
+        max_seq_len_hint = (
+            _get_hisa_host_max_seq_len_hint(None, metadata) or max_seq_len_hint
+        )
         token_to_batch_idx = self._get_hisa_token_to_batch_idx(
             metadata, q_offset, page_table
         )
         hisa_weights = weights[:q_offset]
         if hisa_weights.dim() == 3:
             hisa_weights = hisa_weights.squeeze(2)
-        if _has_deep_gemm_kernel("fp8_fp4_mqa_logits"):
-            nvfp4_hisa_indexer_paged = nvfp4_hisa_indexer_paged_deepgemm
-        else:
-            nvfp4_hisa_indexer_paged = nvfp4_hisa_indexer_paged_torch
-
-        topk_relative = nvfp4_hisa_indexer_paged(
-            (q_fp4[0][:q_offset], q_fp4[1][:q_offset]),
-            index_k_with_scale_buffer,
-            page_table,
-            seqlens_32.reshape(-1),
-            hisa_weights,
-            token_to_batch_idx,
-            block_size=self.hisa_block_size,
-            block_topk=self.hisa_block_topk,
-            compression_ratio=self.hisa_compression_ratio,
-            topk_tokens=self.index_topk,
-            fallback_to_dense_if_short=True,
-        )
+        topk_relative = None
+        if _hisa_nvfp4_collective_key:
+            topk_relative = nvfp4_hisa_indexer_paged_collective_key(
+                (q_fp4[0][:q_offset], q_fp4[1][:q_offset]),
+                index_k_with_scale_buffer,
+                page_table,
+                seqlens_32.reshape(-1),
+                hisa_weights,
+                token_to_batch_idx,
+                block_size=self.hisa_block_size,
+                block_topk=self.hisa_block_topk,
+                compression_ratio=self.hisa_compression_ratio,
+                topk_tokens=self.index_topk,
+                fallback_to_dense_if_short=False,
+                max_seq_len_hint=max_seq_len_hint,
+            )
+        if topk_relative is None:
+            if _has_deep_gemm_kernel("fp8_fp4_mqa_logits"):
+                nvfp4_hisa_indexer_paged = nvfp4_hisa_indexer_paged_deepgemm
+            else:
+                nvfp4_hisa_indexer_paged = nvfp4_hisa_indexer_paged_torch
+            topk_relative = nvfp4_hisa_indexer_paged(
+                (q_fp4[0][:q_offset], q_fp4[1][:q_offset]),
+                index_k_with_scale_buffer,
+                page_table,
+                seqlens_32.reshape(-1),
+                hisa_weights,
+                token_to_batch_idx,
+                block_size=self.hisa_block_size,
+                block_topk=self.hisa_block_topk,
+                compression_ratio=self.hisa_compression_ratio,
+                topk_tokens=self.index_topk,
+                fallback_to_dense_if_short=True,
+            )
         if topk_relative is None:
             topk_relative = self._get_dense_short_relative_topk(
                 seqlens_32,

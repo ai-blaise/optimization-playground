@@ -12,6 +12,10 @@ from sglang.jit_kernel.nvfp4_indexer import (
     _hisa_block_topk_counts,
     fused_store_index_k_cache_nvfp4,
     hisa_precompute_block_reps_indexer_cache_nvfp4,
+    nvfp4_hisa_indexer_paged_collective_key_precomputed,
+    nvfp4_hisa_indexer_paged_megakernel_precomputed,
+    nvfp4_hisa_indexer_paged_parallel_collective_precomputed,
+    nvfp4_hisa_indexer_paged_parallel_megakernel_precomputed,
     nvfp4_hisa_indexer_paged_deepgemm,
     nvfp4_hisa_indexer_paged_deepgemm_precomputed,
     nvfp4_hisa_indexer_paged_torch,
@@ -58,6 +62,12 @@ def _time_cuda(fn, warmup: int, iters: int) -> tuple[float, list[float]]:
         torch.cuda.synchronize()
         samples.append((time.perf_counter() - start) * 1000.0)
     return statistics.median(samples), samples
+
+
+def _require_hisa_result(result, label: str):
+    if result is None:
+        raise RuntimeError(f"{label} is unsupported for this benchmark cell.")
+    return result
 
 
 def _indexcache_nvfp4_paged(
@@ -125,8 +135,21 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--hisa-candidate-scorer",
-        choices=("scalar", "deepgemm", "precomputed"),
+        choices=(
+            "scalar",
+            "deepgemm",
+            "precomputed",
+            "collective-key",
+            "collective-key-probe",
+            "serial-megakernel-probe",
+            "parallel-megakernel-probe",
+            "parallel-collective-probe",
+        ),
         default="scalar",
+        help=(
+            "Candidate scorer to time. *-megakernel-probe modes are opt-in "
+            "cuBLASDx experiments, not production paths."
+        ),
     )
     parser.add_argument(
         "--hisa-compression-ratio",
@@ -187,7 +210,14 @@ def main() -> None:
                 )
             else:
                 prepared_block_topk_counts = None
-            if args.hisa_candidate_scorer == "precomputed":
+            if args.hisa_candidate_scorer in (
+                "precomputed",
+                "collective-key",
+                "collective-key-probe",
+                "serial-megakernel-probe",
+                "parallel-megakernel-probe",
+                "parallel-collective-probe",
+            ):
                 precompute_reps_ms, _ = _time_cuda(
                     lambda: hisa_precompute_block_reps_indexer_cache_nvfp4(
                         cache, page_table, seq_lens
@@ -227,6 +257,99 @@ def main() -> None:
                     compression_ratio=compression_ratio,
                     topk_tokens=topk,
                     fallback_to_dense_if_short=False,
+                )
+            elif args.hisa_candidate_scorer == "serial-megakernel-probe":
+                hisa_call = lambda: _require_hisa_result(
+                    nvfp4_hisa_indexer_paged_megakernel_precomputed(
+                        q_fp4,
+                        cache,
+                        page_table,
+                        seq_lens,
+                        weights,
+                        token_to_batch_idx,
+                        precomputed_reps,
+                        precomputed_max_blocks,
+                        compression_ratio=compression_ratio,
+                        topk_tokens=topk,
+                        fallback_to_dense_if_short=False,
+                        prepared_prefix_lens=prepared_prefix_lens,
+                        prepared_block_counts=prepared_block_counts,
+                        prepared_block_topk_counts=prepared_block_topk_counts,
+                        prepared_effective_block_topk=effective_block_topk,
+                    ),
+                    "NVFP4 HISA serial megakernel probe",
+                )
+            elif args.hisa_candidate_scorer == "parallel-megakernel-probe":
+                hisa_call = lambda: _require_hisa_result(
+                    nvfp4_hisa_indexer_paged_parallel_megakernel_precomputed(
+                        q_fp4,
+                        cache,
+                        page_table,
+                        seq_lens,
+                        weights,
+                        token_to_batch_idx,
+                        precomputed_reps,
+                        precomputed_max_blocks,
+                        compression_ratio=compression_ratio,
+                        topk_tokens=topk,
+                        fallback_to_dense_if_short=False,
+                        prepared_prefix_lens=prepared_prefix_lens,
+                        prepared_block_counts=prepared_block_counts,
+                        prepared_block_topk_counts=prepared_block_topk_counts,
+                        prepared_effective_block_topk=effective_block_topk,
+                    ),
+                    "NVFP4 HISA parallel megakernel probe",
+                )
+            elif args.hisa_candidate_scorer == "parallel-collective-probe":
+                hisa_call = lambda: _require_hisa_result(
+                    nvfp4_hisa_indexer_paged_parallel_collective_precomputed(
+                        q_fp4,
+                        cache,
+                        page_table,
+                        seq_lens,
+                        weights,
+                        token_to_batch_idx,
+                        precomputed_reps,
+                        precomputed_max_blocks,
+                        compression_ratio=compression_ratio,
+                        topk_tokens=topk,
+                        fallback_to_dense_if_short=False,
+                        prepared_prefix_lens=prepared_prefix_lens,
+                        prepared_block_counts=prepared_block_counts,
+                        prepared_block_topk_counts=prepared_block_topk_counts,
+                        prepared_effective_block_topk=effective_block_topk,
+                        prepared_candidate_context_lens=prepared_candidate_context_lens,
+                        prepared_candidate_schedule_metadata=prepared_candidate_schedule_metadata,
+                    ),
+                    "NVFP4 HISA parallel collective probe",
+                )
+            elif args.hisa_candidate_scorer in (
+                "collective-key",
+                "collective-key-probe",
+            ):
+                hisa_call = lambda: _require_hisa_result(
+                    nvfp4_hisa_indexer_paged_collective_key_precomputed(
+                        q_fp4,
+                        cache,
+                        page_table,
+                        seq_lens,
+                        weights,
+                        token_to_batch_idx,
+                        precomputed_reps,
+                        precomputed_max_blocks,
+                        compression_ratio=compression_ratio,
+                        topk_tokens=topk,
+                        fallback_to_dense_if_short=False,
+                        prepared_prefix_lens=prepared_prefix_lens,
+                        prepared_block_counts=prepared_block_counts,
+                        prepared_block_starts=prepared_block_starts,
+                        prepared_block_ends=prepared_block_ends,
+                        prepared_candidate_context_lens=prepared_candidate_context_lens,
+                        prepared_candidate_schedule_metadata=prepared_candidate_schedule_metadata,
+                        prepared_block_topk_counts=prepared_block_topk_counts,
+                        prepared_effective_block_topk=effective_block_topk,
+                    ),
+                    "NVFP4 HISA collective key",
                 )
             elif args.hisa_candidate_scorer == "precomputed":
                 hisa_call = lambda: nvfp4_hisa_indexer_paged_deepgemm_precomputed(

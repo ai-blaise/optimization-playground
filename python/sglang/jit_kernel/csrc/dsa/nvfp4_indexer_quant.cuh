@@ -12,10 +12,19 @@
 
 #include "../gemm/nvfp4/nvfp4_quant.cuh"
 
+#if defined(SGLANG_ENABLE_HISA_SELECTOR_MEGAKERNEL)
+#include <cuda.h>
+#include <cudaTypedefs.h>
+#include <cuda_runtime_api.h>
+#include <cooperative_groups.h>
+#include <cublasdx.hpp>
+#include <deep_gemm/impls/sm100_fp4_paged_mqa_logits.cuh>
+#endif
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <bit>
+#include <climits>
 #include <cstdint>
 #include <stdexcept>
 
@@ -25,6 +34,35 @@ constexpr int kIndexerHeadDim = 128;
 constexpr int kNVFP4ValueBytes = kIndexerHeadDim / 2;
 constexpr int kScaleBytes = 4;
 constexpr float kE2M1Max = 6.0f;
+#if defined(SGLANG_ENABLE_HISA_SELECTOR_MEGAKERNEL)
+constexpr int kHISASelectorHeads = 64;
+constexpr int kHISASelectorTileN = 128;
+constexpr int kHISASelectorWideTileN = 192;
+constexpr int kHISASelectorClusterSize = 4;
+
+#define HISA_SELECTOR_CLUSTER_KERNEL \
+  __global__ __launch_bounds__(128, 1) \
+      __cluster_dims__(1, kHISASelectorClusterSize, 1)
+
+using HISASelectorGemmF32 = decltype(
+    cublasdx::Size<kHISASelectorHeads, kHISASelectorTileN, kIndexerHeadDim>()
+    + cublasdx::Precision<float>()
+    + cublasdx::Type<cublasdx::type::real>()
+    + cublasdx::Function<cublasdx::function::MM>()
+    + cublasdx::Arrangement<cublasdx::row_major, cublasdx::col_major>()
+    + cublasdx::SM<1000>()
+    + cublasdx::BlockDim<128>()
+    + cublasdx::Block());
+using HISASelectorWideGemmF32 = decltype(
+    cublasdx::Size<kHISASelectorHeads, kHISASelectorWideTileN, kIndexerHeadDim>()
+    + cublasdx::Precision<float>()
+    + cublasdx::Type<cublasdx::type::real>()
+    + cublasdx::Function<cublasdx::function::MM>()
+    + cublasdx::Arrangement<cublasdx::row_major, cublasdx::col_major>()
+    + cublasdx::SM<1000>()
+    + cublasdx::BlockDim<128>()
+    + cublasdx::Block());
+#endif
 
 struct NVFP4IndexerStoreParam {
   const void* __restrict__ input;
@@ -163,10 +201,199 @@ struct NVFP4HISAFusedMaskTopKMapParam {
   uint32_t candidate_len;
 };
 
+#if defined(SGLANG_ENABLE_HISA_SELECTOR_MEGAKERNEL)
+struct NVFP4HISASelectorMegakernelParam {
+  const void* __restrict__ q_values;        // [q_rows, 64, 64] packed NVFP4
+  const void* __restrict__ q_scales;        // [q_rows, 64] UE8M0 scales
+  const void* __restrict__ cache;
+  const void* __restrict__ page_table;
+  const void* __restrict__ seq_lens;        // [batch] int32
+  const void* __restrict__ weights;         // [q_rows, 64] float
+  const void* __restrict__ token_to_batch_idx;
+  const void* __restrict__ rep_values;      // [batch * max_blocks, 64]
+  const void* __restrict__ rep_scales;      // [batch * max_blocks]
+  const void* __restrict__ block_counts;    // [q_rows] int32
+  const void* __restrict__ block_topk_counts;  // [q_rows] int32
+  void* __restrict__ topk_indices;          // [q_rows, topk] int32
+  uint32_t q_rows;
+  uint32_t batch_size;
+  uint32_t n_heads;
+  uint32_t max_blocks;
+  uint32_t page_table_stride;
+  uint32_t effective_block_topk;
+  uint32_t topk;
+  uint32_t block_score_capacity;
+  uint32_t candidate_capacity;
+};
+
+struct NVFP4HISASelectorParallelSelectParam {
+  const void* __restrict__ q_values;        // [q_rows, 64, 64] packed NVFP4
+  const void* __restrict__ q_scales;        // [q_rows, 64] UE8M0 scales
+  const void* __restrict__ seq_lens;        // [batch] int32
+  const void* __restrict__ weights;         // [q_rows, 64] float
+  const void* __restrict__ token_to_batch_idx;
+  const void* __restrict__ rep_values;      // [batch * max_blocks, 64]
+  const void* __restrict__ rep_scales;      // [batch * max_blocks]
+  const void* __restrict__ block_counts;    // [q_rows] int32
+  const void* __restrict__ block_topk_counts;  // [q_rows] int32
+  void* __restrict__ selected_blocks;       // [q_rows, effective_block_topk] int32
+  uint32_t q_rows;
+  uint32_t batch_size;
+  uint32_t n_heads;
+  uint32_t max_blocks;
+  uint32_t effective_block_topk;
+  uint32_t block_score_capacity;
+};
+
+struct NVFP4HISASelectorParallelScoreParam {
+  const void* __restrict__ q_values;        // [q_rows, 64, 64] packed NVFP4
+  const void* __restrict__ q_scales;        // [q_rows, 64] UE8M0 scales
+  const void* __restrict__ cache;
+  const void* __restrict__ page_table;
+  const void* __restrict__ seq_lens;        // [batch] int32
+  const void* __restrict__ weights;         // [q_rows, 64] float
+  const void* __restrict__ token_to_batch_idx;
+  const void* __restrict__ selected_blocks; // [q_rows, effective_block_topk] int32
+  void* __restrict__ logits;                // [q_rows, candidate_len] float
+  uint32_t q_rows;
+  uint32_t batch_size;
+  uint32_t n_heads;
+  uint32_t page_table_stride;
+  uint32_t effective_block_topk;
+  uint32_t candidate_len;
+};
+
+struct NVFP4HISASelectorClusterFusedParam {
+  const void* __restrict__ q_values;        // [q_rows, 64, 64] packed NVFP4
+  const void* __restrict__ q_scales;        // [q_rows, 64] UE8M0 scales
+  const void* __restrict__ cache;
+  const void* __restrict__ page_table;
+  const void* __restrict__ seq_lens;        // [batch] int32
+  const void* __restrict__ weights;         // [q_rows, 64] float
+  const void* __restrict__ token_to_batch_idx;
+  const void* __restrict__ rep_values;      // [batch * max_blocks, 64]
+  const void* __restrict__ rep_scales;      // [batch * max_blocks]
+  const void* __restrict__ block_counts;    // [q_rows] int32
+  const void* __restrict__ block_topk_counts;  // [q_rows] int32
+  void* __restrict__ candidate_keys;        // [q_rows, candidate_len] uint32 score-key scratch
+  void* __restrict__ topk_indices;          // [q_rows, topk] int32
+  uint32_t q_rows;
+  uint32_t batch_size;
+  uint32_t n_heads;
+  uint32_t max_blocks;
+  uint32_t page_table_stride;
+  uint32_t effective_block_topk;
+  uint32_t topk;
+  uint32_t block_score_capacity;
+  uint32_t candidate_len;
+};
+
+struct NVFP4HISACandidateKeysTopKMapParam {
+  const void* __restrict__ candidate_keys;  // [q_rows, candidate_len] uint32 score keys
+  const void* __restrict__ top_blocks;      // [q_rows, block_topk] int32
+  void* __restrict__ topk_indices;          // [q_rows, topk] int32
+  uint32_t q_rows;
+  uint32_t topk;
+  uint32_t block_topk;
+  uint32_t candidate_len;
+};
+#endif
+
 SGL_DEVICE uint32_t fp32_to_radix_desc(uint32_t bits) {
   const auto asc_key = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
   return ~asc_key;
 }
+
+#if defined(SGLANG_ENABLE_HISA_SELECTOR_MEGAKERNEL)
+inline PFN_cuTensorMapEncodeTiled_v12000 hisa_get_cu_tensor_map_encode_tiled() {
+  static const auto fn = []() {
+    void* ptr = nullptr;
+    cudaDriverEntryPointQueryResult status = cudaDriverEntryPointSymbolNotFound;
+    const cudaError_t err = cudaGetDriverEntryPointByVersion(
+        "cuTensorMapEncodeTiled",
+        &ptr,
+        12000,
+        cudaEnableDefault,
+        &status);
+    if (err != cudaSuccess || ptr == nullptr ||
+        status != cudaDriverEntryPointSuccess) {
+      throw std::runtime_error(
+          "Failed to resolve cuTensorMapEncodeTiled through CUDA runtime.");
+    }
+    return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(ptr);
+  }();
+  return fn;
+}
+
+inline CUtensorMap hisa_make_tma_desc_2d(
+    const void* base,
+    CUtensorMapDataType dtype,
+    uint64_t gmem_dim0,
+    uint64_t gmem_dim1,
+    uint64_t gmem_stride0_bytes,
+    uint32_t smem_dim0,
+    uint32_t smem_dim1,
+    CUtensorMapSwizzle swizzle) {
+  CUtensorMap tensor_map;
+  const cuuint64_t gmem_dims[2] = {gmem_dim0, gmem_dim1};
+  const cuuint64_t gmem_strides[1] = {gmem_stride0_bytes};
+  const cuuint32_t smem_dims[2] = {smem_dim0, smem_dim1};
+  const cuuint32_t elem_strides[2] = {1, 1};
+  const CUresult result = hisa_get_cu_tensor_map_encode_tiled()(
+      &tensor_map,
+      dtype,
+      2,
+      const_cast<void*>(base),
+      gmem_dims,
+      gmem_strides,
+      smem_dims,
+      elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      swizzle,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (result != CUDA_SUCCESS) {
+    throw std::runtime_error("cuTensorMapEncodeTiled failed for HISA 2D TMA descriptor.");
+  }
+  return tensor_map;
+}
+
+inline CUtensorMap hisa_make_tma_desc_3d(
+    const void* base,
+    CUtensorMapDataType dtype,
+    uint64_t gmem_dim0,
+    uint64_t gmem_dim1,
+    uint64_t gmem_dim2,
+    uint64_t gmem_stride0_bytes,
+    uint64_t gmem_stride1_bytes,
+    uint32_t smem_dim0,
+    uint32_t smem_dim1,
+    uint32_t smem_dim2,
+    CUtensorMapSwizzle swizzle) {
+  CUtensorMap tensor_map;
+  const cuuint64_t gmem_dims[3] = {gmem_dim0, gmem_dim1, gmem_dim2};
+  const cuuint64_t gmem_strides[2] = {gmem_stride0_bytes, gmem_stride1_bytes};
+  const cuuint32_t smem_dims[3] = {smem_dim0, smem_dim1, smem_dim2};
+  const cuuint32_t elem_strides[3] = {1, 1, 1};
+  const CUresult result = hisa_get_cu_tensor_map_encode_tiled()(
+      &tensor_map,
+      dtype,
+      3,
+      const_cast<void*>(base),
+      gmem_dims,
+      gmem_strides,
+      smem_dims,
+      elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      swizzle,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (result != CUDA_SUCCESS) {
+    throw std::runtime_error("cuTensorMapEncodeTiled failed for HISA 3D TMA descriptor.");
+  }
+  return tensor_map;
+}
+#endif
 
 __global__ void hisa_fused_mask_topk_map_indexer_cache_nvfp4(
     const __grid_constant__ NVFP4HISAFusedMaskTopKMapParam param) {
@@ -181,6 +408,7 @@ __global__ void hisa_fused_mask_topk_map_indexer_cache_nvfp4(
   __shared__ uint32_t s_boundary_quota;
   __shared__ uint32_t s_boundary_used;
   __shared__ uint32_t s_above_used;
+  __shared__ uint32_t s_emit_count;
 
   const auto row = blockIdx.x;
   if (row >= param.q_rows) return;
@@ -199,6 +427,7 @@ __global__ void hisa_fused_mask_topk_map_indexer_cache_nvfp4(
     s_less_count = 0;
     s_above_used = 0;
     s_boundary_used = 0;
+    s_emit_count = 0;
   }
   __syncthreads();
 
@@ -230,7 +459,7 @@ __global__ void hisa_fused_mask_topk_map_indexer_cache_nvfp4(
       const bool valid = (token >= 0) && (token < s_prefix_len);
       const auto key =
           valid ? fp32_to_radix_desc(__float_as_uint(logits_row[i])) : 0xffffffffu;
-      if (pass == 0 || ((key & prefix_mask) == selected_prefix)) {
+      if (valid && (pass == 0 || ((key & prefix_mask) == selected_prefix))) {
         atomicAdd(&s_hist[(key >> shift) & 0xffu], 1u);
       }
     }
@@ -299,8 +528,13 @@ __global__ void hisa_fused_mask_topk_map_indexer_cache_nvfp4(
   }
   __syncthreads();
 
-  // Pad remaining [keep, topk) slots with -1.
-  for (uint32_t i = keep + tid; i < param.topk; i += kThreads) {
+  if (tid == 0) {
+    const uint32_t boundary_written = min(s_boundary_used, boundary_quota);
+    s_emit_count = min(keep, min(s_above_used, above_count) + boundary_written);
+  }
+  __syncthreads();
+
+  for (uint32_t i = s_emit_count + tid; i < param.topk; i += kThreads) {
     out_row[i] = -1;
   }
 }
@@ -384,6 +618,2468 @@ SGL_DEVICE float warp_sum(float value) {
   value += __shfl_down_sync(0xffffffff, value, 1);
   return value;
 }
+
+#if defined(SGLANG_ENABLE_HISA_SELECTOR_MEGAKERNEL)
+SGL_DEVICE char* hisa_align_smem(char* ptr, uintptr_t alignment) {
+  const uintptr_t raw = reinterpret_cast<uintptr_t>(ptr);
+  return reinterpret_cast<char*>((raw + alignment - 1) & ~(alignment - 1));
+}
+
+SGL_DEVICE bool hisa_selector_better(
+    float score_a,
+    int ordinal_a,
+    float score_b,
+    int ordinal_b) {
+  if (score_a > score_b) return true;
+  if (score_a < score_b) return false;
+  return ordinal_a < ordinal_b;
+}
+
+SGL_DEVICE uint32_t fp32_to_ordered_asc(uint32_t bits) {
+  return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+}
+
+SGL_DEVICE uint64_t hisa_candidate_key_from_score_ordinal(
+    float score,
+    uint32_t ordinal) {
+  if (!(score > -3.0e38f)) return 0ull;
+  const uint32_t score_key = fp32_to_ordered_asc(__float_as_uint(score));
+  const uint32_t ordinal_key = 0xffffffffu - ordinal;
+  return (static_cast<uint64_t>(score_key) << 32) | ordinal_key;
+}
+
+SGL_DEVICE uint64_t hisa_candidate_key_asc_from_score_ordinal(
+    float score,
+    uint32_t ordinal) {
+  if (!(score > -3.0e38f)) return UINT64_MAX;
+  const uint64_t score_key = fp32_to_radix_desc(__float_as_uint(score));
+  return (score_key << 32) | static_cast<uint64_t>(ordinal);
+}
+
+SGL_DEVICE uint32_t hisa_candidate_key_ordinal(uint64_t key) {
+  return 0xffffffffu - static_cast<uint32_t>(key);
+}
+
+SGL_DEVICE uint32_t hisa_candidate_key_asc_ordinal(uint64_t key) {
+  return static_cast<uint32_t>(key);
+}
+
+__global__ void hisa_candidate_keys_topk_map_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISACandidateKeysTopKMapParam param) {
+  constexpr uint32_t kThreads = 256;
+  constexpr uint32_t kTopKBits = 11;
+  constexpr uint32_t kBins = 1u << kTopKBits;
+  constexpr uint32_t kTopKPasses = (32u + kTopKBits - 1u) / kTopKBits;
+  constexpr uint32_t kWarps = kThreads / 32;
+  constexpr uint32_t kBinsPerThread = (kBins + kThreads - 1u) / kThreads;
+  constexpr uint32_t kHISABlockSize = 128;
+
+  __shared__ uint32_t s_hist[kBins];
+  __shared__ uint32_t s_prefix[kBins];
+  __shared__ uint32_t s_warp_totals[kWarps];
+  __shared__ uint32_t s_warp_prefix[kWarps];
+  __shared__ uint32_t s_threshold_key;
+  __shared__ uint32_t s_less_count;
+  __shared__ uint32_t s_boundary_quota;
+  __shared__ uint32_t s_boundary_used;
+  __shared__ uint32_t s_above_used;
+  __shared__ uint32_t s_emit_count;
+  __shared__ uint32_t s_selected_bin;
+
+  const uint32_t row = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+  if (row >= param.q_rows) return;
+
+  const uint32_t keep = min(param.topk, param.candidate_len);
+  const auto* keys_row =
+      static_cast<const uint32_t*>(param.candidate_keys) +
+      static_cast<int64_t>(row) * param.candidate_len;
+  const auto* blocks_row =
+      static_cast<const int32_t*>(param.top_blocks) +
+      static_cast<int64_t>(row) * param.block_topk;
+  auto* out_row =
+      static_cast<int32_t*>(param.topk_indices) +
+      static_cast<int64_t>(row) * param.topk;
+
+  if (tid == 0) {
+    s_threshold_key = 0;
+    s_less_count = 0;
+    s_above_used = 0;
+    s_boundary_used = 0;
+    s_emit_count = 0;
+  }
+  __syncthreads();
+
+  #pragma unroll
+  for (uint32_t pass = 0; pass < kTopKPasses; ++pass) {
+    const uint32_t bits_remaining = 32u - pass * kTopKBits;
+    const uint32_t bits_this = min(kTopKBits, bits_remaining);
+    const uint32_t shift = bits_remaining - bits_this;
+    const uint32_t active_bins = 1u << bits_this;
+    const uint32_t digit_mask = active_bins - 1u;
+    const uint32_t prefix_mask =
+        pass == 0 ? 0u : (0xffffffffu << (shift + bits_this));
+    const uint32_t selected_prefix = s_threshold_key & prefix_mask;
+
+    for (uint32_t bin = tid; bin < active_bins; bin += kThreads) {
+      s_hist[bin] = 0;
+    }
+    __syncthreads();
+
+    for (uint32_t i = tid; i < param.candidate_len; i += kThreads) {
+      const uint32_t key = keys_row[i];
+      if (key != 0xffffffffu &&
+          (pass == 0 || ((key & prefix_mask) == selected_prefix))) {
+        atomicAdd(&s_hist[(key >> shift) & digit_mask], 1u);
+      }
+    }
+    __syncthreads();
+
+    uint32_t lane_sum = 0;
+    const uint32_t bin_base = tid * kBinsPerThread;
+    #pragma unroll
+    for (uint32_t j = 0; j < kBinsPerThread; ++j) {
+      const uint32_t bin = bin_base + j;
+      if (bin < active_bins) lane_sum += s_hist[bin];
+    }
+    uint32_t scan = lane_sum;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+      const auto y = __shfl_up_sync(0xffffffff, scan, off);
+      if (static_cast<int>(tid & 31u) >= off) scan += y;
+    }
+    const uint32_t warp_id = tid >> 5;
+    if ((tid & 31u) == 31u) s_warp_totals[warp_id] = scan;
+    __syncthreads();
+
+    if (tid < 32) {
+      uint32_t warp_sum = tid < kWarps ? s_warp_totals[tid] : 0u;
+      uint32_t warp_scan = warp_sum;
+      #pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const auto y = __shfl_up_sync(0xffffffff, warp_scan, off);
+        if (static_cast<int>(tid) >= off) warp_scan += y;
+      }
+      if (tid < kWarps) {
+        s_warp_prefix[tid] = warp_scan - warp_sum;
+      }
+    }
+    __syncthreads();
+
+    uint32_t running = s_warp_prefix[warp_id] + scan - lane_sum;
+    #pragma unroll
+    for (uint32_t j = 0; j < kBinsPerThread; ++j) {
+      const uint32_t bin = bin_base + j;
+      if (bin < active_bins) {
+        running += s_hist[bin];
+        s_prefix[bin] = running;
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      s_selected_bin = active_bins - 1u;
+    }
+    __syncthreads();
+
+    const uint32_t target = keep > s_less_count ? keep - s_less_count : 1u;
+    for (uint32_t bin = tid; bin < active_bins; bin += kThreads) {
+      if (s_prefix[bin] >= target) {
+        atomicMin(&s_selected_bin, bin);
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      const uint32_t b = min(s_selected_bin, active_bins - 1u);
+      const uint32_t before = b == 0 ? 0u : s_prefix[b - 1];
+      s_less_count += before;
+      s_threshold_key = selected_prefix | (b << shift);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    s_boundary_quota = keep > s_less_count ? keep - s_less_count : 0u;
+    s_above_used = 0;
+    s_boundary_used = 0;
+  }
+  __syncthreads();
+
+  const uint32_t threshold_key = s_threshold_key;
+  const uint32_t above_count = s_less_count;
+  const uint32_t boundary_quota = s_boundary_quota;
+  for (uint32_t i = tid; i < param.candidate_len; i += kThreads) {
+    const uint32_t key = keys_row[i];
+    if (key == 0xffffffffu) continue;
+    const uint32_t block_slot = i / kHISABlockSize;
+    const uint32_t block_offset = i - block_slot * kHISABlockSize;
+    int32_t token = -1;
+    if (block_slot < param.block_topk) {
+      const int32_t block_id = blocks_row[block_slot];
+      if (block_id >= 0) {
+        token = block_id * static_cast<int32_t>(kHISABlockSize) +
+                static_cast<int32_t>(block_offset);
+      }
+    }
+    if (key < threshold_key) {
+      const uint32_t slot = atomicAdd(&s_above_used, 1u);
+      if (slot < above_count) out_row[slot] = token;
+    } else if (key == threshold_key) {
+      const uint32_t slot = atomicAdd(&s_boundary_used, 1u);
+      if (slot < boundary_quota) out_row[above_count + slot] = token;
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    const uint32_t boundary_written = min(s_boundary_used, boundary_quota);
+    s_emit_count = min(keep, min(s_above_used, above_count) + boundary_written);
+  }
+  __syncthreads();
+
+  for (uint32_t i = s_emit_count + tid; i < param.topk; i += kThreads) {
+    out_row[i] = -1;
+  }
+}
+
+template <uint32_t kNumHeads,
+          uint32_t kHeadDim, uint32_t BLOCK_KV,
+          uint32_t kNumQStages, uint32_t kNumKVStages,
+          uint32_t SPLIT_KV,
+          uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
+          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
+CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
+void hisa_sm100_fp4_paged_mqa_candidate_keys(
+    const uint32_t batch_size,
+    const uint32_t candidate_len,
+    const uint32_t block_table_stride,
+    const uint32_t block_topk,
+    const uint32_t* context_lens,
+    uint32_t* candidate_keys,
+    const uint32_t* block_table,
+    const uint32_t* source_page_table,
+    const uint32_t* schedule_meta,
+    const int32_t* selected_blocks,
+    const int32_t* prefix_lens,
+    const int32_t* token_to_batch_idx,
+    int32_t* fused_topk_indices,
+    const uint32_t topk,
+    const uint32_t source_page_table_stride,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_q,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
+  using Barrier = cutlass::arch::ClusterTransactionBarrier;
+
+  constexpr uint32_t kNextN = 1;
+  constexpr bool kIsContextLens2D = true;
+  constexpr bool kIsVarlen = false;
+  constexpr uint32_t kNextNAtom = 1;
+  constexpr uint32_t kNumNextNAtoms = 1;
+  constexpr uint32_t kNumTmemStages = 3;
+  constexpr uint32_t kNumUTCCPAlignedElems = 128;
+  constexpr uint32_t UMMA_M = 128;
+  constexpr uint32_t UMMA_N = kNumHeads;
+  constexpr uint32_t UMMA_K = 64;
+  constexpr uint32_t kNumSFQAtom =
+      deep_gemm::math::constexpr_align(kNumHeads, kNumUTCCPAlignedElems);
+  constexpr uint32_t kNumSFKV =
+      deep_gemm::math::constexpr_align(SPLIT_KV, kNumUTCCPAlignedElems);
+  constexpr uint32_t kRealNumSFQAtom = kNumHeads;
+  DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
+  DG_STATIC_ASSERT(SPLIT_KV == kNumMathWarpGroups * UMMA_M and SPLIT_KV % kNumUTCCPAlignedElems == 0, "Invalid `SPLIT_KV`");
+  DG_STATIC_ASSERT(kHeadDim == 128, "HISA candidate key scorer expects head_dim=128");
+
+  const auto sm_idx = blockIdx.x;
+  const auto warp_idx = cutlass::canonical_warp_idx_sync();
+  const auto warpgroup_idx = warp_idx / 4;
+  const auto lane_idx = deep_gemm::ptx::get_lane_idx();
+  constexpr uint32_t kSpecWarpStart = kNumMathWarpGroups * 4;
+
+  if (warp_idx == kSpecWarpStart) {
+    cute::prefetch_tma_descriptor(&tensor_map_q);
+    cute::prefetch_tma_descriptor(&tensor_map_sf_q);
+    cute::prefetch_tma_descriptor(&tensor_map_weights);
+    cute::prefetch_tma_descriptor(&tensor_map_kv);
+    cute::prefetch_tma_descriptor(&tensor_map_sf_kv);
+  }
+
+  constexpr uint32_t kSwizzleAlignment = 8 * (kHeadDim / 2);
+  constexpr uint32_t SMEM_Q_SIZE_PER_STAGE      = kNextNAtom * kNumHeads * (kHeadDim / 2);
+  constexpr uint32_t SMEM_SF_Q_SIZE_PER_STAGE   = kNumSFQAtom * sizeof(int);
+  constexpr uint32_t SMEM_KV_SIZE_PER_STAGE     = SPLIT_KV * (kHeadDim / 2);
+  constexpr uint32_t SMEM_SF_KV_SIZE_PER_STAGE  = kNumSFKV * sizeof(int);
+  constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = kNextNAtom * kNumHeads * sizeof(float);
+
+  extern __shared__ __align__(kSwizzleAlignment) uint8_t smem_buffer[];
+  DG_STATIC_ASSERT(SMEM_Q_SIZE_PER_STAGE  % kSwizzleAlignment == 0, "Unaligned TMA swizzling");
+  DG_STATIC_ASSERT(SMEM_KV_SIZE_PER_STAGE % kSwizzleAlignment == 0, "Unaligned TMA swizzling");
+
+  auto smem_q = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) {
+    return smem_buffer + SMEM_Q_SIZE_PER_STAGE * i;
+  });
+  auto smem_kv = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) {
+    return smem_buffer + SMEM_Q_SIZE_PER_STAGE * kNumQStages + SMEM_KV_SIZE_PER_STAGE * i;
+  });
+  const auto smem_sf_ptr = smem_buffer + (SMEM_Q_SIZE_PER_STAGE * kNumQStages + SMEM_KV_SIZE_PER_STAGE * kNumKVStages);
+  auto smem_sf_q = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) {
+    return reinterpret_cast<uint32_t*>(smem_sf_ptr + SMEM_SF_Q_SIZE_PER_STAGE * i);
+  });
+  auto smem_sf_kv = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) {
+    return reinterpret_cast<uint32_t*>(smem_sf_ptr + SMEM_SF_Q_SIZE_PER_STAGE * kNumQStages + SMEM_SF_KV_SIZE_PER_STAGE * i);
+  });
+  auto smem_weights = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) {
+    return reinterpret_cast<float*>(
+        smem_sf_ptr + SMEM_SF_Q_SIZE_PER_STAGE * kNumQStages +
+        SMEM_SF_KV_SIZE_PER_STAGE * kNumKVStages +
+        SMEM_WEIGHT_SIZE_PER_STAGE * i);
+  });
+
+  const auto barrier_ptr = reinterpret_cast<Barrier*>(smem_weights[kNumQStages]);
+  auto full_q_barriers     = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + i; });
+  auto empty_q_barriers    = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + kNumQStages + i; });
+  auto full_kv_barriers    = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + kNumQStages * 2 + i; });
+  auto empty_kv_barriers   = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + kNumQStages * 2 + kNumKVStages + i; });
+  const auto tmem_barrier_ptr = barrier_ptr + kNumQStages * 2 + kNumKVStages * 2;
+  auto full_tmem_barriers  = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return tmem_barrier_ptr + i; });
+  auto empty_tmem_barriers = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return tmem_barrier_ptr + kNumTmemStages + i; });
+  auto tmem_ptr_in_smem    = reinterpret_cast<uint32_t*>(tmem_barrier_ptr + kNumTmemStages * 2);
+
+  constexpr uint32_t kNumAccumTmemCols = kNextNAtom * kNumHeads * kNumTmemStages;
+  constexpr uint32_t kNumTmemCols =
+      deep_gemm::utils::get_num_aligned_tmem_cols<
+          kNumAccumTmemCols + kNumSFQAtom / 32 + kNumSFKV / 32>();
+  constexpr uint32_t kTmemStartColOfSFQ = kNumAccumTmemCols;
+  constexpr uint32_t kTmemStartColOfSFKV = kNumAccumTmemCols + kNumSFQAtom / 32;
+  DG_STATIC_ASSERT(kNumTmemCols <= 512, "Too many tensor memory");
+
+  if (warp_idx == kSpecWarpStart and cute::elect_one_sync()) {
+    #pragma unroll
+    for (uint32_t i = 0; i < kNumQStages; ++i) {
+      full_q_barriers[i]->init(1);
+      empty_q_barriers[i]->init(kNumMathThreads + 32);
+    }
+    cutlass::arch::fence_barrier_init();
+  }
+  if (warp_idx == kSpecWarpStart + 1 and cute::elect_one_sync()) {
+    #pragma unroll
+    for (uint32_t i = 0; i < kNumKVStages; ++i) {
+      full_kv_barriers[i]->init(1);
+      empty_kv_barriers[i]->init(1);
+    }
+    cutlass::arch::fence_barrier_init();
+  }
+  if (warp_idx == kSpecWarpStart + 2) {
+    if (cute::elect_one_sync()) {
+      #pragma unroll
+      for (uint32_t i = 0; i < kNumTmemStages; ++i) {
+        full_tmem_barriers[i]->init(1);
+        empty_tmem_barriers[i]->init(128);
+      }
+      cutlass::arch::fence_barrier_init();
+    }
+    cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
+  }
+  __syncthreads();
+
+  cudaGridDependencySynchronize();
+
+  constexpr uint32_t kNumBlocksPerSplit = SPLIT_KV / BLOCK_KV;
+  using Scheduler = deep_gemm::sched::PagedMQALogitsScheduler<
+      kNextN, kIsContextLens2D, kIsVarlen, BLOCK_KV,
+      kNumBlocksPerSplit, kNumNextNAtoms>;
+  DG_STATIC_ASSERT(SPLIT_KV == BLOCK_KV * kNumBlocksPerSplit, "Invalid `SPLIT_KV`");
+
+  auto make_pipeline = [](const uint32_t& num_stages) {
+    return [iter_idx = 0u, num_stages](const uint32_t& step = 1) mutable
+        -> cute::tuple<uint32_t, uint32_t> {
+      uint32_t current_idx = iter_idx;
+      iter_idx += step;
+      return {current_idx % num_stages, (current_idx / num_stages) & 1};
+    };
+  };
+  auto advance_q_pipeline    = make_pipeline(kNumQStages);
+  auto advance_kv_pipeline   = make_pipeline(kNumKVStages);
+  auto advance_tmem_pipeline = make_pipeline(kNumTmemStages);
+
+  constexpr uint32_t kNumSpecializedRegisters = 56;
+  constexpr uint32_t kNumMathRegisters = 224;
+
+  if (warp_idx == kSpecWarpStart) {
+    cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
+    if (cute::elect_one_sync()) {
+      auto scheduler = Scheduler(sm_idx, batch_size, context_lens, schedule_meta, nullptr);
+      uint32_t last_q_atom_idx = batch_size * kNumNextNAtoms;
+      uint32_t q_atom_idx, _, __;
+      while (scheduler.fetch_next_task(q_atom_idx, _, __)) {
+        if (q_atom_idx != last_q_atom_idx) {
+          CUTE_TIE_DECL(advance_q_pipeline(), q_stage_idx, q_phase);
+          empty_q_barriers[q_stage_idx]->wait(q_phase ^ 1);
+          const auto q_token_idx = Scheduler::atom_to_token_idx(q_atom_idx);
+          cute::SM90_TMA_LOAD_2D::copy(
+              &tensor_map_q,
+              reinterpret_cast<uint64_t*>(full_q_barriers[q_stage_idx]),
+              static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+              smem_q[q_stage_idx],
+              0,
+              q_token_idx * kNumHeads);
+          deep_gemm::tma::copy<kNextNAtom * kNumHeads, 1, 0>(
+              &tensor_map_sf_q,
+              full_q_barriers[q_stage_idx],
+              smem_sf_q[q_stage_idx],
+              0,
+              q_token_idx);
+          deep_gemm::tma::copy<kNumHeads, kNextNAtom, 0>(
+              &tensor_map_weights,
+              full_q_barriers[q_stage_idx],
+              smem_weights[q_stage_idx],
+              0,
+              q_token_idx);
+          full_q_barriers[q_stage_idx]->arrive_and_expect_tx(
+              SMEM_Q_SIZE_PER_STAGE + kRealNumSFQAtom * sizeof(int) +
+              SMEM_WEIGHT_SIZE_PER_STAGE);
+        }
+        last_q_atom_idx = q_atom_idx;
+      }
+    }
+    __syncwarp();
+  } else if (warp_idx == kSpecWarpStart + 1) {
+    cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
+    auto scheduler = Scheduler(sm_idx, batch_size, context_lens, schedule_meta, nullptr);
+    uint32_t kv_block_idx_ptr = 32, kv_block_idx_storage;
+    uint32_t last_q_atom_idx = batch_size * kNumNextNAtoms;
+    uint32_t q_atom_idx, kv_idx, num_kv;
+    while (scheduler.fetch_next_task(q_atom_idx, kv_idx, num_kv)) {
+      if (q_atom_idx != last_q_atom_idx) kv_block_idx_ptr = 32;
+      last_q_atom_idx = q_atom_idx;
+
+      if (kv_block_idx_ptr == 32) {
+        kv_block_idx_ptr = 0;
+        kv_block_idx_storage = 0;
+        const uint32_t candidate_page = kv_idx + lane_idx;
+        if (candidate_page < num_kv) {
+          const uint32_t q_idx = Scheduler::atom_to_block_table_row(q_atom_idx);
+          if (source_page_table != nullptr) {
+            const uint32_t block_slot = candidate_page >> 1;
+            const uint32_t half = candidate_page & 1u;
+            const int32_t batch = token_to_batch_idx[q_idx];
+            int32_t selected_block = -1;
+            if (block_slot < block_topk) {
+              selected_block =
+                  selected_blocks[q_idx * static_cast<uint64_t>(block_topk) +
+                                  block_slot];
+            }
+            if (batch >= 0 && selected_block >= 0) {
+              kv_block_idx_storage = source_page_table[
+                  static_cast<uint64_t>(batch) * source_page_table_stride +
+                  static_cast<uint32_t>(selected_block) * 2u + half];
+            }
+          } else {
+            const auto block_table_offset =
+                q_idx * static_cast<uint64_t>(block_table_stride);
+            kv_block_idx_storage =
+                block_table[block_table_offset + candidate_page];
+          }
+        }
+      }
+      __syncwarp();
+
+      int kv_block_idx[kNumBlocksPerSplit];
+      #pragma unroll
+      for (int i = 0; i < kNumBlocksPerSplit; ++i)
+        kv_block_idx[i] = __shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr + i);
+      kv_block_idx_ptr += kNumBlocksPerSplit;
+      DG_STATIC_ASSERT(32 % kNumBlocksPerSplit == 0, "Invalid `SPLIT_KV`");
+
+      CUTE_TIE_DECL(advance_kv_pipeline(), kv_stage_idx, kv_phase);
+      if (cute::elect_one_sync()) {
+        empty_kv_barriers[kv_stage_idx]->wait(kv_phase ^ 1);
+        #pragma unroll
+        for (int i = 0; i < kNumBlocksPerSplit; ++i) {
+          cute::SM90_TMA_LOAD_3D::copy(
+              &tensor_map_kv,
+              reinterpret_cast<uint64_t*>(full_kv_barriers[kv_stage_idx]),
+              static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+              smem_kv[kv_stage_idx] + (BLOCK_KV * kHeadDim / 2) * i,
+              0,
+              0,
+              kv_block_idx[i]);
+          deep_gemm::tma::copy<BLOCK_KV, 1, 0>(
+              &tensor_map_sf_kv,
+              full_kv_barriers[kv_stage_idx],
+              smem_sf_kv[kv_stage_idx] + BLOCK_KV * i,
+              0,
+              kv_block_idx[i]);
+        }
+        full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(
+            SMEM_KV_SIZE_PER_STAGE + SMEM_SF_KV_SIZE_PER_STAGE);
+      }
+    }
+  } else if (warp_idx == kSpecWarpStart + 2) {
+    cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
+    auto scheduler = Scheduler(sm_idx, batch_size, context_lens, schedule_meta, nullptr);
+    DG_TRAP_ONLY_DEVICE_ASSERT(deep_gemm::ptx::ld_shared(tmem_ptr_in_smem) == 0);
+
+    auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
+      DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
+      uint32_t values[4];
+      #pragma unroll
+      for (uint32_t i = 0; i < 4; ++i)
+        values[i] = deep_gemm::ptx::ld_shared(smem_ptr + (i ^ (lane_idx >> 3)) * 32 + lane_idx);
+      __syncwarp();
+      #pragma unroll
+      for (uint32_t i = 0; i < 4; ++i)
+        deep_gemm::ptx::st_shared(smem_ptr + lane_idx * 4 + (i ^ (lane_idx >> 3)), values[i]);
+    };
+
+    auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
+        cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
+        cutlass::float_ue8m0_t, UMMA_M, UMMA_N,
+        cute::UMMA::Major::K, cute::UMMA::Major::K>();
+    auto sf_desc = deep_gemm::mma::sm100::make_sf_desc(nullptr);
+
+    uint32_t last_q_atom_idx = batch_size * kNumNextNAtoms;
+    uint32_t q_atom_idx, kv_idx, _;
+    while (scheduler.fetch_next_task(q_atom_idx, kv_idx, _)) {
+      uint32_t q_stage_idx, q_phase;
+      if (q_atom_idx != last_q_atom_idx) {
+        CUTE_TIE(advance_q_pipeline(), q_stage_idx, q_phase);
+        if (last_q_atom_idx != batch_size * kNumNextNAtoms)
+          empty_q_barriers[(q_stage_idx + kNumQStages - 1) % kNumQStages]->arrive();
+        full_q_barriers[q_stage_idx]->wait(q_phase);
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumSFQAtom / kNumUTCCPAlignedElems; ++i) {
+          auto smem_ptr = smem_sf_q[q_stage_idx] + i * kNumUTCCPAlignedElems;
+          utccp_required_smem_warp_transpose(smem_ptr);
+          cutlass::arch::fence_view_async_shared();
+          deep_gemm::mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
+          if (cute::elect_one_sync())
+            cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sf_desc, kTmemStartColOfSFQ + i * 4);
+          __syncwarp();
+        }
+      }
+      last_q_atom_idx = q_atom_idx;
+
+      CUTE_TIE_DECL(advance_kv_pipeline(), kv_stage_idx, kv_phase);
+      full_kv_barriers[kv_stage_idx]->wait(kv_phase);
+
+      #pragma unroll
+      for (uint32_t i = 0; i < kNumSFKV / kNumUTCCPAlignedElems; ++i) {
+        auto smem_ptr = smem_sf_kv[kv_stage_idx] + i * kNumUTCCPAlignedElems;
+        utccp_required_smem_warp_transpose(smem_ptr);
+        cutlass::arch::fence_view_async_shared();
+      }
+
+      if (cute::elect_one_sync()) {
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumSFKV / kNumUTCCPAlignedElems; ++i) {
+          auto smem_ptr = smem_sf_kv[kv_stage_idx] + i * kNumUTCCPAlignedElems;
+          deep_gemm::mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
+          cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sf_desc, kTmemStartColOfSFKV + i * 4);
+        }
+
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumMathWarpGroups; ++i) {
+          CUTE_TIE_DECL(advance_tmem_pipeline(), tmem_stage_idx, tmem_phase);
+          uint32_t tmem_addr = tmem_stage_idx * UMMA_N;
+
+          empty_tmem_barriers[tmem_stage_idx]->wait(tmem_phase ^ 1);
+          deep_gemm::ptx::tcgen05_after_thread_sync();
+
+          #pragma unroll
+          for (uint32_t k = 0; k < kHeadDim / UMMA_K; ++k) {
+            auto runtime_instr_desc =
+                deep_gemm::mma::sm100::make_runtime_instr_desc_with_sf_id(
+                    instr_desc, k * 2, k * 2);
+            auto a_desc = deep_gemm::mma::sm100::make_smem_desc(
+                cute::UMMA::LayoutType::SWIZZLE_64B,
+                smem_kv[kv_stage_idx] + i * UMMA_M * (kHeadDim / 2) + k * UMMA_K / 2,
+                8 * (kHeadDim / 2),
+                0);
+            auto b_desc = deep_gemm::mma::sm100::make_smem_desc(
+                cute::UMMA::LayoutType::SWIZZLE_64B,
+                smem_q[q_stage_idx] + k * UMMA_K / 2,
+                8 * (kHeadDim / 2),
+                0);
+            deep_gemm::ptx::SM100_MMA_MXF4_SS::fma(
+                a_desc,
+                b_desc,
+                tmem_addr,
+                k,
+                runtime_instr_desc,
+                kTmemStartColOfSFKV + i * 4,
+                kTmemStartColOfSFQ);
+          }
+          asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                       ::"r"(cute::cast_smem_ptr_to_uint(full_tmem_barriers[tmem_stage_idx])));
+        }
+      }
+      cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(empty_kv_barriers[kv_stage_idx]));
+    }
+  } else if (warp_idx == kSpecWarpStart + 3) {
+    cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
+  } else if (warp_idx < kSpecWarpStart) {
+    cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
+    auto scheduler = Scheduler(sm_idx, batch_size, context_lens, schedule_meta, nullptr);
+    const auto math_warpgroup_idx = warpgroup_idx;
+    const auto math_thread_idx = warp_idx * 32 + lane_idx;
+
+    auto tmem_load = [](auto num_elems_c, const uint32_t& tmem_addr, float* accum) {
+      constexpr int N = decltype(num_elems_c)::value;
+      DG_STATIC_ASSERT(N == 32 or N == 64, "Unsupported TMEM load size");
+      using Loader = cute::conditional_t<N == 32,
+          cute::SM100_TMEM_LOAD_32dp32b32x,
+          cute::SM100_TMEM_LOAD_32dp32b64x>;
+      [&]<size_t... Is>(cute::index_sequence<Is...>) {
+        Loader::copy(tmem_addr, reinterpret_cast<uint32_t*>(accum)[Is]...);
+      }(cute::make_index_sequence<N>{});
+      cutlass::arch::fence_view_async_tmem_load();
+    };
+
+    advance_tmem_pipeline(math_warpgroup_idx);
+
+    float accum[kNumHeads];
+    float weights[kNumHeads];
+    uint32_t last_q_atom_idx = batch_size * kNumNextNAtoms;
+    uint32_t q_atom_idx, kv_idx, _;
+    while (scheduler.fetch_next_task(q_atom_idx, kv_idx, _)) {
+      uint32_t q_stage_idx, q_phase;
+      if (q_atom_idx != last_q_atom_idx) {
+        CUTE_TIE_DECL(advance_q_pipeline(), q_stage_idx, q_phase);
+        if (last_q_atom_idx != batch_size * kNumNextNAtoms)
+          empty_q_barriers[(q_stage_idx + kNumQStages - 1) % kNumQStages]->arrive();
+        full_q_barriers[q_stage_idx]->wait(q_phase);
+
+        #pragma unroll
+        for (uint32_t j = 0; j < kNumHeads; j += 4) {
+          float4 raw = deep_gemm::ptx::ld_shared((float4*)(smem_weights[q_stage_idx] + j));
+          weights[j + 0] = raw.x;
+          weights[j + 1] = raw.y;
+          weights[j + 2] = raw.z;
+          weights[j + 3] = raw.w;
+        }
+      }
+      last_q_atom_idx = q_atom_idx;
+
+      const auto q_token_idx = Scheduler::atom_to_token_idx(q_atom_idx);
+      const auto candidate_pos = kv_idx * BLOCK_KV + math_thread_idx;
+      const auto key_offset = q_token_idx * static_cast<uint64_t>(candidate_len) + candidate_pos;
+
+      CUTE_TIE_DECL(advance_tmem_pipeline(kNumMathWarpGroups), tmem_stage_idx, tmem_phase);
+      full_tmem_barriers[tmem_stage_idx]->wait(tmem_phase);
+      deep_gemm::ptx::tcgen05_after_thread_sync();
+
+      uint32_t tmem_addr = tmem_stage_idx * UMMA_N;
+      tmem_load(cute::Int<kNumHeads / 2>{}, tmem_addr, accum);
+      tmem_load(cute::Int<kNumHeads / 2>{}, tmem_addr + kNumHeads / 2, accum + kNumHeads / 2);
+
+      auto sum_0 = make_float2(0, 0);
+      auto sum_1 = make_float2(0, 0);
+      const auto transform = [&](const uint32_t& j, const float2& sum) {
+        auto a = make_float2(fmaxf(accum[j], 0), fmaxf(accum[j + 1], 0));
+        auto b = make_float2(weights[j], weights[j + 1]);
+        return __ffma2_rn(a, b, sum);
+      };
+      #pragma unroll
+      for (uint32_t j = 0; j < kNumHeads; j += 4) {
+        sum_0 = transform(j, sum_0);
+        sum_1 = transform(j + 2, sum_1);
+      }
+      auto sum = __fadd2_rn(sum_0, sum_1);
+      const float score = sum.x + sum.y;
+
+      uint32_t key = 0xffffffffu;
+      if (candidate_pos < candidate_len) {
+        const uint32_t block_slot = candidate_pos / 128u;
+        const uint32_t block_offset = candidate_pos - block_slot * 128u;
+        const int32_t block_id =
+            block_slot < block_topk
+                ? selected_blocks[q_token_idx * static_cast<uint64_t>(block_topk) + block_slot]
+                : -1;
+        const int32_t token =
+            block_id >= 0
+                ? block_id * 128 + static_cast<int32_t>(block_offset)
+                : -1;
+        const int32_t prefix_len = prefix_lens[q_token_idx];
+        if (token >= 0 && token < prefix_len) {
+          key = fp32_to_radix_desc(__float_as_uint(score));
+        }
+      }
+      candidate_keys[key_offset] = key;
+
+      deep_gemm::ptx::tcgen05_before_thread_sync();
+      empty_tmem_barriers[tmem_stage_idx]->arrive();
+    }
+
+    cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
+    if (warp_idx == 0)
+      cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
+  }
+
+  __syncthreads();
+  if (fused_topk_indices == nullptr || topk == 0) return;
+
+  cooperative_groups::this_grid().sync();
+
+  constexpr uint32_t kTopKBins = 256;
+  constexpr uint32_t kHISABlockSize = 128;
+  auto* topk_smem = reinterpret_cast<uint32_t*>(smem_buffer);
+  auto* s_hist = topk_smem;
+  auto* s_prefix = s_hist + kTopKBins;
+  auto* s_scalars = s_prefix + kTopKBins;
+  constexpr uint32_t kThresholdSlot = 0;
+  constexpr uint32_t kLessSlot = 1;
+  constexpr uint32_t kBoundaryQuotaSlot = 2;
+  constexpr uint32_t kBoundaryUsedSlot = 3;
+  constexpr uint32_t kAboveUsedSlot = 4;
+  constexpr uint32_t kEmitCountSlot = 5;
+
+  const uint32_t tid = threadIdx.x;
+  const uint32_t keep = min(topk, candidate_len);
+  for (uint32_t topk_row = blockIdx.x; topk_row < batch_size; topk_row += gridDim.x) {
+    const auto* keys_row =
+        candidate_keys + static_cast<uint64_t>(topk_row) * candidate_len;
+    const auto* blocks_row =
+        selected_blocks + static_cast<uint64_t>(topk_row) * block_topk;
+    auto* out_row =
+        fused_topk_indices + static_cast<uint64_t>(topk_row) * topk;
+
+    if (tid == 0) {
+      s_scalars[kThresholdSlot] = 0u;
+      s_scalars[kLessSlot] = 0u;
+      s_scalars[kAboveUsedSlot] = 0u;
+      s_scalars[kBoundaryUsedSlot] = 0u;
+      s_scalars[kEmitCountSlot] = 0u;
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (uint32_t pass = 0; pass < 4; ++pass) {
+      const uint32_t shift = 24u - pass * 8u;
+      const uint32_t prefix_mask =
+          pass == 0 ? 0u : (0xffffffffu << (shift + 8u));
+      const uint32_t selected_prefix = s_scalars[kThresholdSlot] & prefix_mask;
+
+      for (uint32_t bin = tid; bin < kTopKBins; bin += blockDim.x) {
+        s_hist[bin] = 0u;
+      }
+      __syncthreads();
+
+      for (uint32_t i = tid; i < candidate_len; i += blockDim.x) {
+        const uint32_t key = keys_row[i];
+        if (key != 0xffffffffu &&
+            (pass == 0 || ((key & prefix_mask) == selected_prefix))) {
+          atomicAdd(&s_hist[(key >> shift) & 0xffu], 1u);
+        }
+      }
+      __syncthreads();
+
+      if (tid < 32) {
+        uint32_t lane_sum = 0u;
+        for (uint32_t b = tid * 8; b < (tid + 1) * 8; ++b) lane_sum += s_hist[b];
+        uint32_t scan = lane_sum;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+          const auto y = __shfl_up_sync(0xffffffff, scan, off);
+          if (static_cast<int>(tid) >= off) scan += y;
+        }
+        const uint32_t base = scan - lane_sum;
+        uint32_t running = base;
+        for (uint32_t b = tid * 8; b < (tid + 1) * 8; ++b) {
+          running += s_hist[b];
+          s_prefix[b] = running;
+        }
+      }
+      __syncthreads();
+
+      if (tid == 0) {
+        const uint32_t less_count = s_scalars[kLessSlot];
+        const uint32_t target = keep > less_count ? keep - less_count : 1u;
+        uint32_t b = 0u;
+        while (b + 1 < kTopKBins && s_prefix[b] < target) ++b;
+        const uint32_t before = b == 0 ? 0u : s_prefix[b - 1];
+        s_scalars[kLessSlot] = less_count + before;
+        s_scalars[kThresholdSlot] = selected_prefix | (b << shift);
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      const uint32_t less_count = s_scalars[kLessSlot];
+      s_scalars[kBoundaryQuotaSlot] = keep > less_count ? keep - less_count : 0u;
+      s_scalars[kAboveUsedSlot] = 0u;
+      s_scalars[kBoundaryUsedSlot] = 0u;
+    }
+    __syncthreads();
+
+    const uint32_t threshold_key = s_scalars[kThresholdSlot];
+    const uint32_t above_count = s_scalars[kLessSlot];
+    const uint32_t boundary_quota = s_scalars[kBoundaryQuotaSlot];
+    for (uint32_t i = tid; i < candidate_len; i += blockDim.x) {
+      const uint32_t key = keys_row[i];
+      if (key == 0xffffffffu) continue;
+      const uint32_t block_slot = i / kHISABlockSize;
+      const uint32_t block_offset = i - block_slot * kHISABlockSize;
+      int32_t token = -1;
+      if (block_slot < block_topk) {
+        const int32_t block_id = blocks_row[block_slot];
+        if (block_id >= 0) {
+          token = block_id * static_cast<int32_t>(kHISABlockSize) +
+                  static_cast<int32_t>(block_offset);
+        }
+      }
+      if (key < threshold_key) {
+        const uint32_t slot = atomicAdd(&s_scalars[kAboveUsedSlot], 1u);
+        if (slot < above_count) out_row[slot] = token;
+      } else if (key == threshold_key) {
+        const uint32_t slot = atomicAdd(&s_scalars[kBoundaryUsedSlot], 1u);
+        if (slot < boundary_quota) out_row[above_count + slot] = token;
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      const uint32_t boundary_written =
+          min(s_scalars[kBoundaryUsedSlot], s_scalars[kBoundaryQuotaSlot]);
+      s_scalars[kEmitCountSlot] = min(
+          keep,
+          min(s_scalars[kAboveUsedSlot], s_scalars[kLessSlot]) +
+              boundary_written);
+    }
+    __syncthreads();
+
+    for (uint32_t i = s_scalars[kEmitCountSlot] + tid; i < topk; i += blockDim.x) {
+      out_row[i] = -1;
+    }
+    __syncthreads();
+  }
+
+}
+
+template <uint32_t kNumHeads,
+          uint32_t kHeadDim, uint32_t BLOCK_KV,
+          uint32_t kNumQStages, uint32_t kNumKVStages,
+          uint32_t SPLIT_KV,
+          uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
+          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
+CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
+void hisa_sm100_fp4_paged_mqa_candidate_keys_row_split(
+    const uint32_t q_rows,
+    const uint32_t candidate_len,
+    const uint32_t row_splits,
+    const uint32_t block_topk,
+    uint32_t* candidate_keys,
+    int32_t* fused_topk_indices,
+    const uint32_t topk,
+    const uint32_t* source_page_table,
+    const int32_t* selected_blocks,
+    const int32_t* prefix_lens,
+    const int32_t* token_to_batch_idx,
+    const uint32_t source_page_table_stride,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_q,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
+  using Barrier = cutlass::arch::ClusterTransactionBarrier;
+
+  constexpr uint32_t kNextNAtom = 1;
+  constexpr uint32_t kNumTmemStages = 3;
+  constexpr uint32_t kNumUTCCPAlignedElems = 128;
+  constexpr uint32_t UMMA_M = 128;
+  constexpr uint32_t UMMA_N = kNumHeads;
+  constexpr uint32_t UMMA_K = 64;
+  constexpr uint32_t kNumSFQAtom =
+      deep_gemm::math::constexpr_align(kNumHeads, kNumUTCCPAlignedElems);
+  constexpr uint32_t kNumSFKV =
+      deep_gemm::math::constexpr_align(SPLIT_KV, kNumUTCCPAlignedElems);
+  constexpr uint32_t kRealNumSFQAtom = kNumHeads;
+  constexpr uint32_t kPagesPerTask = SPLIT_KV / BLOCK_KV;
+  constexpr uint32_t kHISABlockSize = 128;
+  constexpr uint32_t kTopKBits = 11;
+  constexpr uint32_t kTopKBins = 1u << kTopKBits;
+  constexpr uint32_t kTopKPasses = (32u + kTopKBits - 1u) / kTopKBits;
+  DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
+  DG_STATIC_ASSERT(SPLIT_KV == kNumMathWarpGroups * UMMA_M and SPLIT_KV % kNumUTCCPAlignedElems == 0, "Invalid `SPLIT_KV`");
+  DG_STATIC_ASSERT(kHeadDim == 128, "HISA candidate row-split scorer expects head_dim=128");
+  DG_STATIC_ASSERT(BLOCK_KV == 64 and kPagesPerTask == 4, "HISA row-split scorer expects 64-token pages and 256-token tasks");
+
+  __shared__ uint32_t s_threshold_key;
+  __shared__ uint32_t s_less_count;
+  __shared__ uint32_t s_boundary_quota;
+  __shared__ uint32_t s_boundary_used;
+  __shared__ uint32_t s_above_used;
+  __shared__ uint32_t s_emit_count;
+  __shared__ uint32_t s_selected_bin;
+
+  const uint32_t row = blockIdx.x;
+  const uint32_t row_split = blockIdx.y;
+  if (row >= q_rows || row_split >= row_splits) return;
+
+  const uint32_t candidate_pages = deep_gemm::math::ceil_div(candidate_len, BLOCK_KV);
+  const uint32_t tasks_per_row = deep_gemm::math::ceil_div(candidate_len, SPLIT_KV);
+  const uint32_t task_begin =
+      static_cast<uint64_t>(tasks_per_row) * row_split / row_splits;
+  const uint32_t task_end =
+      static_cast<uint64_t>(tasks_per_row) * (row_split + 1) / row_splits;
+  const int32_t batch = token_to_batch_idx[row];
+  const int32_t prefix_len = prefix_lens[row];
+
+  const auto warp_idx = cutlass::canonical_warp_idx_sync();
+  const auto warpgroup_idx = warp_idx / 4;
+  const auto lane_idx = deep_gemm::ptx::get_lane_idx();
+  constexpr uint32_t kSpecWarpStart = kNumMathWarpGroups * 4;
+
+  if (warp_idx == kSpecWarpStart) {
+    cute::prefetch_tma_descriptor(&tensor_map_q);
+    cute::prefetch_tma_descriptor(&tensor_map_sf_q);
+    cute::prefetch_tma_descriptor(&tensor_map_weights);
+    cute::prefetch_tma_descriptor(&tensor_map_kv);
+    cute::prefetch_tma_descriptor(&tensor_map_sf_kv);
+  }
+
+  constexpr uint32_t kSwizzleAlignment = 8 * (kHeadDim / 2);
+  constexpr uint32_t SMEM_Q_SIZE_PER_STAGE      = kNextNAtom * kNumHeads * (kHeadDim / 2);
+  constexpr uint32_t SMEM_SF_Q_SIZE_PER_STAGE   = kNumSFQAtom * sizeof(int);
+  constexpr uint32_t SMEM_KV_SIZE_PER_STAGE     = SPLIT_KV * (kHeadDim / 2);
+  constexpr uint32_t SMEM_SF_KV_SIZE_PER_STAGE  = kNumSFKV * sizeof(int);
+  constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = kNextNAtom * kNumHeads * sizeof(float);
+
+  extern __shared__ __align__(kSwizzleAlignment) uint8_t smem_buffer[];
+  DG_STATIC_ASSERT(SMEM_Q_SIZE_PER_STAGE  % kSwizzleAlignment == 0, "Unaligned TMA swizzling");
+  DG_STATIC_ASSERT(SMEM_KV_SIZE_PER_STAGE % kSwizzleAlignment == 0, "Unaligned TMA swizzling");
+
+  auto smem_q = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) {
+    return smem_buffer + SMEM_Q_SIZE_PER_STAGE * i;
+  });
+  auto smem_kv = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) {
+    return smem_buffer + SMEM_Q_SIZE_PER_STAGE * kNumQStages + SMEM_KV_SIZE_PER_STAGE * i;
+  });
+  const auto smem_sf_ptr = smem_buffer + (SMEM_Q_SIZE_PER_STAGE * kNumQStages + SMEM_KV_SIZE_PER_STAGE * kNumKVStages);
+  auto smem_sf_q = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) {
+    return reinterpret_cast<uint32_t*>(smem_sf_ptr + SMEM_SF_Q_SIZE_PER_STAGE * i);
+  });
+  auto smem_sf_kv = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) {
+    return reinterpret_cast<uint32_t*>(smem_sf_ptr + SMEM_SF_Q_SIZE_PER_STAGE * kNumQStages + SMEM_SF_KV_SIZE_PER_STAGE * i);
+  });
+  auto smem_weights = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) {
+    return reinterpret_cast<float*>(
+        smem_sf_ptr + SMEM_SF_Q_SIZE_PER_STAGE * kNumQStages +
+        SMEM_SF_KV_SIZE_PER_STAGE * kNumKVStages +
+        SMEM_WEIGHT_SIZE_PER_STAGE * i);
+  });
+
+  const auto barrier_ptr = reinterpret_cast<Barrier*>(smem_weights[kNumQStages]);
+  auto full_q_barriers     = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + i; });
+  auto empty_q_barriers    = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + kNumQStages + i; });
+  auto full_kv_barriers    = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + kNumQStages * 2 + i; });
+  auto empty_kv_barriers   = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + kNumQStages * 2 + kNumKVStages + i; });
+  const auto tmem_barrier_ptr = barrier_ptr + kNumQStages * 2 + kNumKVStages * 2;
+  auto full_tmem_barriers  = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return tmem_barrier_ptr + i; });
+  auto empty_tmem_barriers = deep_gemm::utils::PatternVisitor([&](const uint32_t& i) { return tmem_barrier_ptr + kNumTmemStages + i; });
+  auto tmem_ptr_in_smem    = reinterpret_cast<uint32_t*>(tmem_barrier_ptr + kNumTmemStages * 2);
+
+  constexpr uint32_t kNumAccumTmemCols = kNextNAtom * kNumHeads * kNumTmemStages;
+  constexpr uint32_t kNumTmemCols =
+      deep_gemm::utils::get_num_aligned_tmem_cols<
+          kNumAccumTmemCols + kNumSFQAtom / 32 + kNumSFKV / 32>();
+  constexpr uint32_t kTmemStartColOfSFQ = kNumAccumTmemCols;
+  constexpr uint32_t kTmemStartColOfSFKV = kNumAccumTmemCols + kNumSFQAtom / 32;
+  DG_STATIC_ASSERT(kNumTmemCols <= 512, "Too many tensor memory");
+
+  if (warp_idx == kSpecWarpStart and cute::elect_one_sync()) {
+    #pragma unroll
+    for (uint32_t i = 0; i < kNumQStages; ++i) {
+      full_q_barriers[i]->init(1);
+      empty_q_barriers[i]->init(kNumMathThreads + 32);
+    }
+    cutlass::arch::fence_barrier_init();
+  }
+  if (warp_idx == kSpecWarpStart + 1 and cute::elect_one_sync()) {
+    #pragma unroll
+    for (uint32_t i = 0; i < kNumKVStages; ++i) {
+      full_kv_barriers[i]->init(1);
+      empty_kv_barriers[i]->init(1);
+    }
+    cutlass::arch::fence_barrier_init();
+  }
+  if (warp_idx == kSpecWarpStart + 2) {
+    if (cute::elect_one_sync()) {
+      #pragma unroll
+      for (uint32_t i = 0; i < kNumTmemStages; ++i) {
+        full_tmem_barriers[i]->init(1);
+        empty_tmem_barriers[i]->init(128);
+      }
+      cutlass::arch::fence_barrier_init();
+    }
+    cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
+  }
+  __syncthreads();
+
+  cudaGridDependencySynchronize();
+
+  auto make_pipeline = [](const uint32_t& num_stages) {
+    return [iter_idx = 0u, num_stages](const uint32_t& step = 1) mutable
+        -> cute::tuple<uint32_t, uint32_t> {
+      uint32_t current_idx = iter_idx;
+      iter_idx += step;
+      return {current_idx % num_stages, (current_idx / num_stages) & 1};
+    };
+  };
+  auto advance_q_pipeline    = make_pipeline(kNumQStages);
+  auto advance_kv_pipeline   = make_pipeline(kNumKVStages);
+  auto advance_tmem_pipeline = make_pipeline(kNumTmemStages);
+
+  constexpr uint32_t kNumSpecializedRegisters = 56;
+  constexpr uint32_t kNumMathRegisters = 224;
+
+  if (warp_idx == kSpecWarpStart) {
+    cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
+    if (cute::elect_one_sync()) {
+      CUTE_TIE_DECL(advance_q_pipeline(), q_stage_idx, q_phase);
+      empty_q_barriers[q_stage_idx]->wait(q_phase ^ 1);
+      cute::SM90_TMA_LOAD_2D::copy(
+          &tensor_map_q,
+          reinterpret_cast<uint64_t*>(full_q_barriers[q_stage_idx]),
+          static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+          smem_q[q_stage_idx],
+          0,
+          row * kNumHeads);
+      deep_gemm::tma::copy<kNextNAtom * kNumHeads, 1, 0>(
+          &tensor_map_sf_q,
+          full_q_barriers[q_stage_idx],
+          smem_sf_q[q_stage_idx],
+          0,
+          row);
+      deep_gemm::tma::copy<kNumHeads, kNextNAtom, 0>(
+          &tensor_map_weights,
+          full_q_barriers[q_stage_idx],
+          smem_weights[q_stage_idx],
+          0,
+          row);
+      full_q_barriers[q_stage_idx]->arrive_and_expect_tx(
+          SMEM_Q_SIZE_PER_STAGE + kRealNumSFQAtom * sizeof(int) +
+          SMEM_WEIGHT_SIZE_PER_STAGE);
+    }
+    __syncwarp();
+  } else if (warp_idx == kSpecWarpStart + 1) {
+    cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
+    for (uint32_t task = task_begin; task < task_end; ++task) {
+      const uint32_t kv_idx = task * kPagesPerTask;
+      uint32_t kv_block_idx_storage = 0;
+      const uint32_t candidate_page = kv_idx + lane_idx;
+      if (candidate_page < candidate_pages && batch >= 0) {
+        const uint32_t block_slot = candidate_page >> 1;
+        const uint32_t half = candidate_page & 1u;
+        int32_t selected_block = -1;
+        if (block_slot < block_topk) {
+          selected_block =
+              selected_blocks[row * static_cast<uint64_t>(block_topk) +
+                              block_slot];
+        }
+        if (selected_block >= 0) {
+          kv_block_idx_storage = source_page_table[
+              static_cast<uint64_t>(batch) * source_page_table_stride +
+              static_cast<uint32_t>(selected_block) * 2u + half];
+        }
+      }
+      __syncwarp();
+
+      int kv_block_idx[kPagesPerTask];
+      #pragma unroll
+      for (int i = 0; i < static_cast<int>(kPagesPerTask); ++i)
+        kv_block_idx[i] = __shfl_sync(0xffffffff, kv_block_idx_storage, i);
+
+      CUTE_TIE_DECL(advance_kv_pipeline(), kv_stage_idx, kv_phase);
+      if (cute::elect_one_sync()) {
+        empty_kv_barriers[kv_stage_idx]->wait(kv_phase ^ 1);
+        #pragma unroll
+        for (int i = 0; i < static_cast<int>(kPagesPerTask); ++i) {
+          cute::SM90_TMA_LOAD_3D::copy(
+              &tensor_map_kv,
+              reinterpret_cast<uint64_t*>(full_kv_barriers[kv_stage_idx]),
+              static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+              smem_kv[kv_stage_idx] + (BLOCK_KV * kHeadDim / 2) * i,
+              0,
+              0,
+              kv_block_idx[i]);
+          deep_gemm::tma::copy<BLOCK_KV, 1, 0>(
+              &tensor_map_sf_kv,
+              full_kv_barriers[kv_stage_idx],
+              smem_sf_kv[kv_stage_idx] + BLOCK_KV * i,
+              0,
+              kv_block_idx[i]);
+        }
+        full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(
+            SMEM_KV_SIZE_PER_STAGE + SMEM_SF_KV_SIZE_PER_STAGE);
+      }
+    }
+  } else if (warp_idx == kSpecWarpStart + 2) {
+    cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
+    DG_TRAP_ONLY_DEVICE_ASSERT(deep_gemm::ptx::ld_shared(tmem_ptr_in_smem) == 0);
+
+    auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
+      DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
+      uint32_t values[4];
+      #pragma unroll
+      for (uint32_t i = 0; i < 4; ++i)
+        values[i] = deep_gemm::ptx::ld_shared(smem_ptr + (i ^ (lane_idx >> 3)) * 32 + lane_idx);
+      __syncwarp();
+      #pragma unroll
+      for (uint32_t i = 0; i < 4; ++i)
+        deep_gemm::ptx::st_shared(smem_ptr + lane_idx * 4 + (i ^ (lane_idx >> 3)), values[i]);
+    };
+
+    auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
+        cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
+        cutlass::float_ue8m0_t, UMMA_M, UMMA_N,
+        cute::UMMA::Major::K, cute::UMMA::Major::K>();
+    auto sf_desc = deep_gemm::mma::sm100::make_sf_desc(nullptr);
+
+    CUTE_TIE_DECL(advance_q_pipeline(), q_stage_idx, q_phase);
+    full_q_barriers[q_stage_idx]->wait(q_phase);
+    #pragma unroll
+    for (uint32_t i = 0; i < kNumSFQAtom / kNumUTCCPAlignedElems; ++i) {
+      auto smem_ptr = smem_sf_q[q_stage_idx] + i * kNumUTCCPAlignedElems;
+      utccp_required_smem_warp_transpose(smem_ptr);
+      cutlass::arch::fence_view_async_shared();
+      deep_gemm::mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
+      if (cute::elect_one_sync())
+        cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sf_desc, kTmemStartColOfSFQ + i * 4);
+      __syncwarp();
+    }
+
+    for (uint32_t task = task_begin; task < task_end; ++task) {
+      CUTE_TIE_DECL(advance_kv_pipeline(), kv_stage_idx, kv_phase);
+      full_kv_barriers[kv_stage_idx]->wait(kv_phase);
+
+      #pragma unroll
+      for (uint32_t i = 0; i < kNumSFKV / kNumUTCCPAlignedElems; ++i) {
+        auto smem_ptr = smem_sf_kv[kv_stage_idx] + i * kNumUTCCPAlignedElems;
+        utccp_required_smem_warp_transpose(smem_ptr);
+        cutlass::arch::fence_view_async_shared();
+      }
+
+      if (cute::elect_one_sync()) {
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumSFKV / kNumUTCCPAlignedElems; ++i) {
+          auto smem_ptr = smem_sf_kv[kv_stage_idx] + i * kNumUTCCPAlignedElems;
+          deep_gemm::mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
+          cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sf_desc, kTmemStartColOfSFKV + i * 4);
+        }
+
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumMathWarpGroups; ++i) {
+          CUTE_TIE_DECL(advance_tmem_pipeline(), tmem_stage_idx, tmem_phase);
+          uint32_t tmem_addr = tmem_stage_idx * UMMA_N;
+
+          empty_tmem_barriers[tmem_stage_idx]->wait(tmem_phase ^ 1);
+          deep_gemm::ptx::tcgen05_after_thread_sync();
+
+          #pragma unroll
+          for (uint32_t k = 0; k < kHeadDim / UMMA_K; ++k) {
+            auto runtime_instr_desc =
+                deep_gemm::mma::sm100::make_runtime_instr_desc_with_sf_id(
+                    instr_desc, k * 2, k * 2);
+            auto a_desc = deep_gemm::mma::sm100::make_smem_desc(
+                cute::UMMA::LayoutType::SWIZZLE_64B,
+                smem_kv[kv_stage_idx] + i * UMMA_M * (kHeadDim / 2) + k * UMMA_K / 2,
+                8 * (kHeadDim / 2),
+                0);
+            auto b_desc = deep_gemm::mma::sm100::make_smem_desc(
+                cute::UMMA::LayoutType::SWIZZLE_64B,
+                smem_q[q_stage_idx] + k * UMMA_K / 2,
+                8 * (kHeadDim / 2),
+                0);
+            deep_gemm::ptx::SM100_MMA_MXF4_SS::fma(
+                a_desc,
+                b_desc,
+                tmem_addr,
+                k,
+                runtime_instr_desc,
+                kTmemStartColOfSFKV + i * 4,
+                kTmemStartColOfSFQ);
+          }
+          asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                       ::"r"(cute::cast_smem_ptr_to_uint(full_tmem_barriers[tmem_stage_idx])));
+        }
+      }
+      cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(empty_kv_barriers[kv_stage_idx]));
+    }
+  } else if (warp_idx == kSpecWarpStart + 3) {
+    cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
+  } else if (warp_idx < kSpecWarpStart) {
+    cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
+    const auto math_warpgroup_idx = warpgroup_idx;
+    const auto math_thread_idx = warp_idx * 32 + lane_idx;
+
+    auto tmem_load = [](auto num_elems_c, const uint32_t& tmem_addr, float* accum) {
+      constexpr int N = decltype(num_elems_c)::value;
+      DG_STATIC_ASSERT(N == 32 or N == 64, "Unsupported TMEM load size");
+      using Loader = cute::conditional_t<N == 32,
+          cute::SM100_TMEM_LOAD_32dp32b32x,
+          cute::SM100_TMEM_LOAD_32dp32b64x>;
+      [&]<size_t... Is>(cute::index_sequence<Is...>) {
+        Loader::copy(tmem_addr, reinterpret_cast<uint32_t*>(accum)[Is]...);
+      }(cute::make_index_sequence<N>{});
+      cutlass::arch::fence_view_async_tmem_load();
+    };
+
+    advance_tmem_pipeline(math_warpgroup_idx);
+
+    float accum[kNumHeads];
+    float weights[kNumHeads];
+
+    CUTE_TIE_DECL(advance_q_pipeline(), q_stage_idx, q_phase);
+    full_q_barriers[q_stage_idx]->wait(q_phase);
+    #pragma unroll
+    for (uint32_t j = 0; j < kNumHeads; j += 4) {
+      float4 raw = deep_gemm::ptx::ld_shared((float4*)(smem_weights[q_stage_idx] + j));
+      weights[j + 0] = raw.x;
+      weights[j + 1] = raw.y;
+      weights[j + 2] = raw.z;
+      weights[j + 3] = raw.w;
+    }
+
+    for (uint32_t task = task_begin; task < task_end; ++task) {
+      const auto candidate_pos = task * SPLIT_KV + math_thread_idx;
+      const auto key_offset = row * static_cast<uint64_t>(candidate_len) + candidate_pos;
+
+      CUTE_TIE_DECL(advance_tmem_pipeline(kNumMathWarpGroups), tmem_stage_idx, tmem_phase);
+      full_tmem_barriers[tmem_stage_idx]->wait(tmem_phase);
+      deep_gemm::ptx::tcgen05_after_thread_sync();
+
+      uint32_t tmem_addr = tmem_stage_idx * UMMA_N;
+      tmem_load(cute::Int<kNumHeads / 2>{}, tmem_addr, accum);
+      tmem_load(cute::Int<kNumHeads / 2>{}, tmem_addr + kNumHeads / 2, accum + kNumHeads / 2);
+
+      auto sum_0 = make_float2(0, 0);
+      auto sum_1 = make_float2(0, 0);
+      const auto transform = [&](const uint32_t& j, const float2& sum) {
+        auto a = make_float2(fmaxf(accum[j], 0), fmaxf(accum[j + 1], 0));
+        auto b = make_float2(weights[j], weights[j + 1]);
+        return __ffma2_rn(a, b, sum);
+      };
+      #pragma unroll
+      for (uint32_t j = 0; j < kNumHeads; j += 4) {
+        sum_0 = transform(j, sum_0);
+        sum_1 = transform(j + 2, sum_1);
+      }
+      auto sum = __fadd2_rn(sum_0, sum_1);
+      const float score = sum.x + sum.y;
+
+      uint32_t key = 0xffffffffu;
+      if (candidate_pos < candidate_len) {
+        const uint32_t block_slot = candidate_pos / 128u;
+        const uint32_t block_offset = candidate_pos - block_slot * 128u;
+        const int32_t block_id =
+            block_slot < block_topk
+                ? selected_blocks[row * static_cast<uint64_t>(block_topk) + block_slot]
+                : -1;
+        const int32_t token =
+            block_id >= 0
+                ? block_id * 128 + static_cast<int32_t>(block_offset)
+                : -1;
+        if (token >= 0 && token < prefix_len) {
+          key = fp32_to_radix_desc(__float_as_uint(score));
+        }
+      }
+      if (candidate_pos < candidate_len) {
+        candidate_keys[key_offset] = key;
+      }
+
+      deep_gemm::ptx::tcgen05_before_thread_sync();
+      empty_tmem_barriers[tmem_stage_idx]->arrive();
+    }
+
+    cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
+    if (warp_idx == 0)
+      cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
+  }
+
+  if (fused_topk_indices == nullptr || topk == 0) return;
+  if (row_splits == 1u) {
+    __threadfence_block();
+    __syncthreads();
+  } else {
+    __threadfence();
+    auto cluster = cooperative_groups::this_cluster();
+    cluster.sync();
+    if (row_split != 0) return;
+  }
+
+  const uint32_t tid = threadIdx.x;
+  constexpr uint32_t kTopKThreads = 256;
+  constexpr uint32_t kTopKWarps = kTopKThreads / 32;
+  constexpr uint32_t kTopKBinsPerThread =
+      (kTopKBins + kTopKThreads - 1u) / kTopKThreads;
+  const bool topk_active = tid < kTopKThreads;
+  const uint32_t keep = min(topk, candidate_len);
+  const auto* keys_row =
+      candidate_keys + static_cast<int64_t>(row) * candidate_len;
+  const auto* blocks_row =
+      selected_blocks + static_cast<int64_t>(row) * block_topk;
+  auto* out_row =
+      fused_topk_indices + static_cast<int64_t>(row) * topk;
+  auto* topk_smem = reinterpret_cast<uint32_t*>(smem_buffer);
+  auto* s_hist = topk_smem;
+  auto* s_prefix = s_hist + kTopKBins;
+  auto* s_warp_totals = s_prefix + kTopKBins;
+  auto* s_warp_prefix = s_warp_totals + kTopKWarps;
+
+  if (tid == 0) {
+    s_threshold_key = 0u;
+    s_less_count = 0u;
+    s_above_used = 0u;
+    s_boundary_used = 0u;
+    s_emit_count = 0u;
+  }
+  __syncthreads();
+
+  #pragma unroll
+  for (uint32_t pass = 0; pass < kTopKPasses; ++pass) {
+    const uint32_t bits_remaining = 32u - pass * kTopKBits;
+    const uint32_t bits_this = min(kTopKBits, bits_remaining);
+    const uint32_t shift = bits_remaining - bits_this;
+    const uint32_t active_bins = 1u << bits_this;
+    const uint32_t digit_mask = active_bins - 1u;
+    const uint32_t prefix_mask =
+        pass == 0 ? 0u : (0xffffffffu << (shift + bits_this));
+    const uint32_t selected_prefix = s_threshold_key & prefix_mask;
+
+    if (topk_active) {
+      for (uint32_t bin = tid; bin < active_bins; bin += kTopKThreads) {
+        s_hist[bin] = 0u;
+      }
+    }
+    __syncthreads();
+
+    if (topk_active) {
+      for (uint32_t i = tid; i < candidate_len; i += kTopKThreads) {
+        const uint32_t key = keys_row[i];
+        if (key != 0xffffffffu &&
+            (pass == 0 || ((key & prefix_mask) == selected_prefix))) {
+          atomicAdd(&s_hist[(key >> shift) & digit_mask], 1u);
+        }
+      }
+    }
+    __syncthreads();
+
+    if (topk_active) {
+      uint32_t lane_sum = 0u;
+      const uint32_t bin_base = tid * kTopKBinsPerThread;
+      #pragma unroll
+      for (uint32_t j = 0; j < kTopKBinsPerThread; ++j) {
+        const uint32_t bin = bin_base + j;
+        if (bin < active_bins) lane_sum += s_hist[bin];
+      }
+      uint32_t scan = lane_sum;
+      #pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const auto y = __shfl_up_sync(0xffffffff, scan, off);
+        if (static_cast<int>(tid & 31u) >= off) scan += y;
+      }
+      const uint32_t warp_id = tid >> 5;
+      if ((tid & 31u) == 31u) s_warp_totals[warp_id] = scan;
+      __syncthreads();
+
+      if (tid < 32) {
+        uint32_t warp_sum = tid < kTopKWarps ? s_warp_totals[tid] : 0u;
+        uint32_t warp_scan = warp_sum;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+          const auto y = __shfl_up_sync(0xffffffff, warp_scan, off);
+          if (static_cast<int>(tid) >= off) warp_scan += y;
+        }
+        if (tid < kTopKWarps) {
+          s_warp_prefix[tid] = warp_scan - warp_sum;
+        }
+      }
+      __syncthreads();
+
+      uint32_t running = s_warp_prefix[warp_id] + scan - lane_sum;
+      #pragma unroll
+      for (uint32_t j = 0; j < kTopKBinsPerThread; ++j) {
+        const uint32_t bin = bin_base + j;
+        if (bin < active_bins) {
+          running += s_hist[bin];
+          s_prefix[bin] = running;
+        }
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      s_selected_bin = active_bins - 1u;
+    }
+    __syncthreads();
+
+    const uint32_t target = keep > s_less_count ? keep - s_less_count : 1u;
+    if (topk_active) {
+      for (uint32_t bin = tid; bin < active_bins; bin += kTopKThreads) {
+        if (s_prefix[bin] >= target) {
+          atomicMin(&s_selected_bin, bin);
+        }
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      const uint32_t b = min(s_selected_bin, active_bins - 1u);
+      const uint32_t before = b == 0 ? 0u : s_prefix[b - 1];
+      s_less_count += before;
+      s_threshold_key = selected_prefix | (b << shift);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    s_boundary_quota = keep > s_less_count ? keep - s_less_count : 0u;
+    s_above_used = 0u;
+    s_boundary_used = 0u;
+  }
+  __syncthreads();
+
+  const uint32_t threshold_key = s_threshold_key;
+  const uint32_t above_count = s_less_count;
+  const uint32_t boundary_quota = s_boundary_quota;
+  if (topk_active) {
+    for (uint32_t i = tid; i < candidate_len; i += kTopKThreads) {
+      const uint32_t key = keys_row[i];
+      if (key == 0xffffffffu) continue;
+      const uint32_t block_slot = i / kHISABlockSize;
+      const uint32_t block_offset = i - block_slot * kHISABlockSize;
+      int32_t token = -1;
+      if (block_slot < block_topk) {
+        const int32_t block_id = blocks_row[block_slot];
+        if (block_id >= 0) {
+          token = block_id * static_cast<int32_t>(kHISABlockSize) +
+                  static_cast<int32_t>(block_offset);
+        }
+      }
+      if (key < threshold_key) {
+        const uint32_t slot = atomicAdd(&s_above_used, 1u);
+        if (slot < above_count) out_row[slot] = token;
+      } else if (key == threshold_key) {
+        const uint32_t slot = atomicAdd(&s_boundary_used, 1u);
+        if (slot < boundary_quota) out_row[above_count + slot] = token;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    const uint32_t boundary_written = min(s_boundary_used, s_boundary_quota);
+    s_emit_count = min(keep, min(s_above_used, s_less_count) + boundary_written);
+  }
+  __syncthreads();
+
+  if (topk_active) {
+    for (uint32_t i = s_emit_count + tid; i < topk; i += kTopKThreads) {
+      out_row[i] = -1;
+    }
+  }
+}
+
+template <typename IndicesT, uint32_t kPageSize, class GEMM, uint32_t kTileN>
+__global__ void hisa_selector_megakernel_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISASelectorMegakernelParam param) {
+  constexpr int64_t kPageBytes = (kNVFP4ValueBytes + kScaleBytes) * kPageSize;
+  constexpr uint32_t kHISABlockSize = 128;
+  const uint32_t row = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+  if (row >= param.q_rows) return;
+
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  char* cursor = reinterpret_cast<char*>(smem_raw);
+  float* block_scores = reinterpret_cast<float*>(cursor);
+  cursor += sizeof(float) * param.block_score_capacity;
+  int32_t* block_indices = reinterpret_cast<int32_t*>(cursor);
+  cursor += sizeof(int32_t) * param.block_score_capacity;
+  int32_t* selected_blocks = reinterpret_cast<int32_t*>(cursor);
+  cursor += sizeof(int32_t) * param.effective_block_topk;
+  float* candidate_scores = reinterpret_cast<float*>(cursor);
+  cursor += sizeof(float) * param.candidate_capacity;
+  uint16_t* candidate_ordinals = reinterpret_cast<uint16_t*>(cursor);
+  cursor += sizeof(uint16_t) * param.candidate_capacity;
+  cursor = hisa_align_smem(cursor, 16);
+  auto gemm_smem = reinterpret_cast<void*>(cursor);
+  auto [smem_a, smem_b, smem_c] = cublasdx::slice_shared_memory<GEMM>(gemm_smem);
+  auto a_shared = cublasdx::make_tensor(smem_a, GEMM::get_layout_smem_a());
+  auto b_shared = cublasdx::make_tensor(smem_b, GEMM::get_layout_smem_b());
+  auto c_shared = cublasdx::make_tensor(smem_c, GEMM::get_layout_smem_c());
+  __shared__ uint32_t s_hist[256];
+  __shared__ uint32_t s_prefix[256];
+  __shared__ uint32_t s_threshold_key;
+  __shared__ uint32_t s_less_count;
+  __shared__ uint32_t s_boundary_quota;
+  __shared__ uint32_t s_boundary_used;
+  __shared__ uint32_t s_above_used;
+
+  const int32_t batch =
+      static_cast<const int32_t*>(param.token_to_batch_idx)[row];
+  if (batch < 0 || static_cast<uint32_t>(batch) >= param.batch_size) {
+    for (uint32_t i = tid; i < param.topk; i += blockDim.x) {
+      static_cast<int32_t*>(param.topk_indices)[
+          static_cast<int64_t>(row) * param.topk + i] = -1;
+    }
+    return;
+  }
+  const int32_t prefix_len = max(0, static_cast<const int32_t*>(param.seq_lens)[batch]);
+  const uint32_t block_count = min(
+      static_cast<uint32_t>(static_cast<const int32_t*>(param.block_counts)[row]),
+      param.max_blocks);
+
+  for (uint32_t i = tid; i < param.block_score_capacity; i += blockDim.x) {
+    block_scores[i] = -INFINITY;
+    block_indices[i] = INT_MAX;
+  }
+  for (uint32_t i = tid; i < param.effective_block_topk; i += blockDim.x) {
+    selected_blocks[i] = -1;
+  }
+  for (uint32_t i = tid; i < param.candidate_capacity; i += blockDim.x) {
+    candidate_scores[i] = -INFINITY;
+    candidate_ordinals[i] = UINT16_MAX;
+  }
+  __syncthreads();
+
+  if (prefix_len <= 0 || block_count == 0) {
+    for (uint32_t i = tid; i < param.topk; i += blockDim.x) {
+      static_cast<int32_t*>(param.topk_indices)[
+          static_cast<int64_t>(row) * param.topk + i] = -1;
+    }
+    return;
+  }
+
+  const auto* q_values =
+      static_cast<const uint8_t*>(param.q_values) +
+      static_cast<int64_t>(row) * param.n_heads * kNVFP4ValueBytes;
+  const auto* q_scales =
+      static_cast<const uint32_t*>(param.q_scales) +
+      static_cast<int64_t>(row) * param.n_heads;
+  for (uint32_t idx = tid; idx < kHISASelectorHeads * kIndexerHeadDim;
+       idx += blockDim.x) {
+    const uint32_t head = idx / kIndexerHeadDim;
+    const uint32_t dim = idx - head * kIndexerHeadDim;
+    a_shared(head, dim) = load_nvfp4_value(
+        q_values + static_cast<int64_t>(head) * kNVFP4ValueBytes,
+        q_scales + head,
+        dim);
+  }
+  __syncthreads();
+
+  const auto* rep_values = static_cast<const uint8_t*>(param.rep_values);
+  const auto* rep_scales = static_cast<const uint32_t*>(param.rep_scales);
+  const auto* weights =
+      static_cast<const float*>(param.weights) + static_cast<int64_t>(row) * param.n_heads;
+  for (uint32_t tile_start = 0; tile_start < block_count;
+       tile_start += kTileN) {
+    const uint32_t tile_count = min(kTileN, block_count - tile_start);
+    for (uint32_t idx = tid; idx < kIndexerHeadDim * kTileN;
+         idx += blockDim.x) {
+      const uint32_t dim = idx / kTileN;
+      const uint32_t n = idx - dim * kTileN;
+      float value = 0.0f;
+      if (n < tile_count) {
+        const uint32_t block_id = tile_start + n;
+        const int64_t rep_row =
+            (static_cast<int64_t>(batch) * param.max_blocks + block_id);
+        value = load_nvfp4_value(
+            rep_values + rep_row * kNVFP4ValueBytes,
+            rep_scales + rep_row,
+            dim);
+      }
+      b_shared(dim, n) = value;
+    }
+    for (uint32_t idx = tid; idx < kHISASelectorHeads * kTileN;
+         idx += blockDim.x) {
+      const uint32_t head = idx / kTileN;
+      const uint32_t n = idx - head * kTileN;
+      c_shared(head, n) = 0.0f;
+    }
+    __syncthreads();
+
+    GEMM().execute(1.0f, a_shared, b_shared, 0.0f, c_shared);
+    __syncthreads();
+
+    for (uint32_t n = tid; n < kTileN; n += blockDim.x) {
+      if (n < tile_count) {
+        float score = 0.0f;
+        for (uint32_t head = 0; head < kHISASelectorHeads; ++head) {
+          const float dot = c_shared(head, n);
+          if (dot > 0.0f) score += dot * weights[head];
+        }
+        block_scores[tile_start + n] = score;
+      }
+    }
+    __syncthreads();
+  }
+
+  for (uint32_t i = tid; i < param.block_score_capacity; i += blockDim.x) {
+    block_indices[i] = i < block_count ? static_cast<int32_t>(i) : INT_MAX;
+    if (i >= block_count) block_scores[i] = -INFINITY;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    block_scores[0] = INFINITY;
+    block_scores[block_count - 1] = INFINITY;
+  }
+  __syncthreads();
+
+  for (uint32_t k_size = 2; k_size <= param.block_score_capacity; k_size <<= 1) {
+    for (uint32_t j = k_size >> 1; j > 0; j >>= 1) {
+      for (uint32_t i = tid; i < param.block_score_capacity; i += blockDim.x) {
+        const uint32_t other = i ^ j;
+        if (other > i && other < param.block_score_capacity) {
+          const float score_i = block_scores[i];
+          const float score_o = block_scores[other];
+          const int32_t block_i = block_indices[i];
+          const int32_t block_o = block_indices[other];
+          const bool left_better = (i & k_size) == 0;
+          const bool i_better =
+              hisa_selector_better(score_i, block_i, score_o, block_o);
+          const bool should_swap =
+              (left_better && !i_better) || (!left_better && i_better);
+          if (should_swap) {
+            block_scores[i] = score_o;
+            block_scores[other] = score_i;
+            block_indices[i] = block_o;
+            block_indices[other] = block_i;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  const uint32_t row_block_topk = min(
+      static_cast<uint32_t>(
+          max(0, static_cast<const int32_t*>(param.block_topk_counts)[row])),
+      param.effective_block_topk);
+  const uint32_t keep_blocks = min(row_block_topk, block_count);
+  for (uint32_t slot = tid; slot < param.effective_block_topk; slot += blockDim.x) {
+    selected_blocks[slot] = slot < keep_blocks ? block_indices[slot] : -1;
+  }
+  __syncthreads();
+
+  if (param.effective_block_topk * kHISABlockSize == param.topk) {
+    for (uint32_t i = tid; i < param.topk; i += blockDim.x) {
+      const uint32_t slot = i / kHISABlockSize;
+      const uint32_t offset = i - slot * kHISABlockSize;
+      int32_t token = -1;
+      if (slot < param.effective_block_topk) {
+        const int32_t block_id = selected_blocks[slot];
+        if (block_id >= 0) {
+          token = block_id * static_cast<int32_t>(kHISABlockSize) +
+                  static_cast<int32_t>(offset);
+        }
+      }
+      static_cast<int32_t*>(param.topk_indices)[
+          static_cast<int64_t>(row) * param.topk + i] =
+          token >= 0 && token < prefix_len ? token : -1;
+    }
+    return;
+  }
+
+  const auto* page_table = static_cast<const IndicesT*>(param.page_table);
+  const auto* cache = static_cast<const uint8_t*>(param.cache);
+  const uint32_t candidate_len =
+      min(param.effective_block_topk * kHISABlockSize, param.candidate_capacity);
+  for (uint32_t tile_start = 0; tile_start < candidate_len; tile_start += kTileN) {
+    const uint32_t tile_count = min(kTileN, candidate_len - tile_start);
+    for (uint32_t idx = tid; idx < kIndexerHeadDim * kTileN;
+         idx += blockDim.x) {
+      const uint32_t dim = idx / kTileN;
+      const uint32_t n = idx - dim * kTileN;
+      const uint32_t candidate_pos = tile_start + n;
+      const uint32_t slot = candidate_pos / kHISABlockSize;
+      const uint32_t offset = candidate_pos - slot * kHISABlockSize;
+      const int32_t block_id =
+          slot < param.effective_block_topk ? selected_blocks[slot] : -1;
+      const int32_t block_token_start =
+          block_id * static_cast<int32_t>(kHISABlockSize);
+      const int32_t token = block_token_start + static_cast<int32_t>(offset);
+      float value = 0.0f;
+      if (n < tile_count && block_id >= 0 && token >= 0 && token < prefix_len) {
+        const uint32_t logical_page = static_cast<uint32_t>(token) / kPageSize;
+        const uint32_t offset = static_cast<uint32_t>(token) & (kPageSize - 1);
+        const auto page =
+            page_table[static_cast<int64_t>(batch) * param.page_table_stride +
+                       logical_page];
+        if (page >= 0) {
+          const auto* page_ptr = cache + static_cast<int64_t>(page) * kPageBytes;
+          const auto* value_ptr = page_ptr + offset * kNVFP4ValueBytes;
+          const auto* scale_ptr = reinterpret_cast<const uint32_t*>(
+              page_ptr + kNVFP4ValueBytes * kPageSize + offset * kScaleBytes);
+          value = load_nvfp4_value(value_ptr, scale_ptr, dim);
+        }
+      }
+      b_shared(dim, n) = value;
+    }
+    for (uint32_t idx = tid; idx < kHISASelectorHeads * kTileN;
+         idx += blockDim.x) {
+      const uint32_t head = idx / kTileN;
+      const uint32_t n = idx - head * kTileN;
+      c_shared(head, n) = 0.0f;
+    }
+    __syncthreads();
+
+    GEMM().execute(1.0f, a_shared, b_shared, 0.0f, c_shared);
+    __syncthreads();
+
+    for (uint32_t n = tid; n < kTileN; n += blockDim.x) {
+      const uint32_t candidate_pos = tile_start + n;
+      if (candidate_pos >= param.candidate_capacity) continue;
+      const uint32_t slot = candidate_pos / kHISABlockSize;
+      const uint32_t offset = candidate_pos - slot * kHISABlockSize;
+      const int32_t block_id =
+          slot < param.effective_block_topk ? selected_blocks[slot] : -1;
+      const int32_t block_token_start =
+          block_id * static_cast<int32_t>(kHISABlockSize);
+      const int32_t token = block_token_start + static_cast<int32_t>(offset);
+      float score = -INFINITY;
+      uint16_t ordinal = UINT16_MAX;
+      if (n < tile_count && block_id >= 0 && token >= 0 && token < prefix_len) {
+        score = 0.0f;
+        for (uint32_t head = 0; head < kHISASelectorHeads; ++head) {
+          const float dot = c_shared(head, n);
+          if (dot > 0.0f) score += dot * weights[head];
+        }
+        ordinal = static_cast<uint16_t>(candidate_pos);
+      }
+      candidate_scores[candidate_pos] = score;
+      candidate_ordinals[candidate_pos] = ordinal;
+    }
+    __syncthreads();
+  }
+  const uint32_t keep = min(param.topk, candidate_len);
+  if (tid == 0) {
+    s_threshold_key = 0;
+    s_less_count = 0;
+    s_above_used = 0;
+    s_boundary_used = 0;
+  }
+  __syncthreads();
+
+  #pragma unroll
+  for (int pass = 0; pass < 4; ++pass) {
+    const auto shift = 24u - static_cast<uint32_t>(pass) * 8u;
+    const auto prefix_mask =
+        pass == 0 ? 0u : (0xffffffffu << (shift + 8u));
+    const auto selected_prefix = s_threshold_key & prefix_mask;
+
+    for (uint32_t bin = tid; bin < 256; bin += blockDim.x) {
+      s_hist[bin] = 0;
+    }
+    __syncthreads();
+
+    for (uint32_t i = tid; i < candidate_len; i += blockDim.x) {
+      const bool valid = candidate_ordinals[i] != UINT16_MAX;
+      const auto key =
+          valid ? fp32_to_radix_desc(__float_as_uint(candidate_scores[i])) : 0xffffffffu;
+      if (pass == 0 || ((key & prefix_mask) == selected_prefix)) {
+        atomicAdd(&s_hist[(key >> shift) & 0xffu], 1u);
+      }
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+      uint32_t lane_sum = 0;
+      for (uint32_t b = tid * 8; b < (tid + 1) * 8; ++b) lane_sum += s_hist[b];
+      uint32_t scan = lane_sum;
+      #pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const auto y = __shfl_up_sync(0xffffffff, scan, off);
+        if (static_cast<int>(tid) >= off) scan += y;
+      }
+      const auto base = scan - lane_sum;
+      uint32_t running = base;
+      for (uint32_t b = tid * 8; b < (tid + 1) * 8; ++b) {
+        running += s_hist[b];
+        s_prefix[b] = running;
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      const auto target = keep > s_less_count ? keep - s_less_count : 1u;
+      uint32_t b = 0;
+      while (b + 1 < 256 && s_prefix[b] < target) ++b;
+      const auto before = b == 0 ? 0u : s_prefix[b - 1];
+      s_less_count += before;
+      s_threshold_key = selected_prefix | (b << shift);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    s_boundary_quota = keep > s_less_count ? keep - s_less_count : 0u;
+    s_above_used = 0;
+    s_boundary_used = 0;
+  }
+  __syncthreads();
+
+  const auto threshold_key = s_threshold_key;
+  const auto above_count = s_less_count;
+  const auto boundary_quota = s_boundary_quota;
+  auto* out_row =
+      static_cast<int32_t*>(param.topk_indices) + static_cast<int64_t>(row) * param.topk;
+  for (uint32_t i = tid; i < candidate_len; i += blockDim.x) {
+    const bool valid = candidate_ordinals[i] != UINT16_MAX;
+    const auto key =
+        valid ? fp32_to_radix_desc(__float_as_uint(candidate_scores[i])) : 0xffffffffu;
+    if (!valid) continue;
+    const uint32_t slot_id = i / kHISABlockSize;
+    const uint32_t offset = i - slot_id * kHISABlockSize;
+    const int32_t block_id =
+        slot_id < param.effective_block_topk ? selected_blocks[slot_id] : -1;
+    const int32_t token = block_id >= 0
+                              ? block_id * static_cast<int32_t>(kHISABlockSize) +
+                                    static_cast<int32_t>(offset)
+                              : -1;
+    if (key < threshold_key) {
+      const auto out = atomicAdd(&s_above_used, 1u);
+      if (out < above_count) out_row[out] = token;
+    } else if (key == threshold_key) {
+      const auto out = atomicAdd(&s_boundary_used, 1u);
+      if (out < boundary_quota) out_row[above_count + out] = token;
+    }
+  }
+  __syncthreads();
+  for (uint32_t i = keep + tid; i < param.topk; i += blockDim.x) {
+    out_row[i] = -1;
+  }
+}
+
+template <class GEMM>
+__global__ void hisa_selector_parallel_select_blocks_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISASelectorParallelSelectParam param) {
+  const uint32_t row = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+  if (row >= param.q_rows) return;
+
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  char* cursor = reinterpret_cast<char*>(smem_raw);
+  float* block_scores = reinterpret_cast<float*>(cursor);
+  cursor += sizeof(float) * param.block_score_capacity;
+  int32_t* block_indices = reinterpret_cast<int32_t*>(cursor);
+  cursor += sizeof(int32_t) * param.block_score_capacity;
+  cursor = hisa_align_smem(cursor, 16);
+  auto gemm_smem = reinterpret_cast<void*>(cursor);
+  auto [smem_a, smem_b, smem_c] = cublasdx::slice_shared_memory<GEMM>(gemm_smem);
+  auto a_shared = cublasdx::make_tensor(smem_a, GEMM::get_layout_smem_a());
+  auto b_shared = cublasdx::make_tensor(smem_b, GEMM::get_layout_smem_b());
+  auto c_shared = cublasdx::make_tensor(smem_c, GEMM::get_layout_smem_c());
+
+  auto* selected_blocks =
+      static_cast<int32_t*>(param.selected_blocks) +
+      static_cast<int64_t>(row) * param.effective_block_topk;
+  for (uint32_t i = tid; i < param.effective_block_topk; i += blockDim.x) {
+    selected_blocks[i] = -1;
+  }
+
+  const int32_t batch =
+      static_cast<const int32_t*>(param.token_to_batch_idx)[row];
+  if (batch < 0 || static_cast<uint32_t>(batch) >= param.batch_size) {
+    return;
+  }
+  const int32_t prefix_len = max(0, static_cast<const int32_t*>(param.seq_lens)[batch]);
+  const uint32_t block_count = min(
+      static_cast<uint32_t>(static_cast<const int32_t*>(param.block_counts)[row]),
+      param.max_blocks);
+
+  for (uint32_t i = tid; i < param.block_score_capacity; i += blockDim.x) {
+    block_scores[i] = -INFINITY;
+    block_indices[i] = INT_MAX;
+  }
+  __syncthreads();
+  if (prefix_len <= 0 || block_count == 0) return;
+
+  const auto* q_values =
+      static_cast<const uint8_t*>(param.q_values) +
+      static_cast<int64_t>(row) * param.n_heads * kNVFP4ValueBytes;
+  const auto* q_scales =
+      static_cast<const uint32_t*>(param.q_scales) +
+      static_cast<int64_t>(row) * param.n_heads;
+  for (uint32_t idx = tid; idx < kHISASelectorHeads * kIndexerHeadDim;
+       idx += blockDim.x) {
+    const uint32_t head = idx / kIndexerHeadDim;
+    const uint32_t dim = idx - head * kIndexerHeadDim;
+    a_shared(head, dim) = load_nvfp4_value(
+        q_values + static_cast<int64_t>(head) * kNVFP4ValueBytes,
+        q_scales + head,
+        dim);
+  }
+  __syncthreads();
+
+  const auto* rep_values = static_cast<const uint8_t*>(param.rep_values);
+  const auto* rep_scales = static_cast<const uint32_t*>(param.rep_scales);
+  const auto* weights =
+      static_cast<const float*>(param.weights) + static_cast<int64_t>(row) * param.n_heads;
+  for (uint32_t tile_start = 0; tile_start < block_count;
+       tile_start += kHISASelectorTileN) {
+    const uint32_t tile_count = min(kHISASelectorTileN, block_count - tile_start);
+    for (uint32_t idx = tid; idx < kIndexerHeadDim * kHISASelectorTileN;
+         idx += blockDim.x) {
+      const uint32_t dim = idx / kHISASelectorTileN;
+      const uint32_t n = idx - dim * kHISASelectorTileN;
+      float value = 0.0f;
+      if (n < tile_count) {
+        const uint32_t block_id = tile_start + n;
+        const int64_t rep_row =
+            static_cast<int64_t>(batch) * param.max_blocks + block_id;
+        value = load_nvfp4_value(
+            rep_values + rep_row * kNVFP4ValueBytes,
+            rep_scales + rep_row,
+            dim);
+      }
+      b_shared(dim, n) = value;
+    }
+    for (uint32_t idx = tid; idx < kHISASelectorHeads * kHISASelectorTileN;
+         idx += blockDim.x) {
+      const uint32_t head = idx / kHISASelectorTileN;
+      const uint32_t n = idx - head * kHISASelectorTileN;
+      c_shared(head, n) = 0.0f;
+    }
+    __syncthreads();
+
+    GEMM().execute(1.0f, a_shared, b_shared, 0.0f, c_shared);
+    __syncthreads();
+
+    for (uint32_t n = tid; n < kHISASelectorTileN; n += blockDim.x) {
+      if (n < tile_count) {
+        float score = 0.0f;
+        for (uint32_t head = 0; head < kHISASelectorHeads; ++head) {
+          const float dot = c_shared(head, n);
+          if (dot > 0.0f) score += dot * weights[head];
+        }
+        block_scores[tile_start + n] = score;
+      }
+    }
+    __syncthreads();
+  }
+
+  for (uint32_t i = tid; i < param.block_score_capacity; i += blockDim.x) {
+    block_indices[i] = i < block_count ? static_cast<int32_t>(i) : INT_MAX;
+    if (i >= block_count) block_scores[i] = -INFINITY;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    block_scores[0] = INFINITY;
+    block_scores[block_count - 1] = INFINITY;
+  }
+  __syncthreads();
+
+  for (uint32_t k_size = 2; k_size <= param.block_score_capacity; k_size <<= 1) {
+    for (uint32_t j = k_size >> 1; j > 0; j >>= 1) {
+      for (uint32_t i = tid; i < param.block_score_capacity; i += blockDim.x) {
+        const uint32_t other = i ^ j;
+        if (other > i && other < param.block_score_capacity) {
+          const float score_i = block_scores[i];
+          const float score_o = block_scores[other];
+          const int32_t block_i = block_indices[i];
+          const int32_t block_o = block_indices[other];
+          const bool left_better = (i & k_size) == 0;
+          const bool i_better =
+              hisa_selector_better(score_i, block_i, score_o, block_o);
+          const bool should_swap =
+              (left_better && !i_better) || (!left_better && i_better);
+          if (should_swap) {
+            block_scores[i] = score_o;
+            block_scores[other] = score_i;
+            block_indices[i] = block_o;
+            block_indices[other] = block_i;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  const uint32_t row_block_topk = min(
+      static_cast<uint32_t>(
+          max(0, static_cast<const int32_t*>(param.block_topk_counts)[row])),
+      param.effective_block_topk);
+  const uint32_t keep_blocks = min(row_block_topk, block_count);
+  for (uint32_t slot = tid; slot < param.effective_block_topk; slot += blockDim.x) {
+    selected_blocks[slot] = slot < keep_blocks ? block_indices[slot] : -1;
+  }
+}
+
+template <typename IndicesT, uint32_t kPageSize, class GEMM>
+__global__ void hisa_selector_parallel_score_candidates_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISASelectorParallelScoreParam param) {
+  constexpr int64_t kPageBytes = (kNVFP4ValueBytes + kScaleBytes) * kPageSize;
+  constexpr uint32_t kHISABlockSize = 128;
+  const uint32_t row = blockIdx.x;
+  const uint32_t block_slot = blockIdx.y;
+  const uint32_t tid = threadIdx.x;
+  if (row >= param.q_rows || block_slot >= param.effective_block_topk) return;
+
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  auto gemm_smem = reinterpret_cast<void*>(smem_raw);
+  auto [smem_a, smem_b, smem_c] = cublasdx::slice_shared_memory<GEMM>(gemm_smem);
+  auto a_shared = cublasdx::make_tensor(smem_a, GEMM::get_layout_smem_a());
+  auto b_shared = cublasdx::make_tensor(smem_b, GEMM::get_layout_smem_b());
+  auto c_shared = cublasdx::make_tensor(smem_c, GEMM::get_layout_smem_c());
+
+  const int32_t batch =
+      static_cast<const int32_t*>(param.token_to_batch_idx)[row];
+  const int32_t prefix_len =
+      (batch >= 0 && static_cast<uint32_t>(batch) < param.batch_size)
+          ? max(0, static_cast<const int32_t*>(param.seq_lens)[batch])
+          : 0;
+  const int32_t block_id =
+      static_cast<const int32_t*>(param.selected_blocks)[
+          static_cast<int64_t>(row) * param.effective_block_topk + block_slot];
+  const int32_t block_token_start =
+      block_id * static_cast<int32_t>(kHISABlockSize);
+
+  const auto* q_values =
+      static_cast<const uint8_t*>(param.q_values) +
+      static_cast<int64_t>(row) * param.n_heads * kNVFP4ValueBytes;
+  const auto* q_scales =
+      static_cast<const uint32_t*>(param.q_scales) +
+      static_cast<int64_t>(row) * param.n_heads;
+  for (uint32_t idx = tid; idx < kHISASelectorHeads * kIndexerHeadDim;
+       idx += blockDim.x) {
+    const uint32_t head = idx / kIndexerHeadDim;
+    const uint32_t dim = idx - head * kIndexerHeadDim;
+    a_shared(head, dim) = load_nvfp4_value(
+        q_values + static_cast<int64_t>(head) * kNVFP4ValueBytes,
+        q_scales + head,
+        dim);
+  }
+
+  const auto* page_table = static_cast<const IndicesT*>(param.page_table);
+  const auto* cache = static_cast<const uint8_t*>(param.cache);
+  for (uint32_t idx = tid; idx < kIndexerHeadDim * kHISASelectorTileN;
+       idx += blockDim.x) {
+    const uint32_t dim = idx / kHISASelectorTileN;
+    const uint32_t n = idx - dim * kHISASelectorTileN;
+    const int32_t token = block_token_start + static_cast<int32_t>(n);
+    float value = 0.0f;
+    if (batch >= 0 && block_id >= 0 && token >= 0 && token < prefix_len) {
+      const uint32_t logical_page = static_cast<uint32_t>(token) / kPageSize;
+      const uint32_t offset = static_cast<uint32_t>(token) & (kPageSize - 1);
+      const auto page =
+          page_table[static_cast<int64_t>(batch) * param.page_table_stride +
+                     logical_page];
+      if (page >= 0) {
+        const auto* page_ptr = cache + static_cast<int64_t>(page) * kPageBytes;
+        const auto* value_ptr = page_ptr + offset * kNVFP4ValueBytes;
+        const auto* scale_ptr = reinterpret_cast<const uint32_t*>(
+            page_ptr + kNVFP4ValueBytes * kPageSize + offset * kScaleBytes);
+        value = load_nvfp4_value(value_ptr, scale_ptr, dim);
+      }
+    }
+    b_shared(dim, n) = value;
+  }
+  for (uint32_t idx = tid; idx < kHISASelectorHeads * kHISASelectorTileN;
+       idx += blockDim.x) {
+    const uint32_t head = idx / kHISASelectorTileN;
+    const uint32_t n = idx - head * kHISASelectorTileN;
+    c_shared(head, n) = 0.0f;
+  }
+  __syncthreads();
+
+  GEMM().execute(1.0f, a_shared, b_shared, 0.0f, c_shared);
+  __syncthreads();
+
+  const auto* weights =
+      static_cast<const float*>(param.weights) + static_cast<int64_t>(row) * param.n_heads;
+  auto* logits_row =
+      static_cast<float*>(param.logits) + static_cast<int64_t>(row) * param.candidate_len;
+  for (uint32_t n = tid; n < kHISASelectorTileN; n += blockDim.x) {
+    const uint32_t candidate_pos = block_slot * kHISABlockSize + n;
+    if (candidate_pos >= param.candidate_len) continue;
+    const int32_t token = block_token_start + static_cast<int32_t>(n);
+    float score = -INFINITY;
+    if (block_id >= 0 && token >= 0 && token < prefix_len) {
+      score = 0.0f;
+      for (uint32_t head = 0; head < kHISASelectorHeads; ++head) {
+        const float dot = c_shared(head, n);
+        if (dot > 0.0f) score += dot * weights[head];
+      }
+    }
+    logits_row[candidate_pos] = score;
+  }
+}
+
+template <typename IndicesT, uint32_t kPageSize, class GEMM>
+HISA_SELECTOR_CLUSTER_KERNEL void hisa_selector_cluster_fused_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISASelectorClusterFusedParam param) {
+  constexpr int64_t kPageBytes = (kNVFP4ValueBytes + kScaleBytes) * kPageSize;
+  constexpr uint32_t kHISABlockSize = 128;
+  constexpr uint32_t kBins = 256;
+  const uint32_t row = blockIdx.x;
+  const uint32_t cluster_rank = blockIdx.y;
+  const uint32_t tid = threadIdx.x;
+  if (row >= param.q_rows) return;
+
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  char* cursor = reinterpret_cast<char*>(smem_raw);
+  float* block_scores = reinterpret_cast<float*>(cursor);
+  cursor += sizeof(float) * param.block_score_capacity;
+  int32_t* block_indices = reinterpret_cast<int32_t*>(cursor);
+  cursor += sizeof(int32_t) * param.block_score_capacity;
+  int32_t* selected_blocks = reinterpret_cast<int32_t*>(cursor);
+  cursor += sizeof(int32_t) * param.effective_block_topk;
+  cursor = hisa_align_smem(cursor, 16);
+  auto gemm_smem = reinterpret_cast<void*>(cursor);
+  auto [smem_a, smem_b, smem_c] = cublasdx::slice_shared_memory<GEMM>(gemm_smem);
+  auto a_shared = cublasdx::make_tensor(smem_a, GEMM::get_layout_smem_a());
+  auto b_shared = cublasdx::make_tensor(smem_b, GEMM::get_layout_smem_b());
+  auto c_shared = cublasdx::make_tensor(smem_c, GEMM::get_layout_smem_c());
+
+  __shared__ uint32_t s_hist[kBins];
+  __shared__ uint32_t s_prefix[kBins];
+  __shared__ uint32_t s_threshold_key;
+  __shared__ uint32_t s_less_count;
+  __shared__ uint32_t s_boundary_quota;
+  __shared__ uint32_t s_boundary_used;
+  __shared__ uint32_t s_above_used;
+  __shared__ uint32_t s_emit_count;
+
+  auto* out_row =
+      static_cast<int32_t*>(param.topk_indices) + static_cast<int64_t>(row) * param.topk;
+
+  const int32_t batch =
+      static_cast<const int32_t*>(param.token_to_batch_idx)[row];
+  if (batch < 0 || static_cast<uint32_t>(batch) >= param.batch_size) {
+    if (cluster_rank == 0) {
+      for (uint32_t i = tid; i < param.topk; i += blockDim.x) out_row[i] = -1;
+    }
+    return;
+  }
+  const int32_t prefix_len = max(0, static_cast<const int32_t*>(param.seq_lens)[batch]);
+  const uint32_t block_count = min(
+      static_cast<uint32_t>(static_cast<const int32_t*>(param.block_counts)[row]),
+      param.max_blocks);
+
+  for (uint32_t i = tid; i < param.block_score_capacity; i += blockDim.x) {
+    block_scores[i] = -INFINITY;
+    block_indices[i] = INT_MAX;
+  }
+  for (uint32_t i = tid; i < param.effective_block_topk; i += blockDim.x) {
+    selected_blocks[i] = -1;
+  }
+  __syncthreads();
+
+  if (prefix_len <= 0 || block_count == 0) {
+    if (cluster_rank == 0) {
+      for (uint32_t i = tid; i < param.topk; i += blockDim.x) out_row[i] = -1;
+    }
+    return;
+  }
+
+  const auto* q_values =
+      static_cast<const uint8_t*>(param.q_values) +
+      static_cast<int64_t>(row) * param.n_heads * kNVFP4ValueBytes;
+  const auto* q_scales =
+      static_cast<const uint32_t*>(param.q_scales) +
+      static_cast<int64_t>(row) * param.n_heads;
+  for (uint32_t idx = tid; idx < kHISASelectorHeads * kIndexerHeadDim;
+       idx += blockDim.x) {
+    const uint32_t head = idx / kIndexerHeadDim;
+    const uint32_t dim = idx - head * kIndexerHeadDim;
+    a_shared(head, dim) = load_nvfp4_value(
+        q_values + static_cast<int64_t>(head) * kNVFP4ValueBytes,
+        q_scales + head,
+        dim);
+  }
+  __syncthreads();
+
+  const auto* rep_values = static_cast<const uint8_t*>(param.rep_values);
+  const auto* rep_scales = static_cast<const uint32_t*>(param.rep_scales);
+  const auto* weights =
+      static_cast<const float*>(param.weights) + static_cast<int64_t>(row) * param.n_heads;
+  for (uint32_t tile_start = 0; tile_start < block_count;
+       tile_start += kHISASelectorTileN) {
+    const uint32_t tile_count = min(kHISASelectorTileN, block_count - tile_start);
+    for (uint32_t idx = tid; idx < kIndexerHeadDim * kHISASelectorTileN;
+         idx += blockDim.x) {
+      const uint32_t dim = idx / kHISASelectorTileN;
+      const uint32_t n = idx - dim * kHISASelectorTileN;
+      float value = 0.0f;
+      if (n < tile_count) {
+        const uint32_t block_id = tile_start + n;
+        const int64_t rep_row =
+            static_cast<int64_t>(batch) * param.max_blocks + block_id;
+        value = load_nvfp4_value(
+            rep_values + rep_row * kNVFP4ValueBytes,
+            rep_scales + rep_row,
+            dim);
+      }
+      b_shared(dim, n) = value;
+    }
+    for (uint32_t idx = tid; idx < kHISASelectorHeads * kHISASelectorTileN;
+         idx += blockDim.x) {
+      const uint32_t head = idx / kHISASelectorTileN;
+      const uint32_t n = idx - head * kHISASelectorTileN;
+      c_shared(head, n) = 0.0f;
+    }
+    __syncthreads();
+
+    GEMM().execute(1.0f, a_shared, b_shared, 0.0f, c_shared);
+    __syncthreads();
+
+    for (uint32_t n = tid; n < kHISASelectorTileN; n += blockDim.x) {
+      if (n < tile_count) {
+        float score = 0.0f;
+        for (uint32_t head = 0; head < kHISASelectorHeads; ++head) {
+          const float dot = c_shared(head, n);
+          if (dot > 0.0f) score += dot * weights[head];
+        }
+        block_scores[tile_start + n] = score;
+      }
+    }
+    __syncthreads();
+  }
+
+  for (uint32_t i = tid; i < param.block_score_capacity; i += blockDim.x) {
+    block_indices[i] = i < block_count ? static_cast<int32_t>(i) : INT_MAX;
+    if (i >= block_count) block_scores[i] = -INFINITY;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    block_scores[0] = INFINITY;
+    block_scores[block_count - 1] = INFINITY;
+  }
+  __syncthreads();
+
+  for (uint32_t k_size = 2; k_size <= param.block_score_capacity; k_size <<= 1) {
+    for (uint32_t j = k_size >> 1; j > 0; j >>= 1) {
+      for (uint32_t i = tid; i < param.block_score_capacity; i += blockDim.x) {
+        const uint32_t other = i ^ j;
+        if (other > i && other < param.block_score_capacity) {
+          const float score_i = block_scores[i];
+          const float score_o = block_scores[other];
+          const int32_t block_i = block_indices[i];
+          const int32_t block_o = block_indices[other];
+          const bool left_better = (i & k_size) == 0;
+          const bool i_better =
+              hisa_selector_better(score_i, block_i, score_o, block_o);
+          const bool should_swap =
+              (left_better && !i_better) || (!left_better && i_better);
+          if (should_swap) {
+            block_scores[i] = score_o;
+            block_scores[other] = score_i;
+            block_indices[i] = block_o;
+            block_indices[other] = block_i;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  const uint32_t row_block_topk = min(
+      static_cast<uint32_t>(
+          max(0, static_cast<const int32_t*>(param.block_topk_counts)[row])),
+      param.effective_block_topk);
+  const uint32_t keep_blocks = min(row_block_topk, block_count);
+  for (uint32_t slot = tid; slot < param.effective_block_topk; slot += blockDim.x) {
+    selected_blocks[slot] = slot < keep_blocks ? block_indices[slot] : -1;
+  }
+  __syncthreads();
+
+  if (param.candidate_len == param.topk) {
+    if (cluster_rank == 0) {
+      for (uint32_t i = tid; i < param.topk; i += blockDim.x) {
+        const uint32_t slot = i / kHISABlockSize;
+        const uint32_t offset = i - slot * kHISABlockSize;
+        int32_t token = -1;
+        if (slot < param.effective_block_topk) {
+          const int32_t block_id = selected_blocks[slot];
+          if (block_id >= 0) {
+            token = block_id * static_cast<int32_t>(kHISABlockSize) +
+                    static_cast<int32_t>(offset);
+          }
+        }
+        out_row[i] = token >= 0 && token < prefix_len ? token : -1;
+      }
+    }
+    return;
+  }
+
+  const auto* page_table = static_cast<const IndicesT*>(param.page_table);
+  const auto* cache = static_cast<const uint8_t*>(param.cache);
+  auto* candidate_keys =
+      static_cast<uint32_t*>(param.candidate_keys) +
+      static_cast<int64_t>(row) * param.candidate_len;
+  for (uint32_t tile_start = cluster_rank * kHISASelectorTileN;
+       tile_start < param.candidate_len;
+       tile_start += kHISASelectorTileN * kHISASelectorClusterSize) {
+    const uint32_t tile_count = min(kHISASelectorTileN, param.candidate_len - tile_start);
+    for (uint32_t idx = tid; idx < kIndexerHeadDim * kHISASelectorTileN;
+         idx += blockDim.x) {
+      const uint32_t dim = idx / kHISASelectorTileN;
+      const uint32_t n = idx - dim * kHISASelectorTileN;
+      const uint32_t candidate_pos = tile_start + n;
+      const uint32_t slot = candidate_pos / kHISABlockSize;
+      const uint32_t offset = candidate_pos - slot * kHISABlockSize;
+      const int32_t block_id =
+          slot < param.effective_block_topk ? selected_blocks[slot] : -1;
+      const int32_t block_token_start =
+          block_id * static_cast<int32_t>(kHISABlockSize);
+      const int32_t token = block_token_start + static_cast<int32_t>(offset);
+      float value = 0.0f;
+      if (n < tile_count && block_id >= 0 && token >= 0 && token < prefix_len) {
+        const uint32_t logical_page = static_cast<uint32_t>(token) / kPageSize;
+        const uint32_t page_offset = static_cast<uint32_t>(token) & (kPageSize - 1);
+        const auto page =
+            page_table[static_cast<int64_t>(batch) * param.page_table_stride +
+                       logical_page];
+        if (page >= 0) {
+          const auto* page_ptr = cache + static_cast<int64_t>(page) * kPageBytes;
+          const auto* value_ptr = page_ptr + page_offset * kNVFP4ValueBytes;
+          const auto* scale_ptr = reinterpret_cast<const uint32_t*>(
+              page_ptr + kNVFP4ValueBytes * kPageSize + page_offset * kScaleBytes);
+          value = load_nvfp4_value(value_ptr, scale_ptr, dim);
+        }
+      }
+      b_shared(dim, n) = value;
+    }
+    for (uint32_t idx = tid; idx < kHISASelectorHeads * kHISASelectorTileN;
+         idx += blockDim.x) {
+      const uint32_t head = idx / kHISASelectorTileN;
+      const uint32_t n = idx - head * kHISASelectorTileN;
+      c_shared(head, n) = 0.0f;
+    }
+    __syncthreads();
+
+    GEMM().execute(1.0f, a_shared, b_shared, 0.0f, c_shared);
+    __syncthreads();
+
+    for (uint32_t n = tid; n < kHISASelectorTileN; n += blockDim.x) {
+      const uint32_t candidate_pos = tile_start + n;
+      if (n >= tile_count || candidate_pos >= param.candidate_len) continue;
+      const uint32_t slot = candidate_pos / kHISABlockSize;
+      const uint32_t offset = candidate_pos - slot * kHISABlockSize;
+      const int32_t block_id =
+          slot < param.effective_block_topk ? selected_blocks[slot] : -1;
+      const int32_t block_token_start =
+          block_id * static_cast<int32_t>(kHISABlockSize);
+      const int32_t token = block_token_start + static_cast<int32_t>(offset);
+      uint32_t key = 0xffffffffu;
+      if (block_id >= 0 && token >= 0 && token < prefix_len) {
+        float score = 0.0f;
+        for (uint32_t head = 0; head < kHISASelectorHeads; ++head) {
+          const float dot = c_shared(head, n);
+          if (dot > 0.0f) score += dot * weights[head];
+        }
+        key = fp32_to_radix_desc(__float_as_uint(score));
+      }
+      candidate_keys[candidate_pos] = key;
+    }
+    __syncthreads();
+  }
+
+  __threadfence();
+  cooperative_groups::this_cluster().sync();
+  if (cluster_rank != 0) return;
+
+  const uint32_t keep = min(param.topk, param.candidate_len);
+  if (tid == 0) {
+    s_threshold_key = 0u;
+    s_less_count = 0;
+    s_above_used = 0;
+    s_boundary_used = 0;
+    s_emit_count = 0;
+  }
+  __syncthreads();
+
+  #pragma unroll
+  for (uint32_t pass = 0; pass < 4; ++pass) {
+    const uint32_t shift = 24u - pass * 8u;
+    const uint32_t prefix_mask =
+        pass == 0 ? 0u : (0xffffffffu << (shift + 8u));
+    const uint32_t selected_prefix = s_threshold_key & prefix_mask;
+
+    for (uint32_t bin = tid; bin < kBins; bin += blockDim.x) s_hist[bin] = 0;
+    __syncthreads();
+
+    for (uint32_t i = tid; i < param.candidate_len; i += blockDim.x) {
+      const uint32_t key = candidate_keys[i];
+      if (key != 0xffffffffu &&
+          (pass == 0 || ((key & prefix_mask) == selected_prefix))) {
+        atomicAdd(&s_hist[(key >> shift) & 0xffu], 1u);
+      }
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+      uint32_t lane_sum = 0;
+      for (uint32_t b = tid * 8; b < (tid + 1) * 8; ++b) lane_sum += s_hist[b];
+      uint32_t scan = lane_sum;
+      #pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const auto y = __shfl_up_sync(0xffffffff, scan, off);
+        if (static_cast<int>(tid) >= off) scan += y;
+      }
+      const auto base = scan - lane_sum;
+      uint32_t running = base;
+      for (uint32_t b = tid * 8; b < (tid + 1) * 8; ++b) {
+        running += s_hist[b];
+        s_prefix[b] = running;
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      const uint32_t target = keep > s_less_count ? keep - s_less_count : 1u;
+      uint32_t b = 0;
+      while (b + 1 < kBins && s_prefix[b] < target) ++b;
+      const uint32_t before = b == 0 ? 0u : s_prefix[b - 1];
+      s_less_count += before;
+      s_threshold_key = selected_prefix | (b << shift);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    s_boundary_quota = keep > s_less_count ? keep - s_less_count : 0u;
+    s_above_used = 0;
+    s_boundary_used = 0;
+  }
+  __syncthreads();
+
+  const uint32_t threshold_key = s_threshold_key;
+  const uint32_t above_count = s_less_count;
+  const uint32_t boundary_quota = s_boundary_quota;
+  for (uint32_t i = tid; i < param.candidate_len; i += blockDim.x) {
+    const uint32_t key = candidate_keys[i];
+    if (key == 0xffffffffu) continue;
+    const uint32_t slot = i / kHISABlockSize;
+    const uint32_t offset = i - slot * kHISABlockSize;
+    const int32_t block_id =
+        slot < param.effective_block_topk ? selected_blocks[slot] : -1;
+    const int32_t token =
+        block_id >= 0 ? block_id * static_cast<int32_t>(kHISABlockSize) +
+                            static_cast<int32_t>(offset)
+                      : -1;
+    if (key < threshold_key) {
+      const auto out = atomicAdd(&s_above_used, 1u);
+      if (out < above_count) out_row[out] = token;
+    } else if (key == threshold_key) {
+      const auto out = atomicAdd(&s_boundary_used, 1u);
+      if (out < boundary_quota) out_row[above_count + out] = token;
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    const uint32_t boundary_written = min(s_boundary_used, boundary_quota);
+    s_emit_count = min(keep, min(s_above_used, above_count) + boundary_written);
+  }
+  __syncthreads();
+  for (uint32_t i = s_emit_count + tid; i < param.topk; i += blockDim.x) {
+    out_row[i] = -1;
+  }
+}
+#endif
 
 SGL_DEVICE uint32_t pack_eight_e2m1(
     float x0, float x1, float y0, float y1, float next_x0,
@@ -1197,6 +3893,59 @@ struct NVFP4IndexerQuantKernel {
       hisa_map_candidate_indices_indexer_cache_nvfp4;
   static constexpr auto fused_mask_topk_map_kernel =
       hisa_fused_mask_topk_map_indexer_cache_nvfp4;
+#if defined(SGLANG_ENABLE_HISA_SELECTOR_MEGAKERNEL)
+  static constexpr auto selector_megakernel_kernel =
+      hisa_selector_megakernel_indexer_cache_nvfp4<
+          IndicesT, kPageSize, HISASelectorGemmF32, kHISASelectorTileN>;
+  static constexpr auto selector_megakernel_wide_kernel =
+      hisa_selector_megakernel_indexer_cache_nvfp4<
+          IndicesT, kPageSize, HISASelectorWideGemmF32, kHISASelectorWideTileN>;
+  static constexpr auto selector_parallel_select_kernel =
+      hisa_selector_parallel_select_blocks_indexer_cache_nvfp4<
+          HISASelectorGemmF32>;
+  static constexpr auto selector_parallel_score_kernel =
+      hisa_selector_parallel_score_candidates_indexer_cache_nvfp4<
+          IndicesT, kPageSize, HISASelectorGemmF32>;
+  static constexpr auto selector_cluster_fused_kernel =
+      hisa_selector_cluster_fused_indexer_cache_nvfp4<
+          IndicesT, kPageSize, HISASelectorGemmF32>;
+  static constexpr auto candidate_keys_topk_map_kernel =
+      hisa_candidate_keys_topk_map_indexer_cache_nvfp4;
+  static constexpr auto deepgemm_candidate_logits_kernel =
+      deep_gemm::sm100_fp4_paged_mqa_logits<
+          1,
+          kHISASelectorHeads,
+          kIndexerHeadDim,
+          kPageSize,
+          true,
+          false,
+          3,
+          10,
+          256,
+          128,
+          256,
+          float>;
+	  static constexpr auto deepgemm_candidate_keys_kernel =
+	      hisa_sm100_fp4_paged_mqa_candidate_keys<
+	          kHISASelectorHeads,
+	          kIndexerHeadDim,
+	          kPageSize,
+          3,
+		          10,
+	          256,
+	          128,
+	          256>;
+	  static constexpr auto deepgemm_candidate_keys_row_split_kernel =
+	      hisa_sm100_fp4_paged_mqa_candidate_keys_row_split<
+	          kHISASelectorHeads,
+	          kIndexerHeadDim,
+	          kPageSize,
+	          3,
+	          10,
+	          256,
+	          128,
+	          256>;
+#endif
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);
@@ -1704,6 +4453,1337 @@ struct NVFP4IndexerQuantKernel {
     LaunchKernel(params.q_rows, kThreads, device_.unwrap())(
         fused_mask_topk_map_kernel, params);
   }
+
+#if defined(SGLANG_ENABLE_HISA_SELECTOR_MEGAKERNEL)
+  static void hisa_candidate_keys_topk_map(
+      tvm::ffi::TensorView candidate_keys,
+      tvm::ffi::TensorView top_blocks,
+      tvm::ffi::TensorView topk_indices) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto CL = SymbolicSize{"candidate_len"};
+    auto BT = SymbolicSize{"block_topk"};
+    auto K = SymbolicSize{"topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, CL}).with_dtype<int32_t>().with_device(device_).verify(candidate_keys);
+    TensorMatcher({Q, BT}).with_dtype<int32_t>().with_device(device_).verify(top_blocks);
+    TensorMatcher({Q, K}).with_dtype<int32_t>().with_device(device_).verify(topk_indices);
+    if (static_cast<uint32_t>(CL.unwrap()) != static_cast<uint32_t>(BT.unwrap()) * 128) {
+      throw std::runtime_error("candidate_keys_topk_map requires candidate_len == block_topk * 128");
+    }
+    const auto params = NVFP4HISACandidateKeysTopKMapParam{
+        .candidate_keys = candidate_keys.data_ptr(),
+        .top_blocks = top_blocks.data_ptr(),
+        .topk_indices = topk_indices.data_ptr(),
+        .q_rows = static_cast<uint32_t>(Q.unwrap()),
+        .topk = static_cast<uint32_t>(K.unwrap()),
+        .block_topk = static_cast<uint32_t>(BT.unwrap()),
+        .candidate_len = static_cast<uint32_t>(CL.unwrap()),
+    };
+    constexpr uint32_t kThreads = 256;
+    LaunchKernel(params.q_rows, kThreads, device_.unwrap())(
+        candidate_keys_topk_map_kernel, params);
+  }
+
+  static void hisa_selector_megakernel(
+      tvm::ffi::TensorView q_values,
+      tvm::ffi::TensorView q_scales,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView weights,
+      tvm::ffi::TensorView token_to_batch_idx,
+      tvm::ffi::TensorView rep_values,
+      tvm::ffi::TensorView rep_scales,
+      tvm::ffi::TensorView block_counts,
+      tvm::ffi::TensorView block_topk_counts,
+      tvm::ffi::TensorView topk_indices,
+      int64_t max_blocks,
+      int64_t effective_block_topk) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto H = SymbolicSize{"n_heads"};
+    auto B = SymbolicSize{"batch_size"};
+    auto P = SymbolicSize{"page_table_stride"};
+    auto R = SymbolicSize{"rep_rows"};
+    auto K = SymbolicSize{"topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, H, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_values);
+    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({B, P}).with_dtype<IndicesT>().with_device(device_).verify(page_table);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(token_to_batch_idx);
+    TensorMatcher({R, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(rep_values);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(rep_scales);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(block_counts);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(block_topk_counts);
+    TensorMatcher({Q, K}).with_dtype<int32_t>().with_device(device_).verify(topk_indices);
+    if (static_cast<uint32_t>(H.unwrap()) != kHISASelectorHeads) {
+      throw std::runtime_error("hisa_selector_megakernel requires exactly 64 heads.");
+    }
+    if (max_blocks <= 0 || effective_block_topk <= 0) {
+      throw std::runtime_error("hisa_selector_megakernel got non-positive selector dimensions.");
+    }
+    const auto expected_rep_rows =
+        static_cast<int64_t>(B.unwrap()) * static_cast<int64_t>(max_blocks);
+    if (static_cast<int64_t>(R.unwrap()) != expected_rep_rows) {
+      throw std::runtime_error("hisa_selector_megakernel got mismatched block rep rows.");
+    }
+    uint32_t block_score_capacity = 1;
+    while (block_score_capacity < static_cast<uint32_t>(max_blocks)) {
+      block_score_capacity <<= 1;
+    }
+    const uint32_t candidate_len =
+        static_cast<uint32_t>(effective_block_topk) * 128u;
+    const uint32_t topk = static_cast<uint32_t>(K.unwrap());
+    uint32_t candidate_capacity = 1;
+    const uint32_t min_candidate_capacity = max(candidate_len, topk);
+    while (candidate_capacity < min_candidate_capacity) {
+      candidate_capacity <<= 1;
+    }
+    if (candidate_capacity > 8192) {
+      throw std::runtime_error(
+          "hisa_selector_megakernel currently supports candidate_capacity <= 8192.");
+    }
+    const auto params = NVFP4HISASelectorMegakernelParam{
+        .q_values = q_values.data_ptr(),
+        .q_scales = q_scales.data_ptr(),
+        .cache = cache.data_ptr(),
+        .page_table = page_table.data_ptr(),
+        .seq_lens = seq_lens.data_ptr(),
+        .weights = weights.data_ptr(),
+        .token_to_batch_idx = token_to_batch_idx.data_ptr(),
+        .rep_values = rep_values.data_ptr(),
+        .rep_scales = rep_scales.data_ptr(),
+        .block_counts = block_counts.data_ptr(),
+        .block_topk_counts = block_topk_counts.data_ptr(),
+        .topk_indices = topk_indices.data_ptr(),
+        .q_rows = static_cast<uint32_t>(Q.unwrap()),
+        .batch_size = static_cast<uint32_t>(B.unwrap()),
+        .n_heads = static_cast<uint32_t>(H.unwrap()),
+        .max_blocks = static_cast<uint32_t>(max_blocks),
+        .page_table_stride = static_cast<uint32_t>(P.unwrap()),
+        .effective_block_topk = static_cast<uint32_t>(effective_block_topk),
+        .topk = topk,
+        .block_score_capacity = block_score_capacity,
+        .candidate_capacity = candidate_capacity,
+    };
+    const bool use_wide_tile = false;
+    const size_t gemm_smem_bytes =
+        use_wide_tile
+            ? cublasdx::get_shared_storage_size<HISASelectorWideGemmF32>()
+            : cublasdx::get_shared_storage_size<HISASelectorGemmF32>();
+    const size_t smem_bytes =
+        sizeof(float) * static_cast<size_t>(params.block_score_capacity)
+        + sizeof(int32_t) * static_cast<size_t>(params.block_score_capacity)
+        + sizeof(int32_t) * static_cast<size_t>(params.effective_block_topk)
+        + sizeof(float) * static_cast<size_t>(params.candidate_capacity)
+        + sizeof(uint16_t) * static_cast<size_t>(params.candidate_capacity)
+        + 16
+        + gemm_smem_bytes;
+    auto kernel = use_wide_tile ? selector_megakernel_wide_kernel
+                                : selector_megakernel_kernel;
+    if (smem_bytes > 48 * 1024) {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(
+          kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem_bytes)));
+    }
+    LaunchKernel(params.q_rows, HISASelectorGemmF32::block_dim, device_.unwrap(), smem_bytes)(
+        kernel, params);
+    RuntimeDeviceCheck();
+  }
+
+  static void hisa_selector_parallel_select_blocks(
+      tvm::ffi::TensorView q_values,
+      tvm::ffi::TensorView q_scales,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView weights,
+      tvm::ffi::TensorView token_to_batch_idx,
+      tvm::ffi::TensorView rep_values,
+      tvm::ffi::TensorView rep_scales,
+      tvm::ffi::TensorView block_counts,
+      tvm::ffi::TensorView block_topk_counts,
+      tvm::ffi::TensorView selected_blocks,
+      int64_t max_blocks,
+      int64_t effective_block_topk) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto H = SymbolicSize{"n_heads"};
+    auto B = SymbolicSize{"batch_size"};
+    auto R = SymbolicSize{"rep_rows"};
+    auto EB = SymbolicSize{"effective_block_topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, H, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_values);
+    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(token_to_batch_idx);
+    TensorMatcher({R, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(rep_values);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(rep_scales);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(block_counts);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(block_topk_counts);
+    TensorMatcher({Q, EB}).with_dtype<int32_t>().with_device(device_).verify(selected_blocks);
+    if (static_cast<uint32_t>(H.unwrap()) != kHISASelectorHeads) {
+      throw std::runtime_error("hisa_selector_parallel_select_blocks requires exactly 64 heads.");
+    }
+    if (max_blocks <= 0 || effective_block_topk <= 0 ||
+        static_cast<int64_t>(EB.unwrap()) != effective_block_topk) {
+      throw std::runtime_error("hisa_selector_parallel_select_blocks got mismatched dimensions.");
+    }
+    const auto expected_rep_rows =
+        static_cast<int64_t>(B.unwrap()) * static_cast<int64_t>(max_blocks);
+    if (static_cast<int64_t>(R.unwrap()) != expected_rep_rows) {
+      throw std::runtime_error("hisa_selector_parallel_select_blocks got mismatched block rep rows.");
+    }
+    uint32_t block_score_capacity = 1;
+    while (block_score_capacity < static_cast<uint32_t>(max_blocks)) {
+      block_score_capacity <<= 1;
+    }
+    const auto params = NVFP4HISASelectorParallelSelectParam{
+        .q_values = q_values.data_ptr(),
+        .q_scales = q_scales.data_ptr(),
+        .seq_lens = seq_lens.data_ptr(),
+        .weights = weights.data_ptr(),
+        .token_to_batch_idx = token_to_batch_idx.data_ptr(),
+        .rep_values = rep_values.data_ptr(),
+        .rep_scales = rep_scales.data_ptr(),
+        .block_counts = block_counts.data_ptr(),
+        .block_topk_counts = block_topk_counts.data_ptr(),
+        .selected_blocks = selected_blocks.data_ptr(),
+        .q_rows = static_cast<uint32_t>(Q.unwrap()),
+        .batch_size = static_cast<uint32_t>(B.unwrap()),
+        .n_heads = static_cast<uint32_t>(H.unwrap()),
+        .max_blocks = static_cast<uint32_t>(max_blocks),
+        .effective_block_topk = static_cast<uint32_t>(effective_block_topk),
+        .block_score_capacity = block_score_capacity,
+    };
+    const size_t smem_bytes =
+        sizeof(float) * static_cast<size_t>(params.block_score_capacity)
+        + sizeof(int32_t) * static_cast<size_t>(params.block_score_capacity)
+        + 16
+        + cublasdx::get_shared_storage_size<HISASelectorGemmF32>();
+    auto kernel = selector_parallel_select_kernel;
+    if (smem_bytes > 48 * 1024) {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(
+          kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem_bytes)));
+    }
+    LaunchKernel(params.q_rows, HISASelectorGemmF32::block_dim, device_.unwrap(), smem_bytes)(
+        kernel, params);
+    RuntimeDeviceCheck();
+  }
+
+  static void hisa_selector_parallel_score_candidates(
+      tvm::ffi::TensorView q_values,
+      tvm::ffi::TensorView q_scales,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView weights,
+      tvm::ffi::TensorView token_to_batch_idx,
+      tvm::ffi::TensorView selected_blocks,
+      tvm::ffi::TensorView logits) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto H = SymbolicSize{"n_heads"};
+    auto B = SymbolicSize{"batch_size"};
+    auto P = SymbolicSize{"page_table_stride"};
+    auto EB = SymbolicSize{"effective_block_topk"};
+    auto CL = SymbolicSize{"candidate_len"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, H, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_values);
+    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({B, P}).with_dtype<IndicesT>().with_device(device_).verify(page_table);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(token_to_batch_idx);
+    TensorMatcher({Q, EB}).with_dtype<int32_t>().with_device(device_).verify(selected_blocks);
+    TensorMatcher({Q, CL}).with_dtype<float>().with_device(device_).verify(logits);
+    if (static_cast<uint32_t>(H.unwrap()) != kHISASelectorHeads) {
+      throw std::runtime_error("hisa_selector_parallel_score_candidates requires exactly 64 heads.");
+    }
+    if (static_cast<uint32_t>(CL.unwrap()) != static_cast<uint32_t>(EB.unwrap()) * 128u) {
+      throw std::runtime_error("hisa_selector_parallel_score_candidates requires candidate_len == effective_block_topk * 128.");
+    }
+    const auto params = NVFP4HISASelectorParallelScoreParam{
+        .q_values = q_values.data_ptr(),
+        .q_scales = q_scales.data_ptr(),
+        .cache = cache.data_ptr(),
+        .page_table = page_table.data_ptr(),
+        .seq_lens = seq_lens.data_ptr(),
+        .weights = weights.data_ptr(),
+        .token_to_batch_idx = token_to_batch_idx.data_ptr(),
+        .selected_blocks = selected_blocks.data_ptr(),
+        .logits = logits.data_ptr(),
+        .q_rows = static_cast<uint32_t>(Q.unwrap()),
+        .batch_size = static_cast<uint32_t>(B.unwrap()),
+        .n_heads = static_cast<uint32_t>(H.unwrap()),
+        .page_table_stride = static_cast<uint32_t>(P.unwrap()),
+        .effective_block_topk = static_cast<uint32_t>(EB.unwrap()),
+        .candidate_len = static_cast<uint32_t>(CL.unwrap()),
+    };
+    const size_t smem_bytes =
+        cublasdx::get_shared_storage_size<HISASelectorGemmF32>();
+    auto kernel = selector_parallel_score_kernel;
+    if (smem_bytes > 48 * 1024) {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(
+          kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem_bytes)));
+    }
+    LaunchKernel(
+        dim3(params.q_rows, params.effective_block_topk),
+        HISASelectorGemmF32::block_dim,
+        device_.unwrap(),
+        smem_bytes)(kernel, params);
+    RuntimeDeviceCheck();
+  }
+
+  static void hisa_selector_cluster_fused(
+      tvm::ffi::TensorView q_values,
+      tvm::ffi::TensorView q_scales,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView weights,
+      tvm::ffi::TensorView token_to_batch_idx,
+      tvm::ffi::TensorView rep_values,
+      tvm::ffi::TensorView rep_scales,
+      tvm::ffi::TensorView block_counts,
+      tvm::ffi::TensorView block_topk_counts,
+      tvm::ffi::TensorView candidate_keys,
+      tvm::ffi::TensorView topk_indices,
+      int64_t max_blocks,
+      int64_t effective_block_topk) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto H = SymbolicSize{"n_heads"};
+    auto B = SymbolicSize{"batch_size"};
+    auto P = SymbolicSize{"page_table_stride"};
+    auto R = SymbolicSize{"rep_rows"};
+    auto CL = SymbolicSize{"candidate_len"};
+    auto K = SymbolicSize{"topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, H, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_values);
+    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({B, P}).with_dtype<IndicesT>().with_device(device_).verify(page_table);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(token_to_batch_idx);
+    TensorMatcher({R, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(rep_values);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(rep_scales);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(block_counts);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(block_topk_counts);
+    TensorMatcher({Q, CL}).with_dtype<int32_t>().with_device(device_).verify(candidate_keys);
+    TensorMatcher({Q, K}).with_dtype<int32_t>().with_device(device_).verify(topk_indices);
+    if (static_cast<uint32_t>(H.unwrap()) != kHISASelectorHeads) {
+      throw std::runtime_error("hisa_selector_cluster_fused requires exactly 64 heads.");
+    }
+    if (max_blocks <= 0 || effective_block_topk <= 0) {
+      throw std::runtime_error("hisa_selector_cluster_fused got non-positive selector dimensions.");
+    }
+    if (static_cast<uint32_t>(CL.unwrap()) != static_cast<uint32_t>(effective_block_topk) * 128u) {
+      throw std::runtime_error("hisa_selector_cluster_fused requires candidate_len == effective_block_topk * 128.");
+    }
+    const auto expected_rep_rows =
+        static_cast<int64_t>(B.unwrap()) * static_cast<int64_t>(max_blocks);
+    if (static_cast<int64_t>(R.unwrap()) != expected_rep_rows) {
+      throw std::runtime_error("hisa_selector_cluster_fused got mismatched block rep rows.");
+    }
+    uint32_t block_score_capacity = 1;
+    while (block_score_capacity < static_cast<uint32_t>(max_blocks)) {
+      block_score_capacity <<= 1;
+    }
+    const auto params = NVFP4HISASelectorClusterFusedParam{
+        .q_values = q_values.data_ptr(),
+        .q_scales = q_scales.data_ptr(),
+        .cache = cache.data_ptr(),
+        .page_table = page_table.data_ptr(),
+        .seq_lens = seq_lens.data_ptr(),
+        .weights = weights.data_ptr(),
+        .token_to_batch_idx = token_to_batch_idx.data_ptr(),
+        .rep_values = rep_values.data_ptr(),
+        .rep_scales = rep_scales.data_ptr(),
+        .block_counts = block_counts.data_ptr(),
+        .block_topk_counts = block_topk_counts.data_ptr(),
+        .candidate_keys = candidate_keys.data_ptr(),
+        .topk_indices = topk_indices.data_ptr(),
+        .q_rows = static_cast<uint32_t>(Q.unwrap()),
+        .batch_size = static_cast<uint32_t>(B.unwrap()),
+        .n_heads = static_cast<uint32_t>(H.unwrap()),
+        .max_blocks = static_cast<uint32_t>(max_blocks),
+        .page_table_stride = static_cast<uint32_t>(P.unwrap()),
+        .effective_block_topk = static_cast<uint32_t>(effective_block_topk),
+        .topk = static_cast<uint32_t>(K.unwrap()),
+        .block_score_capacity = block_score_capacity,
+        .candidate_len = static_cast<uint32_t>(CL.unwrap()),
+    };
+    const size_t smem_bytes =
+        sizeof(float) * static_cast<size_t>(params.block_score_capacity)
+        + sizeof(int32_t) * static_cast<size_t>(params.block_score_capacity)
+        + sizeof(int32_t) * static_cast<size_t>(params.effective_block_topk)
+        + 16
+        + cublasdx::get_shared_storage_size<HISASelectorGemmF32>();
+    auto kernel = selector_cluster_fused_kernel;
+    if (smem_bytes > 48 * 1024) {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(
+          kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem_bytes)));
+    }
+    LaunchKernel(
+        {params.q_rows, kHISASelectorClusterSize},
+        HISASelectorGemmF32::block_dim,
+        device_.unwrap(),
+        smem_bytes)
+        .enable_cluster({1, kHISASelectorClusterSize})(kernel, params);
+    RuntimeDeviceCheck();
+  }
+
+  static void hisa_deepgemm_candidate_logits(
+      tvm::ffi::TensorView q_values,
+      tvm::ffi::TensorView q_scales,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView weights,
+      tvm::ffi::TensorView candidate_context_lens,
+      tvm::ffi::TensorView candidate_page_table,
+      tvm::ffi::TensorView schedule_meta,
+      tvm::ffi::TensorView logits) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto H = SymbolicSize{"n_heads"};
+    auto PT = SymbolicSize{"candidate_pages"};
+    auto CL = SymbolicSize{"candidate_len"};
+    auto S = SymbolicSize{"schedule_rows"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, H, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_values);
+    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+    TensorMatcher({Q, 1}).with_dtype<int32_t>().with_device(device_).verify(candidate_context_lens);
+    TensorMatcher({Q, PT}).with_dtype<int32_t>().with_device(device_).verify(candidate_page_table);
+    TensorMatcher({S, 2}).with_dtype<int32_t>().with_device(device_).verify(schedule_meta);
+    TensorMatcher({Q, CL}).with_dtype<float>().with_device(device_).verify(logits);
+
+    if (static_cast<uint32_t>(H.unwrap()) != kHISASelectorHeads) {
+      throw std::runtime_error("hisa_deepgemm_candidate_logits requires exactly 64 heads.");
+    }
+    if (static_cast<uint32_t>(CL.unwrap()) % 256u != 0) {
+      throw std::runtime_error("hisa_deepgemm_candidate_logits requires candidate_len aligned to 256.");
+    }
+    if (static_cast<uint32_t>(PT.unwrap()) * kPageSize < static_cast<uint32_t>(CL.unwrap())) {
+      throw std::runtime_error("hisa_deepgemm_candidate_logits page table is too short for candidate_len.");
+    }
+    if (static_cast<uint32_t>(S.unwrap()) <= 1) {
+      throw std::runtime_error("hisa_deepgemm_candidate_logits got empty schedule metadata.");
+    }
+
+    constexpr uint32_t kSplitKV = 256;
+	    constexpr uint32_t kNumQStages = 3;
+	    constexpr uint32_t kNumKVStages = 10;
+    constexpr uint32_t kNumTmemStages = 3;
+    constexpr uint32_t kSpecializedThreads = 128;
+    constexpr uint32_t kMathThreads = 256;
+    constexpr uint32_t kNextNAtom = 1;
+    const uint32_t q_rows = static_cast<uint32_t>(Q.unwrap());
+    const uint32_t candidate_len = static_cast<uint32_t>(CL.unwrap());
+    const uint32_t num_pages = static_cast<uint32_t>(cache.size(0));
+    const uint32_t num_sms = static_cast<uint32_t>(S.unwrap() - 1);
+
+    const auto tensor_map_q = hisa_make_tma_desc_2d(
+        q_values.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+        kIndexerHeadDim,
+        static_cast<uint64_t>(q_rows) * kHISASelectorHeads,
+        static_cast<uint64_t>(q_values.strides()[1]),
+        kIndexerHeadDim,
+        kHISASelectorHeads,
+        CU_TENSOR_MAP_SWIZZLE_64B);
+    const auto tensor_map_sf_q = hisa_make_tma_desc_2d(
+        q_scales.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_INT32,
+        kHISASelectorHeads,
+        q_rows,
+        static_cast<uint64_t>(q_scales.strides()[0]) * sizeof(int32_t),
+        kHISASelectorHeads,
+        kNextNAtom,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+    const auto tensor_map_weights = hisa_make_tma_desc_2d(
+        weights.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        kHISASelectorHeads,
+        q_rows,
+        static_cast<uint64_t>(weights.strides()[0]) * sizeof(float),
+        kHISASelectorHeads,
+        kNextNAtom,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+    const auto tensor_map_kv = hisa_make_tma_desc_3d(
+        cache.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+        kIndexerHeadDim,
+        kPageSize,
+        num_pages,
+        kNVFP4ValueBytes,
+        static_cast<uint64_t>(cache.strides()[0]),
+        kIndexerHeadDim,
+        kPageSize,
+        1,
+        CU_TENSOR_MAP_SWIZZLE_64B);
+    const auto* scale_base =
+        static_cast<const uint8_t*>(cache.data_ptr()) +
+        static_cast<size_t>(kNVFP4ValueBytes) * kPageSize;
+    const auto tensor_map_sf_kv = hisa_make_tma_desc_2d(
+        scale_base,
+        CU_TENSOR_MAP_DATA_TYPE_INT32,
+        kPageSize,
+        num_pages,
+        static_cast<uint64_t>(cache.strides()[0]),
+        kPageSize,
+        1,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+
+    const size_t smem_q_size_per_stage =
+        static_cast<size_t>(kNextNAtom) * kHISASelectorHeads * (kIndexerHeadDim / 2);
+    const size_t smem_sf_q_size_per_stage = 128 * sizeof(int32_t);
+    const size_t smem_kv_size_per_stage = kSplitKV * (kIndexerHeadDim / 2);
+    const size_t smem_sf_kv_size_per_stage = kSplitKV * sizeof(int32_t);
+    const size_t smem_weight_size_per_stage =
+        static_cast<size_t>(kNextNAtom) * kHISASelectorHeads * sizeof(float);
+    const size_t smem_barriers =
+        (kNumQStages + kNumKVStages + kNumTmemStages) * 2 * 8;
+    const size_t smem_tmem_ptr = 4;
+    const size_t smem_bytes =
+        kNumQStages *
+            (smem_q_size_per_stage + smem_sf_q_size_per_stage +
+             smem_weight_size_per_stage)
+        + kNumKVStages * (smem_kv_size_per_stage + smem_sf_kv_size_per_stage)
+        + smem_barriers + smem_tmem_ptr;
+
+    auto kernel = deepgemm_candidate_logits_kernel;
+    if (smem_bytes > 48 * 1024) {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(
+          kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem_bytes)));
+    }
+	    LaunchKernel(num_sms, kSpecializedThreads + kMathThreads, device_.unwrap(), smem_bytes)(
+	        kernel,
+	        q_rows,
+        candidate_len,
+        static_cast<uint32_t>(PT.unwrap()),
+        reinterpret_cast<const uint32_t*>(candidate_context_lens.data_ptr()),
+        static_cast<float*>(logits.data_ptr()),
+        reinterpret_cast<const uint32_t*>(candidate_page_table.data_ptr()),
+        static_cast<const uint32_t*>(nullptr),
+        reinterpret_cast<const uint32_t*>(schedule_meta.data_ptr()),
+        tensor_map_q,
+        tensor_map_sf_q,
+        tensor_map_kv,
+        tensor_map_sf_kv,
+        tensor_map_weights);
+    RuntimeDeviceCheck();
+  }
+
+  static void hisa_deepgemm_candidate_keys(
+      tvm::ffi::TensorView q_values,
+      tvm::ffi::TensorView q_scales,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView weights,
+      tvm::ffi::TensorView candidate_context_lens,
+      tvm::ffi::TensorView candidate_page_table,
+      tvm::ffi::TensorView source_page_table,
+      tvm::ffi::TensorView schedule_meta,
+      tvm::ffi::TensorView selected_blocks,
+      tvm::ffi::TensorView prefix_lens,
+      tvm::ffi::TensorView token_to_batch_idx,
+      tvm::ffi::TensorView candidate_keys) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto H = SymbolicSize{"n_heads"};
+    auto PT = SymbolicSize{"candidate_pages"};
+    auto B = SymbolicSize{"source_page_table_batches"};
+    auto P = SymbolicSize{"source_page_table_stride"};
+    auto BT = SymbolicSize{"block_topk"};
+    auto CL = SymbolicSize{"candidate_len"};
+    auto S = SymbolicSize{"schedule_rows"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, H, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_values);
+    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+    TensorMatcher({Q, 1}).with_dtype<int32_t>().with_device(device_).verify(candidate_context_lens);
+    TensorMatcher({B, P}).with_dtype<int32_t>().with_device(device_).verify(source_page_table);
+    const bool use_source_page_table =
+        static_cast<uint32_t>(B.unwrap()) > 0u &&
+        static_cast<uint32_t>(P.unwrap()) > 0u;
+    if (!use_source_page_table) {
+      TensorMatcher({Q, PT}).with_dtype<int32_t>().with_device(device_).verify(candidate_page_table);
+    }
+    TensorMatcher({S, 2}).with_dtype<int32_t>().with_device(device_).verify(schedule_meta);
+    TensorMatcher({Q, BT}).with_dtype<int32_t>().with_device(device_).verify(selected_blocks);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(prefix_lens);
+    TensorMatcher({-1}).with_dtype<int32_t>().with_device(device_).verify(token_to_batch_idx);
+    TensorMatcher({Q, CL}).with_dtype<int32_t>().with_device(device_).verify(candidate_keys);
+
+    if (static_cast<uint32_t>(H.unwrap()) != kHISASelectorHeads) {
+      throw std::runtime_error("hisa_deepgemm_candidate_keys requires exactly 64 heads.");
+    }
+    if (static_cast<uint32_t>(CL.unwrap()) != static_cast<uint32_t>(BT.unwrap()) * 128u) {
+      throw std::runtime_error("hisa_deepgemm_candidate_keys requires candidate_len == block_topk * 128.");
+    }
+    if (static_cast<uint32_t>(CL.unwrap()) % 256u != 0) {
+      throw std::runtime_error("hisa_deepgemm_candidate_keys requires candidate_len aligned to 256.");
+    }
+    if (!use_source_page_table &&
+        static_cast<uint32_t>(PT.unwrap()) * kPageSize < static_cast<uint32_t>(CL.unwrap())) {
+      throw std::runtime_error("hisa_deepgemm_candidate_keys page table is too short for candidate_len.");
+    }
+    if (use_source_page_table &&
+        static_cast<uint32_t>(token_to_batch_idx.size(0)) < static_cast<uint32_t>(Q.unwrap())) {
+      throw std::runtime_error("hisa_deepgemm_candidate_keys source page-table mode requires token_to_batch_idx per row.");
+    }
+    if (static_cast<uint32_t>(S.unwrap()) <= 1) {
+      throw std::runtime_error("hisa_deepgemm_candidate_keys got empty schedule metadata.");
+    }
+
+    constexpr uint32_t kSplitKV = 256;
+	    constexpr uint32_t kNumQStages = 3;
+	    constexpr uint32_t kNumKVStages = 10;
+    constexpr uint32_t kNumTmemStages = 3;
+    constexpr uint32_t kSpecializedThreads = 128;
+    constexpr uint32_t kMathThreads = 256;
+    constexpr uint32_t kNextNAtom = 1;
+    const uint32_t q_rows = static_cast<uint32_t>(Q.unwrap());
+    const uint32_t candidate_len = static_cast<uint32_t>(CL.unwrap());
+    const uint32_t num_pages = static_cast<uint32_t>(cache.size(0));
+    const uint32_t num_sms = static_cast<uint32_t>(S.unwrap() - 1);
+
+    const auto tensor_map_q = hisa_make_tma_desc_2d(
+        q_values.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+        kIndexerHeadDim,
+        static_cast<uint64_t>(q_rows) * kHISASelectorHeads,
+        static_cast<uint64_t>(q_values.strides()[1]),
+        kIndexerHeadDim,
+        kHISASelectorHeads,
+        CU_TENSOR_MAP_SWIZZLE_64B);
+    const auto tensor_map_sf_q = hisa_make_tma_desc_2d(
+        q_scales.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_INT32,
+        kHISASelectorHeads,
+        q_rows,
+        static_cast<uint64_t>(q_scales.strides()[0]) * sizeof(int32_t),
+        kHISASelectorHeads,
+        kNextNAtom,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+    const auto tensor_map_weights = hisa_make_tma_desc_2d(
+        weights.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        kHISASelectorHeads,
+        q_rows,
+        static_cast<uint64_t>(weights.strides()[0]) * sizeof(float),
+        kHISASelectorHeads,
+        kNextNAtom,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+    const auto tensor_map_kv = hisa_make_tma_desc_3d(
+        cache.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+        kIndexerHeadDim,
+        kPageSize,
+        num_pages,
+        kNVFP4ValueBytes,
+        static_cast<uint64_t>(cache.strides()[0]),
+        kIndexerHeadDim,
+        kPageSize,
+        1,
+        CU_TENSOR_MAP_SWIZZLE_64B);
+    const auto* scale_base =
+        static_cast<const uint8_t*>(cache.data_ptr()) +
+        static_cast<size_t>(kNVFP4ValueBytes) * kPageSize;
+    const auto tensor_map_sf_kv = hisa_make_tma_desc_2d(
+        scale_base,
+        CU_TENSOR_MAP_DATA_TYPE_INT32,
+        kPageSize,
+        num_pages,
+        static_cast<uint64_t>(cache.strides()[0]),
+        kPageSize,
+        1,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+
+    const size_t smem_q_size_per_stage =
+        static_cast<size_t>(kNextNAtom) * kHISASelectorHeads * (kIndexerHeadDim / 2);
+    const size_t smem_sf_q_size_per_stage = 128 * sizeof(int32_t);
+    const size_t smem_kv_size_per_stage = kSplitKV * (kIndexerHeadDim / 2);
+    const size_t smem_sf_kv_size_per_stage = kSplitKV * sizeof(int32_t);
+    const size_t smem_weight_size_per_stage =
+        static_cast<size_t>(kNextNAtom) * kHISASelectorHeads * sizeof(float);
+    const size_t smem_barriers =
+        (kNumQStages + kNumKVStages + kNumTmemStages) * 2 * 8;
+    const size_t smem_tmem_ptr = 4;
+    const size_t smem_bytes =
+        kNumQStages *
+            (smem_q_size_per_stage + smem_sf_q_size_per_stage +
+             smem_weight_size_per_stage)
+        + kNumKVStages * (smem_kv_size_per_stage + smem_sf_kv_size_per_stage)
+        + smem_barriers + smem_tmem_ptr;
+
+    auto kernel = deepgemm_candidate_keys_kernel;
+    if (smem_bytes > 48 * 1024) {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(
+          kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem_bytes)));
+    }
+    LaunchKernel(num_sms, kSpecializedThreads + kMathThreads, device_.unwrap(), smem_bytes)(
+        kernel,
+        q_rows,
+        candidate_len,
+        use_source_page_table ? 0u : static_cast<uint32_t>(PT.unwrap()),
+        static_cast<uint32_t>(BT.unwrap()),
+        reinterpret_cast<const uint32_t*>(candidate_context_lens.data_ptr()),
+        reinterpret_cast<uint32_t*>(candidate_keys.data_ptr()),
+        use_source_page_table
+            ? static_cast<const uint32_t*>(nullptr)
+            : reinterpret_cast<const uint32_t*>(candidate_page_table.data_ptr()),
+        use_source_page_table
+            ? reinterpret_cast<const uint32_t*>(source_page_table.data_ptr())
+            : static_cast<const uint32_t*>(nullptr),
+        reinterpret_cast<const uint32_t*>(schedule_meta.data_ptr()),
+        reinterpret_cast<int32_t*>(selected_blocks.data_ptr()),
+        reinterpret_cast<const int32_t*>(prefix_lens.data_ptr()),
+        use_source_page_table
+            ? reinterpret_cast<const int32_t*>(token_to_batch_idx.data_ptr())
+            : static_cast<const int32_t*>(nullptr),
+        static_cast<int32_t*>(nullptr),
+        0u,
+        use_source_page_table ? static_cast<uint32_t>(P.unwrap()) : 0u,
+        tensor_map_q,
+        tensor_map_sf_q,
+        tensor_map_kv,
+        tensor_map_sf_kv,
+	        tensor_map_weights);
+	    RuntimeDeviceCheck();
+	  }
+
+  static void hisa_deepgemm_candidate_topk_cooperative(
+      tvm::ffi::TensorView q_values,
+      tvm::ffi::TensorView q_scales,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView weights,
+      tvm::ffi::TensorView candidate_context_lens,
+      tvm::ffi::TensorView source_page_table,
+      tvm::ffi::TensorView schedule_meta,
+      tvm::ffi::TensorView selected_blocks,
+      tvm::ffi::TensorView prefix_lens,
+      tvm::ffi::TensorView token_to_batch_idx,
+      tvm::ffi::TensorView candidate_keys,
+      tvm::ffi::TensorView topk_indices) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto H = SymbolicSize{"n_heads"};
+    auto B = SymbolicSize{"source_page_table_batches"};
+    auto P = SymbolicSize{"source_page_table_stride"};
+    auto BT = SymbolicSize{"block_topk"};
+    auto CL = SymbolicSize{"candidate_len"};
+    auto K = SymbolicSize{"topk"};
+    auto S = SymbolicSize{"schedule_rows"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, H, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_values);
+    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+    TensorMatcher({Q, 1}).with_dtype<int32_t>().with_device(device_).verify(candidate_context_lens);
+    TensorMatcher({B, P}).with_dtype<int32_t>().with_device(device_).verify(source_page_table);
+    TensorMatcher({S, 2}).with_dtype<int32_t>().with_device(device_).verify(schedule_meta);
+    TensorMatcher({Q, BT}).with_dtype<int32_t>().with_device(device_).verify(selected_blocks);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(prefix_lens);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(token_to_batch_idx);
+    TensorMatcher({Q, CL}).with_dtype<int32_t>().with_device(device_).verify(candidate_keys);
+    TensorMatcher({Q, K}).with_dtype<int32_t>().with_device(device_).verify(topk_indices);
+
+    if (static_cast<uint32_t>(H.unwrap()) != kHISASelectorHeads) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cooperative requires exactly 64 heads.");
+    }
+    if (static_cast<uint32_t>(B.unwrap()) == 0u || static_cast<uint32_t>(P.unwrap()) == 0u) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cooperative requires source page-table mode.");
+    }
+    if (static_cast<uint32_t>(CL.unwrap()) != static_cast<uint32_t>(BT.unwrap()) * 128u) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cooperative requires candidate_len == block_topk * 128.");
+    }
+    if (static_cast<uint32_t>(CL.unwrap()) % 256u != 0) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cooperative requires candidate_len aligned to 256.");
+    }
+    if (static_cast<uint32_t>(K.unwrap()) == 0u) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cooperative requires positive topk.");
+    }
+    if (static_cast<uint32_t>(S.unwrap()) <= 1) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cooperative got empty schedule metadata.");
+    }
+
+    constexpr uint32_t kSplitKV = 256;
+    constexpr uint32_t kNumQStages = 3;
+    constexpr uint32_t kNumKVStages = 10;
+    constexpr uint32_t kNumTmemStages = 3;
+    constexpr uint32_t kSpecializedThreads = 128;
+    constexpr uint32_t kMathThreads = 256;
+    constexpr uint32_t kNextNAtom = 1;
+    const uint32_t q_rows = static_cast<uint32_t>(Q.unwrap());
+    const uint32_t candidate_len = static_cast<uint32_t>(CL.unwrap());
+    const uint32_t num_pages = static_cast<uint32_t>(cache.size(0));
+    const uint32_t num_sms = static_cast<uint32_t>(S.unwrap() - 1);
+
+    const auto tensor_map_q = hisa_make_tma_desc_2d(
+        q_values.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+        kIndexerHeadDim,
+        static_cast<uint64_t>(q_rows) * kHISASelectorHeads,
+        static_cast<uint64_t>(q_values.strides()[1]),
+        kIndexerHeadDim,
+        kHISASelectorHeads,
+        CU_TENSOR_MAP_SWIZZLE_64B);
+    const auto tensor_map_sf_q = hisa_make_tma_desc_2d(
+        q_scales.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_INT32,
+        kHISASelectorHeads,
+        q_rows,
+        static_cast<uint64_t>(q_scales.strides()[0]) * sizeof(int32_t),
+        kHISASelectorHeads,
+        kNextNAtom,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+    const auto tensor_map_weights = hisa_make_tma_desc_2d(
+        weights.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        kHISASelectorHeads,
+        q_rows,
+        static_cast<uint64_t>(weights.strides()[0]) * sizeof(float),
+        kHISASelectorHeads,
+        kNextNAtom,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+    const auto tensor_map_kv = hisa_make_tma_desc_3d(
+        cache.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+        kIndexerHeadDim,
+        kPageSize,
+        num_pages,
+        kNVFP4ValueBytes,
+        static_cast<uint64_t>(cache.strides()[0]),
+        kIndexerHeadDim,
+        kPageSize,
+        1,
+        CU_TENSOR_MAP_SWIZZLE_64B);
+    const auto* scale_base =
+        static_cast<const uint8_t*>(cache.data_ptr()) +
+        static_cast<size_t>(kNVFP4ValueBytes) * kPageSize;
+    const auto tensor_map_sf_kv = hisa_make_tma_desc_2d(
+        scale_base,
+        CU_TENSOR_MAP_DATA_TYPE_INT32,
+        kPageSize,
+        num_pages,
+        static_cast<uint64_t>(cache.strides()[0]),
+        kPageSize,
+        1,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+
+    const size_t smem_q_size_per_stage =
+        static_cast<size_t>(kNextNAtom) * kHISASelectorHeads * (kIndexerHeadDim / 2);
+    const size_t smem_sf_q_size_per_stage = 128 * sizeof(int32_t);
+    const size_t smem_kv_size_per_stage = kSplitKV * (kIndexerHeadDim / 2);
+    const size_t smem_sf_kv_size_per_stage = kSplitKV * sizeof(int32_t);
+    const size_t smem_weight_size_per_stage =
+        static_cast<size_t>(kNextNAtom) * kHISASelectorHeads * sizeof(float);
+    const size_t smem_barriers =
+        (kNumQStages + kNumKVStages + kNumTmemStages) * 2 * 8;
+    const size_t smem_tmem_ptr = 4;
+    const size_t smem_bytes =
+        kNumQStages *
+            (smem_q_size_per_stage + smem_sf_q_size_per_stage +
+             smem_weight_size_per_stage)
+        + kNumKVStages * (smem_kv_size_per_stage + smem_sf_kv_size_per_stage)
+        + smem_barriers + smem_tmem_ptr;
+
+    auto kernel = deepgemm_candidate_keys_kernel;
+    if (smem_bytes > 48 * 1024) {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(
+          kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem_bytes)));
+    }
+    const auto dl_device = device_.unwrap();
+    int cooperative = 0;
+    RuntimeDeviceCheck(cudaDeviceGetAttribute(
+        &cooperative, cudaDevAttrCooperativeLaunch, dl_device.device_id));
+    if (cooperative == 0) {
+      throw std::runtime_error("Device does not support cooperative HISA candidate topk launch.");
+    }
+
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeCooperative;
+    attrs[0].val.cooperative = 1;
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(num_sms);
+    config.blockDim = dim3(kSpecializedThreads + kMathThreads);
+    config.dynamicSmemBytes = smem_bytes;
+    config.stream = LaunchKernel::resolve_device(dl_device);
+    config.attrs = attrs;
+    config.numAttrs = 1;
+    RuntimeDeviceCheck(cudaLaunchKernelEx(
+        &config,
+        kernel,
+        q_rows,
+        candidate_len,
+        0u,
+        static_cast<uint32_t>(BT.unwrap()),
+        reinterpret_cast<const uint32_t*>(candidate_context_lens.data_ptr()),
+        reinterpret_cast<uint32_t*>(candidate_keys.data_ptr()),
+        static_cast<const uint32_t*>(nullptr),
+        reinterpret_cast<const uint32_t*>(source_page_table.data_ptr()),
+        reinterpret_cast<const uint32_t*>(schedule_meta.data_ptr()),
+        reinterpret_cast<int32_t*>(selected_blocks.data_ptr()),
+        reinterpret_cast<const int32_t*>(prefix_lens.data_ptr()),
+        reinterpret_cast<const int32_t*>(token_to_batch_idx.data_ptr()),
+        reinterpret_cast<int32_t*>(topk_indices.data_ptr()),
+        static_cast<uint32_t>(K.unwrap()),
+        static_cast<uint32_t>(P.unwrap()),
+        tensor_map_q,
+        tensor_map_sf_q,
+        tensor_map_kv,
+        tensor_map_sf_kv,
+        tensor_map_weights));
+    RuntimeDeviceCheck();
+  }
+
+	  static void hisa_deepgemm_candidate_keys_row_split(
+	      tvm::ffi::TensorView q_values,
+	      tvm::ffi::TensorView q_scales,
+	      tvm::ffi::TensorView cache,
+	      tvm::ffi::TensorView weights,
+	      tvm::ffi::TensorView source_page_table,
+	      tvm::ffi::TensorView selected_blocks,
+	      tvm::ffi::TensorView prefix_lens,
+	      tvm::ffi::TensorView token_to_batch_idx,
+	      tvm::ffi::TensorView candidate_keys,
+	      int row_splits) {
+	    using namespace host;
+
+	    auto Q = SymbolicSize{"q_rows"};
+	    auto H = SymbolicSize{"n_heads"};
+	    auto B = SymbolicSize{"source_page_table_batches"};
+	    auto P = SymbolicSize{"source_page_table_stride"};
+	    auto BT = SymbolicSize{"block_topk"};
+	    auto CL = SymbolicSize{"candidate_len"};
+	    auto device_ = SymbolicDevice{};
+	    device_.set_options<kDLCUDA>();
+	    TensorMatcher({Q, H, kNVFP4ValueBytes})
+	        .with_dtype<uint8_t>()
+	        .with_device(device_)
+	        .verify(q_values);
+	    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+	    TensorMatcher({-1, -1})
+	        .with_strides({kPageBytes, 1})
+	        .with_dtype<uint8_t>()
+	        .with_device(device_)
+	        .verify(cache);
+	    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+	    TensorMatcher({B, P}).with_dtype<int32_t>().with_device(device_).verify(source_page_table);
+	    TensorMatcher({Q, BT}).with_dtype<int32_t>().with_device(device_).verify(selected_blocks);
+	    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(prefix_lens);
+	    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(token_to_batch_idx);
+	    TensorMatcher({Q, CL}).with_dtype<int32_t>().with_device(device_).verify(candidate_keys);
+
+	    if (row_splits <= 0) {
+	      throw std::runtime_error("hisa_deepgemm_candidate_keys_row_split requires positive row_splits.");
+	    }
+	    if (static_cast<uint32_t>(H.unwrap()) != kHISASelectorHeads) {
+	      throw std::runtime_error("hisa_deepgemm_candidate_keys_row_split requires exactly 64 heads.");
+	    }
+	    if (kPageSize != 64) {
+	      throw std::runtime_error("hisa_deepgemm_candidate_keys_row_split requires page_size=64.");
+	    }
+	    if (static_cast<uint32_t>(CL.unwrap()) != static_cast<uint32_t>(BT.unwrap()) * 128u) {
+	      throw std::runtime_error("hisa_deepgemm_candidate_keys_row_split requires candidate_len == block_topk * 128.");
+	    }
+	    if (static_cast<uint32_t>(CL.unwrap()) % 256u != 0) {
+	      throw std::runtime_error("hisa_deepgemm_candidate_keys_row_split requires candidate_len aligned to 256.");
+	    }
+	    if (static_cast<uint32_t>(token_to_batch_idx.size(0)) < static_cast<uint32_t>(Q.unwrap())) {
+	      throw std::runtime_error("hisa_deepgemm_candidate_keys_row_split requires token_to_batch_idx per row.");
+	    }
+
+	    constexpr uint32_t kSplitKV = 256;
+	    constexpr uint32_t kNumQStages = 3;
+	    constexpr uint32_t kNumKVStages = 10;
+	    constexpr uint32_t kNumTmemStages = 3;
+	    constexpr uint32_t kSpecializedThreads = 128;
+	    constexpr uint32_t kMathThreads = 256;
+	    constexpr uint32_t kNextNAtom = 1;
+	    const uint32_t q_rows = static_cast<uint32_t>(Q.unwrap());
+	    const uint32_t candidate_len = static_cast<uint32_t>(CL.unwrap());
+	    const uint32_t num_pages = static_cast<uint32_t>(cache.size(0));
+	    const uint32_t row_splits_u = static_cast<uint32_t>(row_splits);
+
+	    const auto tensor_map_q = hisa_make_tma_desc_2d(
+	        q_values.data_ptr(),
+	        CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+	        kIndexerHeadDim,
+	        static_cast<uint64_t>(q_rows) * kHISASelectorHeads,
+	        static_cast<uint64_t>(q_values.strides()[1]),
+	        kIndexerHeadDim,
+	        kHISASelectorHeads,
+	        CU_TENSOR_MAP_SWIZZLE_64B);
+	    const auto tensor_map_sf_q = hisa_make_tma_desc_2d(
+	        q_scales.data_ptr(),
+	        CU_TENSOR_MAP_DATA_TYPE_INT32,
+	        kHISASelectorHeads,
+	        q_rows,
+	        static_cast<uint64_t>(q_scales.strides()[0]) * sizeof(int32_t),
+	        kHISASelectorHeads,
+	        kNextNAtom,
+	        CU_TENSOR_MAP_SWIZZLE_NONE);
+	    const auto tensor_map_weights = hisa_make_tma_desc_2d(
+	        weights.data_ptr(),
+	        CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+	        kHISASelectorHeads,
+	        q_rows,
+	        static_cast<uint64_t>(weights.strides()[0]) * sizeof(float),
+	        kHISASelectorHeads,
+	        kNextNAtom,
+	        CU_TENSOR_MAP_SWIZZLE_NONE);
+	    const auto tensor_map_kv = hisa_make_tma_desc_3d(
+	        cache.data_ptr(),
+	        CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+	        kIndexerHeadDim,
+	        kPageSize,
+	        num_pages,
+	        kNVFP4ValueBytes,
+	        static_cast<uint64_t>(cache.strides()[0]),
+	        kIndexerHeadDim,
+	        kPageSize,
+	        1,
+	        CU_TENSOR_MAP_SWIZZLE_64B);
+	    const auto* scale_base =
+	        static_cast<const uint8_t*>(cache.data_ptr()) +
+	        static_cast<size_t>(kNVFP4ValueBytes) * kPageSize;
+	    const auto tensor_map_sf_kv = hisa_make_tma_desc_2d(
+	        scale_base,
+	        CU_TENSOR_MAP_DATA_TYPE_INT32,
+	        kPageSize,
+	        num_pages,
+	        static_cast<uint64_t>(cache.strides()[0]),
+	        kPageSize,
+	        1,
+	        CU_TENSOR_MAP_SWIZZLE_NONE);
+
+	    const size_t smem_q_size_per_stage =
+	        static_cast<size_t>(kNextNAtom) * kHISASelectorHeads * (kIndexerHeadDim / 2);
+	    const size_t smem_sf_q_size_per_stage = 128 * sizeof(int32_t);
+	    const size_t smem_kv_size_per_stage = kSplitKV * (kIndexerHeadDim / 2);
+	    const size_t smem_sf_kv_size_per_stage = kSplitKV * sizeof(int32_t);
+	    const size_t smem_weight_size_per_stage =
+	        static_cast<size_t>(kNextNAtom) * kHISASelectorHeads * sizeof(float);
+	    const size_t smem_barriers =
+	        (kNumQStages + kNumKVStages + kNumTmemStages) * 2 * 8;
+	    const size_t smem_tmem_ptr = 4;
+	    const size_t smem_bytes =
+	        kNumQStages *
+	            (smem_q_size_per_stage + smem_sf_q_size_per_stage +
+	             smem_weight_size_per_stage)
+	        + kNumKVStages * (smem_kv_size_per_stage + smem_sf_kv_size_per_stage)
+	        + smem_barriers + smem_tmem_ptr;
+
+	    auto kernel = deepgemm_candidate_keys_row_split_kernel;
+	    if (smem_bytes > 48 * 1024) {
+	      RuntimeDeviceCheck(cudaFuncSetAttribute(
+	          kernel,
+	          cudaFuncAttributeMaxDynamicSharedMemorySize,
+	          static_cast<int>(smem_bytes)));
+	    }
+	    LaunchKernel(dim3(q_rows, row_splits_u), kSpecializedThreads + kMathThreads, device_.unwrap(), smem_bytes)(
+	        kernel,
+	        q_rows,
+	        candidate_len,
+	        row_splits_u,
+	        static_cast<uint32_t>(BT.unwrap()),
+		        reinterpret_cast<uint32_t*>(candidate_keys.data_ptr()),
+		        static_cast<int32_t*>(nullptr),
+		        0u,
+		        reinterpret_cast<const uint32_t*>(source_page_table.data_ptr()),
+	        reinterpret_cast<const int32_t*>(selected_blocks.data_ptr()),
+	        reinterpret_cast<const int32_t*>(prefix_lens.data_ptr()),
+	        reinterpret_cast<const int32_t*>(token_to_batch_idx.data_ptr()),
+	        static_cast<uint32_t>(P.unwrap()),
+	        tensor_map_q,
+	        tensor_map_sf_q,
+	        tensor_map_kv,
+	        tensor_map_sf_kv,
+	        tensor_map_weights);
+		    RuntimeDeviceCheck();
+		  }
+
+  static void hisa_deepgemm_candidate_topk_cluster(
+      tvm::ffi::TensorView q_values,
+      tvm::ffi::TensorView q_scales,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView weights,
+      tvm::ffi::TensorView source_page_table,
+      tvm::ffi::TensorView selected_blocks,
+      tvm::ffi::TensorView prefix_lens,
+      tvm::ffi::TensorView token_to_batch_idx,
+      tvm::ffi::TensorView candidate_keys,
+      tvm::ffi::TensorView topk_indices,
+      int row_splits,
+      int use_cluster) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto H = SymbolicSize{"n_heads"};
+    auto B = SymbolicSize{"source_page_table_batches"};
+    auto P = SymbolicSize{"source_page_table_stride"};
+    auto BT = SymbolicSize{"block_topk"};
+    auto CL = SymbolicSize{"candidate_len"};
+    auto K = SymbolicSize{"topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, H, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_values);
+    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+    TensorMatcher({B, P}).with_dtype<int32_t>().with_device(device_).verify(source_page_table);
+    TensorMatcher({Q, BT}).with_dtype<int32_t>().with_device(device_).verify(selected_blocks);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(prefix_lens);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(token_to_batch_idx);
+    TensorMatcher({Q, CL}).with_dtype<int32_t>().with_device(device_).verify(candidate_keys);
+    TensorMatcher({Q, K}).with_dtype<int32_t>().with_device(device_).verify(topk_indices);
+
+    if (static_cast<uint32_t>(H.unwrap()) != kHISASelectorHeads) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cluster requires exactly 64 heads.");
+    }
+    if (kPageSize != 64) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cluster requires page_size=64.");
+    }
+    if (static_cast<uint32_t>(CL.unwrap()) != static_cast<uint32_t>(BT.unwrap()) * 128u) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cluster requires candidate_len == block_topk * 128.");
+    }
+    if (static_cast<uint32_t>(CL.unwrap()) % 256u != 0) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cluster requires candidate_len aligned to 256.");
+    }
+    if (static_cast<uint32_t>(K.unwrap()) == 0) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cluster requires positive topk.");
+    }
+    if (row_splits <= 0) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cluster requires positive row_splits.");
+    }
+    const uint32_t row_splits_u = static_cast<uint32_t>(row_splits);
+    const bool cluster_launch = use_cluster != 0;
+    if (cluster_launch && row_splits_u != static_cast<uint32_t>(kHISASelectorClusterSize)) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cluster cluster launch requires row_splits=4.");
+    }
+    if (!cluster_launch && row_splits_u != 1u) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cluster non-cluster launch requires row_splits=1.");
+    }
+    if (static_cast<uint32_t>(token_to_batch_idx.size(0)) < static_cast<uint32_t>(Q.unwrap())) {
+      throw std::runtime_error("hisa_deepgemm_candidate_topk_cluster requires token_to_batch_idx per row.");
+    }
+
+    constexpr uint32_t kSplitKV = 256;
+    constexpr uint32_t kNumQStages = 3;
+	    constexpr uint32_t kNumKVStages = 10;
+    constexpr uint32_t kNumTmemStages = 3;
+    constexpr uint32_t kSpecializedThreads = 128;
+    constexpr uint32_t kMathThreads = 256;
+    constexpr uint32_t kNextNAtom = 1;
+    const uint32_t q_rows = static_cast<uint32_t>(Q.unwrap());
+    const uint32_t candidate_len = static_cast<uint32_t>(CL.unwrap());
+    const uint32_t num_pages = static_cast<uint32_t>(cache.size(0));
+
+    const auto tensor_map_q = hisa_make_tma_desc_2d(
+        q_values.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+        kIndexerHeadDim,
+        static_cast<uint64_t>(q_rows) * kHISASelectorHeads,
+        static_cast<uint64_t>(q_values.strides()[1]),
+        kIndexerHeadDim,
+        kHISASelectorHeads,
+        CU_TENSOR_MAP_SWIZZLE_64B);
+    const auto tensor_map_sf_q = hisa_make_tma_desc_2d(
+        q_scales.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_INT32,
+        kHISASelectorHeads,
+        q_rows,
+        static_cast<uint64_t>(q_scales.strides()[0]) * sizeof(int32_t),
+        kHISASelectorHeads,
+        kNextNAtom,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+    const auto tensor_map_weights = hisa_make_tma_desc_2d(
+        weights.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        kHISASelectorHeads,
+        q_rows,
+        static_cast<uint64_t>(weights.strides()[0]) * sizeof(float),
+        kHISASelectorHeads,
+        kNextNAtom,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+    const auto tensor_map_kv = hisa_make_tma_desc_3d(
+        cache.data_ptr(),
+        CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+        kIndexerHeadDim,
+        kPageSize,
+        num_pages,
+        kNVFP4ValueBytes,
+        static_cast<uint64_t>(cache.strides()[0]),
+        kIndexerHeadDim,
+        kPageSize,
+        1,
+        CU_TENSOR_MAP_SWIZZLE_64B);
+    const auto* scale_base =
+        static_cast<const uint8_t*>(cache.data_ptr()) +
+        static_cast<size_t>(kNVFP4ValueBytes) * kPageSize;
+    const auto tensor_map_sf_kv = hisa_make_tma_desc_2d(
+        scale_base,
+        CU_TENSOR_MAP_DATA_TYPE_INT32,
+        kPageSize,
+        num_pages,
+        static_cast<uint64_t>(cache.strides()[0]),
+        kPageSize,
+        1,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+
+    const size_t smem_q_size_per_stage =
+        static_cast<size_t>(kNextNAtom) * kHISASelectorHeads * (kIndexerHeadDim / 2);
+    const size_t smem_sf_q_size_per_stage = 128 * sizeof(int32_t);
+    const size_t smem_kv_size_per_stage = kSplitKV * (kIndexerHeadDim / 2);
+    const size_t smem_sf_kv_size_per_stage = kSplitKV * sizeof(int32_t);
+    const size_t smem_weight_size_per_stage =
+        static_cast<size_t>(kNextNAtom) * kHISASelectorHeads * sizeof(float);
+    const size_t smem_barriers =
+        (kNumQStages + kNumKVStages + kNumTmemStages) * 2 * 8;
+    const size_t smem_tmem_ptr = 4;
+    const size_t smem_bytes =
+        kNumQStages *
+            (smem_q_size_per_stage + smem_sf_q_size_per_stage +
+             smem_weight_size_per_stage)
+        + kNumKVStages * (smem_kv_size_per_stage + smem_sf_kv_size_per_stage)
+        + smem_barriers + smem_tmem_ptr;
+
+    auto kernel = deepgemm_candidate_keys_row_split_kernel;
+    if (smem_bytes > 48 * 1024) {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(
+          kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem_bytes)));
+    }
+    auto launch = LaunchKernel(
+        dim3(q_rows, row_splits_u),
+        kSpecializedThreads + kMathThreads,
+        device_.unwrap(),
+        smem_bytes);
+    if (cluster_launch) {
+      launch.enable_cluster({1, kHISASelectorClusterSize});
+    }
+    launch(
+        kernel,
+        q_rows,
+        candidate_len,
+        row_splits_u,
+        static_cast<uint32_t>(BT.unwrap()),
+        reinterpret_cast<uint32_t*>(candidate_keys.data_ptr()),
+        reinterpret_cast<int32_t*>(topk_indices.data_ptr()),
+        static_cast<uint32_t>(K.unwrap()),
+        reinterpret_cast<const uint32_t*>(source_page_table.data_ptr()),
+        reinterpret_cast<const int32_t*>(selected_blocks.data_ptr()),
+        reinterpret_cast<const int32_t*>(prefix_lens.data_ptr()),
+        reinterpret_cast<const int32_t*>(token_to_batch_idx.data_ptr()),
+        static_cast<uint32_t>(P.unwrap()),
+        tensor_map_q,
+        tensor_map_sf_q,
+        tensor_map_kv,
+        tensor_map_sf_kv,
+        tensor_map_weights);
+    RuntimeDeviceCheck();
+  }
+#endif
 
   static void hisa_map_candidate_indices(
       tvm::ffi::TensorView top_blocks,

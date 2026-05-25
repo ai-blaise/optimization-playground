@@ -1298,6 +1298,10 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+    if os.environ.get("SGLANG_CRIU_KEEP_POSIX_SEMAPHORES") == "1":
+        from sglang.srt.criu_multiprocessing import preserve_posix_semaphores_for_criu
+
+        preserve_posix_semaphores_for_criu()
 
 
 def _set_gc(server_args: ServerArgs):

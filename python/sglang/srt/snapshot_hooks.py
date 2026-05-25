@@ -19,6 +19,7 @@ Hard constraints — see
 """
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -39,29 +40,49 @@ POST_RESUME_SIGNAL = signal.SIGRTMIN + 6
 _pre_snapshot_state: dict[str, Any] = {}
 
 
-def _write_ready(payload: dict[str, Any]) -> None:
-    """Atomically signal the agent that pre_snapshot finished."""
-    tmp = READY_FILE + ".tmp"
+def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f)
-    os.rename(tmp, READY_FILE)
+    os.rename(tmp, path)
+
+
+def _write_ready(payload: dict[str, Any]) -> None:
+    """Atomically signal the agent that pre_snapshot finished."""
+    payload = dict(payload, pid=os.getpid())
+    _atomic_write_json(READY_FILE, payload)
+    _atomic_write_json(f"{READY_FILE}.{os.getpid()}", payload)
 
 
 def _write_ready_error(message: str) -> None:
-    with open(READY_ERR_FILE, "w", encoding="utf-8") as f:
-        f.write(message)
+    for path in (READY_ERR_FILE, f"{READY_ERR_FILE}.{os.getpid()}"):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(message)
 
 
 def _drain_kv_router(timeout_s: float) -> None:
     """Detach this replica from the Dynamo KV router event queue.
 
-    Imported lazily because the dynamo_runtime package may not be on the
-    import path during unit tests. A missing import is treated as fatal —
-    the replica is part of a Dynamo deployment, the runtime must be there.
+    Imported lazily because some production images embed the Dynamo sidecar
+    path differently from the worker runtime. Missing Dynamo bindings are a
+    no-op; present bindings must drain successfully.
     """
-    from dynamo_runtime import kv_router  # noqa: WPS433
+    kv_router = _import_kv_router()
+    if kv_router is None:
+        logger.info("dynamo_runtime.kv_router is not available; skipping KV router drain")
+        return
 
     kv_router.detach_current_replica(timeout_s=timeout_s)
+
+
+def _import_kv_router() -> Any | None:
+    try:
+        runtime = importlib.import_module("dynamo_runtime")
+    except ModuleNotFoundError as exc:
+        if exc.name == "dynamo_runtime":
+            return None
+        raise
+    return runtime.kv_router
 
 
 def _drain_inflight(deadline_s: float) -> None:
@@ -114,7 +135,10 @@ def _restore_nccl(state: dict[str, Any]) -> None:
 
 
 def _attach_kv_router() -> None:
-    from dynamo_runtime import kv_router  # noqa: WPS433
+    kv_router = _import_kv_router()
+    if kv_router is None:
+        logger.info("dynamo_runtime.kv_router is not available; skipping KV router attach")
+        return
 
     kv_router.attach_current_replica()
 
@@ -165,8 +189,10 @@ def _post_resume_handler(signum: int, frame: Any) -> None:
             _restore_nccl(nccl_state)
         _attach_kv_router()
 
-        with open(RESUME_FILE, "w", encoding="utf-8") as f:
-            f.write(str(time.time()))
+        payload = str(time.time())
+        for path in (RESUME_FILE, f"{RESUME_FILE}.{os.getpid()}"):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(payload)
         logger.info("post_resume complete; replica is serving")
     except Exception:  # pylint: disable=broad-except
         logger.exception("post_resume failed")

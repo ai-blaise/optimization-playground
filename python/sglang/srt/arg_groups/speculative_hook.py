@@ -368,7 +368,17 @@ def _handle_smc(server_args: "ServerArgs") -> None:
     server_args.speculative_eagle_topk = 1
     server_args.speculative_num_steps = server_args.smc_gamma
     server_args.speculative_num_draft_tokens = server_args.smc_gamma + 1
-    server_args.disable_overlap_schedule = True
+    # SMC supports the overlap scheduler under spec v2 end-to-end (bonus-token
+    # stream recording + seq-len handoff are wired up), so don't disable it
+    # unconditionally. Mirror _handle_eagle_family: keep overlap ON under spec
+    # v2, only falling back to spec v1 (overlap off) when it is explicitly off.
+    if not envs.SGLANG_ENABLE_SPEC_V2.get():
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "SMC: overlap scheduler disabled because SGLANG_ENABLE_SPEC_V2=0."
+        )
+    else:
+        logger.info("SMC: overlap scheduler enabled (spec v2).")
 
 
 def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:

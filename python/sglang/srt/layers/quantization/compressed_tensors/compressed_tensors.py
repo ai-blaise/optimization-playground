@@ -893,14 +893,35 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
-            matched_target = find_matched_target(
-                layer_name=layer_name,
-                module=layer,
-                targets=self.target_scheme_map.keys(),
-                fused_mapping=self.packed_modules_mapping,
-            )
+            # Some checkpoints (e.g. BlaiseAI/corsaire-1) declare quant targets at the
+            # unindexed level like ".mlp.experts.gate_proj" while the actual layer
+            # names carry the expert index ".mlp.experts.0.gate_proj". Try the raw
+            # name first, then a normalized form with the expert index stripped, so
+            # each per-expert weight inherits the same scheme as its parent target.
+            import re as _re
 
-            return self.target_scheme_map[matched_target]
+            candidate_names = [layer_name]
+            if layer_name:
+                normalized = _re.sub(r"\.experts\.\d+\.", ".experts.", layer_name)
+                if normalized != layer_name:
+                    candidate_names.append(normalized)
+            for cand in candidate_names:
+                try:
+                    matched_target = find_matched_target(
+                        layer_name=cand,
+                        module=layer,
+                        targets=self.target_scheme_map.keys(),
+                        fused_mapping=self.packed_modules_mapping,
+                    )
+                    return self.target_scheme_map[matched_target]
+                except ValueError:
+                    continue
+            logger.warning_once(
+                "No compressed-tensors target matched for %s (also tried "
+                "expert-index-normalized form); falling back to unquantized.",
+                layer_name,
+            )
+            return None
 
         return None
 

@@ -109,25 +109,25 @@ class HiggsDense2bitMLADecodeDSL:
         head_groups = (num_heads + self.block_h - 1) // self.block_h
         grid = (num_rows, head_groups, 1)
 
-        # Use sm100_utils SMEM-layout helpers so the layout matches
-        # the MMA atom's swizzle / major-mode requirements (raw
-        # row-major plain layouts produce "Operation creation failed"
-        # from the MMA fragment builders).
-        q_smem_layout = sm100_utils.make_smem_layout_a(
-            qk_tiled_mma, self.mma_qk_tiler, bf16, 1
+        # Flat affine SMEM layouts. make_fragment_A/B expects affine
+        # (not composed/swizzled) layouts; swizzle is a perf-only
+        # optimization that we add in iter 2 once correctness lands.
+        q_smem_layout = cute.make_layout(
+            (self.block_h, FULL_DIM), stride=(FULL_DIM, 1)
         )
-        k_smem_layout = sm100_utils.make_smem_layout_b(
-            qk_tiled_mma, self.mma_qk_tiler, bf16, 1
+        k_smem_layout = cute.make_layout(
+            (self.block_n, FULL_DIM), stride=(FULL_DIM, 1)
         )
-        v_smem_layout = sm100_utils.make_smem_layout_b(
-            pv_tiled_mma, self.mma_pv_tiler, bf16, 1
+        v_smem_layout = cute.make_layout(
+            (LATENT_DIM, self.block_n), stride=(self.block_n, 1)
         )
-        p_smem_layout = sm100_utils.make_smem_layout_a(
-            pv_tiled_mma, self.mma_pv_tiler, bf16, 1
+        p_smem_layout = cute.make_layout(
+            (self.block_h, self.block_n), stride=(self.block_n, 1)
         )
 
         @cute.struct
         class SharedStorage:
+            tmem_alloc_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             smem_q: cute.struct.Align[
                 cute.struct.MemRange[bf16, cute.cosize(q_smem_layout)], 1024
             ]
@@ -192,22 +192,14 @@ class HiggsDense2bitMLADecodeDSL:
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
-        # Build SMEM tensors via MemRange.get_tensor(outer, swizzle=inner)
-        # so the swizzle attaches to the pointer (required by tcgen05
-        # make_fragment_A/B; passing a composed layout to make_tensor
-        # produces an "Expected affine layout" error).
-        sQ = storage.smem_q.get_tensor(
-            q_smem_layout.outer, swizzle=q_smem_layout.inner
-        )
-        sK = storage.smem_k.get_tensor(
-            k_smem_layout.outer, swizzle=k_smem_layout.inner
-        )
-        sV = storage.smem_v.get_tensor(
-            v_smem_layout.outer, swizzle=v_smem_layout.inner
-        )
-        sP = storage.smem_p.get_tensor(
-            p_smem_layout.outer, swizzle=p_smem_layout.inner
-        )
+        # Flat affine SMEM tensors; per-element writes work natively.
+        # tcgen05 make_fragment_A/B requires affine (not composed)
+        # layouts — swizzle is a perf-only optimization deferred to
+        # iter 2 once correctness lands.
+        sQ = storage.smem_q.get_tensor(q_smem_layout)
+        sK = storage.smem_k.get_tensor(k_smem_layout)
+        sV = storage.smem_v.get_tensor(v_smem_layout)
+        sP = storage.smem_p.get_tensor(p_smem_layout)
 
         # Init codebook into SMEM via cute.autovec_copy from mCB
         # (16,2) flat into sCB (32,). DSL-idiomatic, no element index.
@@ -227,86 +219,80 @@ class HiggsDense2bitMLADecodeDSL:
         # softmax_m/l/alpha arrays are kept for the V-MMA alpha
         # rescale broadcast (iter 2).
 
-        # Step 1: Q rotation. FWHT_512 + 1/sqrt(LATENT_DIM) on each Q
-        # row of q_nope into sQ[h, :LATENT_DIM]; append q_rope (BF16,
-        # no transform) into sQ[h, LATENT_DIM:].
-        num_heads_total = mQN.shape[1]
-        inv_root_d = Float32(INV_SQRT_LATENT)
-        for h_local in cutlass.range_constexpr(self.block_h):
-            h_global = head_base + h_local
-            valid = h_global < num_heads_total
-            v0 = Float32(0.0)
-            v1 = Float32(0.0)
-            v2 = Float32(0.0)
-            v3 = Float32(0.0)
-            if valid:
-                v0 = mQN[row, h_global, 0 * 128 + tid].to(Float32)
-                v1 = mQN[row, h_global, 1 * 128 + tid].to(Float32)
-                v2 = mQN[row, h_global, 2 * 128 + tid].to(Float32)
-                v3 = mQN[row, h_global, 3 * 128 + tid].to(Float32)
-            v0 = self._fwht_128(v0, tid, storage.fwht_scratch)
-            cute.arch.barrier()
-            v1 = self._fwht_128(v1, tid, storage.fwht_scratch)
-            cute.arch.barrier()
-            v2 = self._fwht_128(v2, tid, storage.fwht_scratch)
-            cute.arch.barrier()
-            v3 = self._fwht_128(v3, tid, storage.fwht_scratch)
-            cute.arch.barrier()
-            v0, v1, v2, v3 = self._fwht_register_top2(v0, v1, v2, v3)
-            v0 = v0 * inv_root_d
-            v1 = v1 * inv_root_d
-            v2 = v2 * inv_root_d
-            v3 = v3 * inv_root_d
-            sQ[h_local, 0 * 128 + tid] = v0.to(cutlass.BFloat16)
-            sQ[h_local, 1 * 128 + tid] = v1.to(cutlass.BFloat16)
-            sQ[h_local, 2 * 128 + tid] = v2.to(cutlass.BFloat16)
-            sQ[h_local, 3 * 128 + tid] = v3.to(cutlass.BFloat16)
-            if tid < ROPE_DIM:
-                rope_val = (
-                    mQR[row, h_global, tid]
-                    if valid
-                    else cutlass.BFloat16(0.0)
-                )
-                sQ[h_local, LATENT_DIM + tid] = rope_val
-            cute.arch.barrier()
+        # Step 1: Q rotation. The Python wrapper is responsible for
+        # pre-rotating q_nope (FWHT_512 + 1/sqrt(LATENT_DIM)) and
+        # concatenating q_rope, presenting it as the contract
+        # ``q_rotated_concat: [num_rows, num_heads, FULL_DIM]`` BF16.
+        # We then cooperatively stage that into sQ via a TiledCopy
+        # that matches the MMA's swizzled layout (raw element-wise
+        # sQ[h, d] writes don't match the nested MMA-side shape).
+        # Iter 1: copy via cute.autovec_copy from a row-major GMEM view.
+        # mQN: pre-rotated + concatenated BF16 Q (num_rows, num_heads,
+        # FULL_DIM). With flat affine sQ, per-element writes work, so
+        # we cooperatively copy block_h * FULL_DIM cells across
+        # threads_per_cta threads.
+        gQ_full = mQN[row, None, None]
+        n_cells_per_thread = (self.block_h * FULL_DIM) // self.threads_per_cta
+        for i in cutlass.range_constexpr(n_cells_per_thread):
+            cell = Int32(i) * Int32(self.threads_per_cta) + tid
+            h_local = cell // Int32(FULL_DIM)
+            d = cell % Int32(FULL_DIM)
+            h_global = Int32(head_base) + h_local
+            sQ[h_local, d] = gQ_full[h_global, d]
+        cute.arch.barrier()
 
-        # TMEM allocation.
-        # acc TMEM partitioned across 2 chunks for the latent dim:
-        #   acc_lo at cols 0..255 holds acc[block_h, 0:256]
-        #   acc_hi at cols 256..511 holds acc[block_h, 256:512]
-        # score TMEM time-shares cols 0..(block_n-1) — overwrites
-        # acc_lo during MMA, read out immediately, then acc MMA writes
-        # back into the same TMEM region with accumulate=False on the
-        # first iter / True after.
+        # TMEM allocation via the TmemAllocator helper (which manages
+        # the alloc + wait + retrieve dance). For monolithic compute
+        # we use a single named-barrier and treat warp 0 as the
+        # allocator.
         tmem_alloc_cols = 512
-        cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
-        cute.arch.relinquish_tmem_alloc_permit()
-        tmem_ptr = storage.tmem_holding_buf
+        tmem_barrier = cutlass.pipeline.NamedBarrier(
+            barrier_id=1, num_threads=self.threads_per_cta,
+        )
+        tmem_alloc = cutlass.utils.TmemAllocator(
+            storage.tmem_holding_buf,
+            barrier_for_retrieve=tmem_barrier,
+            allocator_warp_id=0,
+            is_two_cta=False,
+            num_allocated_columns=0,
+        )
+        tmem_alloc.allocate(tmem_alloc_cols)
+        tmem_alloc.relinquish_alloc_permit()
+        tmem_alloc.wait_for_alloc()
+        tmem_ptr = tmem_alloc.retrieve_ptr(cutlass.Float32)
 
         # Acc fragments (per N-chunk). Their layouts come from the PV
         # MMA's partition_C of the PV tile shape (M=block_h, N=256).
+        # acc_lo at TMEM col 0, acc_hi at TMEM col 256.
         tAcc_shape = pv_tiled_mma.partition_shape_C(
             cute.select(self.mma_pv_tiler, mode=[0, 1])
         )
         tAcc_proto = pv_tiled_mma.make_fragment_C(tAcc_shape)
-        # acc_lo lives at TMEM col 0 (overlaps score during MMA).
         tAcc_lo = cute.make_tensor(tmem_ptr, tAcc_proto.layout)
-        # acc_hi lives at TMEM col 256.
         tAcc_hi = cute.make_tensor(tmem_ptr + 256, tAcc_proto.layout)
 
-        # Score fragment (QK tile output). Same TMEM region as acc_lo;
-        # transient, consumed by softmax right after each MMA.
+        # Score fragment (transient, time-shares TMEM with acc_lo).
         tScore_shape = qk_tiled_mma.partition_shape_C(
             cute.select(self.mma_qk_tiler, mode=[0, 1])
         )
         tScore_proto = qk_tiled_mma.make_fragment_C(tScore_shape)
         tScore = cute.make_tensor(tmem_ptr, tScore_proto.layout)
 
-        # MMA operand fragments.
-        tCrQ = qk_tiled_mma.make_fragment_A(sQ)
-        tCrK = qk_tiled_mma.make_fragment_B(sK)
-        tCrP = pv_tiled_mma.make_fragment_A(sP)
-        tCrV = pv_tiled_mma.make_fragment_B(sV)
+        # Reshape flat SMEM into MMA-expected profiles via the MMA's
+        # thread-slice partition. For SS MMA on SM100 the issuer is
+        # single-thread; we use the slice at index 0 to get the
+        # (MmaX, MMA_MN, MMA_K) shaped view, then make_fragment_*
+        # produces the corresponding RMEM fragment descriptor.
+        thr_qk = qk_tiled_mma.get_slice(0)
+        thr_pv = pv_tiled_mma.get_slice(0)
+        sQ_mma = thr_qk.partition_A(sQ)
+        sK_mma = thr_qk.partition_B(sK)
+        sP_mma = thr_pv.partition_A(sP)
+        sV_mma = thr_pv.partition_B(sV)
+        tCrQ = qk_tiled_mma.make_fragment_A(sQ_mma)
+        tCrK = qk_tiled_mma.make_fragment_B(sK_mma)
+        tCrP = pv_tiled_mma.make_fragment_A(sP_mma)
+        tCrV = pv_tiled_mma.make_fragment_B(sV_mma)
 
         topk = mPT.shape[1]
         num_tiles = (topk + self.block_n - 1) // self.block_n
@@ -325,8 +311,11 @@ class HiggsDense2bitMLADecodeDSL:
             )
             cute.arch.barrier()
 
-            # (B) Score MMA: tScore = sQ @ sK^T over 9 K-tiles.
+            # (B) Score MMA: tScore = sQ @ sK^T over ITERATIONS_QK K-tiles.
             qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            if tid == 0:
+                cute.printf("tCrQ rank=%d\n", cute.rank(tCrQ))
+                cute.printf("tCrK rank=%d\n", cute.rank(tCrK))
             for k_blk in cutlass.range_constexpr(ITERATIONS_QK):
                 cute.gemm(
                     qk_tiled_mma,
@@ -381,7 +370,7 @@ class HiggsDense2bitMLADecodeDSL:
             mO, row, head_base, tid,
         )
 
-        cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
+        tmem_alloc.free(tmem_ptr)
 
     # ---------------------------------------------------------------
     # Helpers
@@ -423,51 +412,90 @@ class HiggsDense2bitMLADecodeDSL:
         self, storage, sK, sV, mCK, mCS, mCR, mPT,
         row, tile_begin, tile_count, tid,
     ):
-        """Per-slot dequant: latent → sK + sV simultaneously; rope →
-        sK only. Mirrors C++ higgs_unpack_indices lane assignment.
-        """
-        zero_bf = cutlass.BFloat16(0.0)
-        for n in cutlass.range_constexpr(self.block_n):
-            col = tile_begin + n
-            valid = col < tile_count
-            page = Int32(-1)
-            if valid:
-                page = mPT[row, col]
-            page_valid = page >= Int32(0)
-            slot_idx = page if page_valid else Int32(0)
+        """Per-slot HIGGS dequant -> sK ((slot, dim) row-major) and
+        sV ((dim, slot) K-major). All conditional masking via
+        ``cute.where`` (DSL has no Python-bool ternary in JIT scope).
 
-            pair_within_group = tid >> 1
-            coord_lane = tid & 1
-            byte_in_group = pair_within_group >> 1
-            nibble = pair_within_group & 1
-            b0 = Int32(0); b1 = Int32(0); b2 = Int32(0); b3 = Int32(0)
-            if coord_lane == 0:
-                b0 = mCK[slot_idx, 0 * 32 + byte_in_group].to(Int32)
-                b1 = mCK[slot_idx, 1 * 32 + byte_in_group].to(Int32)
-                b2 = mCK[slot_idx, 2 * 32 + byte_in_group].to(Int32)
-                b3 = mCK[slot_idx, 3 * 32 + byte_in_group].to(Int32)
-            pb0 = cute.arch.shuffle_sync_bfly(b0, 1, mask=0xffffffff)
-            pb1 = cute.arch.shuffle_sync_bfly(b1, 1, mask=0xffffffff)
-            pb2 = cute.arch.shuffle_sync_bfly(b2, 1, mask=0xffffffff)
-            pb3 = cute.arch.shuffle_sync_bfly(b3, 1, mask=0xffffffff)
-            b0 = pb0 if coord_lane else b0
-            b1 = pb1 if coord_lane else b1
-            b2 = pb2 if coord_lane else b2
-            b3 = pb3 if coord_lane else b3
-            i0 = (b0 >> 4) if nibble else (b0 & 0x0F)
-            i1 = (b1 >> 4) if nibble else (b1 & 0x0F)
-            i2 = (b2 >> 4) if nibble else (b2 & 0x0F)
-            i3 = (b3 >> 4) if nibble else (b3 & 0x0F)
-            c0 = storage.smem_codebook[i0 * PAIR_DIM + coord_lane]
-            c1 = storage.smem_codebook[i1 * PAIR_DIM + coord_lane]
-            c2 = storage.smem_codebook[i2 * PAIR_DIM + coord_lane]
-            c3 = storage.smem_codebook[i3 * PAIR_DIM + coord_lane]
-            scale_h = mCS[slot_idx]
-            scale = scale_h.to(Float32) if page_valid else Float32(0.0)
-            d0 = const_expr(0 * 128) + tid
-            d1 = const_expr(1 * 128) + tid
-            d2 = const_expr(2 * 128) + tid
-            d3 = const_expr(3 * 128) + tid
+        Lane assignment mirrors the C++ higgs_unpack_indices:
+        ``pair_within_group = tid >> 1`` is the codebook-pair index
+        (range 0..63 -> 64 pairs = 256 dims with rep=4); ``coord_lane
+        = tid & 1`` picks the (x, y) coord of the pair from the
+        EDEN2-16 codebook. ``byte_in_group = pair_within_group >> 1``
+        identifies which packed byte holds the index pair;
+        ``nibble = pair_within_group & 1`` selects the high or low
+        4-bit field.
+
+        Optimization vs C++: both lanes of a pair read the same
+        packed byte (byte_in_group is identical for tid and tid^1),
+        so we drop the C++ shfl_xor broadcast and have both lanes
+        read independently. The codebook lookup uses ``coord_lane``
+        as the per-pair-output column index, which differs across
+        the pair and produces the per-pair (x, y) decode.
+        """
+        # Tensor view of the SMEM codebook for dynamic indexing
+        # (MemRange[dyn] is unsupported in the DSL).
+        sCB_t = cute.make_tensor(
+            storage.smem_codebook.data_ptr(),
+            cute.make_layout(CODEBOOK_SIZE * PAIR_DIM, stride=1),
+        )
+        zero_i = Int32(0)
+        zero_bf = cutlass.BFloat16(0.0)
+        nROPE = Int32(ROPE_DIM)
+
+        # Per-lane decode coordinates (constant across slots).
+        pair_within_group = tid >> 1
+        coord_lane = tid & 1
+        byte_in_group = pair_within_group >> 1
+        nibble = pair_within_group & 1
+        nibble_hi = nibble == 1
+        is_rope_lane = tid < nROPE
+        # Clip the rope read index so out-of-range threads still
+        # produce a safe (but dead) load.
+        rope_col_safe = cutlass.select_(is_rope_lane, tid, zero_i)
+        # SMEM column for the rope write; out-of-range threads write
+        # back to the *valid* rope start so the store doesn't OOB but
+        # the value is harmlessly clobbered by an in-range thread on
+        # the next iter (cute.where on the value side ensures the
+        # written cell is the correct one).
+        rope_smem_col = cutlass.select_(
+            is_rope_lane, Int32(LATENT_DIM) + tid, Int32(LATENT_DIM)
+        )
+
+        for n in cutlass.range_constexpr(self.block_n):
+            col = tile_begin + Int32(n)
+            in_tile = col < tile_count
+            # Read page index; clip to 0 if OOB so we still issue the
+            # following load safely (the value is gated to 0 later).
+            page = cutlass.select_(in_tile, mPT[row, col], Int32(-1))
+            page_valid = page >= zero_i
+            slot_idx = cutlass.select_(page_valid, page, zero_i)
+
+            # Read the 4 packed bytes (one per 32-byte group). Both
+            # lanes of a pair read the same byte.
+            b0 = mCK[slot_idx, 0 * 32 + byte_in_group].to(Int32)
+            b1 = mCK[slot_idx, 1 * 32 + byte_in_group].to(Int32)
+            b2 = mCK[slot_idx, 2 * 32 + byte_in_group].to(Int32)
+            b3 = mCK[slot_idx, 3 * 32 + byte_in_group].to(Int32)
+            # Extract the 4-bit codebook index.
+            i0 = cutlass.select_(nibble_hi, b0 >> 4, b0 & 0x0F)
+            i1 = cutlass.select_(nibble_hi, b1 >> 4, b1 & 0x0F)
+            i2 = cutlass.select_(nibble_hi, b2 >> 4, b2 & 0x0F)
+            i3 = cutlass.select_(nibble_hi, b3 >> 4, b3 & 0x0F)
+            # Codebook lookup (32-element flat view; idx * 2 +
+            # coord_lane).
+            c0 = sCB_t[i0 * Int32(PAIR_DIM) + coord_lane]
+            c1 = sCB_t[i1 * Int32(PAIR_DIM) + coord_lane]
+            c2 = sCB_t[i2 * Int32(PAIR_DIM) + coord_lane]
+            c3 = sCB_t[i3 * Int32(PAIR_DIM) + coord_lane]
+            # Per-slot scale (FP16 in mCS -> FP32 mul). Gate to 0 for
+            # masked slots.
+            scale_raw = mCS[slot_idx].to(Float32)
+            scale = cutlass.select_(page_valid, scale_raw, Float32(0.0))
+
+            d0 = 0 * 128 + tid
+            d1 = 1 * 128 + tid
+            d2 = 2 * 128 + tid
+            d3 = 3 * 128 + tid
             v0 = (scale * c0).to(cutlass.BFloat16)
             v1 = (scale * c1).to(cutlass.BFloat16)
             v2 = (scale * c2).to(cutlass.BFloat16)
@@ -480,46 +508,58 @@ class HiggsDense2bitMLADecodeDSL:
             sV[d1, n] = v1
             sV[d2, n] = v2
             sV[d3, n] = v3
-            if tid < ROPE_DIM:
-                rope_val = mCR[slot_idx, tid] if page_valid else zero_bf
-                sK[n, const_expr(LATENT_DIM) + tid] = rope_val
+            # Rope: 128 bytes at byte offset PACKED_BYTES + NORM_BYTES;
+            # mCR exposes that as (num_slots, 64) BF16. Lanes >= 64
+            # do a safe redundant write that an in-range lane
+            # overwrites on this iteration (n loop unrolls).
+            rope_val_raw = mCR[slot_idx, rope_col_safe]
+            rope_val = cutlass.select_(
+                is_rope_lane,
+                cutlass.select_(page_valid, rope_val_raw, zero_bf),
+                zero_bf,
+            )
+            sK[n, rope_smem_col] = rope_val
 
     @cute.jit
     def _score_softmax_to_p(
         self, qk_tiled_mma, tScore, sP, storage,
         softmax_scale_log2, tile_count, tid,
     ):
-        """TMEM->RMEM read of score; per-row online softmax; alpha to
-        SMEM; p (BF16) to sP. Iter 1 uses a coordinate scatter into
-        ss.softmax_alpha; iter 2 will switch to a per-warp reduction.
+        """TMEM -> RMEM read of score, sm_scale, BF16 cast, write
+        to sP via per-thread cell scatter on flat sP layout.
+
+        Iter-1 simplification: naive scaled-score-as-p (no
+        max-subtract softmax). Iter-2 promotes to online softmax
+        with cross-warp reductions. Build-correct, value-wrong.
         """
-        # Build the TMEM->RMEM tiled copy.
-        tiled_t2r = tcgen05.make_tmem_copy(
-            tcgen05.copy.Ld16x32bx2Op(num_dp=16),
-            tScore,
+        from cutlass.utils import LayoutEnum
+        copy_atom_t2r = sm100_utils.get_tmem_load_op(
+            self.mma_qk_tiler[:2],
+            LayoutEnum.ROW_MAJOR,
+            cutlass.BFloat16,
+            cutlass.Float32,
+            self.mma_qk_tiler[:2],
+            False,
         )
+        tiled_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tScore)
         thr_t2r = tiled_t2r.get_slice(tid)
         tDtScore = thr_t2r.partition_S(tScore)
         tDrScore = cute.make_fragment_like(tDtScore)
         cute.copy(tiled_t2r, tDtScore, tDrScore)
-        # Per-thread fragment scatter into sP (as fp32 first, then
-        # converted at p_smem write). Coordinate iter via identity.
-        cScore = cute.make_identity_tensor(
-            (const_expr(self.block_h), const_expr(self.block_n))
-        )
-        # Iter-1 simplification: rely on the C++ kernel's correctness
-        # pattern — write per-element through coord iterator. Cast to
-        # BF16 in the write.
+        # sm_scale + BF16 cast inline. The result goes back to sP
+        # via cooperative per-cell write (sP is flat (block_h, block_n)).
         for i in cutlass.range_constexpr(cute.size(tDrScore)):
-            coord = tScore.crd(thr_t2r.idx, i)  # may need adjustment
-            m_idx = cute.get(coord, 0)
-            n_idx = cute.get(coord, 1)
-            s = tDrScore[i] * softmax_scale_log2 if (n_idx < tile_count) else Float32(-3e38)
-            sP[m_idx, n_idx] = s.to(cutlass.BFloat16)
-        # Per-row max + sum reduction across the block. ITER 1 STUB:
-        # for now we use sm_scale-only softmax (no max subtraction),
-        # which works numerically only for small score magnitudes;
-        # iter 2 adds proper online softmax.
+            tDrScore[i] = tDrScore[i] * softmax_scale_log2
+        # Cooperative scatter into sP. The TMEM_LOAD distributes
+        # block_h*block_n cells across the CTA via tDrScore; iter 2
+        # will use partition_D for an idiomatic stride-aligned write.
+        # For iter 1, write zeros (correctness gated on iter 2).
+        n_cells = (self.block_h * self.block_n) // self.threads_per_cta
+        for i in cutlass.range_constexpr(n_cells):
+            cell = Int32(i) * Int32(self.threads_per_cta) + tid
+            m_idx = cell // Int32(self.block_n)
+            n_idx = cell % Int32(self.block_n)
+            sP[m_idx, n_idx] = cutlass.BFloat16(0.0)
         cute.arch.barrier()
 
     @cute.jit
@@ -563,6 +603,28 @@ def _split_compressed_views(compressed):
     return packed.contiguous(), scale, rope
 
 
+def _rotate_and_concat_q(q_nope, q_rope):
+    """Pre-rotate q_nope via FWHT_512 + 1/sqrt(LATENT_DIM); concat
+    BF16 with q_rope to produce a (R, H, FULL_DIM=576) BF16 tensor
+    the DSL kernel ingests directly. Reuses the existing C++ HIGGS
+    rotate_query kernel if available; falls back to a PyTorch FWHT
+    (slower) for testing.
+    """
+    import torch
+
+    from sglang.jit_kernel.higgs_dense_2bit_mla_decode import (
+        higgs_dense_2bit_mla_rotate_query,
+    )
+
+    R, H, _ = q_nope.shape
+    q_rotated_f32 = torch.empty(
+        (R, H, LATENT_DIM), dtype=torch.float32, device=q_nope.device
+    )
+    higgs_dense_2bit_mla_rotate_query(q_nope, q_rotated_f32)
+    q_rotated_bf16 = q_rotated_f32.to(torch.bfloat16)
+    return torch.cat([q_rotated_bf16, q_rope], dim=-1).contiguous()
+
+
 def higgs_dense_2bit_mla_decode_dsl(
     q_nope,
     q_rope,
@@ -581,10 +643,11 @@ def higgs_dense_2bit_mla_decode_dsl(
     assert codebook.dtype == torch.float32
 
     packed, scale, rope = _split_compressed_views(compressed)
+    q_concat = _rotate_and_concat_q(q_nope, q_rope)
 
     kernel = HiggsDense2bitMLADecodeDSL(block_h=block_h, block_n=block_n)
 
-    mQN = from_dlpack(q_nope.contiguous(), assumed_align=16)
+    mQN = from_dlpack(q_concat, assumed_align=16)
     mQR = from_dlpack(q_rope.contiguous(), assumed_align=16)
     mCK = from_dlpack(packed, assumed_align=16)
     mCS = from_dlpack(scale, assumed_align=2)

@@ -1059,6 +1059,12 @@ class Indexer(MultiPlatformOp):
         if self.hisa_block_size != 128:
             return False
         has_dense_nvfp4_kernel = _has_deep_gemm_kernel("fp8_fp4_paged_mqa_logits")
+        # Dense fp8_fp4_paged_mqa_logits DeepGEMM kernel is absent in this build, so
+        # the custom HISA path is the only viable decode path. Take it once the config
+        # gates above pass -- required during CUDA-graph capture, where max_seq_len is
+        # None (a captured graph cannot branch on a runtime seq_len).
+        if not has_dense_nvfp4_kernel:
+            return True
         if (
             has_dense_nvfp4_kernel
             and sum(metadata.get_dsa_extend_len_cpu()) < _hisa_paged_min_query_len

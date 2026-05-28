@@ -901,6 +901,30 @@ class Indexer(MultiPlatformOp):
                 )
                 return result
 
+        # The DeepGEMM fp8_fp4_paged_mqa_logits kernel is not available in this build
+        # (sgl_kernel was compiled without it and SGLANG_ENABLE_JIT_DEEPGEMM=0). The
+        # _should_use_hisa_nvfp4_paged check can return False during cuda-graph capture
+        # because the synthetic forward_batch fails one of its gates; in that case we
+        # must still force the HISA path here or _require_deep_gemm_kernel below raises
+        # and capture fails with "DeepGEMM kernel fp8_fp4_paged_mqa_logits is required
+        # for this DSA path".
+        if is_nvfp4 and not _has_deep_gemm_kernel("fp8_fp4_paged_mqa_logits"):
+            result = self._get_topk_hisa_nvfp4_paged(
+                q_fp8,
+                kv_cache_fp8,
+                block_tables,
+                seqlens_32,
+                weights,
+                metadata,
+                max_seq_len_hint=int(max_seq_len),
+            )
+            if result is None:
+                raise RuntimeError(
+                    "HISA NVFP4 paged returned None and DeepGEMM fp8_fp4_paged_mqa_logits "
+                    "is unavailable; no viable indexer path remains."
+                )
+            return result
+
         profile_start = _hisa_profile_start(q_tensor.device)
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.

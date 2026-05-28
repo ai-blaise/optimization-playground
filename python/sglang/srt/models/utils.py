@@ -62,6 +62,15 @@ class WeightsMapper:
         )
 
     def _map_name(self, key: str) -> Optional[str]:
+        # Regex-pattern keys (used by compressed-tensors target_scheme_map: e.g.
+        # "re:.*self_attn\\.o_proj$") MUST NOT be prefix/substring/suffix-rewritten.
+        # The HF-to-SGLang mapper is a literal-name translator; applying it to a
+        # regex string would prepend "model." (or other) and break the
+        # find_matched_target regex branch (target must start with "re:"), causing
+        # spurious "Unable to find matching target" errors at scheduler init.
+        if key.startswith("re:"):
+            return key
+
         for substr, new_key in sorted(
             self.orig_to_new_substr.items(), key=lambda i: len(i[0]), reverse=True
         ):

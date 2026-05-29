@@ -419,6 +419,23 @@ class Envs:
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Enable per-token NVFP4 activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # HIGGS dense 2-bit MoE expert-weight scheme (task #15, B200 DSv3.2).
+    # When True, the HIGGS scheme keeps its 2-bit packed expert weights on
+    # device and runs trtllm_bf16_moe at runtime by re-dequanting per
+    # call. Trades GEMM throughput for ~8x weight-memory savings. When
+    # False (default), HIGGS-packed weights are dequanted once at load
+    # time and re-quantized to NVFP4 so the trtllm fp4 kernel runs
+    # unchanged — no runtime perf delta vs the W4A4 NVFP4 path but no
+    # GPU memory savings either. The follow-on flashinfer fork that
+    # consumes HIGGS-packed weights inline will subsume this knob.
+    SGLANG_OPT_USE_HIGGS_MOE_2BIT_BF16_RUNTIME = EnvBool(False)
+    # Optional sub-row FWHT block size for HIGGS MoE expert weights.
+    # 0 / unset = use the full row (one FWHT block of size in_dim per
+    # row, matching the dense MLA latent convention). Power-of-two
+    # values let larger hidden_size models (e.g. 7168) trade codec
+    # accuracy against per-row CTA shared-memory budget when the
+    # follow-on CUDA kernel lands.
+    SGLANG_OPT_HIGGS_MOE_2BIT_BLOCK_SIZE = EnvInt(0)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)

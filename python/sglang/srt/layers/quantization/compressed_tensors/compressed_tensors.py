@@ -39,6 +39,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
+    CompressedTensorsHiggsDense2BitMoE,
     CompressedTensorsLinearScheme,
     CompressedTensorsMoEScheme,
     CompressedTensorsMxInt4MoE,
@@ -525,6 +526,40 @@ class CompressedTensorsConfig(QuantizationConfig):
         # All conditions satisfied.
         return True
 
+    def _is_higgs_2bit_moe(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        """Detect a HIGGS dense 2-bit MoE expert-weight quantization.
+
+        HIGGS lives outside the compressed-tensors ``QuantizationArgs``
+        type system because the upstream pydantic validator only
+        accepts ``num_bits in {4, 8}`` for ``type=FLOAT``. We therefore
+        signal HIGGS through the checkpoint's top-level
+        ``quantization_config.format`` string (one of
+        ``higgs-dense-2bit-moe`` / ``higgs_dense_2bit_moe``) and treat
+        the per-target ``weight_quant`` as best-effort metadata.
+        """
+        fmt = (self.quant_format or "").lower().replace("_", "-")
+        if fmt in ("higgs-dense-2bit-moe", "higgs-dense-2bit"):
+            return True
+        # Fall-back path: a checkpoint that *did* manage to express
+        # num_bits=2 FLOAT directly (e.g. via a custom args validator).
+        if weight_quant is None:
+            return False
+        try:
+            is_2_bit_float = (
+                weight_quant.num_bits == 2
+                and weight_quant.type == QuantizationType.FLOAT
+            )
+        except Exception:
+            return False
+        is_symmetric = bool(getattr(weight_quant, "symmetric", False))
+        is_tensor_group = (
+            getattr(weight_quant, "strategy", None)
+            == QuantizationStrategy.TENSOR_GROUP.value
+        )
+        return is_2_bit_float and is_symmetric and is_tensor_group
+
     def _is_fp4a4_nvfp4(
         self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ):
@@ -733,6 +768,13 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
+
+        # HIGGS 2-bit MoE detection runs first because the checkpoint's
+        # top-level ``format`` string drives the decision; the per-target
+        # ``weight_quant`` may be omitted on a stricter HIGGS checkpoint.
+        if self._is_higgs_2bit_moe(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsHiggsDense2BitMoE")
+            return CompressedTensorsHiggsDense2BitMoE()
 
         if weight_quant is None:
             logger.warning_once(

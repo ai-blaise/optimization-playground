@@ -3647,6 +3647,96 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
         compact_page_table = compact_page_table.masked_fill(~mask, -1)
         return kv_cache, compact_page_table
 
+    def get_higgs_selected_kv_buffer_trtllm(
+        self,
+        layer_id: int,
+        page_table: torch.Tensor,
+        page_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """trtllm DSA decode view of the HIGGS-packed latent+rope cache.
+
+        Sparse materialization adapter for
+        :func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` with
+        ``sparse_mla_top_k > 0``. The trtllm-gen kernel is closed-source CUBIN
+        (cannot dequant in-kernel), so we materialize the *selected* HIGGS
+        slots dictated by ``page_table`` into a compact BF16 buffer laid out
+        as ``(num_compact_pages, page_size, kv_cache_dim)``, then re-emit
+        ``block_tables`` pointing into that compact buffer.
+
+        Why this works: when ``sparse_mla_top_k > 0``, the trtllm kernel
+        treats each ``block_tables[b, t, k]`` value as a flat token index
+        ``flat_idx`` into a paged dense buffer of shape
+        ``(num_pages, page_size, kv_cache_dim)`` and reads
+        ``kv_cache[flat_idx // page_size, flat_idx % page_size, :]``. The
+        existing :meth:`get_higgs_selected_kv_buffer` already writes the
+        selected slots row-by-row into a compact ``(B*K, 1, kv_cache_dim)``
+        buffer with ``compact_page_table[b, k] = b * K + k`` (or ``-1`` for
+        invalid). Reshaping that compact buffer to
+        ``(B*K // page_size, page_size, kv_cache_dim)`` makes the indices
+        line up: the flat indices the kernel reads land in the right page,
+        row pair by construction.
+
+        Memory cost: ``batch * sparse_mla_top_k * 576 * 2 B`` (BF16) per
+        layer per step — ``B=128, K=2048 -> ~301 MiB`` reused across all
+        61 MoE layers via the shared ``_higgs_selected_buffer``. The dequant
+        cost is the same ``B*K`` HIGGS-slot inverse transforms the
+        flashmla_sparse / tokenspeed_mla HIGGS paths already pay; the only
+        new cost is the BF16-page-shape reshape (zero copies — same storage,
+        different stride view) and the kernel dispatch path.
+
+        # NOTE(ai-blaise #19): we materialize one BF16 slot per page_table
+        # entry rather than deduping repeated indices. K=2048 is the indexer
+        # top-k cap; in practice top-k is set to context length so there are
+        # few duplicates and the dedup pass would add overhead. The trtllm
+        # kernel reads every block_tables entry exactly once anyway, so a
+        # write-side dedup buys nothing.
+
+        # NOTE(ai-blaise #19): an alternative composition would have been
+        # to teach the trtllm CUBIN to consume HIGGS-packed slots directly
+        # (a custom fetch indirection). That kernel is closed-source so we
+        # cannot extend it; this sparse-materialize-then-call path is the
+        # tightest possible "compose, don't branch" answer for trtllm DSA.
+
+        Args:
+          layer_id: layer index into the per-layer KV buffer list.
+          page_table: ``(qo_len, sparse_mla_top_k)`` ``int32`` token-loc page
+            table from the indexer (``-1`` marks padding/invalid).
+          page_size: trtllm KV page size (must be 32 or 64; DSA uses 64).
+
+        Returns:
+          ``(kv_cache_paged, compact_page_table)`` where
+          ``kv_cache_paged`` has shape
+          ``(qo_len * sparse_mla_top_k // page_size, page_size, kv_cache_dim)``
+          BF16, and ``compact_page_table`` has shape
+          ``(qo_len, sparse_mla_top_k)`` ``int32`` (``-1`` preserved).
+        """
+        assert page_size in (32, 64), (
+            "trtllm DSA decode only supports page_size 32 or 64; "
+            f"got page_size={page_size}."
+        )
+        assert page_table.dim() == 2, (
+            f"page_table must be 2-D (qo_len, top_k); got {page_table.shape}."
+        )
+        total = page_table.numel()
+        if total % page_size != 0:
+            raise ValueError(
+                "HIGGS trtllm DSA path requires page_table.numel() "
+                f"({total}) to be a multiple of page_size ({page_size}). "
+                "The DSA indexer should pad top-k to a 64-aligned value."
+            )
+        kv_compact, compact_page_table = self.get_higgs_selected_kv_buffer(
+            layer_id,
+            page_table,
+            fp8_layout=False,
+        )
+        # kv_compact is (total, 1, kv_cache_dim); the underlying buffer is
+        # contiguous on the last two axes, so .view() to the paged layout
+        # is zero-copy.
+        kv_cache_paged = kv_compact.view(
+            total // page_size, page_size, self.kv_cache_dim
+        )
+        return kv_cache_paged, compact_page_table
+
     def forward_higgs_dense_2bit_mla_decode(
         self,
         layer_id: int,

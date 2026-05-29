@@ -502,8 +502,12 @@ def hisa_candidate_score_indexer_cache_nvfp4(
     candidate_indices = torch.empty(
         (q_values.shape[0], candidate_len), dtype=torch.int32, device=q_values.device
     )
-    if q_values.shape[1] > 8:
-        logits.zero_()
+    # iter1 candidate_score (n_heads > 8 branch) no longer atomicAdd-accumulates
+    # partial head_group dots into logits — every (cand, row) slot is now
+    # written exactly once (warp 0 writes the valid score; thread 0 writes
+    # -INFINITY in the invalid-token early-return). The legacy
+    # `if q_values.shape[1] > 8: logits.zero_()` zero-init kernel is therefore
+    # dead and has been dropped to save a per-call memset.
     _get_module_fast(
         torch.bfloat16, page_table.dtype, page_size
     ).hisa_candidate_score_indexer_cache_nvfp4(

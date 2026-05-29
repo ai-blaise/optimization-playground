@@ -716,6 +716,16 @@ __global__ void higgs_dense_2bit_dequant_const_codebook_kernel(
 // ─── Page-table dequant variant ─────────────────────────────────────────────
 // Mirrors TurboQuant's ``dequantize_page_table_selected_2p5_kernel``. The
 // page table indexes flat slots; rows with page < 0 are masked.
+//
+// Invalid-row early-exit (ai-blaise #19 iter2): when ``page < 0`` the row is
+// padding emitted by the DSA indexer (top-k slot beyond ``min(seq_len,
+// dsa_index_topk)``). The downstream consumer reads ``seq_lens[b]`` entries
+// per query and ignores the trailing pad block_table values, so we can drop
+// the FWHT_512 work and the per-row STG of 576 B BF16 entirely. The
+// ``compact_page_table[row] = -1`` write must still happen so reshape-based
+// callers see a consistent invalid marker. The branch is CTA-uniform (every
+// thread in the block reads the same ``page`` value), so no `__syncthreads`
+// in ``fwht_512_swizzled`` is reached by a partial set of threads.
 
 __global__ void higgs_dense_2bit_dequant_page_table_kernel(
     const uint8_t* __restrict__ compressed,
@@ -734,8 +744,9 @@ __global__ void higgs_dense_2bit_dequant_page_table_kernel(
   if (tid == 0) {
     compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
   }
+  if (page < 0) return;
 
-  const int64_t loc = page >= 0 ? static_cast<int64_t>(page) : 0;
+  const int64_t loc = static_cast<int64_t>(page);
   const uint8_t* slot = compressed + loc * compressed_stride_0;
   bf16_t* row_out = out + row * out_stride_0;
 
@@ -783,8 +794,9 @@ __global__ void higgs_dense_2bit_dequant_page_table_const_codebook_kernel(
   if (tid == 0) {
     compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
   }
+  if (page < 0) return;
 
-  const int64_t loc = page >= 0 ? static_cast<int64_t>(page) : 0;
+  const int64_t loc = static_cast<int64_t>(page);
   const uint8_t* slot = compressed + loc * compressed_stride_0;
   bf16_t* row_out = out + row * out_stride_0;
 
@@ -926,8 +938,9 @@ __global__ void higgs_dense_2bit_dequant_page_table_vec4_kernel(
   if (tid == 0) {
     compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
   }
+  if (page < 0) return;
 
-  const int64_t loc = page >= 0 ? static_cast<int64_t>(page) : 0;
+  const int64_t loc = static_cast<int64_t>(page);
   const uint8_t* slot = compressed + loc * compressed_stride_0;
   bf16_t* row_out = out + row * out_stride_0;
 
@@ -979,8 +992,9 @@ __global__ void higgs_dense_2bit_dequant_page_table_vec4_ldg_codebook_kernel(
   if (tid == 0) {
     compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
   }
+  if (page < 0) return;
 
-  const int64_t loc = page >= 0 ? static_cast<int64_t>(page) : 0;
+  const int64_t loc = static_cast<int64_t>(page);
   const uint8_t* slot = compressed + loc * compressed_stride_0;
   bf16_t* row_out = out + row * out_stride_0;
 
@@ -1059,8 +1073,9 @@ higgs_dense_2bit_dequant_page_table_pair_lanes_scale_broadcast_kernel(
   if (tid == 0) {
     compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
   }
+  if (page < 0) return;
 
-  const int64_t loc = page >= 0 ? static_cast<int64_t>(page) : 0;
+  const int64_t loc = static_cast<int64_t>(page);
   const uint8_t* slot = compressed + loc * compressed_stride_0;
   bf16_t* row_out = out + row * out_stride_0;
 
@@ -1199,7 +1214,15 @@ higgs_dense_2bit_dequant_saw_scalar2_coalesced_kernel(
   if (compact_page_table != nullptr && lane == 0) {
     compact_page_table[row] = raw_loc >= 0 ? static_cast<int32_t>(row) : -1;
   }
-  const int64_t loc = raw_loc >= 0 ? static_cast<int64_t>(raw_loc) : 0;
+  // ai-blaise #19 iter2: invalid-row early-exit. The DSA indexer pads
+  // top-k per query with -1 sentinels past min(seq_len, dsa_index_topk);
+  // downstream consumers honour seq_lens and never read those slots. The
+  // saw_scalar2 coalesced kernel assigns one warp per row so we can drop
+  // the per-row packed-store loop and rope copy without blocking other
+  // warps in the same block — no __syncthreads is reached in this kernel
+  // body, so a warp-uniform return is safe.
+  if (raw_loc < 0) return;
+  const int64_t loc = static_cast<int64_t>(raw_loc);
   const uint8_t* slot = compressed + loc * compressed_stride_0;
   bf16_t* row_out = out + row * out_stride_0;
 

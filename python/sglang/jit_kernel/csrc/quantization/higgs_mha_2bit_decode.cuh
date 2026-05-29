@@ -207,7 +207,6 @@ higgs_mha_2bit_decode_stage1_split_kernel(
                          + kv_head * mid_stride_1
                          + split * mid_stride_2;
 
-  __shared__ float smem128[kBlockThreads];
   __shared__ float smem512[4 * kBlockThreads];                     // 4-way FWHT scratch (2 KB)
   __shared__ float cb_smem[kCodebookSize * kPairDim];
   __shared__ bf16_t q_smem[kBlockH][kSmemRowStrideBF16];           // 4.2 KB
@@ -245,19 +244,31 @@ higgs_mha_2bit_decode_stage1_split_kernel(
     return;
   }
 
-  // Pre-FWHT all kBlockH Q heads into q_smem (scalar one at a time).
+  // Pre-FWHT all kBlockH Q heads into q_smem in groups of 4. The x4
+  // variant runs four FWHT_128s in lock-step under the same 3 syncs
+  // a scalar call needs, cutting prologue sync count from 4*kBlockH
+  // to 3*(kBlockH/4) + (kBlockH/4) (3 internal + 1 between-batch).
   __syncthreads();
-  for (int h = 0; h < kBlockH; ++h) {
-    const int q_head = q_head_base + h;
-    float qv = 0.0f;
-    if (h < active_h) {
-      const bf16_t* q_row = q + row * q_stride_0 + q_head * q_stride_1;
-      qv = bf16_to_float(q_row[tid]);
+  static_assert(kBlockH % 4 == 0, "kBlockH must be a multiple of 4");
+  for (int hb = 0; hb < kBlockH; hb += 4) {
+    float qv[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int h = hb + j;
+      const int q_head = q_head_base + h;
+      if (h < active_h) {
+        const bf16_t* q_row = q + row * q_stride_0 + q_head * q_stride_1;
+        qv[j] = bf16_to_float(q_row[tid]);
+      } else {
+        qv[j] = 0.0f;
+      }
     }
-    qv = fwht_128elem(qv, tid, smem128);
+    fwht_128elem_x4(qv, tid, smem512);
     __syncthreads();
-    qv *= kInvSqrtHeadDim;
-    q_smem[h][tid] = __float2bfloat16(qv);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      q_smem[hb + j][tid] = __float2bfloat16(qv[j] * kInvSqrtHeadDim);
+    }
   }
 
   const int warp_id = tid >> 5;

@@ -2507,8 +2507,29 @@ class DeepseekSparseAttnBackend(
             )
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
 
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
+        # The trtllm DSA kernel reads the dense paged KV cache via flat
+        # token indices in ``block_tables``. For dense BF16/FP8 pools the
+        # backing buffer can be reshaped in-place. For HIGGS-packed pools
+        # the slots are 258 B uint8 (256 packed indices + fp16 scale + 64
+        # B rope) and dequant must happen *before* the kernel runs; the
+        # trtllm-gen CUBIN is closed-source and cannot fetch + dequant
+        # in-kernel. We sparsely materialize the indexer-selected slots
+        # (B*K rows where K = sparse_mla_top_k) into a compact BF16 paged
+        # view + rewritten block_tables — see
+        # :meth:`HiggsDense2BitDSATokenToKVPool.get_higgs_selected_kv_buffer_trtllm`.
+        is_higgs_dense_pool = (
+            getattr(
+                self.token_to_kv_pool,
+                "higgs_dense_2bit_preset",
+                None,
+            )
+            == "eden2_16"
+        )
+        if not is_higgs_dense_pool:
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cache = k_cache.view(
+                -1, self.real_page_size, self.kv_cache_dim
+            ).unsqueeze(1)
 
         if merge_query:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2539,6 +2560,24 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
+        if is_higgs_dense_pool:
+            # NOTE(ai-blaise #19): the HIGGS sparse-materialize adapter
+            # writes a compact ``(qo_len * top_k, 1, kv_cache_dim)`` BF16
+            # buffer + rewritten compact_page_table whose flat indices
+            # land in the right (page_idx, slot_in_page) pair when
+            # reshaped to ``(num_compact_pages, page_size, kv_cache_dim)``.
+            kv_cache_paged, page_table_1 = (
+                self.token_to_kv_pool.get_higgs_selected_kv_buffer_trtllm(
+                    layer.layer_id,
+                    page_table_1,
+                    self.real_page_size,
+                )
+            )
+            # trtllm kernel expects 4-D kv_cache; add the kv_heads=1 axis.
+            kv = kv_cache_paged.unsqueeze(1)
+        else:
+            kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
@@ -2551,7 +2590,6 @@ class DeepseekSparseAttnBackend(
         _, num_heads, head_dim = q_all.shape
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
-        kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 

@@ -6,7 +6,6 @@ import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.dsa_indexer import call_indexer_topk
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -25,6 +24,7 @@ from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
@@ -155,7 +155,7 @@ class DeepseekMLAForwardMixin:
             and sum(forward_batch.extend_prefix_lens_cpu) > 0
         )
         if has_prefill_prefix:
-            token_to_kv_pool = forward_batch.token_to_kv_pool
+            token_to_kv_pool = get_token_to_kv_pool()
             token_to_kv_pool.prefetch_layersplit_kv_buffer(self.layer_id)
         if self.q_lora_rank is not None:
             q, latent_cache = (
@@ -235,7 +235,7 @@ class DeepseekMLAForwardMixin:
 
             # q_lora needed by indexer
             if self.use_dsa:
-                token_to_kv_pool = forward_batch.token_to_kv_pool
+                token_to_kv_pool = get_token_to_kv_pool()
                 full_kv_pool = getattr(token_to_kv_pool, "full_kv_pool", None)
                 uses_layersplit_kv = (
                     getattr(token_to_kv_pool, "layersplit_policy", None) is not None
@@ -290,21 +290,13 @@ class DeepseekMLAForwardMixin:
                     # piecewise capture we still go straight through the
                     # original call to avoid any extra buffer allocation
                     # on hot decode paths.
-                    if is_in_piecewise_cuda_graph():
-                        topk_indices = call_indexer_topk(
-                            x=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            indexer=self.indexer,
-                        )
-                    else:
-                        topk_indices = self.indexer(
-                            x=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=self.layer_id,
-                        )
+                    topk_indices = self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                    )
                 else:
                     # skip_topk reuses prev layer's indices; mirror into this
                     # layer's slot so the captured buffer matches what's used.
@@ -317,21 +309,13 @@ class DeepseekMLAForwardMixin:
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
                     if not self.skip_topk or prev_topk_indices is None:
-                        if is_in_piecewise_cuda_graph():
-                            topk_indices = call_indexer_topk(
-                                x=hidden_states,
-                                q_lora=q_lora,
-                                positions=positions,
-                                indexer=self.indexer,
-                            )
-                        else:
-                            topk_indices = self.indexer(
-                                x=hidden_states,
-                                q_lora=q_lora,
-                                positions=positions,
-                                forward_batch=forward_batch,
-                                layer_id=self.layer_id,
-                            )
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
                     else:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices

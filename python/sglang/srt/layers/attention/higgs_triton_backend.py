@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.triton_ops.higgs_decode_attention import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HiggsMHA2BitTokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -89,7 +90,7 @@ class HiggsTritonAttnBackend(TritonAttnBackend):
             # HIGGS pool computes its own per-row FP16 scale; drops
             # external k_scale/v_scale silently (see
             # HiggsMHA2BitTokenToKVPool.set_kv_buffer).
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            get_token_to_kv_pool().set_kv_buffer(
                 layer,
                 forward_batch.out_cache_loc,
                 k,

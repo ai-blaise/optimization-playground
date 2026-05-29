@@ -388,6 +388,27 @@ def fused_store_index_k_cache_nvfp4(
     ).fused_store_index_k_cache_nvfp4(key, index_k_with_scale, out_cache_loc)
 
 
+from sglang.srt.utils.custom_op import register_custom_op as _register_custom_op
+
+
+@_register_custom_op(mutates_args=["values", "scales"])
+def _quantize_indexer_q_nvfp4_op(
+    query: torch.Tensor,
+    values: torch.Tensor,
+    scales: torch.Tensor,
+    indices_dtype_idx: int,
+    page_size: int,
+) -> None:
+    # Dispatch on the indices dtype index because torch.library custom op
+    # schemas don't accept torch.dtype directly. Caller encodes int64=0,
+    # int32=1. Dynamo sees this op as one opaque node and never enters
+    # _get_module_fast (which dispatches to a JIT-compiled module).
+    indices_dtype = torch.int64 if indices_dtype_idx == 0 else torch.int32
+    _get_module_fast(query.dtype, indices_dtype, page_size).quantize_indexer_q_nvfp4(
+        query, values, scales
+    )
+
+
 @debug_kernel_api
 def quantize_indexer_q_nvfp4(
     query: torch.Tensor, indices_dtype: torch.dtype = torch.int64, page_size: int = 64
@@ -405,8 +426,9 @@ def quantize_indexer_q_nvfp4(
         device=query.device,
     )
     scales = torch.empty((query.shape[0],), dtype=torch.int32, device=query.device)
-    _get_module_fast(query.dtype, indices_dtype, page_size).quantize_indexer_q_nvfp4(
-        query, values, scales
+    indices_dtype_idx = 0 if indices_dtype == torch.int64 else 1
+    _quantize_indexer_q_nvfp4_op(
+        query, values, scales, indices_dtype_idx, page_size
     )
     return (
         values.view(*original_shape[:-1], original_shape[-1] // 2),

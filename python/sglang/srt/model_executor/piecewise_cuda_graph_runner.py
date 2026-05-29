@@ -150,6 +150,25 @@ def set_torch_compile_config():
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
 
+    # Pre-warm cache_once-wrapped helpers so the closure-cell `result_map`
+    # is non-empty BEFORE Dynamo first traces a function that calls them.
+    # Without this the empty-dict-vs-non-empty-dict guard fails on every
+    # subsequent call and triggers a recompile per layer per capture size.
+    try:
+        from sgl_kernel.utils import is_arch_support_pdl
+        is_arch_support_pdl()
+    except Exception:
+        pass
+
+    # capture_scalar_outputs lets Dynamo turn cpu_tensor.max().item() into a
+    # SymInt; without it the DSA indexer's seq-length checks become hard
+    # recompile triggers.
+    torch._dynamo.config.capture_scalar_outputs = True
+    torch._dynamo.config.capture_dynamic_output_shape_ops = True
+    # Suppress is the safety valve: Dynamo will fall back to eager on
+    # untraceable constructs instead of aborting piecewise capture.
+    torch._dynamo.config.suppress_errors = True
+
     if _is_musa:
         from sglang.srt.hardware_backend.musa.utils.patch_torch import (
             patch_fx_custom_device,
@@ -404,10 +423,32 @@ class PiecewiseCudaGraphRunner:
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_gpu=(
+                    torch.full(
+                        (self.dp_size,),
+                        num_tokens,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    if self.model_runner.server_args.enable_dp_attention
+                    else None
+                ),
+                global_num_tokens_for_logprob_gpu=(
+                    torch.full(
+                        (self.dp_size,),
+                        num_tokens,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    if self.model_runner.server_args.enable_dp_attention
+                    else None
+                ),
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
+                global_dp_buffer_len=(
+                    num_tokens * self.dp_size
+                    if self.model_runner.server_args.enable_dp_attention
+                    else None
+                ),
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
@@ -572,10 +613,32 @@ class PiecewiseCudaGraphRunner:
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_gpu=(
+                    torch.full(
+                        (self.dp_size,),
+                        num_tokens,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    if self.model_runner.server_args.enable_dp_attention
+                    else None
+                ),
+                global_num_tokens_for_logprob_gpu=(
+                    torch.full(
+                        (self.dp_size,),
+                        num_tokens,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    if self.model_runner.server_args.enable_dp_attention
+                    else None
+                ),
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
+                global_dp_buffer_len=(
+                    num_tokens * self.dp_size
+                    if self.model_runner.server_args.enable_dp_attention
+                    else None
+                ),
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,

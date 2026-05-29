@@ -1735,6 +1735,7 @@ class Scheduler(
 
     def init_batch_result_processor(self) -> None:
         self.batch_result_processor = SchedulerBatchResultProcessor(
+            scheduler=self,
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
             enable_overlap=self.enable_overlap,
@@ -3213,11 +3214,13 @@ class Scheduler(
 
                 with self._overlap_forward_isolation(batch):
                     # SMCWorker handles its own verified-id handoff and has
-                    # no future_indices; spec_v2 / non-spec use FutureIndices.
+                    # no future_indices; spec_v2 / non-spec pass the raw
+                    # req_pool_indices tensor directly (upstream removed
+                    # the FutureIndices wrapper class).
                     future_indices = (
                         None
                         if self.spec_algorithm.is_smc()
-                        else FutureIndices(indices=batch.req_pool_indices)
+                        else batch.req_pool_indices
                     )
 
                     # Spec_v2 fires on_publish mid-worker (between verify and
@@ -3267,10 +3270,7 @@ class Scheduler(
                 # real token from output_tokens_buf via the negated indices.
                 # SMC has no future_indices; the helper falls back to
                 # materializing input_ids from spec_info.verified_id.
-                self.future_map.set_input_ids_sentinel(
-                    batch,
-                    future_indices.indices if future_indices is not None else None,
-                )
+                self.future_map.set_input_ids_sentinel(batch, future_indices)
 
                 if batch.spec_algorithm.is_smc():
                     # SMC: store spec_info for overlap, but don't overwrite

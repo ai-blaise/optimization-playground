@@ -308,7 +308,6 @@ from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
@@ -336,13 +335,7 @@ if _is_cuda:
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         topk_result: torch.Tensor,
-        *,
-        q_fp8_scales: Optional[torch.Tensor] = None,
     ) -> None:
-        # NOTE(ai-blaise): `q_fp8_scales` lets NVFP4 indexer use this same
-        # PCG-friendly custom op. When provided, the indexer receives
-        # the (values, scales) tuple form it expects; otherwise FP8 flows
-        # through as a plain tensor.
         assert (
             _is_cuda
         ), "Internal error: piecewise CUDA graph is only supported on CUDA"
@@ -362,15 +355,11 @@ if _is_cuda:
             act_quant=act_quant,
             out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
         )
-        if q_fp8_scales is not None:
-            q_for_topk = (q_fp8[:extend_num_tokens], q_fp8_scales[:extend_num_tokens])
-        else:
-            q_for_topk = q_fp8[:extend_num_tokens]
         indexer._get_topk_ragged(
             False,
             forward_batch,
             layer_id,
-            q_for_topk,
+            q_fp8[:extend_num_tokens],
             weights,
             metadata,
             topk_result,
@@ -397,7 +386,7 @@ if _is_cuda:
         softmax_scale: float,
         q_scale: torch.Tensor,
     ) -> torch.Tensor:
-        out = torch.mm(x, weight.t()).to(torch.float32)
+        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
@@ -675,7 +664,7 @@ class Indexer(MultiPlatformOp):
     @staticmethod
     def _uses_nvfp4_indexer(forward_batch: ForwardBatch) -> bool:
         return (
-            getattr(get_token_to_kv_pool(), "indexer_quantization", None)
+            getattr(forward_batch.token_to_kv_pool, "indexer_quantization", None)
             == INDEXER_NVFP4_QUANT_METHOD
         )
 
@@ -690,7 +679,7 @@ class Indexer(MultiPlatformOp):
         if not can_use_dsa_nvfp4_indexer(
             query.dtype,
             forward_batch.out_cache_loc.dtype,
-            get_token_to_kv_pool().page_size,
+            forward_batch.token_to_kv_pool.page_size,
         ):
             raise RuntimeError(
                 "DSA Indexer NVFP4 was requested but the Blackwell NVFP4 "
@@ -699,7 +688,7 @@ class Indexer(MultiPlatformOp):
         q_values, q_scales = quantize_indexer_q_nvfp4(
             query,
             indices_dtype=forward_batch.out_cache_loc.dtype,
-            page_size=get_token_to_kv_pool().page_size,
+            page_size=forward_batch.token_to_kv_pool.page_size,
         )
         return (q_values, q_scales), None
 
@@ -762,7 +751,7 @@ class Indexer(MultiPlatformOp):
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
         if _is_cuda:
-            return torch.mm(x, self.weights_proj.weight.t()).to(torch.float32)
+            return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 
         weights, _ = self.weights_proj(x)
         if _is_hip:
@@ -1099,7 +1088,7 @@ class Indexer(MultiPlatformOp):
         block_kv = page_size
         num_heads_kv = 1
         head_dim_with_sf = (
-            get_token_to_kv_pool().indexer_cache_layout.token_bytes
+            forward_batch.token_to_kv_pool.indexer_cache_layout.token_bytes
         )
         kv_cache_fp8 = kv_cache_fp8.view(
             kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
@@ -1766,7 +1755,7 @@ class Indexer(MultiPlatformOp):
 
         if hisa_extend_ok and q_offset >= hisa_boundary_q:
             index_k_with_scale_buffer = (
-                get_token_to_kv_pool().get_index_k_with_scale_buffer(
+                forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
                     layer_id=layer_id
                 )
             )
@@ -1781,12 +1770,6 @@ class Indexer(MultiPlatformOp):
                 ke,
                 metadata,
             )
-            # If the caller (e.g. piecewise CUDA graph custom op) pre-allocated
-            # the output buffer, copy into it so the mutated buffer carries the
-            # HISA result. Otherwise return the freshly allocated tensor.
-            if topk_result is not None and result is not topk_result:
-                topk_result.copy_(result)
-                result = topk_result
             _hisa_profile_end(
                 "hisa_extend",
                 profile_start,
@@ -1803,7 +1786,7 @@ class Indexer(MultiPlatformOp):
 
         if hisa_nvfp4_extend_ok:
             index_k_with_scale_buffer = (
-                get_token_to_kv_pool().get_index_k_with_scale_buffer(
+                forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
                     layer_id=layer_id
                 )
             )
@@ -1816,11 +1799,6 @@ class Indexer(MultiPlatformOp):
                 weights,
                 metadata,
             )
-            # Same buffer-copy contract as the HISA FP8 path above so the
-            # PCG custom op writes propagate.
-            if topk_result is not None and result is not None and result is not topk_result:
-                topk_result.copy_(result)
-                result = topk_result
             if result is not None:
                 _hisa_profile_end(
                     "hisa_nvfp4_extend",
@@ -2389,7 +2367,7 @@ class Indexer(MultiPlatformOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
 
-        pool = get_token_to_kv_pool()
+        pool = forward_batch.token_to_kv_pool
         if not pool.layersplit_owns_layer(layer_id):
             pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return
@@ -2420,7 +2398,7 @@ class Indexer(MultiPlatformOp):
             get_global_server_args(),
             key.dtype,
             forward_batch.out_cache_loc.dtype,
-            get_token_to_kv_pool().page_size,
+            forward_batch.token_to_kv_pool.page_size,
             auto_compat_check=can_use_dsa_fused_store,
             auto_platform_ok=_is_cuda and (not _is_fp8_fnuz),
         ):
@@ -2749,27 +2727,21 @@ class Indexer(MultiPlatformOp):
                         not enable_dual_stream
                     ), "Internal error: piecewise CUDA graph should not be enabled with dual stream"
 
-                    # PCG fast path. The Tensor-only custom op signature is
-                    # extended with an optional q_fp8_scales kwarg so NVFP4
-                    # (values, scales) flows through alongside FP8.
-                    if isinstance(q_fp8, tuple):
-                        q_fp8_values, q_fp8_scales = q_fp8
-                    else:
-                        q_fp8_values = q_fp8
-                        q_fp8_scales = None
+                    # NVFP4 indexer returns q_fp8 as a (values, scales) tuple;
+                    # unwrap to the values tensor for shape/device queries.
+                    q_fp8_tensor = q_fp8[0] if isinstance(q_fp8, tuple) else q_fp8
                     topk_result = torch.full(
-                        (q_fp8_values.shape[0], self.index_topk),
+                        (q_fp8_tensor.shape[0], self.index_topk),
                         -1,
-                        device=q_fp8_values.device,
+                        device=q_fp8_tensor.device,
                         dtype=torch.int32,
                     )
                     k_cache_and_topk_result(
                         layer_id=layer_id,
                         key=key,
-                        q_fp8=q_fp8_values,
+                        q_fp8=q_fp8,
                         weights=weights,
                         topk_result=topk_result,
-                        q_fp8_scales=q_fp8_scales,
                     )
                 else:
                     topk_result = self._get_topk_ragged(

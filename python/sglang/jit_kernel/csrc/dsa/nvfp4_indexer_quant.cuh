@@ -3255,13 +3255,40 @@ __global__ void quantize_indexer_q_nvfp4(const __grid_constant__ NVFP4IndexerQua
 template <typename IndicesT, uint32_t kPageSize>
 __global__ void hisa_mean_pool_indexer_cache_nvfp4(
     const __grid_constant__ NVFP4HISAMeanPoolParam param) {
+  // iter2: cooperative SMEM staging of up to 2 contiguous pages per HISA block.
+  //
+  // iter1 (legacy) issued one byte-load per (thread, token, dim) directly out
+  // of HBM via load_nvfp4_value — 128 threads * up to 128 tokens of scattered
+  // reads.  At production shapes (batch=32, prefix=16384, max_blocks=128) this
+  // is 4096 CTAs each issuing ~16K random byte fetches.  L1/L2 absorb most of
+  // it, but the per-CTA HBM scatter still dominates.
+  //
+  // The HISA block layout guarantees that the (kBlockSize=128 tokens) span at
+  // most two contiguous logical pages (when kPageSize == 64).  We cooperatively
+  // bulk-load those pages into SMEM (8704 bytes total when kPageSize==64) with
+  // 16-byte vector loads, sync once, then each thread accumulates its mean by
+  // touching SMEM only.  The reduction loop becomes pure SMEM math.
+  //
+  // Correctness: bit-identical to iter1 modulo FP32 accumulation order. Each
+  // (batch, hisa_block, dim) is still summed across the same token_count
+  // tokens in the same order, only the source of each byte is now SMEM rather
+  // than HBM.  Invalid pages (page_id < 0) contribute 0 to the sum, same as
+  // iter1.
   constexpr int64_t kPageBytes = (kNVFP4ValueBytes + kScaleBytes) * kPageSize;
   constexpr uint32_t kBlockSize = 128;
-  const auto dim = threadIdx.x;
+  constexpr uint32_t kMaxPagesPerBlock =
+      (kBlockSize + kPageSize - 1) / kPageSize;  // 2 when kPageSize==64
+  constexpr uint32_t kStagedBytesPerPage =
+      kNVFP4ValueBytes * kPageSize + kScaleBytes * kPageSize;
+  constexpr uint32_t kTotalStagedBytes = kStagedBytesPerPage * kMaxPagesPerBlock;
+
+  __shared__ uint8_t smem_pages[kTotalStagedBytes];
+  __shared__ int32_t smem_page_ids[kMaxPagesPerBlock];
+
+  const auto tid = threadIdx.x;
   const auto hisa_block = blockIdx.x;
   const auto batch = blockIdx.y;
-  if (batch >= param.batch_size || hisa_block >= param.max_blocks ||
-      dim >= kIndexerHeadDim) {
+  if (batch >= param.batch_size || hisa_block >= param.max_blocks) {
     return;
   }
 
@@ -3271,20 +3298,71 @@ __global__ void hisa_mean_pool_indexer_cache_nvfp4(
       token_start < static_cast<uint32_t>(seq_len)
           ? min(kBlockSize, static_cast<uint32_t>(seq_len) - token_start)
           : 0u;
+  const auto logical_page_start = token_start / kPageSize;
+  const auto logical_page_end =
+      token_count == 0 ? logical_page_start
+                       : (token_start + token_count - 1) / kPageSize + 1;
+
+  // Resolve page IDs for the (up to 2) pages spanned by this HISA block. Done
+  // by the first kMaxPagesPerBlock threads; relevant page ids are then visible
+  // to all threads via SMEM after the first sync.
+  if (tid < kMaxPagesPerBlock) {
+    const uint32_t lp = logical_page_start + tid;
+    int32_t page_id = -1;
+    if (lp < logical_page_end) {
+      page_id = static_cast<int32_t>(
+          static_cast<const IndicesT*>(param.page_table)[batch * param.page_table_stride + lp]);
+    }
+    smem_page_ids[tid] = page_id;
+  }
+  __syncthreads();
+
+  // Cooperative bulk staging: for each spanned page we copy
+  //   smem_pages[p * kStagedBytesPerPage ... +kStagedBytesPerPage)
+  // from HBM via 16-byte uint4 loads.  When page_id < 0 the slot is zeroed,
+  // matching iter1's "skip invalid page" semantics (the per-dim sum simply
+  // sees zero contributions for those tokens).
+  constexpr uint32_t kVecBytes = sizeof(uint4);
+  static_assert(kStagedBytesPerPage % kVecBytes == 0,
+                "iter2 mean_pool requires page bytes divisible by 16");
+  constexpr uint32_t kVecsPerPage = kStagedBytesPerPage / kVecBytes;
+  for (uint32_t p = 0; p < kMaxPagesPerBlock; ++p) {
+    const int32_t page_id = smem_page_ids[p];
+    auto* smem_dst =
+        reinterpret_cast<uint4*>(smem_pages + p * kStagedBytesPerPage);
+    if (page_id >= 0) {
+      const auto* src = reinterpret_cast<const uint4*>(
+          static_cast<const uint8_t*>(param.cache) +
+          static_cast<int64_t>(page_id) * kPageBytes);
+      for (uint32_t v = tid; v < kVecsPerPage; v += kBlockSize) {
+        smem_dst[v] = src[v];
+      }
+    } else {
+      const uint4 zero = make_uint4(0, 0, 0, 0);
+      for (uint32_t v = tid; v < kVecsPerPage; v += kBlockSize) {
+        smem_dst[v] = zero;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (tid >= kIndexerHeadDim) {
+    return;
+  }
+  const auto dim = tid;
   float sum = 0.0f;
+  // Per-page strides inside the staged tile.
   for (uint32_t i = 0; i < token_count; ++i) {
     const auto token = token_start + i;
     const auto logical_page = token / kPageSize;
+    const auto local_page = logical_page - logical_page_start;
+    const int32_t page_id = smem_page_ids[local_page];
+    if (page_id < 0) continue;
     const auto offset = token & (kPageSize - 1);
-    const auto page =
-        static_cast<const IndicesT*>(param.page_table)[batch * param.page_table_stride +
-                                                       logical_page];
-    if (page < 0) continue;
-    const auto page_ptr =
-        static_cast<const uint8_t*>(param.cache) + static_cast<int64_t>(page) * kPageBytes;
-    const auto value_ptr = page_ptr + offset * kNVFP4ValueBytes;
-    const auto scale_ptr = reinterpret_cast<const uint32_t*>(
-        page_ptr + kNVFP4ValueBytes * kPageSize + offset * kScaleBytes);
+    const auto* page_smem = smem_pages + local_page * kStagedBytesPerPage;
+    const auto* value_ptr = page_smem + offset * kNVFP4ValueBytes;
+    const auto* scale_ptr = reinterpret_cast<const uint32_t*>(
+        page_smem + kNVFP4ValueBytes * kPageSize + offset * kScaleBytes);
     sum += load_nvfp4_value(value_ptr, scale_ptr, dim);
   }
   const auto out_idx =

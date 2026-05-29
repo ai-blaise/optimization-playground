@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -28,6 +29,15 @@ from sglang.srt.utils import next_power_of_2, set_weight_attrs
 logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsW4A4Nvfp4MoE"]
+
+# Env-var gate for the sgl-native non-swizzled FP4 quantize path on the
+# trtllm NVFP4 MoE deploy. Set SGLANG_USE_SGL_NVFP4_QUANT=1 to swap
+# flashinfer.fp4_quantize for sglang.jit_kernel.nvfp4.scaled_fp4_quant_linear.
+# Default is 0 (flashinfer) for now — flip to default-on once microbench
+# confirms parity at production batch sizes.
+_USE_SGL_NVFP4_QUANT_LINEAR = (
+    os.environ.get("SGLANG_USE_SGL_NVFP4_QUANT", "0") == "1"
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -268,6 +278,11 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
                 requires_grad=False,
             )
+
+            # Pre-sliced [:1] views to avoid re-slicing every decode step
+            # in apply_weights. Both fp4_quantize variants (flashinfer
+            # cute-dsl and sgl-native) require shape [1] global scales.
+            layer.w13_input_scale_quant_slice = layer.w13_input_scale_quant[:1]
         else:
             # swizzle weight scales
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -317,23 +332,37 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         if self.use_flashinfer_trtllm:
             from flashinfer import trtllm_fp4_block_scale_moe
 
-            from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-
             router_logits = topk_output.router_logits
             topk_config = topk_output.topk_config
 
             # global_scale must be shape [1] (strict in cute-dsl backend).
-            hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
-                x,
-                layer.w13_input_scale_quant[:1],
-                self.group_size,  # sf_vec_size
-                False,  # use_ue8m0
-                False,  # is_sf_swizzled_layout
-            )
-            hs_fp4 = hs_fp4_bytes.reshape(x.shape[0], x.shape[1] // 2)
-            hs_scale = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
-                *hs_sf_bytes.shape[:-1], -1
-            )
+            # Pre-sliced [:1] view of w13_input_scale_quant is cached on
+            # the layer at load time (process_weights_after_loading) so
+            # we don't repeat the slice op every step.
+            if _USE_SGL_NVFP4_QUANT_LINEAR:
+                # Sglang-native non-swizzled NVFP4 quantize. Output layouts
+                # match flashinfer's is_sf_swizzled_layout=False path.
+                from sglang.jit_kernel.nvfp4 import scaled_fp4_quant_linear
+
+                hs_fp4, hs_scale = scaled_fp4_quant_linear(
+                    x, layer.w13_input_scale_quant_slice
+                )
+            else:
+                from sglang.srt.layers.quantization.fp4_utils import (
+                    fp4_quantize,
+                )
+
+                hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
+                    x,
+                    layer.w13_input_scale_quant_slice,
+                    self.group_size,  # sf_vec_size
+                    False,  # use_ue8m0
+                    False,  # is_sf_swizzled_layout
+                )
+                hs_fp4 = hs_fp4_bytes.reshape(x.shape[0], x.shape[1] // 2)
+                hs_scale = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
+                    *hs_sf_bytes.shape[:-1], -1
+                )
 
             correction_bias = (
                 None

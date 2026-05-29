@@ -826,6 +826,177 @@ __global__ void higgs_dense_2bit_dequant_page_table_const_codebook_kernel(
   row_out[tid] = __float2bfloat16(result);
 }
 
+// ─── FP8 page-table dequant variant ─────────────────────────────────────────
+// ai-blaise #19 iter3: write FP8 (e4m3) instead of BF16 to feed the trtllm-gen
+// sparse-MLA cubin set's ``QkvE4m3OBfloat16`` variants (48 cubins available in
+// flashinfer 0.6.7.post3, gated on ``kv_cache.dtype == float8_e4m3fn``).
+//
+// Output row layout (576 B total, vs 1152 B for BF16):
+//   row_out[0..511]   = 512 B FP8 latent  (one lane writes one element)
+//   row_out[512..575] = 64  B FP8 rope    (first warp converts from BF16)
+//
+// Per-element quantization: the kernel applies ``inv_kv_scale`` as a
+// multiplicative scale before the FP8 cast so the downstream attention
+// kernel can pass ``k_scale = kv_scale`` via ``bmm1_scale`` and recover the
+// original BF16-range values. The HIGGS lattice scale ``scale_h`` already
+// captures per-token magnitude, so a single per-tensor ``inv_kv_scale``
+// (passed at kernel call time, conservative-bound at startup) suffices.
+// Setting ``inv_kv_scale = 1.0`` and ``k_scale = 1.0`` matches the FP8
+// baseline path's ``mla_quantize_and_rope_for_fp8`` behaviour with
+// ``quant_scale_kv = 1.0``.
+//
+// Memory traffic:
+//   BF16 write  : 128 * 2048 * 576 B BF16 = 301.99 MiB / layer
+//   FP8 write   : 128 * 2048 * 576 B FP8  = 151.00 MiB / layer (-50%)
+//   Kernel read : 128 * 2048 * 576 B FP8  = 151.00 MiB / layer (-50%)
+//   Round-trip  : 302 MiB / layer (vs 604 MiB BF16) — closes ~6 ms of
+//                 the ~12.3 ms HBM-bound TPOT bottleneck.
+
+__global__ void higgs_dense_2bit_dequant_page_table_fp8_kernel(
+    const uint8_t* __restrict__ compressed,
+    const int32_t* __restrict__ page_table,
+    fp8_e4m3_t* __restrict__ out,
+    int32_t* __restrict__ compact_page_table,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0,
+    float inv_kv_scale) {
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= num_rows) return;
+
+  const int32_t page = page_table[row];
+  if (tid == 0) {
+    compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
+  }
+  if (page < 0) return;
+
+  const int64_t loc = static_cast<int64_t>(page);
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  fp8_e4m3_t* row_out = out + row * out_stride_0;
+
+  __shared__ float buf[kLatentDim];
+
+  // Rope tile: 64 BF16 elements at slot[kPackedBytes + kNormBytes = 130];
+  // the slot is uint8-aligned (compressed_stride_0 = 258), so the rope
+  // payload is byte-aligned not bf16-aligned. Stage through a local 8 B
+  // uint8 buffer to avoid misaligned-load faults, then reinterpret as
+  // bf16x2 and downcast inline to FP8. 16 lanes × 4 elements = 64 BF16
+  // in, 64 FP8 out (64 B written, vs 128 B BF16).
+  if (tid < 16) {
+    const uint8_t* slot_rope = slot + kPackedBytes + kNormBytes;
+    fp8_e4m3_t* rope_out = row_out + kLatentDim;
+    const int base = tid * 4;
+    uint8_t bf16_bytes[8];
+    memcpy(bf16_bytes, slot_rope + base * 2, 8);
+    const bf16x2_t rope_pair0 =
+        *reinterpret_cast<const bf16x2_t*>(bf16_bytes);
+    const bf16x2_t rope_pair1 =
+        *reinterpret_cast<const bf16x2_t*>(bf16_bytes + 4);
+    // Apply inv_kv_scale via FP32 path; bf16 → fp32 → ×inv_kv_scale → fp8.
+    const float2 r0 = __bfloat1622float2(rope_pair0);
+    const float2 r1 = __bfloat1622float2(rope_pair1);
+    const float2 r0_scaled =
+        make_float2(r0.x * inv_kv_scale, r0.y * inv_kv_scale);
+    const float2 r1_scaled =
+        make_float2(r1.x * inv_kv_scale, r1.y * inv_kv_scale);
+    fp8x2_e4m3_t p0 = __nv_fp8x2_e4m3(r0_scaled);
+    fp8x2_e4m3_t p1 = __nv_fp8x2_e4m3(r1_scaled);
+    // 4 B write — also byte-aligned, stage through a local uint8 buffer.
+    uint16_t out_bytes[2];
+    memcpy(out_bytes, &p0, 2);
+    memcpy(out_bytes + 1, &p1, 2);
+    memcpy(rope_out + base, out_bytes, 4);
+  }
+
+  const int pair_idx = tid >> 1;
+  const int byte_idx = pair_idx >> 1;
+  const uint8_t packed = slot[byte_idx];
+  const uint32_t cb_idx = static_cast<uint32_t>(
+      (pair_idx & 1) ? (packed >> 4) : (packed & 0x0F));
+
+  const int coord = tid & 1;
+  const float g = __ldg(&codebook[cb_idx * kPairDim + coord]);
+  const half scale_h =
+      *reinterpret_cast<const half*>(slot + kPackedBytes);
+  const float scale = __half2float(scale_h);
+
+  const float rot_recon = scale * g;
+  const float result = fwht_512_swizzled(rot_recon, buf) * kInvSqrtLatentDim;
+  // Scale into FP8 range and saturating cast. Per-tensor inv_kv_scale folds
+  // the downstream attention BMM1 scale absorption.
+  row_out[tid] = __nv_fp8_e4m3(result * inv_kv_scale);
+}
+
+__global__ void higgs_dense_2bit_dequant_page_table_fp8_const_codebook_kernel(
+    const uint8_t* __restrict__ compressed,
+    const int32_t* __restrict__ page_table,
+    fp8_e4m3_t* __restrict__ out,
+    int32_t* __restrict__ compact_page_table,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0,
+    float inv_kv_scale) {
+  (void)codebook;
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= num_rows) return;
+
+  const int32_t page = page_table[row];
+  if (tid == 0) {
+    compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
+  }
+  if (page < 0) return;
+
+  const int64_t loc = static_cast<int64_t>(page);
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  fp8_e4m3_t* row_out = out + row * out_stride_0;
+
+  __shared__ float buf[kLatentDim];
+
+  if (tid < 16) {
+    const uint8_t* slot_rope = slot + kPackedBytes + kNormBytes;
+    fp8_e4m3_t* rope_out = row_out + kLatentDim;
+    const int base = tid * 4;
+    uint8_t bf16_bytes[8];
+    memcpy(bf16_bytes, slot_rope + base * 2, 8);
+    const bf16x2_t rope_pair0 =
+        *reinterpret_cast<const bf16x2_t*>(bf16_bytes);
+    const bf16x2_t rope_pair1 =
+        *reinterpret_cast<const bf16x2_t*>(bf16_bytes + 4);
+    const float2 r0 = __bfloat1622float2(rope_pair0);
+    const float2 r1 = __bfloat1622float2(rope_pair1);
+    const float2 r0_scaled =
+        make_float2(r0.x * inv_kv_scale, r0.y * inv_kv_scale);
+    const float2 r1_scaled =
+        make_float2(r1.x * inv_kv_scale, r1.y * inv_kv_scale);
+    fp8x2_e4m3_t p0 = __nv_fp8x2_e4m3(r0_scaled);
+    fp8x2_e4m3_t p1 = __nv_fp8x2_e4m3(r1_scaled);
+    uint16_t out_bytes[2];
+    memcpy(out_bytes, &p0, 2);
+    memcpy(out_bytes + 1, &p1, 2);
+    memcpy(rope_out + base, out_bytes, 4);
+  }
+
+  const int pair_idx = tid >> 1;
+  const int byte_idx = pair_idx >> 1;
+  const uint8_t packed = slot[byte_idx];
+  const uint32_t cb_idx = static_cast<uint32_t>(
+      (pair_idx & 1) ? (packed >> 4) : (packed & 0x0F));
+
+  const int coord = tid & 1;
+  const float g = eden2_16_codebook_value(cb_idx, coord);
+  const half scale_h =
+      *reinterpret_cast<const half*>(slot + kPackedBytes);
+  const float scale = __half2float(scale_h);
+
+  const float rot_recon = scale * g;
+  const float result = fwht_512_swizzled(rot_recon, buf) * kInvSqrtLatentDim;
+  row_out[tid] = __nv_fp8_e4m3(result * inv_kv_scale);
+}
+
 // ─── Opt-in vec4/shared-codebook dequant candidates ────────────────────────
 // B200 measurement variants only. These keep the incumbent slot layout and
 // output contract unchanged while reducing redundant packed-byte loads: one
@@ -2464,6 +2635,134 @@ struct HiggsDense2BitDequantPageTableConstCodebookKernel {
         num_rows,
         compressed_stride_0.unwrap(),
         out_stride_0.unwrap());
+  }
+};
+
+// ─── FP8 page-table dequant launchers ──────────────────────────────────────
+// ai-blaise #19 iter3: emit fp8_e4m3 (576 B/row) for the trtllm-gen
+// sparse-MLA FP8 cubin path. ``out_stride_0`` is in fp8_e4m3 elements
+// (1 element = 1 byte), so out shape is ``(N, 1, kKvDim)`` with element
+// dtype ``fp8_e4m3_t`` and total per-row payload of 576 B.
+
+struct HiggsDense2BitDequantPageTableFp8Kernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView compact_page_table,
+      tvm::ffi::TensorView codebook,
+      double inv_kv_scale) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto B = SymbolicSize{"num_query_rows"};
+    auto K = SymbolicSize{"topk"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(compact_page_table);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = B.unwrap() * K.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_dequant_page_table_fp8_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<fp8_e4m3_t*>(out.data_ptr()),
+        static_cast<int32_t*>(compact_page_table.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap(),
+        static_cast<float>(inv_kv_scale));
+  }
+};
+
+struct HiggsDense2BitDequantPageTableFp8ConstCodebookKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView compact_page_table,
+      tvm::ffi::TensorView codebook,
+      double inv_kv_scale) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto B = SymbolicSize{"num_query_rows"};
+    auto K = SymbolicSize{"topk"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(compact_page_table);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = B.unwrap() * K.unwrap();
+    if (num_rows == 0) return;
+
+    LaunchKernel(num_rows, kLatentDim, device.unwrap())(
+        higgs_dense_2bit_dequant_page_table_fp8_const_codebook_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<fp8_e4m3_t*>(out.data_ptr()),
+        static_cast<int32_t*>(compact_page_table.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap(),
+        static_cast<float>(inv_kv_scale));
   }
 };
 

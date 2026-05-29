@@ -2538,6 +2538,15 @@ class DeepseekSparseAttnBackend(
             )
             == "eden2_16"
         )
+        # ai-blaise #19 iter3 vector A: enable the FP8 sparse-MLA cubin
+        # path. Halves the HIGGS dequant write traffic and the trtllm-gen
+        # KV read traffic to feed the kernel (302 MiB/step round-trip vs
+        # 604 MiB BF16). Closes ~6 ms of the ~12.3 ms HBM-bound gap.
+        higgs_trtllm_fp8 = (
+            is_higgs_dense_pool
+            and not is_prefill
+            and envs.SGLANG_HIGGS_DSA_TRTLLM_FP8.get()
+        )
         if not is_higgs_dense_pool:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             kv_cache = k_cache.view(
@@ -2552,6 +2561,17 @@ class DeepseekSparseAttnBackend(
             q_all = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        if higgs_trtllm_fp8:
+            # HIGGS path enters _forward_trtllm with a BF16-merged q (the
+            # FP8 ``kv_cache_dtype`` branch above is gated on the *pool's*
+            # FP8 dtype, which the HIGGS pool reports as BF16 for its
+            # dequant output). We saturating-cast the merged q to FP8
+            # here so the trtllm-gen kernel selector picks the FP8
+            # sparse-MLA cubin (matching the FP8 KV materialization).
+            # Per-tensor q_scale = 1.0; the cubin reads ``bmm1_scale``
+            # for fused scale handling.
+            q_all = q_all.to(torch.float8_e4m3fn)
 
         # Align topk_indices with q dimensions
         if topk_indices is not None:
@@ -2579,11 +2599,21 @@ class DeepseekSparseAttnBackend(
             # buffer + rewritten compact_page_table whose flat indices
             # land in the right (page_idx, slot_in_page) pair when
             # reshaped to ``(num_compact_pages, page_size, kv_cache_dim)``.
+            #
+            # ai-blaise #19 iter3: when ``higgs_trtllm_fp8`` is set the
+            # adapter emits FP8 e4m3 (576 B/row vs 1152 B/row BF16).
+            higgs_fp8_inv_kv_scale = (
+                envs.SGLANG_HIGGS_DSA_TRTLLM_FP8_INV_KV_SCALE.get()
+                if higgs_trtllm_fp8
+                else 1.0
+            )
             kv_cache_paged, page_table_1 = (
                 self.token_to_kv_pool.get_higgs_selected_kv_buffer_trtllm(
                     layer.layer_id,
                     page_table_1,
                     self.real_page_size,
+                    fp8_layout=higgs_trtllm_fp8,
+                    fp8_inv_kv_scale=higgs_fp8_inv_kv_scale,
                 )
             )
             # trtllm kernel expects 4-D kv_cache; add the kv_heads=1 axis.
@@ -2597,6 +2627,14 @@ class DeepseekSparseAttnBackend(
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
         )
+        # ai-blaise #19 iter3: when HIGGS FP8 dequant applies inv_kv_scale
+        # multiplicatively before the FP8 cast, the kernel-side BMM1 must
+        # divide by the same factor to recover original-range values.
+        # bmm1_scale = q_scale * k_scale * sm_scale (= layer.scaling); we
+        # fold the inverse into k_scale.
+        if higgs_trtllm_fp8:
+            higgs_inv_kv_scale = envs.SGLANG_HIGGS_DSA_TRTLLM_FP8_INV_KV_SCALE.get()
+            k_scale = k_scale / float(higgs_inv_kv_scale)
         bmm1_scale = q_scale * k_scale * layer.scaling
 
         batch_size = page_table_1.shape[0]

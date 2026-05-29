@@ -139,6 +139,16 @@ def _jit_higgs_dense_2bit_module() -> "Module":
                 "higgs_dense_2bit_detail::"
                 "HiggsDense2BitDequantPageTablePairLanesScaleBroadcastKernel::run",
             ),
+            (
+                "dequantize_higgs_dense_2bit_page_table_fp8",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitDequantPageTableFp8Kernel::run",
+            ),
+            (
+                "dequantize_higgs_dense_2bit_page_table_fp8_const_codebook",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitDequantPageTableFp8ConstCodebookKernel::run",
+            ),
         ],
     )
 
@@ -403,6 +413,64 @@ def dequantize_higgs_dense_2bit_page_table(
         out,
         compact_page_table,
         codebook.contiguous(),
+    )
+
+
+@debug_kernel_api
+def dequantize_higgs_dense_2bit_page_table_fp8(
+    compressed: torch.Tensor,
+    page_table: torch.Tensor,
+    out: torch.Tensor,
+    compact_page_table: torch.Tensor,
+    codebook: torch.Tensor,
+    inv_kv_scale: float = 1.0,
+) -> None:
+    """FP8 page-table variant of :func:`dequantize_higgs_dense_2bit_page_table`.
+
+    ai-blaise #19 iter3: writes FP8 e4m3 (576 B/row) instead of BF16
+    (1152 B/row), halving the HBM round-trip for the trtllm-gen sparse-MLA
+    FP8 cubin path. The kernel applies a per-tensor ``inv_kv_scale``
+    before the saturating FP8 cast; downstream attention should pass
+    ``k_scale = 1 / inv_kv_scale`` via ``bmm1_scale`` to recover the
+    original-range BMM1 inputs.
+
+    Args:
+      compressed: ``(num_slots, 1, 258)`` ``uint8`` packed slots.
+      page_table: ``(B, K)`` ``int32`` slot indices (-1 marks invalid).
+      out: ``(B*K, 1, 576)`` ``torch.float8_e4m3fn`` destination.
+      compact_page_table: ``(B, K)`` ``int32`` written so that valid rows
+        map to themselves and invalid rows map to -1.
+      codebook: ``(16, 2)`` ``float32`` EDEN2-16 lattice.
+      inv_kv_scale: per-tensor scale applied before the FP8 cast. 1.0 by
+        default (saturating cast).
+    """
+    assert compressed.is_cuda
+    assert page_table.is_cuda
+    assert out.is_cuda
+    assert compact_page_table.is_cuda
+    assert compressed.dtype == torch.uint8
+    assert page_table.dtype == torch.int32
+    assert compact_page_table.dtype == torch.int32
+    assert out.dtype == torch.float8_e4m3fn
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_module()
+    candidate = get_higgs_dense_2bit_b200_candidate()
+    # FP8 variants currently exist for the page_table_kernel (codebook
+    # via __ldg) and const_codebook (compile-time codebook constants).
+    # Mirror the BF16 picker for the const_codebook subset; everything
+    # else falls back to the codebook-LDG FP8 kernel.
+    if candidate.page_table_dequant_variant == "const_codebook":
+        kernel = module.dequantize_higgs_dense_2bit_page_table_fp8_const_codebook
+    else:
+        kernel = module.dequantize_higgs_dense_2bit_page_table_fp8
+    kernel(
+        compressed.contiguous(),
+        page_table,
+        out,
+        compact_page_table,
+        codebook.contiguous(),
+        float(inv_kv_scale),
     )
 
 

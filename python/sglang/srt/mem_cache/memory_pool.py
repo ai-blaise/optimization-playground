@@ -52,6 +52,7 @@ from sglang.jit_kernel.turboquant_dense_mla_decode import (
 from sglang.jit_kernel.higgs_dense_2bit import (
     dequantize_higgs_dense_2bit,
     dequantize_higgs_dense_2bit_page_table,
+    dequantize_higgs_dense_2bit_page_table_fp8,
     store_higgs_dense_2bit,
 )
 from sglang.jit_kernel.higgs_dense_2bit_mla_decode import (
@@ -3537,6 +3538,10 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
                     )
 
         self._higgs_selected_buffer: Optional[torch.Tensor] = None
+        # ai-blaise #19 iter3: separate FP8 scratch for the trtllm-gen FP8
+        # sparse-MLA cubin path (Vector A). Reused across MoE layers like
+        # the BF16 sibling buffer above.
+        self._higgs_selected_buffer_fp8: Optional[torch.Tensor] = None
         self._higgs_compact_page_table: Optional[torch.Tensor] = None
         fp16_bytes = (self.kv_lora_rank + self.qk_rope_head_dim) * dtype_bytes
         logger.info(
@@ -3586,16 +3591,19 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
         layer_id: int,
         page_table: torch.Tensor,
         fp8_layout: bool = False,
+        fp8_inv_kv_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Materialize the latent+rope view for a page_table-indexed selection.
 
-        Returns ``(kv_cache, compact_page_table)``. Output is BF16 latent+rope
-        of width ``kv_lora_rank + qk_rope_head_dim`` (i.e. ``kv_cache_dim``).
-        ``fp8_layout`` is accepted for API symmetry with TurboQuant but is
-        not yet supported on the HIGGS path — falls through to the BF16
-        path. This matches the early-stage rollout: HIGGS is targeting
-        ``flashmla_sparse`` / ``tilelang`` first; ``flashmla_kv`` FP8 will
-        come once the codec is proven in production.
+        Returns ``(kv_cache, compact_page_table)``. Output dtype:
+          * ``fp8_layout=False`` (default): BF16, width ``kv_cache_dim``.
+          * ``fp8_layout=True``: ``torch.float8_e4m3fn``, width
+            ``kv_cache_dim``. ai-blaise #19 iter3 vector A path — feeds the
+            trtllm-gen sparse-MLA ``QkvE4m3OBfloat16`` cubin set with a
+            576 B/row buffer (vs 1152 B/row BF16, -50% HBM traffic). The
+            kernel applies ``fp8_inv_kv_scale`` as a per-tensor multiplier
+            before the saturating FP8 cast; downstream attention should
+            pass ``k_scale = 1 / fp8_inv_kv_scale`` via ``bmm1_scale``.
         """
         if not self._uses_higgs_layer(layer_id):
             layer_buffer = self._get_layersplit_kv_buffer(layer_id)
@@ -3609,6 +3617,33 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
             and page_table.is_contiguous()
         ):
             if (
+                self._higgs_compact_page_table is None
+                or self._higgs_compact_page_table.shape != page_table.shape
+            ):
+                self._higgs_compact_page_table = torch.empty_like(page_table)
+            if fp8_layout:
+                # FP8 fast path: half the HBM traffic (576 vs 1152 B/row).
+                if (
+                    self._higgs_selected_buffer_fp8 is None
+                    or self._higgs_selected_buffer_fp8.shape[0]
+                    < page_table.numel()
+                ):
+                    self._higgs_selected_buffer_fp8 = torch.empty(
+                        (page_table.numel(), 1, self.kv_cache_dim),
+                        dtype=torch.float8_e4m3fn,
+                        device=self.device,
+                    )
+                kv_cache = self._higgs_selected_buffer_fp8[: page_table.numel()]
+                dequantize_higgs_dense_2bit_page_table_fp8(
+                    layer_buffer,
+                    page_table,
+                    kv_cache,
+                    self._higgs_compact_page_table,
+                    self.higgs_codec.codebook,
+                    fp8_inv_kv_scale,
+                )
+                return kv_cache, self._higgs_compact_page_table
+            if (
                 self._higgs_selected_buffer is None
                 or self._higgs_selected_buffer.shape[0] < page_table.numel()
             ):
@@ -3617,11 +3652,6 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
                     dtype=self.dtype,
                     device=self.device,
                 )
-            if (
-                self._higgs_compact_page_table is None
-                or self._higgs_compact_page_table.shape != page_table.shape
-            ):
-                self._higgs_compact_page_table = torch.empty_like(page_table)
             kv_cache = self._higgs_selected_buffer[: page_table.numel()]
             dequantize_higgs_dense_2bit_page_table(
                 layer_buffer,
@@ -3639,6 +3669,10 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
             layer_buffer[flat_loc],
             self.dtype,
         )
+        if fp8_layout:
+            kv_cache = (kv_cache.float() * fp8_inv_kv_scale).to(
+                torch.float8_e4m3fn
+            )
         compact_page_table = torch.arange(
             page_table.numel(),
             dtype=page_table.dtype,
@@ -3652,6 +3686,8 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
         layer_id: int,
         page_table: torch.Tensor,
         page_size: int,
+        fp8_layout: bool = False,
+        fp8_inv_kv_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """trtllm DSA decode view of the HIGGS-packed latent+rope cache.
 
@@ -3783,11 +3819,15 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
         kv_compact, compact_page_table = self.get_higgs_selected_kv_buffer(
             layer_id,
             page_table,
-            fp8_layout=False,
+            fp8_layout=fp8_layout,
+            fp8_inv_kv_scale=fp8_inv_kv_scale,
         )
         # kv_compact is (total, 1, kv_cache_dim); the underlying buffer is
         # contiguous on the last two axes, so .view() to the paged layout
-        # is zero-copy.
+        # is zero-copy. ai-blaise #19 iter3: in FP8 mode kv_compact is
+        # ``torch.float8_e4m3fn`` at 576 B/row (vs 1152 B/row BF16); the
+        # trtllm-gen ``QkvE4m3OBfloat16`` cubin is selected automatically
+        # by the kernel launcher based on ``kv_cache.dtype``.
         kv_cache_paged = kv_compact.view(
             total // page_size, page_size, self.kv_cache_dim
         )

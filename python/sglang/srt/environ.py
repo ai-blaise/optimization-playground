@@ -508,6 +508,20 @@ class Envs:
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
 
+    # HIGGS dense 2-bit + trtllm DSA decode FP8 sparse-materialize path
+    # (ai-blaise #19 iter3 vector A). When set, the HIGGS sparse-materialize
+    # adapter emits FP8 (e4m3) instead of BF16 (576 vs 1152 B/row, -50%
+    # HBM traffic), and the query is FP8-quantized so the trtllm-gen
+    # ``QkvE4m3OBfloat16`` sparse-MLA cubin set is selected. Saves ~6 ms
+    # TPOT on the 12.3 ms BF16-bound materialization round-trip.
+    SGLANG_HIGGS_DSA_TRTLLM_FP8 = EnvBool(False)
+    # Per-tensor scale applied before the FP8 cast in the HIGGS dequant
+    # kernel. The downstream attention's ``bmm1_scale`` then multiplies
+    # by ``1/SGLANG_HIGGS_DSA_TRTLLM_FP8_INV_KV_SCALE`` to recover the
+    # original BMM1 magnitudes. Default 1.0 → saturating cast (HIGGS
+    # decompress output is post-norm so typically fits in [-448, 448]).
+    SGLANG_HIGGS_DSA_TRTLLM_FP8_INV_KV_SCALE = EnvFloat(1.0)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 

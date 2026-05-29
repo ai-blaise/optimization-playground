@@ -39,6 +39,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
+    CompressedTensorsHiggsDense2BitMoE,
     CompressedTensorsLinearScheme,
     CompressedTensorsMoEScheme,
     CompressedTensorsMxInt4MoE,
@@ -525,6 +526,30 @@ class CompressedTensorsConfig(QuantizationConfig):
         # All conditions satisfied.
         return True
 
+    def _is_higgs_2bit_moe(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        """Detect a HIGGS dense 2-bit MoE expert-weight quantization.
+
+        HIGGS expert-weight checkpoints expose ``num_bits=2``,
+        ``type=FLOAT`` weights with a tensor-group strategy (one FWHT
+        block per row) and either ``input_quant is None`` (we re-quant
+        activations to NVFP4 at runtime) or a matching 4-bit FLOAT
+        activation declaration. See
+        ``compressed_tensors_higgs_dense_2bit_moe.py``.
+        """
+        if weight_quant is None:
+            return False
+        is_2_bit_float = (
+            weight_quant.num_bits == 2
+            and weight_quant.type == QuantizationType.FLOAT
+        )
+        is_symmetric = weight_quant.symmetric
+        is_tensor_group = (
+            weight_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
+        )
+        return is_2_bit_float and is_symmetric and is_tensor_group
+
     def _is_fp4a4_nvfp4(
         self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ):
@@ -772,6 +797,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ):
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+        elif self._is_higgs_2bit_moe(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsHiggsDense2BitMoE")
+            return CompressedTensorsHiggsDense2BitMoE()
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()

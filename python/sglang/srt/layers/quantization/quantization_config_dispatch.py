@@ -61,6 +61,7 @@ TURBOQUANT_DENSE_QUANT_METHOD = "turboquant_dense"
 DEFAULT_TURBOQUANT_DENSE_KV_PRESET = "latent_2p5bit_nc"
 HIGGS_DENSE_2BIT_QUANT_METHOD = "higgs_dense_2bit"
 HIGGS_MHA_2BIT_QUANT_METHOD = "higgs_mha_2bit"
+HIGGS_DENSE_2BIT_MOE_QUANT_METHOD = "higgs_dense_2bit_moe"
 DEFAULT_DSA_INDEXCACHE_FREQ = 4
 DEFAULT_NSA_INDEXCACHE_FREQ = DEFAULT_DSA_INDEXCACHE_FREQ
 SUPPORTED_CONFIG_INDEXER_MODES = ("vanilla", "indexcache")
@@ -189,6 +190,66 @@ def _maybe_apply_higgs_dense_2bit(server_args: Any, quant_cfg: Dict[str, Any]) -
         "quantization_config.kv_cache_scheme.",
         candidate.name,
     )
+
+
+def _maybe_apply_higgs_dense_2bit_moe(
+    server_args: Any, quant_cfg: Dict[str, Any]
+) -> None:
+    """Promote a HIGGS 2-bit ``expert_weight_scheme`` declaration onto args.
+
+    Recognised JSON shape::
+
+        {
+          "expert_weight_scheme": {
+            "quant_method": "higgs_dense_2bit_moe",
+            "block_size": 0  # optional, 0 = one FWHT block per row
+          }
+        }
+
+    Effect: sets the optional
+    ``server_args.enable_higgs_dense_2bit_moe = True`` flag so the
+    weight-loader's scheme detection upgrades the W4A4 NVFP4 MoE path
+    to :class:`CompressedTensorsHiggsDense2BitMoE`. The CompressedTensors
+    scheme dispatcher itself triggers on the ``num_bits=2``,
+    ``type=FLOAT`` ``TENSOR_GROUP`` weight quantization args; this
+    flag is the explicit operator opt-in that mirrors
+    ``--enable-higgs-dense-2bit-kv-cache``.
+    """
+    expert_scheme = _coerce_dict(quant_cfg.get("expert_weight_scheme"))
+    if expert_scheme is None:
+        return
+    method = expert_scheme.get("quant_method")
+    if method != HIGGS_DENSE_2BIT_MOE_QUANT_METHOD:
+        return
+
+    if not getattr(server_args, "enable_higgs_dense_2bit_moe", False):
+        # Set the flag if the attribute exists on server_args. Older
+        # builds without the new flag silently no-op (the scheme
+        # dispatcher still kicks in via num_bits=2 detection).
+        try:
+            server_args.enable_higgs_dense_2bit_moe = True
+        except AttributeError:
+            pass
+        logger.info(
+            "Enabling HIGGS 2-bit dense MoE expert weights from "
+            "quantization_config (expert_weight_scheme.quant_method="
+            f"{HIGGS_DENSE_2BIT_MOE_QUANT_METHOD})."
+        )
+
+    block_size = expert_scheme.get("block_size")
+    if block_size is not None:
+        try:
+            block_size_int = int(block_size)
+        except (TypeError, ValueError):
+            logger.info(
+                "quantization_config.expert_weight_scheme.block_size=%r is "
+                "not an integer; ignoring.",
+                block_size,
+            )
+        else:
+            os.environ.setdefault(
+                "SGLANG_OPT_HIGGS_MOE_2BIT_BLOCK_SIZE", str(block_size_int)
+            )
 
 
 def get_smc_draft_kv_cache_dtype_from_config(hf_config: Any) -> Optional[str]:
@@ -398,6 +459,7 @@ def apply_quantization_config_dispatch(
         return
     _maybe_apply_turboquant_dense(server_args, quant_cfg)
     _maybe_apply_higgs_dense_2bit(server_args, quant_cfg)
+    _maybe_apply_higgs_dense_2bit_moe(server_args, quant_cfg)
     _maybe_apply_indexer_quantization(server_args, quant_cfg)
     _maybe_apply_moe_runner_backend(server_args, quant_cfg)
 

@@ -4,6 +4,9 @@ from .compressed_tensors_scheme import (
     CompressedTensorsLinearScheme,
     CompressedTensorsMoEScheme,
 )
+from .compressed_tensors_higgs_dense_2bit_moe import (
+    CompressedTensorsHiggsDense2BitMoE,
+)
 from .compressed_tensors_w4a4_mxint4_moe import CompressedTensorsMxInt4MoE
 from .compressed_tensors_w4a4_nvfp4 import CompressedTensorsW4A4Fp4
 from .compressed_tensors_w4a4_nvfp4_moe import CompressedTensorsW4A4Nvfp4MoE
@@ -24,6 +27,7 @@ from .compressed_tensors_wNa16_moe import (
 )
 
 __all__ = [
+    "CompressedTensorsHiggsDense2BitMoE",
     "CompressedTensorsLinearScheme",
     "CompressedTensorsMoEScheme",
     "CompressedTensorsW8A8Fp8",

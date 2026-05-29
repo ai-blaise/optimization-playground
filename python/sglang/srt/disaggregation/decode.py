@@ -1671,6 +1671,13 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 continue
 
+            # SMC requires per-step resampling immediately before forward
+            # (parallel to event_loop_normal_smc at scheduler.py:1573-1574).
+            # Without this, particle weights / group state never advance and
+            # the resampler invariants are violated under disagg-decode.
+            if self.smc_resampler is not None:
+                self.smc_resampler.step_before_forward(self)
+
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch

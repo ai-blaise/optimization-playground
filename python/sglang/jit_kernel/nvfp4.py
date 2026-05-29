@@ -49,7 +49,10 @@ def _nvfp4_arch_env():
 
 @torch.compiler.disable
 def prewarm_nvfp4_jit_modules(
-    *, include_expert_quant: bool = False, include_blockwise_moe: bool = False
+    *,
+    include_expert_quant: bool = False,
+    include_blockwise_moe: bool = False,
+    include_quant_linear: bool = False,
 ) -> None:
     """Materialize NVFP4 JIT modules before torch.compile traces the model."""
     _jit_nvfp4_quant_module()
@@ -58,6 +61,8 @@ def prewarm_nvfp4_jit_modules(
         _jit_nvfp4_expert_quant_module()
     if include_blockwise_moe:
         _jit_nvfp4_blockwise_moe_module()
+    if include_quant_linear:
+        _jit_nvfp4_quant_linear_module()
 
 
 @cache_once
@@ -70,6 +75,32 @@ def _jit_nvfp4_quant_module() -> Module:
             ],
             cuda_wrappers=[
                 ("scaled_fp4_quant", "scaled_fp4_quant_sm100a_sm120a"),
+            ],
+            extra_cuda_cflags=_nvfp4_cuda_flags(),
+            extra_dependencies=["cutlass"],
+        )
+
+
+@cache_once
+def _jit_nvfp4_quant_linear_module() -> Module:
+    """Non-swizzled (linear) layout NVFP4 quantize.
+
+    Produces row-major [m, K/16] fp8_e4m3 scales (no tile-rotation),
+    matching flashinfer.fp4_quantize(is_sf_swizzled_layout=False). Used as
+    the activation pre-quantize for trtllm_fp4_block_scale_moe on the
+    NVFP4 MoE production deploy.
+    """
+    with _nvfp4_arch_env():
+        return load_jit(
+            "nvfp4_quant_linear",
+            cuda_files=[
+                "gemm/nvfp4/nvfp4_quant_linear_kernels.cuh",
+            ],
+            cuda_wrappers=[
+                (
+                    "scaled_fp4_quant_linear",
+                    "scaled_fp4_quant_linear_sm100a_sm120a",
+                ),
             ],
             extra_cuda_cflags=_nvfp4_cuda_flags(),
             extra_dependencies=["cutlass"],
@@ -257,6 +288,76 @@ def scaled_fp4_quant(
         )
 
     _scaled_fp4_quant_custom_op(input, output, output_scale, input_global_scale)
+    output_scale = output_scale.view(torch.float8_e4m3fn)
+    return output, output_scale
+
+
+@register_custom_op(
+    op_name="scaled_fp4_quant_linear",
+    mutates_args=["output", "output_scale"],
+)
+def _scaled_fp4_quant_linear_custom_op(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    input_global_scale: torch.Tensor,
+) -> None:
+    module = _jit_nvfp4_quant_linear_module()
+    module.scaled_fp4_quant_linear(
+        output, input, output_scale, input_global_scale
+    )
+
+
+@debug_kernel_api
+def scaled_fp4_quant_linear(
+    input: torch.Tensor, input_global_scale: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize to NVFP4 with non-swizzled (linear) scale layout.
+
+    Drop-in replacement for flashinfer.fp4_quantize(is_sf_swizzled_layout=False).
+
+    Output shapes:
+        packed FP4: [m, n // 2] uint8
+        scales:     [m, n // 16] fp8_e4m3 (returned as int32-packed view that
+                    callers can reinterpret with .view(torch.float8_e4m3fn))
+
+    Hidden_size = 7168 (DeepSeek) satisfies the alignment constraint
+    (n / 16 = 448 which is divisible by 4 for int32 packing). For other
+    hidden sizes the kernel asserts at launch.
+
+    The scale tensor is written row-major with stride n/16 columns. No
+    padding (in contrast to the swizzled CUTLASS variant which pads M
+    up to 128 and K up to 4). This matches the layout that
+    trtllm_fp4_block_scale_moe consumes via its `bA16` block-scale config.
+    """
+    assert input.ndim >= 1, f"input.ndim needs to be >= 1, but got {input.ndim}."
+    other_dims = 1 if input.ndim == 1 else -1
+    input = input.reshape(other_dims, input.shape[-1])
+    m, n = input.shape
+    block_size = 16
+    device = input.device
+
+    assert n % block_size == 0, f"last dim has to be multiple of 16, but got {n}."
+    assert (
+        n // block_size
+    ) % 4 == 0, (
+        f"n/16={n // block_size} must be divisible by 4 for int32 packing."
+    )
+    assert input.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
+
+    output = torch.empty((m, n // 2), device=device, dtype=torch.uint8)
+    # Allocate scales as int32-packed (4 fp8 per int32). Linear layout has
+    # no row/col padding.
+    output_scale = torch.empty(
+        (m, (n // block_size) // 4), device=device, dtype=torch.int32
+    )
+
+    _scaled_fp4_quant_linear_custom_op(
+        input, output, output_scale, input_global_scale
+    )
     output_scale = output_scale.view(torch.float8_e4m3fn)
     return output, output_scale
 

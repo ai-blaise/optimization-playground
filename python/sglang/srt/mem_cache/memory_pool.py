@@ -3684,18 +3684,74 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
         new cost is the BF16-page-shape reshape (zero copies — same storage,
         different stride view) and the kernel dispatch path.
 
+        Bottleneck analysis (ai-blaise #19 iter2). On B200 with 3 TB/s HBM,
+        the materialize+read round-trip is the dominant cost on this path:
+
+            dequant write : 128 * 2048 * 576 B BF16 = 301.99 MiB / layer
+            kernel read   : 128 * 2048 * 576 B BF16 = 301.99 MiB / layer
+            per layer     : 603.98 MiB total transfer
+            per step (61L): 36.84 GB total transfer
+            HBM bound     : ~12.3 ms TPOT minimum for materialization alone
+
+        The observed HIGGS+tokenspeed_mla TPOT gap vs FP8-trtllm baseline
+        (38.6 ms vs 25.9 ms = 12.7 ms) is consistent with the HIGGS dequant
+        round-trip cost. Replacing tokenspeed_mla (Triton attention) with
+        the trtllm-gen kernel does NOT close that gap — the attention math
+        is roughly HBM-bound by the same materialized BF16 buffer in both
+        paths, and the gap is the materialization itself.
+
+        Two structural follow-ups remain (iter3 / iter4):
+
+          (a) FP8 materialization. The flashinfer trtllm-gen sparse-MLA
+              cubin set includes ``QkvE4m3OBfloat16`` variants (~48 of 96
+              sparse cubins) gated on ``kv_cache.dtype == float8_e4m3fn``.
+              Materializing into FP8 instead of BF16 halves the dequant
+              write + kernel read traffic to ~302 MiB/step — closes
+              ~6 ms of the gap. Requires:
+                - new CUDA kernel
+                  ``higgs_dense_2bit_dequant_page_table_fp8_kernel`` that
+                  writes FP8 (``__nv_fp8_e4m3``) for the latent tile and
+                  downcasts the BF16 rope tile to FP8 inline, producing the
+                  576-byte fully-FP8 slot the trtllm-gen FP8 cubin expects;
+                - query-side FP8 quant via
+                  :func:`mla_quantize_and_rope_for_fp8` (same path the
+                  existing FP8-baseline ``_forward_trtllm`` branch uses);
+                - ``_fuse_rope_for_trtllm_mla`` to recognize HIGGS+trtllm
+                  so the prepare-stage rope skip applies and the fused
+                  rope+quant kernel handles q_rope at trtllm-call time.
+          (b) Cross-layer dequant pipelining. The DSA NVFP4 indexer for
+              layer N+1 has no data dependency on layer N's attention
+              output (it runs on the residual stream after MoE). The
+              dequant for layer N's selected slots can be issued on a
+              separate CUDA stream concurrent with layer N+1's indexer
+              kernel — overlaps ~half of the materialization with the
+              indexer and recovers another ~3 ms when the indexer and
+              dequant are similar latency.
+
         # NOTE(ai-blaise #19): we materialize one BF16 slot per page_table
-        # entry rather than deduping repeated indices. K=2048 is the indexer
-        # top-k cap; in practice top-k is set to context length so there are
-        # few duplicates and the dedup pass would add overhead. The trtllm
-        # kernel reads every block_tables entry exactly once anyway, so a
-        # write-side dedup buys nothing.
+        # entry rather than deduping repeated indices. Each query's top-k
+        # selects from its OWN past context (per-request req_to_token
+        # mapping); two different queries' page_table entries never point
+        # at the same physical slot. There are no cross-query duplicates,
+        # and within a single query top-k indices are distinct by
+        # construction, so a write-side dedup buys nothing on real
+        # workloads.
 
         # NOTE(ai-blaise #19): an alternative composition would have been
         # to teach the trtllm CUBIN to consume HIGGS-packed slots directly
         # (a custom fetch indirection). That kernel is closed-source so we
         # cannot extend it; this sparse-materialize-then-call path is the
         # tightest possible "compose, don't branch" answer for trtllm DSA.
+
+        # ai-blaise #19 iter2 landed change: the page_table dequant CUDA
+        # kernel set in :file:`higgs_dense_2bit_kv.cuh` now early-exits
+        # for rows with ``page < 0`` (top-k padding). That recovers the
+        # dequant work for K-end padding when ``seq_len < sparse_mla_top_k``
+        # (short-context decoders), which is the largest fraction of work
+        # the iter1 implementation was wasting on guaranteed-unread slots.
+        # For long contexts (``seq_len >= 2048``) the indexer fills all
+        # K slots with valid entries so the early-exit saves nothing; that
+        # regime hits the bottleneck above and needs (a) or (b).
 
         Args:
           layer_id: layer index into the per-layer KV buffer list.

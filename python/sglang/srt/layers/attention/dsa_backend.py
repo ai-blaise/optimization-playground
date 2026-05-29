@@ -2517,6 +2517,19 @@ class DeepseekSparseAttnBackend(
         # (B*K rows where K = sparse_mla_top_k) into a compact BF16 paged
         # view + rewritten block_tables — see
         # :meth:`HiggsDense2BitDSATokenToKVPool.get_higgs_selected_kv_buffer_trtllm`.
+        #
+        # ai-blaise #19 iter2 perf note: the materialize→read round-trip
+        # is HBM-bound at ~12.3 ms TPOT minimum on B200, accounting for
+        # the full ~12.7 ms gap vs the FP8-trtllm baseline. iter1 (BF16
+        # materialization + trtllm-gen attention) cannot beat the
+        # baseline because the BF16 dequant traffic dominates. iter2
+        # lands the safe early-exit in the dequant kernel that skips
+        # padding rows (saves ~10–50% of dequant work for sub-2048-token
+        # contexts, ~0 for long contexts). The structural next steps are
+        # FP8 materialization via the ``QkvE4m3`` sparse-MLA cubin set
+        # (cuts the round-trip in half) and cross-layer dequant–indexer
+        # pipelining; see the bottleneck breakdown in
+        # :meth:`HiggsDense2BitDSATokenToKVPool.get_higgs_selected_kv_buffer_trtllm`.
         is_higgs_dense_pool = (
             getattr(
                 self.token_to_kv_pool,

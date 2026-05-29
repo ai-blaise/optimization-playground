@@ -878,18 +878,22 @@ __global__ void higgs_dense_2bit_dequant_page_table_fp8_kernel(
 
   __shared__ float buf[kLatentDim];
 
-  // Rope tile: 64 BF16 elements at slot[kPackedBytes + kNormBytes...],
-  // downcast inline to FP8 (64 B FP8 vs 128 B BF16 written). Use first 16
-  // lanes, 4 elements each via half2 → fp8x2 conversion.
+  // Rope tile: 64 BF16 elements at slot[kPackedBytes + kNormBytes = 130];
+  // the slot is uint8-aligned (compressed_stride_0 = 258), so the rope
+  // payload is byte-aligned not bf16-aligned. Stage through a local 8 B
+  // uint8 buffer to avoid misaligned-load faults, then reinterpret as
+  // bf16x2 and downcast inline to FP8. 16 lanes × 4 elements = 64 BF16
+  // in, 64 FP8 out (64 B written, vs 128 B BF16).
   if (tid < 16) {
-    const bf16_t* slot_rope =
-        reinterpret_cast<const bf16_t*>(slot + kPackedBytes + kNormBytes);
+    const uint8_t* slot_rope = slot + kPackedBytes + kNormBytes;
     fp8_e4m3_t* rope_out = row_out + kLatentDim;
     const int base = tid * 4;
-    // Load 4 BF16 elements, convert to FP8 via 2× bf16x2 → fp8x2.
-    bf16x2_t rope_pair0 = *reinterpret_cast<const bf16x2_t*>(slot_rope + base);
-    bf16x2_t rope_pair1 =
-        *reinterpret_cast<const bf16x2_t*>(slot_rope + base + 2);
+    uint8_t bf16_bytes[8];
+    memcpy(bf16_bytes, slot_rope + base * 2, 8);
+    const bf16x2_t rope_pair0 =
+        *reinterpret_cast<const bf16x2_t*>(bf16_bytes);
+    const bf16x2_t rope_pair1 =
+        *reinterpret_cast<const bf16x2_t*>(bf16_bytes + 4);
     // Apply inv_kv_scale via FP32 path; bf16 → fp32 → ×inv_kv_scale → fp8.
     const float2 r0 = __bfloat1622float2(rope_pair0);
     const float2 r1 = __bfloat1622float2(rope_pair1);
@@ -897,12 +901,13 @@ __global__ void higgs_dense_2bit_dequant_page_table_fp8_kernel(
         make_float2(r0.x * inv_kv_scale, r0.y * inv_kv_scale);
     const float2 r1_scaled =
         make_float2(r1.x * inv_kv_scale, r1.y * inv_kv_scale);
-    fp8x2_e4m3_t p0 =
-        __nv_fp8x2_e4m3(r0_scaled);
-    fp8x2_e4m3_t p1 =
-        __nv_fp8x2_e4m3(r1_scaled);
-    *reinterpret_cast<fp8x2_e4m3_t*>(rope_out + base) = p0;
-    *reinterpret_cast<fp8x2_e4m3_t*>(rope_out + base + 2) = p1;
+    fp8x2_e4m3_t p0 = __nv_fp8x2_e4m3(r0_scaled);
+    fp8x2_e4m3_t p1 = __nv_fp8x2_e4m3(r1_scaled);
+    // 4 B write — also byte-aligned, stage through a local uint8 buffer.
+    uint16_t out_bytes[2];
+    memcpy(out_bytes, &p0, 2);
+    memcpy(out_bytes + 1, &p1, 2);
+    memcpy(rope_out + base, out_bytes, 4);
   }
 
   const int pair_idx = tid >> 1;
@@ -952,13 +957,15 @@ __global__ void higgs_dense_2bit_dequant_page_table_fp8_const_codebook_kernel(
   __shared__ float buf[kLatentDim];
 
   if (tid < 16) {
-    const bf16_t* slot_rope =
-        reinterpret_cast<const bf16_t*>(slot + kPackedBytes + kNormBytes);
+    const uint8_t* slot_rope = slot + kPackedBytes + kNormBytes;
     fp8_e4m3_t* rope_out = row_out + kLatentDim;
     const int base = tid * 4;
-    bf16x2_t rope_pair0 = *reinterpret_cast<const bf16x2_t*>(slot_rope + base);
-    bf16x2_t rope_pair1 =
-        *reinterpret_cast<const bf16x2_t*>(slot_rope + base + 2);
+    uint8_t bf16_bytes[8];
+    memcpy(bf16_bytes, slot_rope + base * 2, 8);
+    const bf16x2_t rope_pair0 =
+        *reinterpret_cast<const bf16x2_t*>(bf16_bytes);
+    const bf16x2_t rope_pair1 =
+        *reinterpret_cast<const bf16x2_t*>(bf16_bytes + 4);
     const float2 r0 = __bfloat1622float2(rope_pair0);
     const float2 r1 = __bfloat1622float2(rope_pair1);
     const float2 r0_scaled =
@@ -967,8 +974,10 @@ __global__ void higgs_dense_2bit_dequant_page_table_fp8_const_codebook_kernel(
         make_float2(r1.x * inv_kv_scale, r1.y * inv_kv_scale);
     fp8x2_e4m3_t p0 = __nv_fp8x2_e4m3(r0_scaled);
     fp8x2_e4m3_t p1 = __nv_fp8x2_e4m3(r1_scaled);
-    *reinterpret_cast<fp8x2_e4m3_t*>(rope_out + base) = p0;
-    *reinterpret_cast<fp8x2_e4m3_t*>(rope_out + base + 2) = p1;
+    uint16_t out_bytes[2];
+    memcpy(out_bytes, &p0, 2);
+    memcpy(out_bytes + 1, &p1, 2);
+    memcpy(rope_out + base, out_bytes, 4);
   }
 
   const int pair_idx = tid >> 1;

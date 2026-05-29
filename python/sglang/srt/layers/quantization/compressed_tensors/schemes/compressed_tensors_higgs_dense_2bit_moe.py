@@ -37,6 +37,21 @@ gain arrives with the follow-on flashinfer fork (see
    preserve the GPU memory savings, at the cost of GEMM throughput
    (~2x slower than NVFP4 compute on B200).
 
+#15 iter2 update
+----------------
+
+The ``_dequant_to_bf16`` helper now routes through
+:func:`sglang.jit_kernel.higgs_moe_2bit_dequant.higgs_moe_2bit_dequant_fast`
+(Triton unpack + scale + fast-Hadamard CUDA inverse FWHT) on CUDA
+tensors. Per-layer per-call cost at DeepSeek-V3.2-REAP per-rank shapes
+(E=32, H=7168, I=2048) drops from ~96 ms (eager) to ~3.3 ms (~29x).
+The eager codec remains the CPU/reference fallback. This makes the
+BF16 runtime path quantitatively closer to viable for a single decode
+step (3.3 ms x 58 layers = ~190 ms dequant per step, still 7-8x the
+FP8-trtllm baseline TPOT), and ungates the iter3 work: a CuTe-fused
+HIGGS-dequant-and-BMM expert GEMM that avoids materializing the BF16
+working tile entirely.
+
 # NOTE(ai-blaise #15): The composition with #19 (HIGGS-aware trtllm DSA)
 # is structural — both tasks need the same per-expert / per-row dequant
 # helper. The codec lives at
@@ -258,11 +273,42 @@ class CompressedTensorsHiggsDense2BitMoE(CompressedTensorsMoEScheme):
         packed: torch.Tensor,
         in_dim: int,
     ) -> torch.Tensor:
-        """HIGGS-packed [E, out_dim, slot] -> BF16 [E, out_dim, in_dim]."""
-        cfg = HiggsMoE2BitConfig(
-            in_dim=in_dim, block_size=self.use_sub_row_blocks
-        )
+        """HIGGS-packed [E, out_dim, slot] -> BF16 [E, out_dim, in_dim].
+
+        Routes through :func:`higgs_moe_2bit_dequant_fast`
+        (Triton unpack + fast-Hadamard CUDA kernel) when CUDA is
+        available — ~30x faster than the eager
+        :func:`dequantize_higgs_moe_weights` reference at DeepSeek-V3.2
+        per-rank MoE shapes (E=32, H=7168, I=2048). Falls back to the
+        eager codec only for CPU tensors or shapes the fast kernel does
+        not support (it requires a power-of-two block_size that divides
+        in_dim; the iter1 codec contract guarantees this).
+        """
+        block_size = self._resolve_block_size(in_dim)
+        if packed.is_cuda:
+            from sglang.jit_kernel.higgs_moe_2bit_dequant import (
+                higgs_moe_2bit_dequant_fast,
+            )
+            return higgs_moe_2bit_dequant_fast(
+                packed, in_dim=in_dim, block_size=block_size,
+            )
+        cfg = HiggsMoE2BitConfig(in_dim=in_dim, block_size=block_size)
         return dequantize_higgs_moe_weights(packed, cfg, dst_dtype=torch.bfloat16)
+
+    def _resolve_block_size(self, in_dim: int) -> int:
+        """Pick the FWHT block size for the given ``in_dim``.
+
+        Honors the env-set override if present. Otherwise picks the
+        largest power-of-two divisor of ``in_dim`` so that the FWHT is
+        well-defined even for non-power-of-two GEMM widths (DeepSeek-V3.2
+        hidden_size=7168 = 7 * 2^10 -> block_size=1024, 7 blocks/row).
+        """
+        if self.use_sub_row_blocks is not None and self.use_sub_row_blocks > 0:
+            return int(self.use_sub_row_blocks)
+        block = 1
+        while (block * 2) <= in_dim and (in_dim % (block * 2)) == 0:
+            block *= 2
+        return block
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Dequant HIGGS -> BF16 -> NVFP4-quantize -> prepare for trtllm.
@@ -611,10 +657,12 @@ class CompressedTensorsHiggsDense2BitMoE(CompressedTensorsMoEScheme):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        # On-the-fly dequant. This is the price of the runtime path —
-        # the dequant kernels here go through the eager codec. A fused
-        # HIGGS-aware GEMM kernel would replace both the dequant and
-        # the BF16 GEMM in one pass; see flashinfer fork follow-up.
+        # On-the-fly dequant. Uses ``higgs_moe_2bit_dequant_fast``
+        # (Triton unpack + fast-Hadamard CUDA kernel) per #15 iter2 —
+        # ~30x faster than the eager codec at DeepSeek-V3.2 per-rank
+        # MoE shapes. A fused HIGGS-aware GEMM kernel would still be a
+        # further ~2x win because it avoids materializing the BF16
+        # working tile; see iter3 vector below.
         w13_bf16 = self._dequant_to_bf16(
             layer.w13_higgs_packed.data, in_dim=self._w13_in_dim
         )

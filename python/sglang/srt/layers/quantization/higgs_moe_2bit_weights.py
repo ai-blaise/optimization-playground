@@ -93,16 +93,15 @@ class HiggsMoE2BitConfig:
     block_size: Optional[int] = None
 
     def __post_init__(self) -> None:
-        if self.in_dim & (self.in_dim - 1):
-            raise ValueError(
-                f"in_dim ({self.in_dim}) must be a power of two."
-            )
         if self.in_dim % HIGGS_PAIR_DIM:
             raise ValueError(
                 f"in_dim ({self.in_dim}) must be a multiple of "
                 f"HIGGS pair dim ({HIGGS_PAIR_DIM})."
             )
         block = self.block_size if self.block_size is not None else self.in_dim
+        # Only the FWHT block must be a power of two. ``in_dim`` itself
+        # need not be — DeepSeek-V3.2's hidden_size=7168 (7*2^10) is
+        # quantized with block_size=1024 (7 blocks per row).
         if block & (block - 1):
             raise ValueError(
                 f"block_size ({block}) must be a power of two."

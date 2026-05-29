@@ -2215,6 +2215,13 @@ class DeepseekSparseAttnBackend(
         selected_kv, block_tables, seq_lens, max_seq_len = (
             self._pack_tokenspeed_selected_kv(kv_cache, page_table_1)
         )
+        # Warmup / first-request path in aggregated (non-disagg) mode can
+        # land here with queries but an empty/all-zero seq_lens (no past KV
+        # built yet). tokenspeed_mla_decode hard-rejects max_seq_len <= 0;
+        # there is nothing to attend to, so return zeros and let the caller
+        # combine with the value projections.
+        if max_seq_len == 0 or seq_lens.numel() == 0:
+            return q_all.new_zeros((q_all.shape[0], layer.tp_q_head_num, layer.v_head_dim))
         query = q_all.view(q_all.shape[0], 1, layer.tp_q_head_num, layer.head_dim)
         if query.dtype != selected_kv.dtype:
             query = query.to(selected_kv.dtype)

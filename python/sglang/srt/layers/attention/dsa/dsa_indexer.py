@@ -1258,15 +1258,12 @@ class Indexer(MultiPlatformOp):
                 q_shape=tuple(int(dim) for dim in q_values.shape),
             )
             return None
-        if q_values.shape[1] not in (32, 64):
-            _hisa_profile_end(
-                "hisa_nvfp4_paged_skip",
-                _hisa_profile_start(q_values.device),
-                q_values.device,
-                reason="unsupported_head_count",
-                num_heads=int(q_values.shape[1]),
-            )
-            return None
+        # Head-count gating removed: the collective-key and DeepGEMM kernels self-skip
+        # via _deepgemm_fp4_mqa_supports (which currently only accepts 64 heads), and
+        # the torch fallback at nvfp4_hisa_indexer_paged_torch supports any head count.
+        # The prior (32, 64) wrapper check turned a 16-head TP=4 shard into a None
+        # return, which falls through to the DeepGEMM fp8_fp4_mqa_logits path in
+        # _get_topk and crashes when that kernel is absent from the wheel.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
         topk_result = torch.full(
             (q_values.shape[0], self.index_topk),
@@ -1732,6 +1729,21 @@ class Indexer(MultiPlatformOp):
 
         if not need_chunk:
             assert q_tensor[:q_offset].shape[0] != 0
+            if is_nvfp4 and not _has_deep_gemm_kernel("fp8_fp4_mqa_logits"):
+                # The non-paged NVFP4 MQA-logits DeepGEMM kernel is absent in this
+                # wheel (sgl_kernel built without it; SGLANG_ENABLE_JIT_DEEPGEMM=0).
+                # The HISA NVFP4 paged path above already attempted (and returned
+                # None) before we reached this fallback; without the kernel there
+                # is no remaining ragged NVFP4 indexer path. Fail loud so the
+                # request errors cleanly instead of crashing the worker via
+                # _require_deep_gemm_kernel inside _deep_gemm_fp4_mqa_logits.
+                raise RuntimeError(
+                    "DSA NVFP4 prefill indexer requires either DeepGEMM "
+                    "fp8_fp4_mqa_logits (absent in this build) or a successful "
+                    "HISA NVFP4 paged fallback (returned None for this batch). "
+                    "Lower hisa_min_seq_len, disable fallback_to_dense_if_short, "
+                    "or enable JIT DeepGEMM (SGLANG_ENABLE_JIT_DEEPGEMM=1)."
+                )
             with self._with_real_sm_count():
                 if is_nvfp4:
                     logits = _deep_gemm_fp4_mqa_logits(
@@ -1799,6 +1811,16 @@ class Indexer(MultiPlatformOp):
                 global_topk_offset.shape[0] >= q_offset
             ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
 
+        if is_nvfp4 and not _has_deep_gemm_kernel("fp8_fp4_mqa_logits"):
+            # Same kernel-absence guard as the non-chunked path above; chunked
+            # prefill takes this branch when the per-call logits buffer would
+            # exceed the budget but it still calls the same DeepGEMM kernel.
+            raise RuntimeError(
+                "DSA NVFP4 prefill indexer (chunked) requires DeepGEMM "
+                "fp8_fp4_mqa_logits which is absent in this build. The HISA "
+                "NVFP4 paged path returned None for this batch. See the "
+                "non-chunked branch above for remediation."
+            )
         start = 0
         while start < q_offset:
             end = min(start + max_rows, q_offset)

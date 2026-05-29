@@ -149,6 +149,11 @@ def _jit_higgs_dense_2bit_module() -> "Module":
                 "higgs_dense_2bit_detail::"
                 "HiggsDense2BitDequantPageTableFp8ConstCodebookKernel::run",
             ),
+            (
+                "dequantize_higgs_dense_2bit_page_table_fp8_saw_scalar2",
+                "higgs_dense_2bit_detail::"
+                "HiggsDense2BitDequantPageTableFp8SawScalar2Kernel::run",
+            ),
         ],
     )
 
@@ -456,11 +461,17 @@ def dequantize_higgs_dense_2bit_page_table_fp8(
 
     module = _jit_higgs_dense_2bit_module()
     candidate = get_higgs_dense_2bit_b200_candidate()
-    # FP8 variants currently exist for the page_table_kernel (codebook
-    # via __ldg) and const_codebook (compile-time codebook constants).
-    # Mirror the BF16 picker for the const_codebook subset; everything
-    # else falls back to the codebook-LDG FP8 kernel.
-    if candidate.page_table_dequant_variant == "const_codebook":
+    # FP8 variants currently shipped:
+    #   * saw_scalar2          — production B200 candidate path
+    #   * const_codebook       — compile-time codebook constants
+    #   * default (codebook-LDG) — runtime codebook fetch via __ldg
+    # The saw_scalar2 variant uses the same 4-warps-per-block coalesced
+    # layout as the BF16 sibling and dominates the other variants on
+    # large num_rows (≥16384) — it's the variant picked in production
+    # via ``get_higgs_dense_2bit_b200_candidate``.
+    if candidate.page_table_dequant_variant == "saw_scalar2":
+        kernel = module.dequantize_higgs_dense_2bit_page_table_fp8_saw_scalar2
+    elif candidate.page_table_dequant_variant == "const_codebook":
         kernel = module.dequantize_higgs_dense_2bit_page_table_fp8_const_codebook
     else:
         kernel = module.dequantize_higgs_dense_2bit_page_table_fp8

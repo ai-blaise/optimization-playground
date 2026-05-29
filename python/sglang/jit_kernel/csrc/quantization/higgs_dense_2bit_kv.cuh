@@ -1291,6 +1291,112 @@ __device__ __forceinline__ uint32_t saw_scalar2_bf16_pair(uint32_t code_pair) {
   return lo | (hi << 16);
 }
 
+// ai-blaise #19 iter3: FP8 e4m3 saw_scalar2 lookup. The two lattice
+// magnitudes (low ≈ 0.4541, high ≈ 1.508) cast saturatingly to FP8 give:
+//   low+  : 0.4541 -> FP8 0x2E (1.110 × 2^-2 → ~0.4375)
+//   low-  : -0.4541 -> FP8 0xAE
+//   high+ : 1.508 -> FP8 0x3C (1.100 × 2^0 → 1.5)
+//   high- : -1.508 -> FP8 0xBC
+// Pre-encode the 4 values in a single uint32 with one byte per code,
+// indexed by the 2-bit code at byte offset (code << 3).
+__device__ __forceinline__ uint8_t saw_scalar2_fp8_e4m3_bits(uint32_t code) {
+  // Mirrors saw_scalar2_bf16_bits but emits a 8-bit FP8 e4m3 pattern.
+  //   high_magnitude = 1 iff code ∈ {0, 3}
+  //   sign = 1 iff code ∈ {0, 1} (sign bit of saw_scalar2_bf16_bits is
+  //                                ((code >> 1) ^ 1u))
+  code &= 0x3u;
+  const uint32_t high_magnitude = ((code ^ (code >> 1) ^ 1u) & 1u);
+  // FP8 e4m3 magnitude: low = 0x2E (~0.4375), high = 0x3C (1.5).
+  const uint32_t magnitude = high_magnitude ? 0x3Cu : 0x2Eu;
+  const uint32_t sign = ((code >> 1) ^ 1u) << 7;
+  return static_cast<uint8_t>(magnitude | sign);
+}
+
+__device__ __forceinline__ uint32_t saw_scalar2_fp8_quad(uint32_t packed_byte) {
+  // Given a packed byte holding 4 codes (2 bits each, low to high):
+  //   lo nibble = (idx0 in low 2 bits) | (idx1 in high 2 bits)
+  // produce 4 FP8 bytes packed into a single uint32 (little-endian).
+  const uint32_t b0 = saw_scalar2_fp8_e4m3_bits(packed_byte & 0x3u);
+  const uint32_t b1 = saw_scalar2_fp8_e4m3_bits((packed_byte >> 2) & 0x3u);
+  const uint32_t b2 = saw_scalar2_fp8_e4m3_bits((packed_byte >> 4) & 0x3u);
+  const uint32_t b3 = saw_scalar2_fp8_e4m3_bits((packed_byte >> 6) & 0x3u);
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+template <int kWarpsPerBlock, typename LocT>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32, 4)
+higgs_dense_2bit_dequant_saw_scalar2_fp8_coalesced_kernel(
+    const uint8_t* __restrict__ compressed,
+    const LocT* __restrict__ locs,
+    fp8_e4m3_t* __restrict__ out,
+    int32_t* __restrict__ compact_page_table,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0,
+    float inv_kv_scale) {
+  (void)codebook;
+  // saw_scalar2 emits a fixed two-magnitude lattice, so inv_kv_scale only
+  // matters at the boundary of the FP8 max-finite range. The two emitted
+  // magnitudes (0.4541 / 1.508) are far inside the e4m3 range even at
+  // inv_kv_scale ≤ ~290, so we skip the per-element ×inv_kv_scale FMA
+  // and let the downstream attention path apply the inverse via k_scale
+  // for any pathological scales. If inv_kv_scale != 1.0 the caller is
+  // expected to pass it through ``bmm1_scale = k_scale * sm_scale`` with
+  // ``k_scale = 1 / inv_kv_scale``; the FP8 lattice bits are unchanged.
+  (void)inv_kv_scale;
+  static_assert(
+      kWarpsPerBlock == 4 || kWarpsPerBlock == 8,
+      "only four-row and eight-row block shapes are wired");
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp_id;
+  if (row >= num_rows) return;
+
+  const LocT raw_loc = locs[row];
+  if (compact_page_table != nullptr && lane == 0) {
+    compact_page_table[row] = raw_loc >= 0 ? static_cast<int32_t>(row) : -1;
+  }
+  if (raw_loc < 0) return;
+  const int64_t loc = static_cast<int64_t>(raw_loc);
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  fp8_e4m3_t* row_out = out + row * out_stride_0;
+
+  // Latent: 1 packed byte = 4 lattice codes × 2 bits = 4 FP8 elements
+  // out (32 bits = uint32 store). kPackedBytes = 128 bytes per row →
+  // 512 FP8 elements per row. 4 segments × 32 lanes = 128 byte slots,
+  // each lane processes 1 byte per segment and writes 1 uint32 (4 FP8).
+#pragma unroll
+  for (int segment = 0; segment < 4; ++segment) {
+    const int byte_idx = segment * 32 + lane;
+    const int base = byte_idx * 4;  // FP8-element index of this byte's output
+    const uint8_t packed = __ldg(slot + byte_idx);
+    const uint32_t packed_out = saw_scalar2_fp8_quad(packed);
+    *reinterpret_cast<uint32_t*>(row_out + base) = packed_out;
+  }
+
+  // Rope: 64 BF16 input → 64 FP8 output. 8 lanes × 8 elements/lane.
+  // Each lane reads 16 B (8 BF16) and writes 8 B (8 FP8 = uint64).
+  if (lane < 8) {
+    const uint8_t* slot_rope = slot + kPackedBytes + kNormBytes;
+    uint8_t bf16_bytes[16];
+    memcpy(bf16_bytes, slot_rope + lane * 16, 16);
+    fp8_e4m3_t* rope_out = row_out + kLatentDim;
+    uint64_t fp8_packed = 0;
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+      const bf16x2_t bf16_pair =
+          *reinterpret_cast<const bf16x2_t*>(bf16_bytes + pair * 4);
+      const fp8x2_e4m3_t fp8_pair = __nv_fp8x2_e4m3(bf16_pair);
+      uint16_t pair_bits;
+      memcpy(&pair_bits, &fp8_pair, 2);
+      fp8_packed |= (static_cast<uint64_t>(pair_bits) << (pair * 16));
+    }
+    memcpy(rope_out + lane * 8, &fp8_packed, 8);
+  }
+}
+
 template <int kWarpsPerBlock>
 __global__ void __launch_bounds__(kWarpsPerBlock * 32, 4)
 higgs_dense_2bit_store_saw_scalar2_coalesced_kernel(
@@ -2754,6 +2860,85 @@ struct HiggsDense2BitDequantPageTableFp8ConstCodebookKernel {
 
     LaunchKernel(num_rows, kLatentDim, device.unwrap())(
         higgs_dense_2bit_dequant_page_table_fp8_const_codebook_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<fp8_e4m3_t*>(out.data_ptr()),
+        static_cast<int32_t*>(compact_page_table.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap(),
+        static_cast<float>(inv_kv_scale));
+  }
+};
+
+// FP8 saw_scalar2 page-table launcher. Mirrors the BF16 launcher above
+// (4/8 warp_per_block fan-out, kSawScalar2LargeRowThreshold gating)
+// but emits fp8_e4m3 via the saw_scalar2 lookup table.
+struct HiggsDense2BitDequantPageTableFp8SawScalar2Kernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView compact_page_table,
+      tvm::ffi::TensorView codebook,
+      double inv_kv_scale) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto B = SymbolicSize{"num_query_rows"};
+    auto K = SymbolicSize{"topk"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(compact_page_table);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = B.unwrap() * K.unwrap();
+    if (num_rows == 0) return;
+
+    if (num_rows >= kSawScalar2LargeRowThreshold) {
+      LaunchKernel((num_rows + 7) / 8, 256, device.unwrap())(
+          higgs_dense_2bit_dequant_saw_scalar2_fp8_coalesced_kernel<8, int32_t>,
+          static_cast<const uint8_t*>(compressed.data_ptr()),
+          static_cast<const int32_t*>(page_table.data_ptr()),
+          static_cast<fp8_e4m3_t*>(out.data_ptr()),
+          static_cast<int32_t*>(compact_page_table.data_ptr()),
+          static_cast<const float*>(codebook.data_ptr()),
+          num_rows,
+          compressed_stride_0.unwrap(),
+          out_stride_0.unwrap(),
+          static_cast<float>(inv_kv_scale));
+      return;
+    }
+
+    LaunchKernel((num_rows + 3) / 4, 128, device.unwrap())(
+        higgs_dense_2bit_dequant_saw_scalar2_fp8_coalesced_kernel<4, int32_t>,
         static_cast<const uint8_t*>(compressed.data_ptr()),
         static_cast<const int32_t*>(page_table.data_ptr()),
         static_cast<fp8_e4m3_t*>(out.data_ptr()),

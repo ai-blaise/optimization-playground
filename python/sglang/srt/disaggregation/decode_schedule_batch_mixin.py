@@ -193,13 +193,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 num_tokens_per_req=server_args.speculative_num_draft_tokens,
             )
             if self.enable_overlap:
-                spec_info.future_indices = future_map.alloc_future_indices(
-                    len(self.seq_lens)
-                )
-                future_map.store_to_map_for_new_smc_batch(
-                    spec_info.future_indices,
-                    spec_info,
-                )
+                # FutureMap exposes publish/stash (not alloc_*/store_to_map_*);
+                # the eagle branch above uses the same constructor+publish+stash
+                # pattern. SMC payload has verified_id + new_seq_lens which is
+                # what FutureMap.stash reads for is_smc().
+                from sglang.srt.managers.overlap_utils import FutureIndices
+
+                spec_info.future_indices = FutureIndices(indices=self.req_pool_indices)
+                future_map.publish(spec_info.future_indices, spec_info.new_seq_lens)
+                future_map.stash(spec_info.future_indices, spec_info)
             self.spec_info = spec_info
         else:
             # Non-spec: input_ids feeds the next decode forward directly.

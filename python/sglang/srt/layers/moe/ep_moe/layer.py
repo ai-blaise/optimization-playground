@@ -101,6 +101,15 @@ class DeepEPMoE(FusedMoE):
         ):
             self.deprecate_flag = True
         elif (
+            envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+            and quant_config is not None
+        ):
+            # SGLANG_MOE_NVFP4_DISPATCH covers compressed-tensors NVFP4 W4A4 (e.g.
+            # BlaiseAI REAP) whose quant_config name isn't "modelopt_fp4". Route
+            # through the parent FusedMoE path; the deepep_normal/ll branches below
+            # assert because forward_deepgemm_contiguous has no NVFP4 W4A4 replacement.
+            self.deprecate_flag = True
+        elif (
             quant_config is None
             and self.w13_weight.dtype == torch.bfloat16
             and get_moe_runner_backend().is_deep_gemm()

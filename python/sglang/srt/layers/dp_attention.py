@@ -126,20 +126,51 @@ class _DpGatheredBufferWrapper:
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
-    def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+    def get_global_dp_buffer(
+        cls,
+        group: GroupCoordinator,
+        size_ref: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # When the caller passes a `size_ref` tensor (the local per-rank
+        # hidden states), derive the global buffer length as
+        # `size_ref.shape[0] * world_size`. Inside torch.compile this keeps
+        # the buffer dim symbolic and the captured graph scales correctly
+        # across piecewise CUDA graph sizes. Outside compile it returns the
+        # same int as the legacy path.
+        if size_ref is not None:
+            length = size_ref.shape[0] * group.world_size
+        else:
+            length = cls._global_dp_buffer_len
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (cls._global_dp_buffer_len, cls._hidden_size),
+                (length, cls._hidden_size),
                 dtype=cls._dtype,
                 device=cls._device,
             )
         return buffer
 
     @classmethod
-    def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+    def get_local_dp_buffer(
+        cls,
+        group: GroupCoordinator,
+        size_ref: Optional[torch.Tensor] = None,
+        size_ref_is_global: bool = False,
+    ) -> torch.Tensor:
+        # When `size_ref_is_global=True`, derive the local length from the
+        # passed *global* tensor's first dim divided by world_size — this is
+        # what the post-attention reduce_scatter needs so the output buffer
+        # scales symbolically with the captured graph instead of being baked
+        # to the warmup-time class var value.
+        if size_ref is not None:
+            if size_ref_is_global:
+                length = size_ref.shape[0] // group.world_size
+            else:
+                length = size_ref.shape[0]
+        else:
+            length = cls._local_dp_buffer_len
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (cls._local_dp_buffer_len, cls._hidden_size),
+                (length, cls._hidden_size),
                 dtype=cls._dtype,
                 device=cls._device,
             )
@@ -193,12 +224,25 @@ def set_dp_buffer_len(
     )
 
 
-def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer(group=group)
+def get_global_dp_buffer(
+    group: GroupCoordinator,
+    size_ref: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_global_dp_buffer(
+        group=group, size_ref=size_ref
+    )
 
 
-def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
+def get_local_dp_buffer(
+    group: GroupCoordinator,
+    size_ref: Optional[torch.Tensor] = None,
+    size_ref_is_global: bool = False,
+) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(
+        group=group,
+        size_ref=size_ref,
+        size_ref_is_global=size_ref_is_global,
+    )
 
 
 def get_global_dp_buffer_len() -> int:
@@ -486,9 +530,12 @@ def _dp_gather_via_all_reduce(
     assert global_tokens.is_contiguous()
 
     if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between global_tokens and local_tokens not allowed"
+        if not torch.compiler.is_compiling():
+            # Dynamo cannot trace `is not` on UntypedStorage; keep the alias
+            # safety check in eager mode only.
+            assert (
+                local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+            ), "aliasing between global_tokens and local_tokens not allowed"
 
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
@@ -573,9 +620,11 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between local_tokens and global_tokens not allowed"
+        if not torch.compiler.is_compiling():
+            # Same as above; gated on torch.compile state.
+            assert (
+                local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+            ), "aliasing between local_tokens and global_tokens not allowed"
 
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True

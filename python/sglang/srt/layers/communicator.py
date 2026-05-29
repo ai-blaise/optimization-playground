@@ -996,8 +996,13 @@ class CommunicateWithAllReduceAndLayerNormFn:
             elif context.attn_tp_rank == 0:
                 hidden_states += residual
 
+            # Pass `size_ref=hidden_states` so the global DP buffer's first
+            # dim is derived from the symbolic local-tokens dim. Under
+            # piecewise CUDA graph this keeps the buffer size scaling
+            # correctly across capture sizes (the captured graph was
+            # otherwise specializing on the warmup-time num_tokens).
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
+                get_global_dp_buffer(get_tp_group(), size_ref=hidden_states),
                 hidden_states,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
@@ -1229,8 +1234,15 @@ class CommunicateSummableTensorPairFn:
             group = get_tp_group()
         else:
             group = get_attention_tp_group()
+        # Pass `size_ref=hidden_states` (the *global* pre-scatter tensor) so
+        # the local buffer's first dim is `global.shape[0] // world_size`,
+        # tracked symbolically by the captured graph instead of frozen at
+        # the warmup-time class var value. Mirrors the get_global_dp_buffer
+        # size_ref fix used in _gather_hidden_states_and_residual.
         hidden_states, global_hidden_states = (
-            get_local_dp_buffer(group),
+            get_local_dp_buffer(
+                group, size_ref=hidden_states, size_ref_is_global=True
+            ),
             hidden_states,
         )
         if should_use_dp_reduce_scatterv():

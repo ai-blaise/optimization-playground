@@ -136,6 +136,15 @@ def fp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> torch.Tensor:
+    # Zero-rows short-circuit: flashinfer mm_fp4 (and cutlass_fp4_gemm)
+    # divide by M internally when computing CTA grid sizes. With M==0
+    # this raises SIGFPE and crashes the whole rank. DP-attention idle
+    # ranks legitimately call the linear layer with zero tokens, so
+    # bypass the kernel and return an empty tensor with the right
+    # output shape and dtype.
+    M = input.shape[-2]
+    if M == 0:
+        return input.new_empty((M, int(out_features)), dtype=out_dtype)
     fp4_backend = get_fp4_gemm_runner_backend()
     if fp4_backend.is_cutlass() and cutlass_fp4_gemm is not None:
         # flashinfer.fp4_quantize returns scale factors as uint8 (e4m3fn bits

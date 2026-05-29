@@ -2971,17 +2971,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         self.attention_layers = []
+        self.indexer_layers = []
         self.moe_layers = []
         self.moe_fusions = []
         self.dsa_indexers = []
         for layer in layer_model.layers:
             attn_layer = None
+            indexer_layer = None
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
                     attn_layer = layer.self_attn.attn
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
                     attn_layer = layer.self_attn.attn_mqa
+                # DSA models attach the indexer alongside the attention.
+                # Collect it so indexer_topk_op can resolve by layer_id.
+                if hasattr(layer.self_attn, "indexer"):
+                    indexer_layer = layer.self_attn.indexer
             # For hybrid model
             elif hasattr(layer, "attn"):
                 attn_layer = layer.attn
@@ -3006,6 +3012,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.attention_layers.append(attn_layer)
             elif hasattr(layer, "mixer"):
                 self.attention_layers.append(None)
+            self.indexer_layers.append(indexer_layer)
 
             moe_block = None
             moe_fusion = None

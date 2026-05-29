@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.dsa.dsa_indexer import call_indexer_topk
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -282,13 +283,28 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.qk_head_dim
                     )
                 if not self.skip_topk or prev_topk_indices is None:
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
-                    )
+                    # Route through the opaque indexer custom op when
+                    # piecewise CUDA graph is active so Dynamo sees one
+                    # node instead of trying to trace into the indexer's
+                    # data-dependent / JIT-compiling body. Outside of
+                    # piecewise capture we still go straight through the
+                    # original call to avoid any extra buffer allocation
+                    # on hot decode paths.
+                    if is_in_piecewise_cuda_graph():
+                        topk_indices = call_indexer_topk(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            indexer=self.indexer,
+                        )
+                    else:
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
                 else:
                     # skip_topk reuses prev layer's indices; mirror into this
                     # layer's slot so the captured buffer matches what's used.
@@ -301,13 +317,21 @@ class DeepseekMLAForwardMixin:
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
                     if not self.skip_topk or prev_topk_indices is None:
-                        topk_indices = self.indexer(
-                            x=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=self.layer_id,
-                        )
+                        if is_in_piecewise_cuda_graph():
+                            topk_indices = call_indexer_topk(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                indexer=self.indexer,
+                            )
+                        else:
+                            topk_indices = self.indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                            )
                     else:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices

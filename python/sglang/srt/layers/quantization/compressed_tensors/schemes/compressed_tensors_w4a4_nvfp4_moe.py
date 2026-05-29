@@ -303,6 +303,17 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
+        # Zero-rows short-circuit (DP-attention forward_idle case).
+        # When this rank has no tokens to process, the upstream topk path
+        # generates a StandardTopKOutput (no topk_config) instead of the
+        # BypassedTopKOutput the trtllm fast path expects. Return an empty
+        # combine_input with the right output shape — collectives still
+        # work because they read sizes from the live tensor.
+        if x.shape[0] == 0:
+            return StandardCombineInput(
+                hidden_states=x.new_empty(x.shape, dtype=x.dtype),
+            )
+
         if self.use_flashinfer_trtllm:
             from flashinfer import trtllm_fp4_block_scale_moe
 

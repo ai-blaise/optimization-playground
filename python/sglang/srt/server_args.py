@@ -3366,12 +3366,19 @@ class ServerArgs:
                 self.moe_runner_backend = "flashinfer_trtllm"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
+            # `compressed-tensors` is permitted because CompressedTensorsW4A4Nvfp4MoE
+            # (see schemes/compressed_tensors_w4a4_nvfp4_moe.py) self-dispatches to its
+            # cutlass_moe_fp4 path when the runner backend is not flashinfer_trtllm.
+            # Picking flashinfer_cutlass over flashinfer_trtllm for compressed-tensors
+            # NVFP4 weights unlocks piecewise CUDA graph (the trtllm runner's bypassed
+            # topk forces it off at _handle_moe_kernel_config:3454).
             assert self.quantization in [
                 "modelopt_fp4",
                 "modelopt_fp8",
                 "modelopt_mixed",
+                "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,

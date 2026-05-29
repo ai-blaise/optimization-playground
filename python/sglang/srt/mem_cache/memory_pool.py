@@ -56,6 +56,8 @@ from sglang.jit_kernel.higgs_dense_2bit import (
 )
 from sglang.jit_kernel.higgs_dense_2bit_mla_decode import (
     higgs_dense_2bit_mla_decode,
+    higgs_dense_2bit_mla_decode_saw_scalar2,
+    higgs_dense_2bit_mla_decode_saw_scalar2_split,
     higgs_dense_2bit_mla_decode_split,
     higgs_dense_2bit_mla_rotate_query,
 )
@@ -80,6 +82,7 @@ from sglang.srt.layers.quantization.turboquant_dense_kv import (
 from sglang.srt.layers.quantization.higgs_dense_2bit_kv import (
     HiggsDense2BitCodec,
     HiggsDense2BitConfig,
+    get_higgs_dense_2bit_b200_candidate,
     select_higgs_mla_decode_num_splits,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -99,6 +102,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -144,6 +148,16 @@ def _set_kv_buffer_impl(
             v_cache.view(-1, row_dim),
             indices,
             row_bytes=row_bytes,
+        )
+
+    if _is_cpu and _cpu_has_amx_support:
+        return torch.ops.sgl_kernel.store_cache_cpu(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            indices,
+            row_dim,
         )
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -792,13 +806,13 @@ class KVCache(abc.ABC):
             k_size_GB = k_size / GB
             v_size_GB = v_size / GB
             logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
             )
             self.mem_usage = k_size_GB + v_size_GB
         else:
             kv_size_GB = kv_size_bytes / GB
             logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
+                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
             )
             self.mem_usage = kv_size_GB
 
@@ -1135,6 +1149,11 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Catch stale indices here instead of as illegal-addr or silent KV corruption.
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return
@@ -1513,19 +1532,37 @@ class HiggsMHA2BitTokenToKVPool(MHATokenToKVPool):
             device=self.device,
         )
 
+    def _dequant_packed_buffer(
+        self,
+        packed: torch.Tensor,
+        codec: Any,
+        head_dim: int,
+    ) -> torch.Tensor:
+        if packed.is_cuda and self.dtype == torch.bfloat16:
+            from sglang.jit_kernel.higgs_mha_2bit_kv import (
+                dequantize_higgs_mha_2bit,
+            )
+
+            out = torch.empty(
+                (*packed.shape[:2], head_dim),
+                dtype=self.dtype,
+                device=packed.device,
+            )
+            dequantize_higgs_mha_2bit(packed, out, codec.codebook)
+            return out
+        return codec.decompress(packed, self.dtype)
+
     def _get_key_buffer(self, layer_id: int):
-        # Legacy path: materialize the full packed cache back to BF16.
-        # This is O(layer_cache_size) per call and adds 200-600x to
-        # decode latency vs FP8 baseline; only the fused
-        # ``HiggsTritonAttnBackend`` is correct for production. Kept
-        # for backends that don't yet have a fused HIGGS-aware path
-        # (e.g. CPU-only correctness oracles).
+        # Fused HIGGS decode reads packed slots directly. This materialization
+        # path remains for extend/prefill and non-fused fallback backends.
         packed = self.k_buffer[layer_id - self.start_layer]
-        return self._higgs_k_codec.decompress(packed, self.dtype)
+        return self._dequant_packed_buffer(packed, self._higgs_k_codec, self.head_dim)
 
     def _get_value_buffer(self, layer_id: int):
         packed = self.v_buffer[layer_id - self.start_layer]
-        return self._higgs_v_codec.decompress(packed, self.dtype)
+        return self._dequant_packed_buffer(
+            packed, self._higgs_v_codec, self.v_head_dim
+        )
 
     def get_packed_key_buffer(self, layer_id: int) -> torch.Tensor:
         """Return the packed (uint8) K buffer for the fused decode path."""
@@ -1562,10 +1599,26 @@ class HiggsMHA2BitTokenToKVPool(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        k_buffer = self.k_buffer[layer_id - self.start_layer]
+        v_buffer = self.v_buffer[layer_id - self.start_layer]
+        if (
+            cache_k.is_cuda
+            and cache_v.is_cuda
+            and cache_k.dtype == torch.bfloat16
+            and cache_v.dtype == torch.bfloat16
+        ):
+            from sglang.srt.layers.attention.triton_ops.higgs_mha_kv_pack import (
+                store_higgs_mha_2bit_triton,
+            )
+
+            store_higgs_mha_2bit_triton(k_buffer, loc, cache_k)
+            store_higgs_mha_2bit_triton(v_buffer, loc, cache_v)
+            return
+
         packed_k = self._higgs_k_codec.compress(cache_k)
         packed_v = self._higgs_v_codec.compress(cache_v)
-        self.k_buffer[layer_id - self.start_layer][loc] = packed_k
-        self.v_buffer[layer_id - self.start_layer][loc] = packed_v
+        k_buffer[loc] = packed_k
+        v_buffer[loc] = packed_v
 
 
 class HybridLinearKVPool(KVCache):
@@ -3621,9 +3674,51 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
             dtype=self.dtype,
             device=q_nope.device,
         )
+        candidate = get_higgs_dense_2bit_b200_candidate()
         num_splits = self._select_higgs_mla_decode_num_splits(
             q_nope.shape[0], q_nope.shape[1], page_table.shape[1]
         )
+        if candidate.name == "store_saw_scalar2":
+            if page_table.shape[1] >= 1024:
+                num_splits = max(num_splits, 16)
+            if num_splits <= 1:
+                higgs_dense_2bit_mla_decode_saw_scalar2(
+                    q_nope,
+                    q_rope,
+                    layer_buffer,
+                    page_table,
+                    out,
+                    self.higgs_codec.codebook,
+                    sm_scale,
+                )
+                return out
+            mid_shape = (
+                q_nope.shape[0],
+                q_nope.shape[1],
+                num_splits,
+                self.kv_lora_rank + 2,
+            )
+            if (
+                self._higgs_mla_decode_mid is None
+                or self._higgs_mla_decode_mid.shape != mid_shape
+            ):
+                self._higgs_mla_decode_mid = torch.empty(
+                    mid_shape,
+                    dtype=torch.float32,
+                    device=q_nope.device,
+                )
+            higgs_dense_2bit_mla_decode_saw_scalar2_split(
+                q_nope,
+                q_rope,
+                layer_buffer,
+                page_table,
+                self._higgs_mla_decode_mid,
+                out,
+                self.higgs_codec.codebook,
+                sm_scale,
+            )
+            return out
+
         if num_splits <= 1:
             higgs_dense_2bit_mla_decode(
                 q_nope,

@@ -347,11 +347,15 @@ class SMCManager:
             num_tokens_per_req=server_args.speculative_num_draft_tokens,
         )
         if use_future_map and scheduler.enable_overlap and scheduler.future_map is not None:
-            future_indices = scheduler.future_map.alloc_future_indices(len(particle_reqs))
-            scheduler.future_map.store_to_map_for_new_smc_batch(
-                future_indices,
-                batch.spec_info,
-            )
+            # FutureMap exposes publish/stash; alloc_future_indices /
+            # store_to_map_for_new_smc_batch were referenced but never
+            # implemented. Match the construction+publish+stash flow that
+            # decode_schedule_batch_mixin uses for the same SMC payload.
+            from sglang.srt.managers.overlap_utils import FutureIndices
+
+            future_indices = FutureIndices(indices=batch.req_pool_indices)
+            scheduler.future_map.publish(future_indices, batch.spec_info.new_seq_lens)
+            scheduler.future_map.stash(future_indices, batch.spec_info)
             batch.spec_info.future_indices = future_indices
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch,

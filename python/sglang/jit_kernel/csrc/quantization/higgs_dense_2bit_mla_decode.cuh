@@ -334,6 +334,144 @@ higgs_dense_2bit_mla_decode_kernel(
   out_row[3 * 128 + tid] = __float2bfloat16(v3 * kInvSqrtLatentDim);
 }
 
+__device__ __forceinline__ float saw_scalar2_value(uint32_t code) {
+  code &= 0x3u;
+  const uint32_t is_small = ((code + 1u) & 0x2u) != 0u;
+  const uint32_t magnitude = is_small ? 0x3ee80000u : 0x3fc10000u;
+  const uint32_t sign = (code < 2u) ? 0x80000000u : 0u;
+  return __uint_as_float(magnitude | sign);
+}
+
+
+__device__ __forceinline__ void saw_scalar2_unpack_pair_lanes(
+    const uint8_t* __restrict__ slot, int tid,
+    float& c0, float& c1, float& c2, float& c3) {
+  uint32_t i0, i1, i2, i3;
+  higgs_unpack_indices(slot, tid, i0, i1, i2, i3);
+  const int coord_shift = (tid & 1) << 1;
+  c0 = saw_scalar2_value(i0 >> coord_shift);
+  c1 = saw_scalar2_value(i1 >> coord_shift);
+  c2 = saw_scalar2_value(i2 >> coord_shift);
+  c3 = saw_scalar2_value(i3 >> coord_shift);
+}
+
+__global__ void __launch_bounds__(kBlockThreads, 8)
+higgs_dense_2bit_mla_decode_saw_scalar2_kernel(
+    const bf16_t* __restrict__ q_nope,
+    const bf16_t* __restrict__ q_rope,
+    const uint8_t* __restrict__ compressed,
+    const int32_t* __restrict__ page_table,
+    bf16_t* __restrict__ out,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t num_heads,
+    int64_t topk,
+    int64_t q_nope_stride_0,
+    int64_t q_nope_stride_1,
+    int64_t q_rope_stride_0,
+    int64_t q_rope_stride_1,
+    int64_t compressed_stride_0,
+    int64_t page_table_stride_0,
+    int64_t out_stride_0,
+    int64_t out_stride_1,
+    float sm_scale) {
+  (void)codebook;
+  const int row = blockIdx.x;
+  const int head = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (row >= num_rows || head >= num_heads) return;
+
+  __shared__ float softmax_state[4];  // [m, l, alpha, beta]
+  __shared__ float warp_partials[4];
+
+  const bf16_t* q_nope_row =
+      q_nope + row * q_nope_stride_0 + head * q_nope_stride_1;
+  const float q0 = bf16_to_float(q_nope_row[0 * 128 + tid]);
+  const float q1 = bf16_to_float(q_nope_row[1 * 128 + tid]);
+  const float q2 = bf16_to_float(q_nope_row[2 * 128 + tid]);
+  const float q3 = bf16_to_float(q_nope_row[3 * 128 + tid]);
+
+  if (tid == 0) {
+    softmax_state[0] = kNegInf;
+    softmax_state[1] = 0.0f;
+  }
+  __syncthreads();
+
+  float q_rope_val = 0.0f;
+  if (tid < kRopeDim) {
+    const bf16_t* q_rope_row =
+        q_rope + row * q_rope_stride_0 + head * q_rope_stride_1;
+    q_rope_val = bf16_to_float(q_rope_row[tid]);
+  }
+  const int32_t* pages = page_table + row * page_table_stride_0;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  float acc2 = 0.0f;
+  float acc3 = 0.0f;
+
+  for (int64_t col = 0; col < topk; ++col) {
+    const int32_t page = __ldg(&pages[col]);
+    const bool valid = page >= 0;
+    const uint8_t* slot =
+        compressed + (valid ? static_cast<int64_t>(page) : 0) *
+        compressed_stride_0;
+
+    float c0 = 0.0f;
+    float c1 = 0.0f;
+    float c2 = 0.0f;
+    float c3 = 0.0f;
+    if (valid) {
+      saw_scalar2_unpack_pair_lanes(slot, tid, c0, c1, c2, c3);
+    }
+
+    float val = valid ? (q0 * c0 + q1 * c1 + q2 * c2 + q3 * c3) : 0.0f;
+    if (tid < kRopeDim && valid) {
+      const bf16_t* rope =
+          reinterpret_cast<const bf16_t*>(slot + kPackedBytes + kNormBytes);
+      val += q_rope_val * bf16_to_float(rope[tid]);
+    }
+
+    const float warp_sum = warp_reduce_sum(val);
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    if (lane == 0) warp_partials[warp_id] = warp_sum;
+    __syncthreads();
+
+    if (tid == 0) {
+      const float total =
+          warp_partials[0] + warp_partials[1] +
+          warp_partials[2] + warp_partials[3];
+      const float score = valid ? total * sm_scale : kNegInf;
+      const float old_m = softmax_state[0];
+      const float old_l = softmax_state[1];
+      const float new_m = fmaxf(old_m, score);
+      const float alpha = __expf(old_m - new_m);
+      const float beta = __expf(score - new_m);
+      softmax_state[0] = new_m;
+      softmax_state[1] = old_l * alpha + beta;
+      softmax_state[2] = alpha;
+      softmax_state[3] = beta;
+    }
+    __syncthreads();
+
+    const float alpha = softmax_state[2];
+    const float beta = softmax_state[3];
+    acc0 = acc0 * alpha + beta * c0;
+    acc1 = acc1 * alpha + beta * c1;
+    acc2 = acc2 * alpha + beta * c2;
+    acc3 = acc3 * alpha + beta * c3;
+  }
+
+  const float denom = softmax_state[1];
+  const bool ok = denom > 0.0f;
+  bf16_t* out_row = out + row * out_stride_0 + head * out_stride_1;
+  out_row[0 * 128 + tid] = __float2bfloat16(ok ? acc0 / denom : 0.0f);
+  out_row[1 * 128 + tid] = __float2bfloat16(ok ? acc1 / denom : 0.0f);
+  out_row[2 * 128 + tid] = __float2bfloat16(ok ? acc2 / denom : 0.0f);
+  out_row[3 * 128 + tid] = __float2bfloat16(ok ? acc3 / denom : 0.0f);
+}
+
 // Pre-rotate q_nope into a float32 buffer holding FWHT_512(q_nope) *
 // kInvSqrtLatentDim. Called once per (row, head) before stage1_split.
 // This matches TurboQuant's rotate_query kernel; pre-rotating once and
@@ -601,6 +739,188 @@ higgs_dense_2bit_mla_decode_stage2_kernel(
   out_row[3 * 128 + tid] = __float2bfloat16(v3 * kInvSqrtLatentDim);
 }
 
+__global__ void __launch_bounds__(kBlockThreads, 8)
+higgs_dense_2bit_mla_decode_saw_scalar2_stage1_split_kernel(
+    const bf16_t* __restrict__ q_nope,
+    const bf16_t* __restrict__ q_rope,
+    const uint8_t* __restrict__ compressed,
+    const int32_t* __restrict__ page_table,
+    float* __restrict__ mid,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t num_heads,
+    int64_t topk,
+    int64_t num_splits,
+    int64_t q_nope_stride_0,
+    int64_t q_nope_stride_1,
+    int64_t q_rope_stride_0,
+    int64_t q_rope_stride_1,
+    int64_t compressed_stride_0,
+    int64_t page_table_stride_0,
+    int64_t mid_stride_0,
+    int64_t mid_stride_1,
+    int64_t mid_stride_2,
+    float sm_scale) {
+  (void)codebook;
+  const int row = blockIdx.x;
+  const int head = blockIdx.y;
+  const int split = blockIdx.z;
+  const int tid = threadIdx.x;
+  if (row >= num_rows || head >= num_heads || split >= num_splits) return;
+
+  __shared__ float softmax_state[4];
+  __shared__ float warp_partials[4];
+
+  const bf16_t* q_nope_row =
+      q_nope + row * q_nope_stride_0 + head * q_nope_stride_1;
+  const float q0 = bf16_to_float(q_nope_row[0 * 128 + tid]);
+  const float q1 = bf16_to_float(q_nope_row[1 * 128 + tid]);
+  const float q2 = bf16_to_float(q_nope_row[2 * 128 + tid]);
+  const float q3 = bf16_to_float(q_nope_row[3 * 128 + tid]);
+
+  if (tid == 0) {
+    softmax_state[0] = kNegInf;
+    softmax_state[1] = 0.0f;
+  }
+  __syncthreads();
+
+  float q_rope_val = 0.0f;
+  if (tid < kRopeDim) {
+    const bf16_t* q_rope_row =
+        q_rope + row * q_rope_stride_0 + head * q_rope_stride_1;
+    q_rope_val = bf16_to_float(q_rope_row[tid]);
+  }
+
+  const int64_t chunk = (topk + num_splits - 1) / num_splits;
+  const int64_t begin = split * chunk;
+  const int64_t end = min(begin + chunk, topk);
+  const int32_t* pages = page_table + row * page_table_stride_0;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  float acc2 = 0.0f;
+  float acc3 = 0.0f;
+
+  for (int64_t col = begin; col < end; ++col) {
+    const int32_t page = __ldg(&pages[col]);
+    const bool valid = page >= 0;
+    const uint8_t* slot =
+        compressed + (valid ? static_cast<int64_t>(page) : 0) *
+        compressed_stride_0;
+
+    float c0 = 0.0f;
+    float c1 = 0.0f;
+    float c2 = 0.0f;
+    float c3 = 0.0f;
+    if (valid) {
+      saw_scalar2_unpack_pair_lanes(slot, tid, c0, c1, c2, c3);
+    }
+
+    float val = valid ? (q0 * c0 + q1 * c1 + q2 * c2 + q3 * c3) : 0.0f;
+    if (tid < kRopeDim && valid) {
+      const bf16_t* rope =
+          reinterpret_cast<const bf16_t*>(slot + kPackedBytes + kNormBytes);
+      val += q_rope_val * bf16_to_float(rope[tid]);
+    }
+
+    const float warp_sum = warp_reduce_sum(val);
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    if (lane == 0) warp_partials[warp_id] = warp_sum;
+    __syncthreads();
+
+    if (tid == 0) {
+      const float total =
+          warp_partials[0] + warp_partials[1] +
+          warp_partials[2] + warp_partials[3];
+      const float score = valid ? total * sm_scale : kNegInf;
+      const float old_m = softmax_state[0];
+      const float old_l = softmax_state[1];
+      const float new_m = fmaxf(old_m, score);
+      const float alpha = __expf(old_m - new_m);
+      const float beta = __expf(score - new_m);
+      softmax_state[0] = new_m;
+      softmax_state[1] = old_l * alpha + beta;
+      softmax_state[2] = alpha;
+      softmax_state[3] = beta;
+    }
+    __syncthreads();
+
+    const float alpha = softmax_state[2];
+    const float beta = softmax_state[3];
+    acc0 = acc0 * alpha + beta * c0;
+    acc1 = acc1 * alpha + beta * c1;
+    acc2 = acc2 * alpha + beta * c2;
+    acc3 = acc3 * alpha + beta * c3;
+  }
+
+  float* mid_row =
+      mid + row * mid_stride_0 + head * mid_stride_1 +
+      split * mid_stride_2;
+  if (tid == 0) {
+    mid_row[0] = softmax_state[0];
+    mid_row[1] = softmax_state[1];
+  }
+  mid_row[2 + 0 * 128 + tid] = acc0;
+  mid_row[2 + 1 * 128 + tid] = acc1;
+  mid_row[2 + 2 * 128 + tid] = acc2;
+  mid_row[2 + 3 * 128 + tid] = acc3;
+}
+
+__global__ void __launch_bounds__(kBlockThreads, 8)
+higgs_dense_2bit_mla_decode_saw_scalar2_stage2_kernel(
+    const float* __restrict__ mid,
+    bf16_t* __restrict__ out,
+    int64_t num_rows,
+    int64_t num_heads,
+    int64_t num_splits,
+    int64_t mid_stride_0,
+    int64_t mid_stride_1,
+    int64_t mid_stride_2,
+    int64_t out_stride_0,
+    int64_t out_stride_1) {
+  const int row = blockIdx.x;
+  const int head = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (row >= num_rows || head >= num_heads) return;
+
+  __shared__ float denom_smem;
+  const float* mid_base =
+      mid + row * mid_stride_0 + head * mid_stride_1;
+
+  float m = kNegInf;
+  for (int64_t s = 0; s < num_splits; ++s) {
+    m = fmaxf(m, mid_base[s * mid_stride_2]);
+  }
+
+  float l = 0.0f;
+  float v0 = 0.0f;
+  float v1 = 0.0f;
+  float v2 = 0.0f;
+  float v3 = 0.0f;
+  for (int64_t s = 0; s < num_splits; ++s) {
+    const float* sb = mid_base + s * mid_stride_2;
+    const float split_m = sb[0];
+    const float split_l = sb[1];
+    const float scale = split_l > 0.0f ? __expf(split_m - m) : 0.0f;
+    l += split_l * scale;
+    v0 += sb[2 + 0 * 128 + tid] * scale;
+    v1 += sb[2 + 1 * 128 + tid] * scale;
+    v2 += sb[2 + 2 * 128 + tid] * scale;
+    v3 += sb[2 + 3 * 128 + tid] * scale;
+  }
+
+  if (tid == 0) denom_smem = l;
+  __syncthreads();
+  const float denom = denom_smem;
+  const bool ok = denom > 0.0f;
+  bf16_t* out_row = out + row * out_stride_0 + head * out_stride_1;
+  out_row[0 * 128 + tid] = __float2bfloat16(ok ? v0 / denom : 0.0f);
+  out_row[1 * 128 + tid] = __float2bfloat16(ok ? v1 / denom : 0.0f);
+  out_row[2 * 128 + tid] = __float2bfloat16(ok ? v2 / denom : 0.0f);
+  out_row[3 * 128 + tid] = __float2bfloat16(ok ? v3 / denom : 0.0f);
+}
+
 // Host-side launchers.
 
 struct HiggsDense2BitMLADecodeKernel {
@@ -664,6 +984,88 @@ struct HiggsDense2BitMLADecodeKernel {
     dim3 grid(R.unwrap(), H.unwrap());
     LaunchKernel(grid, kBlockThreads, device.unwrap())(
         higgs_dense_2bit_mla_decode_kernel,
+        static_cast<const bf16_t*>(q_nope.data_ptr()),
+        static_cast<const bf16_t*>(q_rope.data_ptr()),
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        R.unwrap(),
+        H.unwrap(),
+        K.unwrap(),
+        q_nope_stride_0.unwrap(),
+        q_nope_stride_1.unwrap(),
+        q_rope_stride_0.unwrap(),
+        q_rope_stride_1.unwrap(),
+        compressed_stride_0.unwrap(),
+        page_table_stride_0.unwrap(),
+        out_stride_0.unwrap(),
+        out_stride_1.unwrap(),
+        static_cast<float>(sm_scale));
+  }
+};
+
+struct HiggsDense2BitMLADecodeSawScalar2Kernel {
+  static void run(
+      tvm::ffi::TensorView q_nope,
+      tvm::ffi::TensorView q_rope,
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView codebook,
+      double sm_scale) {
+    using namespace host;
+
+    auto R = SymbolicSize{"num_rows"};
+    auto H = SymbolicSize{"num_heads"};
+    auto K = SymbolicSize{"topk"};
+    auto S = SymbolicSize{"num_slots"};
+    auto q_nope_stride_0 = SymbolicSize{"q_nope_stride_0"};
+    auto q_nope_stride_1 = SymbolicSize{"q_nope_stride_1"};
+    auto q_rope_stride_0 = SymbolicSize{"q_rope_stride_0"};
+    auto q_rope_stride_1 = SymbolicSize{"q_rope_stride_1"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto page_table_stride_0 = SymbolicSize{"page_table_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto out_stride_1 = SymbolicSize{"out_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({R, H, kLatentDim})
+        .with_strides({q_nope_stride_0, q_nope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(q_nope);
+    TensorMatcher({R, H, kRopeDim})
+        .with_strides({q_rope_stride_0, q_rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(q_rope);
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({R, K})
+        .with_strides({page_table_stride_0, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({R, H, kLatentDim})
+        .with_strides({out_stride_0, out_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    if (R.unwrap() == 0 || H.unwrap() == 0 || K.unwrap() == 0) return;
+
+    dim3 grid(R.unwrap(), H.unwrap());
+    LaunchKernel(grid, kBlockThreads, device.unwrap())(
+        higgs_dense_2bit_mla_decode_saw_scalar2_kernel,
         static_cast<const bf16_t*>(q_nope.data_ptr()),
         static_cast<const bf16_t*>(q_rope.data_ptr()),
         static_cast<const uint8_t*>(compressed.data_ptr()),
@@ -826,6 +1228,118 @@ struct HiggsDense2BitMLADecodeSplitKernel {
     LaunchKernel(
         dim3(R.unwrap(), H.unwrap()), kBlockThreads, device.unwrap())(
         higgs_dense_2bit_mla_decode_stage2_kernel,
+        static_cast<const float*>(mid.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        R.unwrap(),
+        H.unwrap(),
+        P.unwrap(),
+        mid_stride_0.unwrap(),
+        mid_stride_1.unwrap(),
+        mid_stride_2.unwrap(),
+        out_stride_0.unwrap(),
+        out_stride_1.unwrap());
+  }
+};
+
+struct HiggsDense2BitMLADecodeSawScalar2SplitKernel {
+  static void run(
+      tvm::ffi::TensorView q_nope,
+      tvm::ffi::TensorView q_rope,
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView mid,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView codebook,
+      double sm_scale) {
+    using namespace host;
+
+    auto R = SymbolicSize{"num_rows"};
+    auto H = SymbolicSize{"num_heads"};
+    auto K = SymbolicSize{"topk"};
+    auto S = SymbolicSize{"num_slots"};
+    auto P = SymbolicSize{"num_splits"};
+    auto q_nope_stride_0 = SymbolicSize{"q_nope_stride_0"};
+    auto q_nope_stride_1 = SymbolicSize{"q_nope_stride_1"};
+    auto q_rope_stride_0 = SymbolicSize{"q_rope_stride_0"};
+    auto q_rope_stride_1 = SymbolicSize{"q_rope_stride_1"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto page_table_stride_0 = SymbolicSize{"page_table_stride_0"};
+    auto mid_stride_0 = SymbolicSize{"mid_stride_0"};
+    auto mid_stride_1 = SymbolicSize{"mid_stride_1"};
+    auto mid_stride_2 = SymbolicSize{"mid_stride_2"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto out_stride_1 = SymbolicSize{"out_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({R, H, kLatentDim})
+        .with_strides({q_nope_stride_0, q_nope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(q_nope);
+    TensorMatcher({R, H, kRopeDim})
+        .with_strides({q_rope_stride_0, q_rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(q_rope);
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({R, K})
+        .with_strides({page_table_stride_0, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({R, H, P, kLatentDim + 2})
+        .with_strides({mid_stride_0, mid_stride_1, mid_stride_2, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(mid);
+    TensorMatcher({R, H, kLatentDim})
+        .with_strides({out_stride_0, out_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    if (R.unwrap() == 0 || H.unwrap() == 0 || K.unwrap() == 0 ||
+        P.unwrap() == 0) {
+      return;
+    }
+
+    LaunchKernel(
+        dim3(R.unwrap(), H.unwrap(), P.unwrap()), kBlockThreads,
+        device.unwrap())(
+        higgs_dense_2bit_mla_decode_saw_scalar2_stage1_split_kernel,
+        static_cast<const bf16_t*>(q_nope.data_ptr()),
+        static_cast<const bf16_t*>(q_rope.data_ptr()),
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<float*>(mid.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        R.unwrap(),
+        H.unwrap(),
+        K.unwrap(),
+        P.unwrap(),
+        q_nope_stride_0.unwrap(),
+        q_nope_stride_1.unwrap(),
+        q_rope_stride_0.unwrap(),
+        q_rope_stride_1.unwrap(),
+        compressed_stride_0.unwrap(),
+        page_table_stride_0.unwrap(),
+        mid_stride_0.unwrap(),
+        mid_stride_1.unwrap(),
+        mid_stride_2.unwrap(),
+        static_cast<float>(sm_scale));
+
+    LaunchKernel(
+        dim3(R.unwrap(), H.unwrap()), kBlockThreads, device.unwrap())(
+        higgs_dense_2bit_mla_decode_saw_scalar2_stage2_kernel,
         static_cast<const float*>(mid.data_ptr()),
         static_cast<bf16_t*>(out.data_ptr()),
         R.unwrap(),

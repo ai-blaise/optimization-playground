@@ -58,6 +58,7 @@ constexpr int kNumPairs = kLatentDim / kPairDim;  // 256
 constexpr int kPackedBytes = kNumPairs / 2;       // 128 bytes
 constexpr int kNormBytes = 2;
 constexpr int kSlotBytes = kPackedBytes + kNormBytes + kRopeDim * 2;  // 258
+constexpr int kSawScalar2LargeRowThreshold = 16384;
 constexpr float kInvSqrtLatentDim = 0.044194173824159216f;  // 1 / sqrt(512)
 
 static_assert(kPackedBytes == 128, "expected 128 packed bytes per slot");
@@ -1081,6 +1082,151 @@ higgs_dense_2bit_dequant_page_table_pair_lanes_scale_broadcast_kernel(
 
 // ─── Host-side launcher structs ─────────────────────────────────────────────
 
+__device__ __forceinline__ uint32_t saw_scalar2_quant_bf16_bits(
+    uint32_t bits) {
+  if ((bits & 0x8000u) != 0) {
+    return bits > 0xbf7bu ? 0u : 1u;
+  }
+  return bits <= 0x3f7bu ? 2u : 3u;
+}
+
+__device__ __forceinline__ uint32_t saw_scalar2_bf16_bits(uint32_t code) {
+  // Codes 0/3 map to the high-magnitude lattice points, 1/2 to low.
+  code &= 0x3u;
+  const uint32_t high_magnitude = ((code ^ (code >> 1) ^ 1u) & 1u);
+  const uint32_t magnitude = 0x3ee8u + high_magnitude * 0x00d9u;
+  const uint32_t sign = ((code >> 1) ^ 1u) << 15;
+  return magnitude | sign;
+}
+
+__device__ __forceinline__ uint32_t saw_scalar2_bf16_pair(uint32_t code_pair) {
+  const uint32_t lo = saw_scalar2_bf16_bits(code_pair & 0x3u);
+  const uint32_t hi = saw_scalar2_bf16_bits((code_pair >> 2) & 0x3u);
+  return lo | (hi << 16);
+}
+
+template <int kWarpsPerBlock>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32, 4)
+higgs_dense_2bit_store_saw_scalar2_coalesced_kernel(
+    uint8_t* __restrict__ compressed,
+    const int64_t* __restrict__ locs,
+    const bf16_t* __restrict__ latent,
+    const bf16_t* __restrict__ rope,
+    const float* __restrict__ codebook,
+    const float* __restrict__ codebook_norm_sq,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t latent_stride_0,
+    int64_t latent_stride_1,
+    int64_t rope_stride_0,
+    int64_t rope_stride_1) {
+  (void)codebook;
+  (void)codebook_norm_sq;
+  (void)latent_stride_1;
+  (void)rope_stride_1;
+  static_assert(
+      kWarpsPerBlock == 4 || kWarpsPerBlock == 8,
+      "only four-row and eight-row block shapes are wired");
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp_id;
+  if (row >= num_rows) return;
+
+  const bf16_t* lat_row = latent + row * latent_stride_0;
+  const uint16_t* lat_bits = reinterpret_cast<const uint16_t*>(lat_row);
+  constexpr float scale = 1.0f;
+
+  const int64_t loc = locs[row];
+  uint8_t* slot = compressed + loc * compressed_stride_0;
+#pragma unroll
+  for (int segment = 0; segment < 4; ++segment) {
+    const int base = (segment * 32 + lane) * 4;
+    const unsigned long long packed_values = __ldg(
+        reinterpret_cast<const unsigned long long*>(lat_bits + base));
+    const uint32_t code0 = saw_scalar2_quant_bf16_bits(
+        static_cast<uint32_t>(packed_values & 0xffffull));
+    const uint32_t code1 = saw_scalar2_quant_bf16_bits(
+        static_cast<uint32_t>((packed_values >> 16) & 0xffffull));
+    const uint32_t code2 = saw_scalar2_quant_bf16_bits(
+        static_cast<uint32_t>((packed_values >> 32) & 0xffffull));
+    const uint32_t code3 = saw_scalar2_quant_bf16_bits(
+        static_cast<uint32_t>((packed_values >> 48) & 0xffffull));
+    const uint32_t idx0 = code0 | (code1 << 2);
+    const uint32_t idx1 = code2 | (code3 << 2);
+    slot[segment * 32 + lane] =
+        static_cast<uint8_t>((idx0 & 0x0F) | ((idx1 & 0x0F) << 4));
+  }
+
+  if (lane == 0) {
+    half scale_h = __float2half(scale);
+    *reinterpret_cast<half*>(slot + kPackedBytes) = scale_h;
+  }
+  if (lane < 8) {
+    const bf16_t* rope_row = rope + row * rope_stride_0;
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(rope_row) + lane * 8;
+    uint16_t* dst = reinterpret_cast<uint16_t*>(slot + kPackedBytes + kNormBytes) +
+        lane * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      dst[i] = __ldg(src + i);
+    }
+  }
+}
+
+template <int kWarpsPerBlock, typename LocT>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32, 4)
+higgs_dense_2bit_dequant_saw_scalar2_coalesced_kernel(
+    const uint8_t* __restrict__ compressed,
+    const LocT* __restrict__ locs,
+    bf16_t* __restrict__ out,
+    int32_t* __restrict__ compact_page_table,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t compressed_stride_0,
+    int64_t out_stride_0) {
+  (void)codebook;
+  static_assert(
+      kWarpsPerBlock == 4 || kWarpsPerBlock == 8,
+      "only four-row and eight-row block shapes are wired");
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp_id;
+  if (row >= num_rows) return;
+
+  const LocT raw_loc = locs[row];
+  if (compact_page_table != nullptr && lane == 0) {
+    compact_page_table[row] = raw_loc >= 0 ? static_cast<int32_t>(row) : -1;
+  }
+  const int64_t loc = raw_loc >= 0 ? static_cast<int64_t>(raw_loc) : 0;
+  const uint8_t* slot = compressed + loc * compressed_stride_0;
+  bf16_t* row_out = out + row * out_stride_0;
+
+#pragma unroll
+  for (int segment = 0; segment < 4; ++segment) {
+    const int byte_idx = segment * 32 + lane;
+    const int base = byte_idx * 4;
+    const uint8_t packed = __ldg(slot + byte_idx);
+    const uint32_t idx0 = static_cast<uint32_t>(packed & 0x0F);
+    const uint32_t idx1 = static_cast<uint32_t>(packed >> 4);
+    const unsigned long long packed_out =
+        static_cast<unsigned long long>(saw_scalar2_bf16_pair(idx0)) |
+        (static_cast<unsigned long long>(saw_scalar2_bf16_pair(idx1)) << 32);
+    *reinterpret_cast<unsigned long long*>(row_out + base) = packed_out;
+  }
+
+  if (lane < 8) {
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(
+        slot + kPackedBytes + kNormBytes) + lane * 8;
+    uint16_t* dst = reinterpret_cast<uint16_t*>(row_out + kLatentDim) + lane * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      dst[i] = __ldg(src + i);
+    }
+  }
+}
+
 struct HiggsDense2BitStoreKernel {
   static void run(
       tvm::ffi::TensorView compressed,
@@ -1731,6 +1877,224 @@ struct HiggsDense2BitStoreConstCodebookWarpPackRopeFirstKernel {
         rope_stride_1.unwrap());
   }
 };
+
+struct HiggsDense2BitStoreSawScalar2Kernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView latent,
+      tvm::ffi::TensorView rope,
+      tvm::ffi::TensorView codebook,
+      tvm::ffi::TensorView codebook_norm_sq) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto latent_stride_0 = SymbolicSize{"latent_stride_0"};
+    auto latent_stride_1 = SymbolicSize{"latent_stride_1"};
+    auto rope_stride_0 = SymbolicSize{"rope_stride_0"};
+    auto rope_stride_1 = SymbolicSize{"rope_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kLatentDim})
+        .with_strides({latent_stride_0, latent_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(latent);
+    TensorMatcher({N, 1, kRopeDim})
+        .with_strides({rope_stride_0, rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(rope);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+    TensorMatcher({kCodebookSize})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook_norm_sq);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    if (num_rows >= kSawScalar2LargeRowThreshold) {
+      LaunchKernel((num_rows + 7) / 8, 256, device.unwrap())(
+          higgs_dense_2bit_store_saw_scalar2_coalesced_kernel<8>,
+          static_cast<uint8_t*>(compressed.data_ptr()),
+          static_cast<const int64_t*>(locs.data_ptr()),
+          static_cast<const bf16_t*>(latent.data_ptr()),
+          static_cast<const bf16_t*>(rope.data_ptr()),
+          static_cast<const float*>(codebook.data_ptr()),
+          static_cast<const float*>(codebook_norm_sq.data_ptr()),
+          num_rows,
+          compressed_stride_0.unwrap(),
+          latent_stride_0.unwrap(),
+          latent_stride_1.unwrap(),
+          rope_stride_0.unwrap(),
+          rope_stride_1.unwrap());
+      return;
+    }
+
+    LaunchKernel((num_rows + 3) / 4, 128, device.unwrap())(
+        higgs_dense_2bit_store_saw_scalar2_coalesced_kernel<4>,
+        static_cast<uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<const bf16_t*>(latent.data_ptr()),
+        static_cast<const bf16_t*>(rope.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        static_cast<const float*>(codebook_norm_sq.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        latent_stride_0.unwrap(),
+        latent_stride_1.unwrap(),
+        rope_stride_0.unwrap(),
+        rope_stride_1.unwrap());
+  }
+};
+
+struct HiggsDense2BitDequantSawScalar2Kernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView locs,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView codebook) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(locs);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = N.unwrap();
+    if (num_rows == 0) return;
+
+    if (num_rows >= kSawScalar2LargeRowThreshold) {
+      LaunchKernel((num_rows + 7) / 8, 256, device.unwrap())(
+          higgs_dense_2bit_dequant_saw_scalar2_coalesced_kernel<8, int64_t>,
+          static_cast<const uint8_t*>(compressed.data_ptr()),
+          static_cast<const int64_t*>(locs.data_ptr()),
+          static_cast<bf16_t*>(out.data_ptr()),
+          static_cast<int32_t*>(nullptr),
+          static_cast<const float*>(codebook.data_ptr()),
+          num_rows,
+          compressed_stride_0.unwrap(),
+          out_stride_0.unwrap());
+      return;
+    }
+
+    LaunchKernel((num_rows + 3) / 4, 128, device.unwrap())(
+        higgs_dense_2bit_dequant_saw_scalar2_coalesced_kernel<4, int64_t>,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int64_t*>(locs.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        static_cast<int32_t*>(nullptr),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap());
+  }
+};
+
+struct HiggsDense2BitDequantPageTableSawScalar2Kernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView compact_page_table,
+      tvm::ffi::TensorView codebook) {
+    using namespace host;
+
+    auto S = SymbolicSize{"num_slots"};
+    auto B = SymbolicSize{"num_query_rows"};
+    auto K = SymbolicSize{"topk"};
+    auto N = SymbolicSize{"num_rows"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({B, K})
+        .with_strides({K, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(compact_page_table);
+    TensorMatcher({N, 1, kKvDim})
+        .with_strides({out_stride_0, kKvDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    const int64_t num_rows = B.unwrap() * K.unwrap();
+    if (num_rows == 0) return;
+
+    if (num_rows >= kSawScalar2LargeRowThreshold) {
+      LaunchKernel((num_rows + 7) / 8, 256, device.unwrap())(
+          higgs_dense_2bit_dequant_saw_scalar2_coalesced_kernel<8, int32_t>,
+          static_cast<const uint8_t*>(compressed.data_ptr()),
+          static_cast<const int32_t*>(page_table.data_ptr()),
+          static_cast<bf16_t*>(out.data_ptr()),
+          static_cast<int32_t*>(compact_page_table.data_ptr()),
+          static_cast<const float*>(codebook.data_ptr()),
+          num_rows,
+          compressed_stride_0.unwrap(),
+          out_stride_0.unwrap());
+      return;
+    }
+
+    LaunchKernel((num_rows + 3) / 4, 128, device.unwrap())(
+        higgs_dense_2bit_dequant_saw_scalar2_coalesced_kernel<4, int32_t>,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        static_cast<int32_t*>(compact_page_table.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        num_rows,
+        compressed_stride_0.unwrap(),
+        out_stride_0.unwrap());
+  }
+};
+
 
 struct HiggsDense2BitDequantKernel {
   static void run(

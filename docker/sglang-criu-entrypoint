@@ -38,15 +38,109 @@ fi
 
 CRIU=${CRIU:-/opt/criu-snapshots/criu}
 PLUGINS=${PLUGINS:-/opt/criu-snapshots/plugins}
-exec "${CRIU}" restore \
-    -D "${SNAPSHOT_DIR}/img" \
-    -W "${SNAPSHOT_DIR}/logs" \
-    -v4 -o restore.log \
-    -d --restore-detached \
-    --shell-job \
-    --tcp-established \
-    --ext-unix-sk \
-    --file-locks \
-    --manage-cgroups full \
-    --lazy-pages \
-    --lib "${PLUGINS}"
+PIDFILE="${SNAPSHOT_DIR}/restore.pid"
+mkdir -p "${SNAPSHOT_DIR}/logs"
+export PATH="/opt/criu-snapshots/bin:${PATH}"
+
+collect_post_restore_pids() {
+    local root_pid=""
+    local pid cmdline proc
+    local target=${SGLANG_CRIU_POST_RESTORE_TARGET:-root}
+
+    if [[ -f "${PIDFILE}" ]]; then
+        root_pid=$(<"${PIDFILE}")
+    fi
+    if [[ "${target}" == "root" && -n "${root_pid}" ]]; then
+        printf "%s\n" "${root_pid}"
+        return
+    fi
+    for proc in /proc/[0-9]*; do
+        pid=${proc##*/}
+        [[ -r "${proc}/cmdline" ]] || continue
+        cmdline=$(tr "\0" " " <"${proc}/cmdline" 2>/dev/null || true)
+        if [[ "${cmdline}" == *sglang::scheduler* ]]; then
+            printf "%s\n" "${pid}"
+        fi
+    done
+    if [[ -n "${root_pid}" ]] && ! pgrep -f "sglang::scheduler" >/dev/null 2>&1; then
+        printf "%s\n" "${root_pid}"
+    fi
+}
+
+signal_post_restore() {
+    local signal_number=${SGLANG_CRIU_POST_RESTORE_SIGNAL:-40}
+    local ready_file=${SGLANG_CRIU_POST_RESTORE_READY:-/var/run/dynamo/post_restore.done}
+    local timeout=${SGLANG_CRIU_POST_RESTORE_TIMEOUT:-120}
+    local deadline
+    local pid
+    local -a pids=()
+
+    [[ "${SGLANG_CRIU_SIGNAL_POST_RESTORE:-1}" == "1" ]] || return 0
+    mapfile -t pids < <(collect_post_restore_pids | sort -n | uniq)
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        echo "sglang-criu-entrypoint: no restored process found for post_restore" >&2
+        return 1
+    fi
+
+    for pid in "${pids[@]}"; do
+        rm -f "${ready_file}.${pid}"
+        kill -s "${signal_number}" "${pid}"
+    done
+    [[ "${timeout}" == "0" ]] && return 0
+
+    deadline=$((SECONDS + timeout))
+    while (( SECONDS < deadline )); do
+        local ready_count=0
+        for pid in "${pids[@]}"; do
+            [[ -s "${ready_file}.${pid}" || -s "${ready_file}" ]] && ((ready_count += 1))
+        done
+        [[ ${ready_count} -eq ${#pids[@]} ]] && return 0
+        sleep 1
+    done
+    echo "sglang-criu-entrypoint: timed out waiting for ${ready_file} from pids ${pids[*]}" >&2
+    return 1
+}
+
+restore_args=(
+    restore
+    -D "${SNAPSHOT_DIR}/img"
+    -W "${SNAPSHOT_DIR}/logs"
+    --pidfile "${PIDFILE}"
+    --root /
+    --join-ns mnt:/proc/self/ns/mnt
+    -v4 -o restore.log
+    -d --restore-detached
+    --shell-job
+    --tcp-established
+    --ext-unix-sk
+    --file-locks
+    --manage-cgroups=full
+    --libdir "${PLUGINS}"
+)
+
+if [[ "${SGLANG_CRIU_INHERIT_NETNS:-1}" == "1" ]]; then
+    exec {netns_fd}< /proc/self/ns/net
+    restore_args+=(--inherit-fd "fd[${netns_fd}]:extRootNetNS")
+fi
+
+set +e
+"${CRIU}" "${restore_args[@]}"
+status=$?
+set -e
+if [[ ${status} -ne 0 ]]; then
+    cat "${SNAPSHOT_DIR}/logs/restore.log" >&2 || true
+    exit "${status}"
+fi
+
+signal_post_restore
+if [[ "${SGLANG_CRIU_RUN_COMMAND_AFTER_RESTORE:-0}" == "1" && $# -gt 0 ]]; then
+    "$@"
+    command_status=$?
+    if [[ "${SGLANG_CRIU_EXIT_AFTER_RESTORE_COMMAND:-0}" == "1" ]]; then
+        exit "${command_status}"
+    fi
+fi
+if [[ "${SGLANG_CRIU_EXIT_AFTER_RESTORE:-0}" == "1" ]]; then
+    exit 0
+fi
+sleep infinity

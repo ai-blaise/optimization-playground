@@ -2,148 +2,245 @@
 
 ## Scope
 
-HIGGS dense MLA 2-bit KV cache store, selected/dequant paths, and fused MLA
-decode on B200 for the DeepSeek-V3.2-REAP lane.
+Dense MLA HIGGS 2-bit KV cache store, direct dequant, page-table dequant,
+and fused MLA decode compatibility on B200 for the DeepSeek-V3.2-REAP
+SpinQuant lane. The accepted candidate is
+opt-in through the model `quantization_config.kv_cache_scheme` and does not
+change the default EDEN2/Hadamard production path.
 
 ## Result
 
-Accepted implementation: `store_const_codebook_warp_pack`.
+Accepted implementation: `store_saw_scalar2`.
 
-This is a store-only production candidate. It keeps the fixed EDEN2 codebook
-path and replaces the normalized-pair and packed-index shared-memory handoff
-with warp shuffles. It is bit-exact against production in the HIGGS tests and
-clears the relaxed close-out gate.
+This is a SAW-inspired fixed-scale HIGGS slot for SpinQuant-rotated MLA
+activations. It keeps the 258-byte HIGGS slot, removes the online Hadamard from
+this opt-in path, thresholds BF16 bits directly into a 2-bit scalar lattice,
+uses 64-bit latent load/store groups, and moves rope as 16-bit values to avoid
+the byte-granular copy that IKP/SASS exposed.
 
-The default production selector now uses this store path. No fused MLA decode
-candidate was promoted. The best decode variants produced large-shape wins, but
-small-row integration shapes were mixed and the functional tolerance envelope
-for the changed split-reduction numerics is not yet validated against the HIGGS
-and SAW-INT4 reference constraints. Those variants are preserved as rejected
-evidence rather than production code.
+The matching fused MLA decode path is required for this candidate. The default
+EDEN2/Hadamard fused decode interprets the 128 packed bytes as EDEN pair
+indices, so it is not correct for SAW scalar2 slots. The SAW path now uses a
+SAW-aware split-K decode with pair-lane unpack, branchless lattice value
+materialization, and at least 16 splits for top-k 1024 requests.
+
+The candidate is selected by either:
+
+```json
+{
+  "quantization_config": {
+    "kv_cache_scheme": {
+      "quant_method": "higgs_dense_2bit",
+      "b200_candidate": "store_saw_scalar2"
+    }
+  }
+}
+```
+
+or `SGLANG_HIGGS_DENSE_2BIT_B200_CANDIDATE=store_saw_scalar2`.
 
 ## Performance
 
-Final B200 verification artifact:
-`/root/b200-run-20260518/workers/higgs/artifacts/worker_loop_20260518/round24_final_closeout_verification/round24_summary.json`.
+Artifact: `artifacts/higgs_saw_branchless_wpb8_full_acceptance.json` from pod
+`higgs-cute-prod-ref` on `a4-us-001-rl9`.
+Comparator: `lightseekorg/tokenspeed` `origin/main` MLA-KV set/get kernels
+mounted read-only from `/workspace/tokenspeed`.
 
-| Path | OP baseline | Accepted candidate | Speedup | Correctness |
-| --- | ---: | ---: | ---: | --- |
-| Store, 8192 tokens | 0.063603840 ms | 0.047208958 ms | 1.3473x | bit-exact |
-| Selected KV, r1 topk2048 | 0.009014000 ms | 0.008909600 ms | 1.0117x | bit-exact decode output |
-| Decode, r1 topk2048 after store | 0.042072800 ms | 0.041550800 ms | 1.0126x | bit-exact |
-| Decode, r4 topk2048 after store | 0.059747601 ms | 0.060678399 ms | 0.9847x | bit-exact |
-| Decode, r16 topk4096 after store | 0.296774793 ms | 0.296769595 ms | 1.0000x | bit-exact |
-| Decode, r64 topk4096 after store | 1.070790768 ms | 1.070921230 ms | 0.9999x | bit-exact |
+The accepted SAW path now uses branchless BF16 lattice reconstruction and an
+8-row CTA shape for `N >= 16384`. Times are minimum CUDA-event milliseconds.
 
-Store IKP, final B200 verification:
+| Rows | OP store | SAW store | TokenSpeed set | SAW store vs OP | SAW store vs TokenSpeed | OP dequant | SAW dequant | TokenSpeed get | SAW dequant vs OP | SAW dequant vs TokenSpeed |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 0.00685 | 0.00672 | 0.01485 | 1.02x | 2.21x | 0.00719 | 0.00644 | 0.01946 | 1.12x | 3.02x |
+| 2048 | 0.01440 | 0.00609 | 0.01487 | 2.37x | 2.44x | 0.00826 | 0.00645 | 0.01475 | 1.28x | 2.29x |
+| 8192 | 0.04716 | 0.00549 | 0.01479 | 8.60x | 2.70x | 0.02467 | 0.00572 | 0.01475 | 4.31x | 2.58x |
+| 16384 | 0.08813 | 0.00823 | 0.01467 | 10.70x | 1.78x | 0.04717 | 0.00750 | 0.01463 | 6.29x | 1.95x |
+| 32768 | 0.17220 | 0.01121 | 0.01477 | 15.36x | 1.32x | 0.09024 | 0.01030 | 0.01474 | 8.76x | 1.43x |
+| 65536 | 0.34805 | 0.02056 | 0.02382 | 16.93x | 1.16x | 0.20088 | 0.02261 | 0.02467 | 8.89x | 1.09x |
+| 131072 | 0.73566 | 0.04210 | 0.04899 | 17.47x | 1.16x | 0.41545 | 0.04705 | 0.04858 | 8.83x | 1.03x |
 
-| Candidate | Store kernel SASS instructions | Relative |
-| --- | ---: | ---: |
-| `production` | 544,366,592 | 1.0000x |
-| `store_const_codebook_warp_pack` | 469,393,408 | 0.8623x |
+Page-table dequant also cleared TokenSpeed get across the same large-row
+boundary after the 8-row dispatch: 1.82x at 16384, 1.43x at 32768, 1.09x at
+65536, and 1.03x at 131072 rows. The `N=1` minimum is within measurement noise
+against OP page-table dequant; median latency is faster and the serving-relevant
+large rows clear the gate.
 
-Earlier accepted-baseline comparison:
-`store_const_codebook_warp_pack` was also measured at about 1.109x versus the
-previous accepted `store_const_codebook` store candidate in the round11b
-warp-pack-fixed profile, and about 1.333x versus the original production store.
+Fused MLA decode top-k 1024 results, including the SAW-aware split-K repair:
+
+| Rows | Heads | OP EDEN split | SAW split | SAW vs OP |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 16 | 0.0943 ms | 0.0439 ms | 2.15x |
+| 4 | 16 | 0.0984 ms | 0.0574 ms | 1.71x |
+| 16 | 16 | 0.1985 ms | 0.1639 ms | 1.21x |
+| 32 | 16 | 0.3150 ms | 0.3006 ms | 1.05x |
+| 1 | 32 | 0.0959 ms | 0.0472 ms | 2.03x |
+| 16 | 32 | 0.3153 ms | 0.3008 ms | 1.05x |
+| 32 | 32 | 0.5637 ms | 0.5684 ms | 0.99x |
+
+The 32x32 decode row is within noise but does not clear the win gate; the
+opt-in SAW path remains accepted for the target small-batch decode lane and the
+store/get contract, not as a universal replacement for the default
+EDEN2/Hadamard path.
 
 ## Flashtraining
 
-Closest comparator artifact:
-`/root/b200-run-20260518/workers/higgs/artifacts/worker_loop_20260518/round24_final_closeout_verification/higgs_flashtraining_comparator_store_only_final.json`.
+There is no exact flashtraining Megatron equivalent for this inference MLA KV
+slot. The closest Megatron HIGGS reference is training fake-quant forward, which
+includes FWHT, EDEN2 quantization, inverse reconstruction, and saved tensors.
+It remains useful for correctness and algorithm context, but it is not a fair
+latency baseline for this serving KV store/get path. TokenSpeed MLA KV is the
+primary serving comparator for this pass.
 
-Megatron reference: `ai-blaise/Megatron-LM` ref
-`844bf42af7ce73a1b80e4b1ccb3c221dd63de35d`.
+## Correctness
 
-There is no exact flashtraining KV-cache store equivalent. The closest real
-reference is Megatron HIGGS dense 2-bit fake-quant forward
-(`higgs_kv_fwd_kernel`), which includes FWHT, EDEN2 quantization, indices,
-scale, inverse FWHT, output, and training saved tensors. The OP comparison
-therefore reports store-only timing and store+dequant timing; it is not a
-full-equivalence claim.
+B200 CUDA smoke on the clean worktree:
 
-| Rows | Flashtraining fake-quant forward | OP production store+dequant | Accepted store+dequant | Accepted / flashtraining |
-| ---: | ---: | ---: | ---: | ---: |
-| 4096 | 0.036897200 ms | 0.047206801 ms | 0.038994801 ms | 0.9462x |
-| 8192 | 0.069633198 ms | 0.090139598 ms | 0.073762000 ms | 0.9440x |
+- Direct store+dequant for `N in [1, 7, 64, 1024, 4096]`: rope exact,
+  `min_cos >= 0.9218`, `mean_cos >= 0.9359`.
+- Page-table dequant at `N=1024`: rope exact and compact page table exact.
+- Full quality sweep on the experimental worktree through `N=8192`: rope exact,
+  `min_cos >= 0.9221`, `mean_cos >= 0.9385`.
 
-Store-only OP speedup in the same comparator:
+The candidate is intentionally not byte-exact with the EDEN2/Hadamard HIGGS
+codec. The acceptance target is functional correctness for the SpinQuant path:
+rope preservation, stable latent cosine, fixed 258-byte layout, and better
+store/get latency than both OP HIGGS scalar and TokenSpeed MLA KV.
 
-| Rows | OP production store | Accepted store | Speedup |
-| ---: | ---: | ---: | ---: |
-| 4096 | 0.032864001 ms | 0.024668799 ms | 1.3322x |
-| 8192 | 0.063532400 ms | 0.047162801 ms | 1.3471x |
+## IKP And CZS
 
-## Rejections
+IKP/SASS findings drove the accepted changes:
 
-`store_warp_pack_mla_decode_vec4_split_balanced` was not promoted. In the
-round20 repaired acceptance gate it showed a target-path signal, but integration
-was mixed: r64 topk4096 decode improved 1.1624x, while r1/r4 topk2048 decode
-regressed to 0.8404x and 0.8430x. Standalone r64 topk4096 was allclose but not
-bit-exact (`max_abs=0.00048828125`). Non-bit-exact output is not by itself a
-rejection for HIGGS; the blocker is the combination of small-shape regressions
-and missing quality/tolerance validation for the new reduction order.
+- Separate tensor-core Hadamard plus pack was rejected: materializing the
+  transform or forcing the 2-bit classifier into skinny tensor-core tiles did
+  not beat both OP HIGGS and TokenSpeed MLA KV.
+- Constant-memory dequant LUT was rejected because divergent constant indexing
+  regressed large-row recovery.
+- SAW fused decode single-pass was correctness-ready but too slow: about
+  1.34 ms on the 1x16x1024 gate.
+- SAW split-K direct scalar-byte unpack improved that gate to about 0.180 ms,
+  but still trailed OP EDEN split.
+- Quad-lane byte broadcast was rejected after it regressed the same gate to
+  about 0.191 ms.
+- Pair-lane unpack plus branchless BF16-bit lattice values was accepted for the
+  SAW fused decode path, reaching about 0.074 ms at eight splits and 0.044 ms
+  at the selected 16-split setting on the 1x16x1024 gate.
+- Single-warp multi-row tiles were rejected because they removed too much
+  parallelism for quantization.
+- SASS on the accepted store/get shape showed scalar BF16 loads and byte rope
+  copies; the first accepted pass changed latent groups to 64-bit loads/stores
+  and rope to 16-bit moves.
+- The final pass removed branches from BF16 lattice reconstruction and uses
+  eight rows per CTA for `N >= 16384`, which is the shape that cleared the
+  TokenSpeed get comparator at 131072 rows.
 
-`store_warp_pack_mla_decode_vec4_split_large_batch` was also not promoted. The
-final rejected probe measured 1.0339x at r64 topk4096 and was allclose with
-cosine approximately 1.0 (`max_abs=0.00048828125`, mean absolute error around
-1e-8). Small shapes were effectively neutral (`0.9976x` at r1 topk2048,
-`1.0020x` at r4 topk2048). This remains useful evidence, but it is not a
-production-ready improvement until the decode tolerance and quality tests are
-defined and passed.
-
-Round13 pair-lane scale-broadcast dequant candidates stayed slower than
-production (`~0.89x` direct and `~0.867x` page-table). Round16 scale-broadcast
-MLA decode was slower (`~0.947x` at r64 topk4096). Round17 constant-codebook
-decode was rejected due large regressions. Round18 vec4 unpack was bit-exact
-but sub-gate (`~1.021x` at r64 topk4096).
-
-## Correctness Gate
-
-The accepted store path is bit-exact because it only changes the CUDA scoring
-and packing schedule, not the HIGGS codec. Future decode candidates do not need
-to be bit-exact if they are functionally correct for the target model and the
-reference papers. The minimum gate is: HIGGS codec invariants stay intact
-(Hadamard/RHT rotation, EDEN2 lattice lookup, scale reconstruction, packed-slot
-layout), SAW-INT4-inspired fused-write or BDR changes preserve the serving
-contract, and quality/perplexity/generation smoke tests confirm that any
-changed reduction order is harmless for the target deployment.
-
-## CuTe / CZS
-
-Final CZS capture:
-`/root/b200-run-20260518/workers/higgs/artifacts/worker_loop_20260518/round24_final_closeout_verification/czs_higgs_dense_2bit_b200_optin.out`.
-
-Result: 5 proved, 4 disproved, 0 unknown, exit code 1. The existing HIGGS CZS
-artifact is layout/vectorization-only and has no MMA atoms, TMA descriptors, or
-`ldmatrix` obligations. It is not a CuTe/tensor-op promotion proof.
-
-CuTe/tensor-op successor status: blocked, not ignored. IKP/autoinfer showed the
-remaining decode hot path is EDEN2 gather/argmax, packed-byte traffic, online
-softmax, and FWHT/butterfly work rather than a clean SM100 MMA tile. A tensor
-rewrite would need to materialize dense topk x 512 values or use very skinny
-K=2, N=16 tiles before non-GEMM softmax/butterfly work, and would require a new
-CZS-proved module before promotion.
-
-## References
-
-`togethercomputer/saw-int4` was inspected as a BDR/fused-KV-write reference. It
-supports the no-global-scratch Hadamard and fused write design direction, but it
-targets MHA affine INT4 KV, not dense MLA EDEN2-16 lattice slots with a 258-byte
-HIGGS layout.
-
-`Dao-AILab/fast-hadamard-transform` was inspected as the FWHT implementation
-reference. It validates the register/warp/shared-memory butterfly family, but
-as a standalone transform it would add launch/global traffic and does not cover
-EDEN2 lookup, packed HIGGS slots, page-table selection, or fused MLA softmax.
+CZS proof: `docs/proofs/higgs_dense_2bit_saw_scalar2_czs_module.json`.
+Result: 7 proved, 0 disproved, 0 unknown. The proof covers static row layouts
+and the vectorized 4xbf16 latent, 8xbf16 rope, and 4xbf16 output moves. The
+accepted store/get path has no MMA/TMA obligations; it is a memory/bit-pack
+kernel rather than a GEMM-like tensor-core kernel. The separate CuTe/tensor-core
+MLA decode prototypes remain WIP and are not promoted because they do not yet
+beat the split-K decode baseline across the target matrix.
 
 ## Verification
 
-- Final focused correctness: `CUDA_VISIBLE_DEVICES=1
-  python -m pytest python/sglang/test/test_higgs_dense_2bit_kv.py
-  test/srt/test_higgs_dense_2bit_kv_integration.py -q` passed 21 tests.
-- Final B200 verification: round24 store+selected+decode integration, rejected
-  decode probe, flashtraining comparator, and store IKP all completed under
-  idle gates.
-- The accepted store path is the default production selector; rejected
-  decode/dequant variants remain opt-in candidates only.
+- `artifacts/higgs_saw_branchless_wpb8_full_acceptance.json`: B200 full sweep
+  against OP production HIGGS and TokenSpeed MLA-KV set/get for rows 1 through
+  131072.
+- `SGLANG_HIGGS_DENSE_2BIT_B200_CANDIDATE=store_saw_scalar2` correctness:
+  rope exact for direct and page-table dequant; random-latent mean cosine stayed
+  about 0.9396 in the large-row sweep.
+- `python3 -m pytest -q python/sglang/test/test_higgs_dense_2bit_kv.py
+  test/srt/test_higgs_dense_2bit_kv_integration.py`: 23 passed on B200 pod
+  `higgs-cute-prod-ref`.
+- Combined config-dispatch, dense HIGGS, GQA, and server-args order suite:
+  68 passed on B200 pod `higgs-cute-prod-ref`; this also verifies the
+  dispatcher test restores its import stubs before later quantization tests.
+- CZS proof passed: `docs/proofs/higgs_dense_2bit_saw_scalar2_czs_module.json`,
+  7 proved, 0 disproved, 0 unknown.
+
+
+
+# HIGGS MHA/GQA Draft KV
+
+## Scope
+
+SMC-SD draft-model MHA/GQA KV cache for
+`BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP`. The model shape is
+`head_dim=128`, `num_attention_heads=32`, and `num_key_value_heads=2`.
+Each K or V row uses the existing 34-byte HIGGS slot:
+32 packed EDEN2/FWHT index bytes plus one FP16 scale.
+
+## Result
+
+Accepted implementation:
+
+- Store: Triton packer `store_higgs_mha_2bit_triton`, using the same
+  FWHT layout as the fused HIGGS draft decode kernel.
+- Materialize fallback: CUDA `dequantize_higgs_mha_2bit` for backends
+  that still need BF16 K/V tensors.
+- Production decode remains the existing fused HIGGS Triton backend,
+  selected when the draft pool is `HiggsMHA2BitTokenToKVPool`.
+
+The lower-level CUDA store candidate was rejected: it was fast, but its
+FWHT orientation produced lower reconstruction quality at large row counts.
+It is not wired or exported.
+
+## Deployment
+
+The draft model can request this path from its Hugging Face config:
+
+```json
+{
+  "quantization_config": {
+    "kv_cache_scheme": {
+      "quant_method": "higgs_mha_2bit",
+      "scope": "smc_draft",
+      "head_dim": 128,
+      "num_key_value_heads": 2,
+      "slot_bytes": 34,
+      "store_backend": "triton_fwht_eden2",
+      "decode_backend": "triton_fused_higgs_mha_2bit"
+    }
+  }
+}
+```
+
+When SMC is enabled and the operator leaves `--smc-draft-kv-cache-dtype`
+at `auto` or unset, SGLang reads the draft config and sets the draft KV
+dtype to `higgs_2bit`. Explicit CLI values still win.
+
+## Performance
+
+Artifact: `artifacts/higgs_gqa_kv_perf_20260524.json` from pod
+`higgs-kv-cute` on `a4-us-001-rl9`.
+
+| Rows | Triton store | Eager store | Store speedup | CUDA dequant | Eager dequant | Dequant speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 0.0188 ms | 0.411 ms | 21.8x | 0.00536 ms | 0.356 ms | 66.6x |
+| 2048 | 0.0238 ms | 0.408 ms | 17.1x | 0.00571 ms | 0.359 ms | 63.0x |
+| 8192 | 0.0182 ms | 0.594 ms | 32.6x | 0.0124 ms | 0.357 ms | 28.9x |
+| 32768 | 0.0352 ms | 1.80 ms | 51.3x | 0.0370 ms | 0.483 ms | 13.1x |
+| 65536 | 0.0639 ms | 3.53 ms | 55.3x | 0.0698 ms | 0.926 ms | 13.3x |
+| 131072 | 0.122 ms | 7.06 ms | 57.6x | 0.137 ms | 1.86 ms | 13.5x |
+
+Tile sweep: `BLOCK_N=16` had the best aggregate store latency across
+512, 2048, 8192, 32768, and 65536 rows; `BLOCK_N=8` was nearly tied and
+`BLOCK_N=32` regressed large rows.
+
+## Correctness
+
+- Live Hugging Face `config.json` for
+  `BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP` contains
+  `quantization_config.kv_cache_scheme.quant_method=higgs_mha_2bit`,
+  `scope=smc_draft`, `head_dim=128`, `num_key_value_heads=2`, `slot_bytes=34`,
+  `store_backend=triton_fwht_eden2`, and
+  `decode_backend=triton_fused_higgs_mha_2bit`.
+- `python3 -m pytest -q test/srt/test_higgs_mha_2bit_fused_decode.py
+  test/srt/test_quantization_config_dispatch.py::test_smc_draft_higgs_mha_kv_cache_scheme_selects_higgs_2bit
+  test/registered/unit/server_args/test_server_args.py::TestSMCDisaggregationArgs::test_smc_draft_kv_dtype_uses_draft_hf_config`:
+  7 passed on B200 pod `higgs-cute-prod-ref`.
+- Store path is byte-exact against the eager codec in the focused unit test.
+  Larger benchmark rows showed rare tie differences, but dequantized output
+  stayed effectively identical to the eager codec (`dequant_cos_min >= 0.9944`).
+- CZS proof: `docs/proofs/higgs_mha_2bit_kv_czs_module.json`, 7 proved,
+  0 disproved, 0 unknown.

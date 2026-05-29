@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
+import math
 import os
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -34,9 +37,26 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "off", "no", "")
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using %d", name, raw, default)
+        return default
+
+
 # Use the fused exact radix top-k tail by default. Disable via env to fall back
 # to the mask + torch.topk + map reference path for A/B testing.
 _hisa_fused_topk = _env_bool("SGLANG_NSA_HISA_FUSED_TOPK", True)
+_hisa_row_split_candidate_keys = _env_bool(
+    "SGLANG_NSA_NVFP4_HISA_ROW_SPLIT_CANDIDATE_KEYS", False
+)
+_hisa_row_split_candidate_key_splits = max(
+    1, _env_int("SGLANG_NSA_NVFP4_HISA_ROW_SPLIT_CANDIDATE_KEY_SPLITS", 1)
+)
 
 
 _hisa_profile_path = os.environ.get(
@@ -51,6 +71,39 @@ _NVFP4_E2M1_CODEBOOK = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 # The current Blackwell FP4 MQA kernels only support TMEM load widths 32/64,
 # so 32 heads would instantiate an unsupported 16-wide load and JIT-fail.
 _DEEPGEMM_FP4_MQA_HEAD_COUNTS = (64,)
+_hisa_candidate_schedule_lock = threading.Lock()
+_hisa_candidate_schedule_cache: dict[
+    tuple[int, int, int, int], tuple[torch.Tensor, object]
+] = {}
+
+
+def _mathdx_include_paths() -> list[str]:
+    spec = importlib.util.find_spec("nvidia.mathdx")
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError(
+            "NVFP4 HISA megakernel requires nvidia-mathdx for cuBLASDx headers."
+        )
+    root = Path(next(iter(spec.submodule_search_locations))).resolve()
+    paths = [
+        root / "include",
+        root / "external" / "cutlass" / "include",
+    ]
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise RuntimeError(f"Missing nvidia-mathdx include paths: {missing}")
+    return [str(path) for path in paths]
+
+
+def _deepgemm_include_paths() -> list[str]:
+    spec = importlib.util.find_spec("deep_gemm")
+    if spec is None or spec.origin is None:
+        raise RuntimeError(
+            "NVFP4 HISA DeepGEMM-source probes require the deep_gemm package."
+        )
+    include_dir = Path(spec.origin).resolve().parent / "include"
+    if not include_dir.exists():
+        raise RuntimeError(f"Missing deep_gemm include path: {include_dir}")
+    return [str(include_dir)]
 
 
 def _deepgemm_has_fp4_mqa_logits() -> bool:
@@ -68,6 +121,49 @@ def _deepgemm_fp4_mqa_supports(q_values: torch.Tensor) -> bool:
         and q_values.shape[1] in _DEEPGEMM_FP4_MQA_HEAD_COUNTS
         and q_values.shape[-1] == 64
     )
+
+
+def _hisa_uniform_candidate_schedule(
+    q_values: torch.Tensor, candidate_len: int, deep_gemm_module
+) -> tuple[torch.Tensor, object]:
+    """Reuse the uniform candidate schedule used by collective HISA scoring."""
+
+    rows = int(q_values.shape[0])
+    candidate_len = int(candidate_len)
+    num_sms = int(deep_gemm_module.get_num_sms())
+    device = q_values.device
+    if device.type != "cuda":
+        context_lens = torch.full(
+            (rows, 1),
+            candidate_len,
+            device=device,
+            dtype=torch.int32,
+        )
+        return context_lens, deep_gemm_module.get_paged_mqa_logits_metadata(
+            context_lens, 64, num_sms
+        )
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (int(device_index), rows, candidate_len, num_sms)
+    with _hisa_candidate_schedule_lock:
+        cached = _hisa_candidate_schedule_cache.get(key)
+        if cached is not None and cached[0].device == device:
+            return cached
+
+    context_lens = torch.full(
+        (rows, 1),
+        candidate_len,
+        device=device,
+        dtype=torch.int32,
+    )
+    schedule_metadata = deep_gemm_module.get_paged_mqa_logits_metadata(
+        context_lens, 64, num_sms
+    )
+    with _hisa_candidate_schedule_lock:
+        _hisa_candidate_schedule_cache[key] = (context_lens, schedule_metadata)
+    return context_lens, schedule_metadata
 
 
 def _is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
@@ -90,77 +186,154 @@ def _hisa_max_blocks(
     return int(((seq_lens_flat.max().item() + block_size - 1) // block_size))
 
 
+def _hisa_max_blocks_from_seq_len(max_seq_len: int, block_size: int) -> int:
+    return max(1, (int(max_seq_len) + int(block_size) - 1) // int(block_size))
+
+
+def _hisa_max_blocks_from_page_table(
+    page_table: torch.Tensor, block_size: int, page_size: int = 64
+) -> int:
+    max_tokens = int(page_table.shape[1]) * int(page_size)
+    return max(1, (max_tokens + int(block_size) - 1) // int(block_size))
+
+
 @cache_once
 def _jit_nvfp4_indexer_module(
-    key_dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
+    key_dtype: torch.dtype,
+    indices_dtype: torch.dtype,
+    page_size: int,
+    enable_hisa_selector_megakernel: bool = False,
 ) -> Module:
     with _nvfp4_arch_env():
         args = make_cpp_args(
             key_dtype, indices_dtype, page_size, is_arch_support_pdl()
         )
+        cuda_wrappers = [
+            (
+                "fused_store_index_k_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::store_index_k",
+            ),
+            (
+                "quantize_indexer_q_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::quantize_q",
+            ),
+            (
+                "dequantize_indexer_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::dequantize",
+            ),
+            (
+                "hisa_mean_pool_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool",
+            ),
+            (
+                "hisa_candidate_score_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score",
+            ),
+            (
+                "hisa_block_score_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_block_score",
+            ),
+            (
+                "hisa_block_topk_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_block_topk",
+            ),
+            (
+                "hisa_block_topk_map_all_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_block_topk_map_all",
+            ),
+            (
+                "hisa_candidate_pages_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_pages",
+            ),
+            (
+                "hisa_mask_candidate_logits_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_mask_candidate_logits",
+            ),
+            (
+                "hisa_mask_logits_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_mask_logits",
+            ),
+            (
+                "hisa_map_topk_indices_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_map_topk_indices",
+            ),
+            (
+                "hisa_map_candidate_indices_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_map_candidate_indices",
+            ),
+            (
+                "hisa_fused_mask_topk_map_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_fused_mask_topk_map",
+            ),
+        ]
+        extra_cuda_cflags = _nvfp4_cuda_flags()
+        extra_include_paths = []
+        if enable_hisa_selector_megakernel:
+            cuda_wrappers.append(
+                (
+                    "hisa_selector_megakernel_indexer_cache_nvfp4",
+                    f"NVFP4IndexerQuantKernel<{args}>::hisa_selector_megakernel",
+                )
+            )
+            cuda_wrappers.extend(
+                [
+                    (
+                        "hisa_selector_parallel_select_blocks_indexer_cache_nvfp4",
+                        f"NVFP4IndexerQuantKernel<{args}>::hisa_selector_parallel_select_blocks",
+                    ),
+                    (
+                        "hisa_selector_parallel_score_candidates_indexer_cache_nvfp4",
+                        f"NVFP4IndexerQuantKernel<{args}>::hisa_selector_parallel_score_candidates",
+                    ),
+                    (
+                        "hisa_selector_cluster_fused_indexer_cache_nvfp4",
+                        f"NVFP4IndexerQuantKernel<{args}>::hisa_selector_cluster_fused",
+                    ),
+                    (
+                        "hisa_deepgemm_candidate_logits_indexer_cache_nvfp4",
+                        f"NVFP4IndexerQuantKernel<{args}>::hisa_deepgemm_candidate_logits",
+                    ),
+                    (
+                        "hisa_deepgemm_candidate_keys_indexer_cache_nvfp4",
+                        f"NVFP4IndexerQuantKernel<{args}>::hisa_deepgemm_candidate_keys",
+                    ),
+                    (
+                        "hisa_deepgemm_candidate_keys_row_split_indexer_cache_nvfp4",
+                        f"NVFP4IndexerQuantKernel<{args}>::hisa_deepgemm_candidate_keys_row_split",
+                    ),
+                    (
+                        "hisa_deepgemm_candidate_topk_cooperative_indexer_cache_nvfp4",
+                        f"NVFP4IndexerQuantKernel<{args}>::hisa_deepgemm_candidate_topk_cooperative",
+                    ),
+                    (
+                        "hisa_deepgemm_candidate_topk_cluster_indexer_cache_nvfp4",
+                        f"NVFP4IndexerQuantKernel<{args}>::hisa_deepgemm_candidate_topk_cluster",
+                    ),
+                    (
+                        "hisa_candidate_keys_topk_map_indexer_cache_nvfp4",
+                        f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_keys_topk_map",
+                    ),
+                ]
+            )
+            extra_cuda_cflags = [
+                *extra_cuda_cflags,
+                "-DSGLANG_ENABLE_HISA_SELECTOR_MEGAKERNEL=1",
+            ]
+            extra_include_paths = [
+                *_mathdx_include_paths(),
+                *_deepgemm_include_paths(),
+            ]
         return load_jit(
-            "nvfp4_indexer_quant",
+            (
+                "nvfp4_indexer_quant_megakernel"
+                if enable_hisa_selector_megakernel
+                else "nvfp4_indexer_quant"
+            ),
             *args,
             cuda_files=["dsa/nvfp4_indexer_quant.cuh"],
-            cuda_wrappers=[
-                (
-                    "fused_store_index_k_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::store_index_k",
-                ),
-                (
-                    "quantize_indexer_q_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::quantize_q",
-                ),
-                (
-                    "dequantize_indexer_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::dequantize",
-                ),
-                (
-                    "hisa_mean_pool_indexer_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool",
-                ),
-                (
-                    "hisa_candidate_score_indexer_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score",
-                ),
-                (
-                    "hisa_block_score_indexer_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::hisa_block_score",
-                ),
-                (
-                    "hisa_block_topk_indexer_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::hisa_block_topk",
-                ),
-                (
-                    "hisa_block_topk_map_all_indexer_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::hisa_block_topk_map_all",
-                ),
-                (
-                    "hisa_candidate_pages_indexer_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_pages",
-                ),
-                (
-                    "hisa_mask_candidate_logits_indexer_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::hisa_mask_candidate_logits",
-                ),
-                (
-                    "hisa_mask_logits_indexer_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::hisa_mask_logits",
-                ),
-                (
-                    "hisa_map_topk_indices_indexer_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::hisa_map_topk_indices",
-                ),
-                (
-                    "hisa_map_candidate_indices_indexer_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::hisa_map_candidate_indices",
-                ),
-                (
-                    "hisa_fused_mask_topk_map_indexer_cache_nvfp4",
-                    f"NVFP4IndexerQuantKernel<{args}>::hisa_fused_mask_topk_map",
-                ),
-            ],
-            extra_cuda_cflags=_nvfp4_cuda_flags(),
+            cuda_wrappers=cuda_wrappers,
+            extra_cuda_cflags=extra_cuda_cflags,
+            extra_include_paths=extra_include_paths,
             extra_dependencies=["cutlass"],
         )
 
@@ -186,6 +359,12 @@ def _get_module_fast(key_dtype, indices_dtype, page_size):
     _cached_key = cache_key
     _cached_module = module
     return module
+
+
+def _get_module_hisa_selector_megakernel(key_dtype, indices_dtype, page_size):
+    return _jit_nvfp4_indexer_module(
+        key_dtype, indices_dtype, page_size, enable_hisa_selector_megakernel=True
+    )
 
 
 @debug_kernel_api
@@ -563,6 +742,833 @@ def hisa_fused_mask_topk_map_indexer_cache_nvfp4(
 
 
 @debug_kernel_api
+def hisa_selector_megakernel_indexer_cache_nvfp4(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    block_rep_fp4: tuple[torch.Tensor, torch.Tensor],
+    max_blocks: int,
+    block_counts: torch.Tensor,
+    block_topk_counts: torch.Tensor,
+    effective_block_topk: int,
+    topk_tokens: int,
+    page_size: int = 64,
+) -> torch.Tensor:
+    q_values, q_scales = q_fp4
+    rep_values, rep_scales = block_rep_fp4
+    if not index_k_with_scale_buffer.is_contiguous():
+        index_k_with_scale_buffer = index_k_with_scale_buffer.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    seq_lens = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    block_counts = block_counts.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    block_topk_counts = block_topk_counts.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    if not q_values.is_contiguous():
+        q_values = q_values.contiguous()
+    if not q_scales.is_contiguous():
+        q_scales = q_scales.contiguous()
+    if not rep_values.is_contiguous():
+        rep_values = rep_values.contiguous()
+    if not rep_scales.is_contiguous():
+        rep_scales = rep_scales.contiguous()
+
+    topk_indices = torch.empty(
+        (q_values.shape[0], topk_tokens),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    _get_module_hisa_selector_megakernel(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_selector_megakernel_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale_buffer,
+        page_table,
+        seq_lens,
+        weights,
+        token_to_batch_idx,
+        rep_values,
+        rep_scales,
+        block_counts,
+        block_topk_counts,
+        topk_indices,
+        max_blocks,
+        effective_block_topk,
+    )
+    return topk_indices
+
+
+@debug_kernel_api
+def hisa_selector_parallel_select_blocks_indexer_cache_nvfp4(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    block_rep_fp4: tuple[torch.Tensor, torch.Tensor],
+    max_blocks: int,
+    block_counts: torch.Tensor,
+    block_topk_counts: torch.Tensor,
+    effective_block_topk: int,
+    page_table_dtype: torch.dtype = torch.int32,
+    page_size: int = 64,
+) -> torch.Tensor:
+    q_values, q_scales = q_fp4
+    rep_values, rep_scales = block_rep_fp4
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    seq_lens = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    block_counts = block_counts.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    block_topk_counts = block_topk_counts.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    if not q_values.is_contiguous():
+        q_values = q_values.contiguous()
+    if not q_scales.is_contiguous():
+        q_scales = q_scales.contiguous()
+    if not rep_values.is_contiguous():
+        rep_values = rep_values.contiguous()
+    if not rep_scales.is_contiguous():
+        rep_scales = rep_scales.contiguous()
+    selected_blocks = torch.empty(
+        (q_values.shape[0], effective_block_topk),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    _get_module_hisa_selector_megakernel(
+        torch.bfloat16, page_table_dtype, page_size
+    ).hisa_selector_parallel_select_blocks_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        seq_lens,
+        weights,
+        token_to_batch_idx,
+        rep_values,
+        rep_scales,
+        block_counts,
+        block_topk_counts,
+        selected_blocks,
+        max_blocks,
+        effective_block_topk,
+    )
+    return selected_blocks
+
+
+@debug_kernel_api
+def hisa_selector_parallel_score_candidates_indexer_cache_nvfp4(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    selected_blocks: torch.Tensor,
+    page_size: int = 64,
+) -> torch.Tensor:
+    q_values, q_scales = q_fp4
+    if not index_k_with_scale_buffer.is_contiguous():
+        index_k_with_scale_buffer = index_k_with_scale_buffer.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    seq_lens = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    if selected_blocks.dtype != torch.int32:
+        selected_blocks = selected_blocks.to(torch.int32)
+    if not selected_blocks.is_contiguous():
+        selected_blocks = selected_blocks.contiguous()
+    if not q_values.is_contiguous():
+        q_values = q_values.contiguous()
+    if not q_scales.is_contiguous():
+        q_scales = q_scales.contiguous()
+    candidate_len = selected_blocks.shape[1] * 128
+    logits = torch.empty(
+        (q_values.shape[0], candidate_len),
+        dtype=torch.float32,
+        device=q_values.device,
+    )
+    _get_module_hisa_selector_megakernel(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_selector_parallel_score_candidates_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale_buffer,
+        page_table,
+        seq_lens,
+        weights,
+        token_to_batch_idx,
+        selected_blocks,
+        logits,
+    )
+    return logits
+
+
+@debug_kernel_api
+def hisa_deepgemm_candidate_logits_indexer_cache_nvfp4(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    weights: torch.Tensor,
+    candidate_context_lens: torch.Tensor,
+    candidate_page_table: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    candidate_len: int,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """Diagnostic source-level FP4 scorer; not a complete fused HISA selector."""
+    q_values, q_scales = q_fp4
+    if q_values.dim() != 3 or q_values.shape[1] != 64 or q_values.shape[2] != 64:
+        raise ValueError(
+            "HISA DeepGEMM-source candidate probe expects q_values [rows, 64, 64]."
+        )
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    if weights.shape != q_scales.shape:
+        raise ValueError(
+            f"HISA DeepGEMM-source candidate probe expects weights {q_scales.shape}, got {weights.shape}."
+        )
+    if candidate_context_lens.dim() == 1:
+        candidate_context_lens = candidate_context_lens.unsqueeze(1)
+    candidate_context_lens = candidate_context_lens.to(
+        device=q_values.device, dtype=torch.int32
+    )
+    if candidate_page_table.dtype != torch.int32:
+        candidate_page_table = candidate_page_table.to(torch.int32)
+    if schedule_metadata.dtype != torch.int32:
+        schedule_metadata = schedule_metadata.to(torch.int32)
+    if not q_values.is_contiguous():
+        q_values = q_values.contiguous()
+    if not q_scales.is_contiguous():
+        q_scales = q_scales.contiguous()
+    if not index_k_with_scale_buffer.is_contiguous():
+        index_k_with_scale_buffer = index_k_with_scale_buffer.contiguous()
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+    if not candidate_context_lens.is_contiguous():
+        candidate_context_lens = candidate_context_lens.contiguous()
+    if not candidate_page_table.is_contiguous():
+        candidate_page_table = candidate_page_table.contiguous()
+    if not schedule_metadata.is_contiguous():
+        schedule_metadata = schedule_metadata.contiguous()
+
+    logits = torch.empty(
+        (q_values.shape[0], int(candidate_len)),
+        dtype=torch.float32,
+        device=q_values.device,
+    )
+    _get_module_hisa_selector_megakernel(
+        torch.bfloat16, candidate_page_table.dtype, page_size
+    ).hisa_deepgemm_candidate_logits_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale_buffer,
+        weights,
+        candidate_context_lens,
+        candidate_page_table,
+        schedule_metadata,
+        logits,
+    )
+    return logits
+
+
+@debug_kernel_api
+def hisa_deepgemm_candidate_keys_indexer_cache_nvfp4(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    weights: torch.Tensor,
+    candidate_context_lens: torch.Tensor,
+    candidate_page_table: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    selected_blocks: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    candidate_len: int,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """Diagnostic collective FP4 scorer that emits masked sortable keys."""
+    q_values, q_scales = q_fp4
+    if q_values.dim() != 3 or q_values.shape[1] != 64 or q_values.shape[2] != 64:
+        raise ValueError(
+            "HISA DeepGEMM-source candidate key probe expects q_values [rows, 64, 64]."
+        )
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    if weights.shape != q_scales.shape:
+        raise ValueError(
+            f"HISA DeepGEMM-source candidate key probe expects weights {q_scales.shape}, got {weights.shape}."
+        )
+    if candidate_context_lens.dim() == 1:
+        candidate_context_lens = candidate_context_lens.unsqueeze(1)
+    candidate_context_lens = candidate_context_lens.to(
+        device=q_values.device, dtype=torch.int32
+    )
+    if candidate_page_table.dtype != torch.int32:
+        candidate_page_table = candidate_page_table.to(torch.int32)
+    if schedule_metadata.dtype != torch.int32:
+        schedule_metadata = schedule_metadata.to(torch.int32)
+    if selected_blocks.dtype != torch.int32:
+        selected_blocks = selected_blocks.to(torch.int32)
+    prefix_lens = prefix_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    if not q_values.is_contiguous():
+        q_values = q_values.contiguous()
+    if not q_scales.is_contiguous():
+        q_scales = q_scales.contiguous()
+    if not index_k_with_scale_buffer.is_contiguous():
+        index_k_with_scale_buffer = index_k_with_scale_buffer.contiguous()
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+    if not candidate_context_lens.is_contiguous():
+        candidate_context_lens = candidate_context_lens.contiguous()
+    if not candidate_page_table.is_contiguous():
+        candidate_page_table = candidate_page_table.contiguous()
+    if not schedule_metadata.is_contiguous():
+        schedule_metadata = schedule_metadata.contiguous()
+    if not selected_blocks.is_contiguous():
+        selected_blocks = selected_blocks.contiguous()
+    if not prefix_lens.is_contiguous():
+        prefix_lens = prefix_lens.contiguous()
+
+    candidate_keys = torch.empty(
+        (q_values.shape[0], int(candidate_len)),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    empty_source_page_table = torch.empty(
+        (0, 1), dtype=torch.int32, device=q_values.device
+    )
+    empty_token_to_batch_idx = torch.empty(
+        (0,), dtype=torch.int32, device=q_values.device
+    )
+    _get_module_hisa_selector_megakernel(
+        torch.bfloat16, candidate_page_table.dtype, page_size
+    ).hisa_deepgemm_candidate_keys_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale_buffer,
+        weights,
+        candidate_context_lens,
+        candidate_page_table,
+        empty_source_page_table,
+        schedule_metadata,
+        selected_blocks,
+        prefix_lens,
+        empty_token_to_batch_idx,
+        candidate_keys,
+    )
+    return candidate_keys
+
+
+@debug_kernel_api
+def hisa_deepgemm_candidate_keys_from_blocks_indexer_cache_nvfp4(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    weights: torch.Tensor,
+    candidate_context_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    selected_blocks: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    candidate_len: int,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """Collective FP4 scorer with in-kernel candidate page derivation."""
+    q_values, q_scales = q_fp4
+    if q_values.dim() != 3 or q_values.shape[1] != 64 or q_values.shape[2] != 64:
+        raise ValueError(
+            "HISA DeepGEMM-source candidate key probe expects q_values [rows, 64, 64]."
+        )
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    if weights.shape != q_scales.shape:
+        raise ValueError(
+            f"HISA DeepGEMM-source candidate key probe expects weights {q_scales.shape}, got {weights.shape}."
+        )
+    if page_table.dtype != torch.int32:
+        raise ValueError(
+            "HISA page-fused candidate key scorer currently requires int32 page_table."
+        )
+    if candidate_context_lens.dim() == 1:
+        candidate_context_lens = candidate_context_lens.unsqueeze(1)
+    candidate_context_lens = candidate_context_lens.to(
+        device=q_values.device, dtype=torch.int32
+    )
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    if schedule_metadata.dtype != torch.int32:
+        schedule_metadata = schedule_metadata.to(torch.int32)
+    if selected_blocks.dtype != torch.int32:
+        selected_blocks = selected_blocks.to(torch.int32)
+    prefix_lens = prefix_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    if not q_values.is_contiguous():
+        q_values = q_values.contiguous()
+    if not q_scales.is_contiguous():
+        q_scales = q_scales.contiguous()
+    if not index_k_with_scale_buffer.is_contiguous():
+        index_k_with_scale_buffer = index_k_with_scale_buffer.contiguous()
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+    if not candidate_context_lens.is_contiguous():
+        candidate_context_lens = candidate_context_lens.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not token_to_batch_idx.is_contiguous():
+        token_to_batch_idx = token_to_batch_idx.contiguous()
+    if not schedule_metadata.is_contiguous():
+        schedule_metadata = schedule_metadata.contiguous()
+    if not selected_blocks.is_contiguous():
+        selected_blocks = selected_blocks.contiguous()
+    if not prefix_lens.is_contiguous():
+        prefix_lens = prefix_lens.contiguous()
+
+    candidate_page_table = torch.empty(
+        (q_values.shape[0], 0),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    candidate_keys = torch.empty(
+        (q_values.shape[0], int(candidate_len)),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    _get_module_hisa_selector_megakernel(
+        torch.bfloat16, torch.int32, page_size
+    ).hisa_deepgemm_candidate_keys_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale_buffer,
+        weights,
+        candidate_context_lens,
+        candidate_page_table,
+        page_table,
+        schedule_metadata,
+        selected_blocks,
+        prefix_lens,
+        token_to_batch_idx,
+        candidate_keys,
+    )
+    return candidate_keys
+
+
+@debug_kernel_api
+def hisa_deepgemm_candidate_topk_cooperative_from_blocks_indexer_cache_nvfp4(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    weights: torch.Tensor,
+    candidate_context_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    selected_blocks: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    candidate_len: int,
+    topk_tokens: int,
+    page_size: int = 64,
+    *,
+    return_candidate_keys: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Cooperative-grid FP4 scorer with in-kernel candidate top-k/map.
+
+    The scoring phase keeps the DeepGEMM persistent SM100 FP4 schedule. The
+    kernel then uses a cooperative grid barrier and reuses resident CTAs to run
+    the score-key top-k/map tail without a second launch.
+    """
+    q_values, q_scales = q_fp4
+    if q_values.dim() != 3 or q_values.shape[1] != 64 or q_values.shape[2] != 64:
+        raise ValueError(
+            "HISA cooperative candidate topk probe expects q_values [rows, 64, 64]."
+        )
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    if weights.shape != q_scales.shape:
+        raise ValueError(
+            f"HISA cooperative candidate topk probe expects weights {q_scales.shape}, got {weights.shape}."
+        )
+    if page_table.dtype != torch.int32:
+        raise ValueError(
+            "HISA cooperative candidate topk probe currently requires int32 page_table."
+        )
+    topk_tokens = int(topk_tokens)
+    if topk_tokens <= 0:
+        raise ValueError("HISA cooperative candidate topk probe requires positive topk.")
+    if candidate_context_lens.dim() == 1:
+        candidate_context_lens = candidate_context_lens.unsqueeze(1)
+    candidate_context_lens = candidate_context_lens.to(
+        device=q_values.device, dtype=torch.int32
+    )
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    if token_to_batch_idx.numel() < q_values.shape[0]:
+        raise ValueError(
+            "HISA cooperative candidate topk probe needs token_to_batch_idx per row."
+        )
+    if schedule_metadata.dtype != torch.int32:
+        schedule_metadata = schedule_metadata.to(torch.int32)
+    if selected_blocks.dtype != torch.int32:
+        selected_blocks = selected_blocks.to(torch.int32)
+    prefix_lens = prefix_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    if not q_values.is_contiguous():
+        q_values = q_values.contiguous()
+    if not q_scales.is_contiguous():
+        q_scales = q_scales.contiguous()
+    if not index_k_with_scale_buffer.is_contiguous():
+        index_k_with_scale_buffer = index_k_with_scale_buffer.contiguous()
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+    if not candidate_context_lens.is_contiguous():
+        candidate_context_lens = candidate_context_lens.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not token_to_batch_idx.is_contiguous():
+        token_to_batch_idx = token_to_batch_idx.contiguous()
+    if not schedule_metadata.is_contiguous():
+        schedule_metadata = schedule_metadata.contiguous()
+    if not selected_blocks.is_contiguous():
+        selected_blocks = selected_blocks.contiguous()
+    if not prefix_lens.is_contiguous():
+        prefix_lens = prefix_lens.contiguous()
+
+    candidate_keys = torch.empty(
+        (q_values.shape[0], int(candidate_len)),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    topk_indices = torch.empty(
+        (q_values.shape[0], topk_tokens),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    _get_module_hisa_selector_megakernel(
+        torch.bfloat16, torch.int32, page_size
+    ).hisa_deepgemm_candidate_topk_cooperative_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale_buffer,
+        weights,
+        candidate_context_lens,
+        page_table,
+        schedule_metadata,
+        selected_blocks,
+        prefix_lens,
+        token_to_batch_idx,
+        candidate_keys,
+        topk_indices,
+    )
+    if return_candidate_keys:
+        return topk_indices, candidate_keys
+    return topk_indices
+
+
+@debug_kernel_api
+def hisa_deepgemm_candidate_keys_row_split_from_blocks_indexer_cache_nvfp4(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    weights: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    selected_blocks: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    candidate_len: int,
+    *,
+    row_splits: int = 1,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """Row-owned SM100 FP4 scorer probe for future fused candidate top-k."""
+    q_values, q_scales = q_fp4
+    if q_values.dim() != 3 or q_values.shape[1] != 64 or q_values.shape[2] != 64:
+        raise ValueError(
+            "HISA row-split candidate key probe expects q_values [rows, 64, 64]."
+        )
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    if weights.shape != q_scales.shape:
+        raise ValueError(
+            f"HISA row-split candidate key probe expects weights {q_scales.shape}, got {weights.shape}."
+        )
+    if page_size != 64:
+        raise ValueError("HISA row-split candidate key probe currently requires page_size=64.")
+    if page_table.dtype != torch.int32:
+        raise ValueError(
+            "HISA row-split candidate key scorer currently requires int32 page_table."
+        )
+    row_splits = max(1, int(row_splits))
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    if token_to_batch_idx.numel() < q_values.shape[0]:
+        raise ValueError("HISA row-split candidate key scorer needs token_to_batch_idx per row.")
+    if selected_blocks.dtype != torch.int32:
+        selected_blocks = selected_blocks.to(torch.int32)
+    prefix_lens = prefix_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    if not q_values.is_contiguous():
+        q_values = q_values.contiguous()
+    if not q_scales.is_contiguous():
+        q_scales = q_scales.contiguous()
+    if not index_k_with_scale_buffer.is_contiguous():
+        index_k_with_scale_buffer = index_k_with_scale_buffer.contiguous()
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not token_to_batch_idx.is_contiguous():
+        token_to_batch_idx = token_to_batch_idx.contiguous()
+    if not selected_blocks.is_contiguous():
+        selected_blocks = selected_blocks.contiguous()
+    if not prefix_lens.is_contiguous():
+        prefix_lens = prefix_lens.contiguous()
+
+    candidate_keys = torch.empty(
+        (q_values.shape[0], int(candidate_len)),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    _get_module_hisa_selector_megakernel(
+        torch.bfloat16, torch.int32, page_size
+    ).hisa_deepgemm_candidate_keys_row_split_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale_buffer,
+        weights,
+        page_table,
+        selected_blocks,
+        prefix_lens,
+        token_to_batch_idx,
+        candidate_keys,
+        row_splits,
+    )
+    return candidate_keys
+
+
+@debug_kernel_api
+def hisa_deepgemm_candidate_topk_cluster_from_blocks_indexer_cache_nvfp4(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    weights: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    selected_blocks: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    candidate_len: int,
+    topk_tokens: int,
+    *,
+    page_size: int = 64,
+    row_splits: int = 4,
+    use_cluster: bool = True,
+    return_candidate_keys: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Cluster-launched FP4 candidate scorer with fused candidate top-k/map."""
+    q_values, q_scales = q_fp4
+    if q_values.dim() != 3 or q_values.shape[1] != 64 or q_values.shape[2] != 64:
+        raise ValueError(
+            "HISA candidate topk cluster probe expects q_values [rows, 64, 64]."
+        )
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    if weights.shape != q_scales.shape:
+        raise ValueError(
+            f"HISA candidate topk cluster probe expects weights {q_scales.shape}, got {weights.shape}."
+        )
+    if page_size != 64:
+        raise ValueError("HISA candidate topk cluster probe currently requires page_size=64.")
+    if page_table.dtype != torch.int32:
+        raise ValueError(
+            "HISA candidate topk cluster probe currently requires int32 page_table."
+        )
+    topk_tokens = int(topk_tokens)
+    if topk_tokens <= 0:
+        raise ValueError("HISA candidate topk cluster probe requires positive topk_tokens.")
+    row_splits = int(row_splits)
+    if row_splits <= 0:
+        raise ValueError("HISA candidate topk cluster probe requires positive row_splits.")
+    if use_cluster and row_splits != 4:
+        raise ValueError("HISA candidate topk cluster probe requires row_splits=4.")
+    if not use_cluster and row_splits != 1:
+        raise ValueError("HISA non-cluster candidate topk probe requires row_splits=1.")
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    if token_to_batch_idx.numel() < q_values.shape[0]:
+        raise ValueError("HISA candidate topk cluster probe needs token_to_batch_idx per row.")
+    if selected_blocks.dtype != torch.int32:
+        selected_blocks = selected_blocks.to(torch.int32)
+    prefix_lens = prefix_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    if not q_values.is_contiguous():
+        q_values = q_values.contiguous()
+    if not q_scales.is_contiguous():
+        q_scales = q_scales.contiguous()
+    if not index_k_with_scale_buffer.is_contiguous():
+        index_k_with_scale_buffer = index_k_with_scale_buffer.contiguous()
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not token_to_batch_idx.is_contiguous():
+        token_to_batch_idx = token_to_batch_idx.contiguous()
+    if not selected_blocks.is_contiguous():
+        selected_blocks = selected_blocks.contiguous()
+    if not prefix_lens.is_contiguous():
+        prefix_lens = prefix_lens.contiguous()
+
+    candidate_keys = torch.empty(
+        (q_values.shape[0], int(candidate_len)),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    topk_indices = torch.empty(
+        (q_values.shape[0], topk_tokens),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    _get_module_hisa_selector_megakernel(
+        torch.bfloat16, torch.int32, page_size
+    ).hisa_deepgemm_candidate_topk_cluster_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale_buffer,
+        weights,
+        page_table,
+        selected_blocks,
+        prefix_lens,
+        token_to_batch_idx,
+        candidate_keys,
+        topk_indices,
+        row_splits,
+        int(bool(use_cluster)),
+    )
+    if return_candidate_keys:
+        return topk_indices, candidate_keys
+    return topk_indices
+
+
+@debug_kernel_api
+def hisa_candidate_keys_topk_map_indexer_cache_nvfp4(
+    candidate_keys: torch.Tensor,
+    selected_blocks: torch.Tensor,
+    topk_tokens: int,
+    page_table_dtype: torch.dtype = torch.int32,
+    page_size: int = 64,
+) -> torch.Tensor:
+    if candidate_keys.dtype != torch.int32:
+        raise ValueError("HISA candidate key topk requires int32 candidate keys.")
+    if selected_blocks.dtype != torch.int32:
+        selected_blocks = selected_blocks.to(torch.int32)
+    if not candidate_keys.is_contiguous():
+        candidate_keys = candidate_keys.contiguous()
+    if not selected_blocks.is_contiguous():
+        selected_blocks = selected_blocks.contiguous()
+    topk_indices = torch.empty(
+        (candidate_keys.shape[0], int(topk_tokens)),
+        dtype=torch.int32,
+        device=candidate_keys.device,
+    )
+    _get_module_hisa_selector_megakernel(
+        torch.bfloat16, page_table_dtype, page_size
+    ).hisa_candidate_keys_topk_map_indexer_cache_nvfp4(
+        candidate_keys,
+        selected_blocks,
+        topk_indices,
+    )
+    return topk_indices
+
+
+@debug_kernel_api
+def hisa_selector_cluster_fused_indexer_cache_nvfp4(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    block_rep_fp4: tuple[torch.Tensor, torch.Tensor],
+    max_blocks: int,
+    block_counts: torch.Tensor,
+    block_topk_counts: torch.Tensor,
+    effective_block_topk: int,
+    topk_tokens: int,
+    page_size: int = 64,
+) -> torch.Tensor:
+    q_values, q_scales = q_fp4
+    rep_values, rep_scales = block_rep_fp4
+    if not index_k_with_scale_buffer.is_contiguous():
+        index_k_with_scale_buffer = index_k_with_scale_buffer.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    seq_lens = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    block_counts = block_counts.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    block_topk_counts = block_topk_counts.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    if not q_values.is_contiguous():
+        q_values = q_values.contiguous()
+    if not q_scales.is_contiguous():
+        q_scales = q_scales.contiguous()
+    if not rep_values.is_contiguous():
+        rep_values = rep_values.contiguous()
+    if not rep_scales.is_contiguous():
+        rep_scales = rep_scales.contiguous()
+
+    candidate_len = int(effective_block_topk) * 128
+    candidate_keys = torch.empty(
+        (q_values.shape[0], candidate_len),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    topk_indices = torch.empty(
+        (q_values.shape[0], topk_tokens),
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    _get_module_hisa_selector_megakernel(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_selector_cluster_fused_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale_buffer,
+        page_table,
+        seq_lens,
+        weights,
+        token_to_batch_idx,
+        rep_values,
+        rep_scales,
+        block_counts,
+        block_topk_counts,
+        candidate_keys,
+        topk_indices,
+        max_blocks,
+        effective_block_topk,
+    )
+    return topk_indices
+
+
+@debug_kernel_api
 def hisa_map_candidate_indices_indexer_cache_nvfp4(
     top_blocks: torch.Tensor,
     prefix_lens: torch.Tensor,
@@ -596,12 +1602,16 @@ def hisa_precompute_block_reps_indexer_cache_nvfp4(
     *,
     block_size: int = 128,
     page_size: int = 64,
+    max_blocks: Optional[int] = None,
     return_float_reps: bool = False,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], int] | tuple[tuple[torch.Tensor, torch.Tensor], int, torch.Tensor]:
     if block_size != 128:
         raise ValueError("NVFP4 HISA precomputed reps require block_size=128.")
     seq_lens_flat = seq_lens.reshape(-1).to(device=page_table.device, dtype=torch.int32)
-    max_blocks = _hisa_max_blocks(seq_lens_flat, page_table, block_size)
+    if max_blocks is None:
+        max_blocks = _hisa_max_blocks(seq_lens_flat, page_table, block_size)
+    else:
+        max_blocks = max(1, int(max_blocks))
     reps = hisa_mean_pool_indexer_cache_nvfp4(
         index_k_with_scale_buffer,
         page_table,
@@ -777,6 +1787,29 @@ def _hisa_block_topk_counts(
         return selected.to(torch.int32), max(1, max_block_topk)
     max_selected = int(selected.max().item()) if selected.numel() else 0
     return selected.to(torch.int32), max(1, max_selected)
+
+
+def _hisa_block_topk_counts_static_width(
+    block_counts: torch.Tensor,
+    *,
+    block_size: int,
+    compression_ratio: Optional[float],
+    max_blocks: int,
+) -> tuple[torch.Tensor, int]:
+    if compression_ratio is None or compression_ratio <= 0:
+        raise ValueError("compression_ratio must be positive for dynamic HISA budgets.")
+    if abs(compression_ratio - round(compression_ratio)) < 1e-6:
+        ratio = int(round(compression_ratio))
+        selected = torch.div(block_counts + ratio - 1, ratio, rounding_mode="floor")
+        effective = (int(max_blocks) + ratio - 1) // ratio
+    else:
+        selected = torch.ceil(block_counts.float() / compression_ratio).to(torch.int32)
+        effective = math.ceil(float(max_blocks) / float(compression_ratio))
+    selected = torch.minimum(selected, block_counts)
+    selected = torch.where(block_counts > 0, selected, torch.zeros_like(selected))
+    effective = max(1, int(effective))
+    selected = torch.minimum(selected, torch.full_like(selected, effective))
+    return selected.to(torch.int32), effective
 
 
 def _select_hisa_blocks(
@@ -1265,11 +2298,11 @@ def nvfp4_hisa_indexer_paged_deepgemm_precomputed(
         block_topk_counts = None
         effective_block_topk = block_topk
     else:
-        block_topk_counts, effective_block_topk = _hisa_block_topk_counts(
+        block_topk_counts, effective_block_topk = _hisa_block_topk_counts_static_width(
             block_counts,
             block_size=block_size,
-            topk_tokens=topk_tokens,
             compression_ratio=compression_ratio,
+            max_blocks=max_blocks,
         )
     candidate_len = effective_block_topk * block_size
     if candidate_len == topk_tokens:
@@ -1324,7 +2357,12 @@ def nvfp4_hisa_indexer_paged_deepgemm_precomputed(
         fused_cuda=True,
     )
 
-    if prepared_candidate_context_lens is None:
+    schedule_metadata = prepared_candidate_schedule_metadata
+    if prepared_candidate_context_lens is None and schedule_metadata is None:
+        context_lens, schedule_metadata = _hisa_uniform_candidate_schedule(
+            q_values, candidate_len, deep_gemm
+        )
+    elif prepared_candidate_context_lens is None:
         context_lens = torch.full(
             (q_values.shape[0], 1),
             candidate_len,
@@ -1335,7 +2373,6 @@ def nvfp4_hisa_indexer_paged_deepgemm_precomputed(
         context_lens = prepared_candidate_context_lens.to(
             device=q_values.device, dtype=torch.int32
         )
-    schedule_metadata = prepared_candidate_schedule_metadata
     if schedule_metadata is None:
         schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
             context_lens, 64, deep_gemm.get_num_sms()
@@ -1431,6 +2468,925 @@ def nvfp4_hisa_indexer_paged_deepgemm_precomputed(
         topk_tokens=topk_tokens,
     )
     return topk_indices.to(torch.int32)
+
+
+def nvfp4_hisa_indexer_paged_collective_key_precomputed(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    block_rep_fp4: tuple[torch.Tensor, torch.Tensor],
+    max_blocks: int,
+    *,
+    block_size: int = 128,
+    block_topk: int = 64,
+    compression_ratio: Optional[float] = 4.0,
+    topk_tokens: int = 2048,
+    fallback_to_dense_if_short: bool = True,
+    prepared_prefix_lens: Optional[torch.Tensor] = None,
+    prepared_block_counts: Optional[torch.Tensor] = None,
+    prepared_block_starts: Optional[torch.Tensor] = None,
+    prepared_block_ends: Optional[torch.Tensor] = None,
+    prepared_candidate_context_lens: Optional[torch.Tensor] = None,
+    prepared_candidate_schedule_metadata: Optional[object] = None,
+    prepared_block_topk_counts: Optional[torch.Tensor] = None,
+    prepared_effective_block_topk: Optional[int] = None,
+) -> Optional[torch.Tensor]:
+    """Collective candidate score-key selector path.
+
+    This keeps the DeepGEMM batched FP4 candidate-scoring shape but changes the
+    candidate epilogue to emit masked score-radix keys directly, then runs a
+    3-pass key top-k/map tail. The candidate page lookup is derived inside the
+    FP4 scorer from selected blocks and the original page table.
+    """
+    if block_size != 128:
+        raise ValueError("Collective-key NVFP4 HISA path requires block_size=128.")
+
+    q_values, q_scales = q_fp4
+    rep_values, rep_scales = block_rep_fp4
+    if not _deepgemm_fp4_mqa_supports(q_values):
+        return None
+    import deep_gemm
+
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    seq_lens_flat = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    if prepared_prefix_lens is None:
+        prefix_lens = seq_lens_flat.index_select(0, token_to_batch_idx.long())
+    else:
+        prefix_lens = prepared_prefix_lens.to(device=q_values.device, dtype=torch.int32)
+    if _should_fallback_to_dense_short(
+        fallback_to_dense_if_short, prefix_lens, topk_tokens
+    ):
+        return None
+
+    if prepared_block_counts is None:
+        block_counts = torch.div(
+            prefix_lens.to(torch.int32) + block_size - 1,
+            block_size,
+            rounding_mode="floor",
+        ).to(torch.int32)
+    else:
+        block_counts = prepared_block_counts.to(device=q_values.device, dtype=torch.int32)
+    if prepared_block_starts is None:
+        block_starts = token_to_batch_idx * max_blocks
+    else:
+        block_starts = prepared_block_starts.to(device=q_values.device, dtype=torch.int32)
+    if prepared_block_ends is None:
+        block_ends = block_starts + block_counts
+    else:
+        block_ends = prepared_block_ends.to(device=q_values.device, dtype=torch.int32)
+
+    stage = _profile_start(q_values.device)
+    block_scores = deep_gemm.fp8_fp4_mqa_logits(
+        (q_values.view(torch.int8), q_scales),
+        (rep_values.view(torch.int8), rep_scales),
+        weights,
+        block_starts.to(torch.int32),
+        block_ends.to(torch.int32),
+        clean_logits=False,
+        max_seqlen_k=max_blocks,
+        logits_dtype=torch.float32,
+    )
+    _profile_end(
+        "key_blockscore_precomputed",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        max_blocks=max_blocks,
+        backend="deepgemm_fp4_mqa",
+        packed_q=True,
+    )
+
+    stage = _profile_start(q_values.device)
+    if prepared_block_topk_counts is not None and prepared_effective_block_topk is not None:
+        block_topk_counts = prepared_block_topk_counts.to(
+            device=q_values.device, dtype=torch.int32
+        )
+        effective_block_topk = int(prepared_effective_block_topk)
+    elif compression_ratio is None or compression_ratio <= 0:
+        block_topk_counts = None
+        effective_block_topk = block_topk
+    else:
+        block_topk_counts, effective_block_topk = _hisa_block_topk_counts_static_width(
+            block_counts,
+            block_size=block_size,
+            compression_ratio=compression_ratio,
+            max_blocks=max_blocks,
+        )
+    candidate_len = effective_block_topk * block_size
+    if candidate_len == topk_tokens:
+        topk_indices = hisa_block_topk_map_all_indexer_cache_nvfp4(
+            block_scores,
+            block_counts,
+            block_topk=effective_block_topk,
+            block_topk_counts=block_topk_counts,
+            prefix_lens=prefix_lens.to(torch.int32),
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "key_block_topk_map_all",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            block_topk=effective_block_topk,
+            compression_ratio=compression_ratio,
+            fused_cuda=True,
+        )
+        return topk_indices
+
+    top_blocks = hisa_block_topk_indexer_cache_nvfp4(
+        block_scores,
+        block_counts,
+        block_topk=effective_block_topk,
+        block_topk_counts=block_topk_counts,
+        page_table_dtype=page_table.dtype,
+    )
+    _profile_end(
+        "key_block_topk",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        block_topk=effective_block_topk,
+        compression_ratio=compression_ratio,
+        fused_cuda=True,
+    )
+
+    context_lens = None
+    schedule_metadata = None
+    if not _hisa_row_split_candidate_keys:
+        schedule_metadata = prepared_candidate_schedule_metadata
+        if prepared_candidate_context_lens is None and schedule_metadata is None:
+            context_lens, schedule_metadata = _hisa_uniform_candidate_schedule(
+                q_values, candidate_len, deep_gemm
+            )
+        elif prepared_candidate_context_lens is None:
+            context_lens = torch.full(
+                (q_values.shape[0], 1),
+                candidate_len,
+                device=q_values.device,
+                dtype=torch.int32,
+            )
+        else:
+            context_lens = prepared_candidate_context_lens.to(
+                device=q_values.device, dtype=torch.int32
+            )
+        if schedule_metadata is None:
+            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                context_lens, 64, deep_gemm.get_num_sms()
+            )
+
+    stage = _profile_start(q_values.device)
+    if _hisa_row_split_candidate_keys:
+        candidate_keys = (
+            hisa_deepgemm_candidate_keys_row_split_from_blocks_indexer_cache_nvfp4(
+                q_fp4,
+                index_k_with_scale_buffer,
+                weights,
+                page_table,
+                token_to_batch_idx,
+                top_blocks,
+                prefix_lens.to(torch.int32),
+                candidate_len,
+                row_splits=_hisa_row_split_candidate_key_splits,
+                page_size=64,
+            )
+        )
+    else:
+        candidate_keys = hisa_deepgemm_candidate_keys_from_blocks_indexer_cache_nvfp4(
+            q_fp4,
+            index_k_with_scale_buffer,
+            weights,
+            context_lens,
+            page_table,
+            token_to_batch_idx,
+            schedule_metadata,
+            top_blocks,
+            prefix_lens.to(torch.int32),
+            candidate_len,
+            page_size=64,
+        )
+    _profile_end(
+        (
+            "candidate_score_keys_row_split"
+            if _hisa_row_split_candidate_keys
+            else "candidate_score_keys"
+        ),
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        candidate_len=candidate_len,
+        fused_score_mask_key=True,
+        fused_candidate_pages=True,
+        row_splits=(
+            _hisa_row_split_candidate_key_splits
+            if _hisa_row_split_candidate_keys
+            else None
+        ),
+    )
+
+    keep = min(topk_tokens, candidate_len)
+    stage = _profile_start(q_values.device)
+    topk_indices = hisa_candidate_keys_topk_map_indexer_cache_nvfp4(
+        candidate_keys,
+        top_blocks,
+        keep,
+        page_table_dtype=page_table.dtype,
+    )
+    _profile_end(
+        "candidate_key_topk_map",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        candidate_len=candidate_len,
+        topk_tokens=int(keep),
+        fused_cuda=True,
+    )
+
+    if keep < topk_tokens:
+        padding = torch.full(
+            (topk_indices.shape[0], topk_tokens - keep),
+            -1,
+            device=topk_indices.device,
+            dtype=torch.int32,
+        )
+        topk_indices = torch.cat((topk_indices, padding), dim=1)
+    return topk_indices.to(torch.int32)
+
+
+def nvfp4_hisa_indexer_paged_collective_key(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    *,
+    block_size: int = 128,
+    block_topk: int = 64,
+    compression_ratio: Optional[float] = 4.0,
+    topk_tokens: int = 2048,
+    fallback_to_dense_if_short: bool = True,
+    max_seq_len_hint: Optional[int] = None,
+) -> Optional[torch.Tensor]:
+    """Runtime wrapper for the collective FP4 score-key HISA path."""
+    if block_size != 128:
+        raise ValueError("Collective-key NVFP4 HISA path requires block_size=128.")
+
+    q_values, _ = q_fp4
+    if not _deepgemm_fp4_mqa_supports(q_values):
+        return None
+    if page_table.dtype != torch.int32:
+        return None
+
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    seq_lens_flat = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    prefix_lens = seq_lens_flat.index_select(0, token_to_batch_idx.long())
+    if fallback_to_dense_if_short:
+        if max_seq_len_hint is not None:
+            if int(max_seq_len_hint) <= int(topk_tokens):
+                return None
+        elif _should_fallback_to_dense_short(True, prefix_lens, topk_tokens):
+            return None
+
+    max_blocks_hint = (
+        _hisa_max_blocks_from_seq_len(max_seq_len_hint, block_size)
+        if max_seq_len_hint is not None
+        else _hisa_max_blocks_from_page_table(page_table, block_size)
+    )
+    stage = _profile_start(q_values.device)
+    block_rep_fp4, max_blocks = hisa_precompute_block_reps_indexer_cache_nvfp4(
+        index_k_with_scale_buffer,
+        page_table,
+        seq_lens_flat,
+        max_blocks=max_blocks_hint,
+    )
+    _profile_end(
+        "key_mean_pool",
+        stage,
+        q_values.device,
+        batches=int(page_table.shape[0]),
+        max_blocks=max_blocks,
+        fused_cuda=True,
+    )
+
+    block_counts = torch.div(
+        prefix_lens.to(torch.int32) + block_size - 1,
+        block_size,
+        rounding_mode="floor",
+    ).to(torch.int32)
+    if compression_ratio is None or compression_ratio <= 0:
+        block_topk_counts = None
+        effective_block_topk = block_topk
+    else:
+        block_topk_counts, effective_block_topk = _hisa_block_topk_counts_static_width(
+            block_counts,
+            block_size=block_size,
+            compression_ratio=compression_ratio,
+            max_blocks=max_blocks,
+        )
+
+    return nvfp4_hisa_indexer_paged_collective_key_precomputed(
+        q_fp4,
+        index_k_with_scale_buffer,
+        page_table,
+        seq_lens_flat,
+        weights,
+        token_to_batch_idx,
+        block_rep_fp4,
+        max_blocks,
+        block_size=block_size,
+        block_topk=block_topk,
+        compression_ratio=compression_ratio,
+        topk_tokens=topk_tokens,
+        fallback_to_dense_if_short=False,
+        prepared_prefix_lens=prefix_lens,
+        prepared_block_counts=block_counts,
+        prepared_block_starts=token_to_batch_idx * max_blocks,
+        prepared_block_ends=token_to_batch_idx * max_blocks + block_counts,
+        prepared_block_topk_counts=block_topk_counts,
+        prepared_effective_block_topk=effective_block_topk,
+    )
+
+
+def nvfp4_hisa_indexer_paged_megakernel_precomputed(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    block_rep_fp4: tuple[torch.Tensor, torch.Tensor],
+    max_blocks: int,
+    *,
+    block_size: int = 128,
+    block_topk: int = 64,
+    compression_ratio: Optional[float] = 4.0,
+    topk_tokens: int = 2048,
+    fallback_to_dense_if_short: bool = True,
+    prepared_prefix_lens: Optional[torch.Tensor] = None,
+    prepared_block_counts: Optional[torch.Tensor] = None,
+    prepared_block_topk_counts: Optional[torch.Tensor] = None,
+    prepared_effective_block_topk: Optional[int] = None,
+) -> Optional[torch.Tensor]:
+    """Serial cuBLASDx HISA selector probe.
+
+    This mirrors the training memory-conservation megakernel shape from the
+    Megatron reference and is kept as an opt-in correctness probe. The target
+    inference implementation should use the parallel/streaming selector scope.
+    """
+    if block_size != 128:
+        raise ValueError("NVFP4 HISA megakernel requires block_size=128.")
+    q_values, _ = q_fp4
+    if q_values.dim() != 3 or q_values.shape[1] != 64 or q_values.shape[-1] != 64:
+        return None
+    if page_table.dtype not in (torch.int32, torch.int64):
+        return None
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    seq_lens_flat = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    if prepared_prefix_lens is None:
+        prefix_lens = seq_lens_flat.index_select(0, token_to_batch_idx.long())
+    else:
+        prefix_lens = prepared_prefix_lens.to(device=q_values.device, dtype=torch.int32)
+    if _should_fallback_to_dense_short(
+        fallback_to_dense_if_short, prefix_lens, topk_tokens
+    ):
+        return None
+    if prepared_block_counts is None:
+        block_counts = torch.div(
+            prefix_lens.to(torch.int32) + block_size - 1,
+            block_size,
+            rounding_mode="floor",
+        ).to(torch.int32)
+    else:
+        block_counts = prepared_block_counts.to(device=q_values.device, dtype=torch.int32)
+    if prepared_block_topk_counts is not None and prepared_effective_block_topk is not None:
+        block_topk_counts = prepared_block_topk_counts.to(
+            device=q_values.device, dtype=torch.int32
+        )
+        effective_block_topk = int(prepared_effective_block_topk)
+    elif compression_ratio is None or compression_ratio <= 0:
+        block_topk_counts = torch.full_like(block_counts, block_topk)
+        effective_block_topk = block_topk
+    else:
+        block_topk_counts, effective_block_topk = _hisa_block_topk_counts(
+            block_counts,
+            block_size=block_size,
+            topk_tokens=topk_tokens,
+            compression_ratio=compression_ratio,
+        )
+    candidate_len = effective_block_topk * block_size
+    candidate_capacity = 1 << (max(topk_tokens, candidate_len, 1) - 1).bit_length()
+    if candidate_capacity > 8192:
+        return None
+
+    stage = _profile_start(q_values.device)
+    topk_indices = hisa_selector_megakernel_indexer_cache_nvfp4(
+        q_fp4,
+        index_k_with_scale_buffer,
+        page_table,
+        seq_lens_flat,
+        weights,
+        token_to_batch_idx,
+        block_rep_fp4,
+        max_blocks,
+        block_counts,
+        block_topk_counts,
+        effective_block_topk,
+        topk_tokens,
+    )
+    _profile_end(
+        "selector_megakernel",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        max_blocks=max_blocks,
+        candidate_len=candidate_len,
+        topk_tokens=topk_tokens,
+        fused_cuda=True,
+    )
+    return topk_indices
+
+
+def nvfp4_hisa_indexer_paged_parallel_megakernel_precomputed(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    block_rep_fp4: tuple[torch.Tensor, torch.Tensor],
+    max_blocks: int,
+    *,
+    block_size: int = 128,
+    block_topk: int = 64,
+    compression_ratio: Optional[float] = 4.0,
+    topk_tokens: int = 2048,
+    fallback_to_dense_if_short: bool = True,
+    prepared_prefix_lens: Optional[torch.Tensor] = None,
+    prepared_block_counts: Optional[torch.Tensor] = None,
+    prepared_block_topk_counts: Optional[torch.Tensor] = None,
+    prepared_effective_block_topk: Optional[int] = None,
+) -> Optional[torch.Tensor]:
+    """Parallel cuBLASDx HISA selector probe.
+
+    This follows the inference-oriented Megatron shape more closely than the
+    serial probe: block selection is per row, candidate scoring is launched over
+    row x selected-block tiles, and the existing fused CUDA tail does mask/top-k
+    and candidate-position mapping.
+    """
+    if block_size != 128:
+        raise ValueError("NVFP4 HISA parallel megakernel requires block_size=128.")
+    q_values, _ = q_fp4
+    if q_values.dim() != 3 or q_values.shape[1] != 64 or q_values.shape[-1] != 64:
+        return None
+    if page_table.dtype not in (torch.int32, torch.int64):
+        return None
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    seq_lens_flat = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    if prepared_prefix_lens is None:
+        prefix_lens = seq_lens_flat.index_select(0, token_to_batch_idx.long())
+    else:
+        prefix_lens = prepared_prefix_lens.to(device=q_values.device, dtype=torch.int32)
+    if _should_fallback_to_dense_short(
+        fallback_to_dense_if_short, prefix_lens, topk_tokens
+    ):
+        return None
+    if prepared_block_counts is None:
+        block_counts = torch.div(
+            prefix_lens.to(torch.int32) + block_size - 1,
+            block_size,
+            rounding_mode="floor",
+        ).to(torch.int32)
+    else:
+        block_counts = prepared_block_counts.to(device=q_values.device, dtype=torch.int32)
+    if prepared_block_topk_counts is not None and prepared_effective_block_topk is not None:
+        block_topk_counts = prepared_block_topk_counts.to(
+            device=q_values.device, dtype=torch.int32
+        )
+        effective_block_topk = int(prepared_effective_block_topk)
+    elif compression_ratio is None or compression_ratio <= 0:
+        block_topk_counts = torch.full_like(block_counts, block_topk)
+        effective_block_topk = block_topk
+    else:
+        block_topk_counts, effective_block_topk = _hisa_block_topk_counts(
+            block_counts,
+            block_size=block_size,
+            topk_tokens=topk_tokens,
+            compression_ratio=compression_ratio,
+        )
+    candidate_len = effective_block_topk * block_size
+
+    stage = _profile_start(q_values.device)
+    top_blocks = hisa_selector_parallel_select_blocks_indexer_cache_nvfp4(
+        q_fp4,
+        seq_lens_flat,
+        weights,
+        token_to_batch_idx,
+        block_rep_fp4,
+        max_blocks,
+        block_counts,
+        block_topk_counts,
+        effective_block_topk,
+        page_table_dtype=page_table.dtype,
+    )
+    _profile_end(
+        "selector_parallel_select_blocks",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        max_blocks=max_blocks,
+        block_topk=effective_block_topk,
+        fused_cuda=True,
+    )
+
+    keep = min(topk_tokens, candidate_len)
+    if candidate_len == topk_tokens:
+        stage = _profile_start(q_values.device)
+        topk_indices = hisa_map_candidate_indices_indexer_cache_nvfp4(
+            top_blocks,
+            prefix_lens.to(torch.int32),
+            topk_tokens,
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "selector_parallel_map_all",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            topk_tokens=topk_tokens,
+            fused_cuda=True,
+        )
+        return topk_indices
+
+    stage = _profile_start(q_values.device)
+    logits = hisa_selector_parallel_score_candidates_indexer_cache_nvfp4(
+        q_fp4,
+        index_k_with_scale_buffer,
+        page_table,
+        seq_lens_flat,
+        weights,
+        token_to_batch_idx,
+        top_blocks,
+    )
+    _profile_end(
+        "selector_parallel_score_candidates",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        candidate_len=candidate_len,
+        fused_cuda=True,
+    )
+
+    stage = _profile_start(q_values.device)
+    topk_indices = hisa_fused_mask_topk_map_indexer_cache_nvfp4(
+        logits,
+        top_blocks,
+        prefix_lens.to(torch.int32),
+        keep,
+        page_table_dtype=page_table.dtype,
+    )
+    _profile_end(
+        "selector_parallel_fused_mask_topk_map",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        candidate_len=candidate_len,
+        topk_tokens=int(keep),
+        fused_cuda=True,
+    )
+    if keep < topk_tokens:
+        padding = torch.full(
+            (topk_indices.shape[0], topk_tokens - keep),
+            -1,
+            device=topk_indices.device,
+            dtype=torch.int32,
+        )
+        topk_indices = torch.cat((topk_indices, padding), dim=1)
+    return topk_indices
+
+
+def nvfp4_hisa_indexer_paged_cluster_fused_precomputed(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    block_rep_fp4: tuple[torch.Tensor, torch.Tensor],
+    max_blocks: int,
+    *,
+    block_size: int = 128,
+    block_topk: int = 64,
+    compression_ratio: Optional[float] = 4.0,
+    topk_tokens: int = 2048,
+    fallback_to_dense_if_short: bool = True,
+    prepared_prefix_lens: Optional[torch.Tensor] = None,
+    prepared_block_counts: Optional[torch.Tensor] = None,
+    prepared_block_topk_counts: Optional[torch.Tensor] = None,
+    prepared_effective_block_topk: Optional[int] = None,
+) -> Optional[torch.Tensor]:
+    """Cluster-fused cuBLASDx HISA selector probe.
+
+    This keeps block scoring, block selection, candidate scoring, top-k, and
+    candidate-position mapping inside one CUDA launch. Cluster ranks split the
+    candidate GEMM tiles for each row, then rank 0 merges the row-local top-k.
+    """
+    if block_size != 128:
+        raise ValueError("NVFP4 HISA cluster-fused selector requires block_size=128.")
+    q_values, _ = q_fp4
+    if q_values.dim() != 3 or q_values.shape[1] != 64 or q_values.shape[-1] != 64:
+        return None
+    if page_table.dtype not in (torch.int32, torch.int64):
+        return None
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    seq_lens_flat = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    if prepared_prefix_lens is None:
+        prefix_lens = seq_lens_flat.index_select(0, token_to_batch_idx.long())
+    else:
+        prefix_lens = prepared_prefix_lens.to(device=q_values.device, dtype=torch.int32)
+    if _should_fallback_to_dense_short(
+        fallback_to_dense_if_short, prefix_lens, topk_tokens
+    ):
+        return None
+    if prepared_block_counts is None:
+        block_counts = torch.div(
+            prefix_lens.to(torch.int32) + block_size - 1,
+            block_size,
+            rounding_mode="floor",
+        ).to(torch.int32)
+    else:
+        block_counts = prepared_block_counts.to(device=q_values.device, dtype=torch.int32)
+    if prepared_block_topk_counts is not None and prepared_effective_block_topk is not None:
+        block_topk_counts = prepared_block_topk_counts.to(
+            device=q_values.device, dtype=torch.int32
+        )
+        effective_block_topk = int(prepared_effective_block_topk)
+    elif compression_ratio is None or compression_ratio <= 0:
+        block_topk_counts = torch.full_like(block_counts, block_topk)
+        effective_block_topk = block_topk
+    else:
+        block_topk_counts, effective_block_topk = _hisa_block_topk_counts(
+            block_counts,
+            block_size=block_size,
+            topk_tokens=topk_tokens,
+            compression_ratio=compression_ratio,
+        )
+    candidate_len = effective_block_topk * block_size
+
+    stage = _profile_start(q_values.device)
+    topk_indices = hisa_selector_cluster_fused_indexer_cache_nvfp4(
+        q_fp4,
+        index_k_with_scale_buffer,
+        page_table,
+        seq_lens_flat,
+        weights,
+        token_to_batch_idx,
+        block_rep_fp4,
+        max_blocks,
+        block_counts,
+        block_topk_counts,
+        effective_block_topk,
+        topk_tokens,
+    )
+    _profile_end(
+        "selector_cluster_fused",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        max_blocks=max_blocks,
+        candidate_len=candidate_len,
+        topk_tokens=topk_tokens,
+        cluster_size=4,
+        fused_cuda=True,
+    )
+    return topk_indices
+
+
+def nvfp4_hisa_indexer_paged_parallel_collective_precomputed(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    index_k_with_scale_buffer: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    block_rep_fp4: tuple[torch.Tensor, torch.Tensor],
+    max_blocks: int,
+    *,
+    block_size: int = 128,
+    block_topk: int = 64,
+    compression_ratio: Optional[float] = 4.0,
+    topk_tokens: int = 2048,
+    fallback_to_dense_if_short: bool = True,
+    prepared_prefix_lens: Optional[torch.Tensor] = None,
+    prepared_block_counts: Optional[torch.Tensor] = None,
+    prepared_block_topk_counts: Optional[torch.Tensor] = None,
+    prepared_effective_block_topk: Optional[int] = None,
+    prepared_candidate_context_lens: Optional[torch.Tensor] = None,
+    prepared_candidate_schedule_metadata: Optional[tuple] = None,
+) -> Optional[torch.Tensor]:
+    """Parallel selector probe with collective Blackwell candidate scoring.
+
+    This keeps the experimental cuBLASDx block-selection probe but replaces the
+    bad row x selected-block candidate-scoring fanout with DeepGEMM's batched
+    paged FP4 MQA logits kernel. It is a probe for the right candidate-scoring
+    shape, not a production selector path.
+    """
+    if block_size != 128:
+        raise ValueError("NVFP4 HISA parallel collective requires block_size=128.")
+    q_values, q_scales = q_fp4
+    if q_values.dim() != 3 or q_values.shape[1] != 64 or q_values.shape[-1] != 64:
+        return None
+    if page_table.dtype not in (torch.int32, torch.int64):
+        return None
+    if not _deepgemm_fp4_mqa_supports(q_values):
+        return None
+    if weights.dim() == 3 and weights.shape[-1] == 1:
+        weights = weights.squeeze(-1)
+    token_to_batch_idx = token_to_batch_idx.reshape(-1).to(
+        device=q_values.device, dtype=torch.int32
+    )
+    seq_lens_flat = seq_lens.reshape(-1).to(device=q_values.device, dtype=torch.int32)
+    if prepared_prefix_lens is None:
+        prefix_lens = seq_lens_flat.index_select(0, token_to_batch_idx.long())
+    else:
+        prefix_lens = prepared_prefix_lens.to(device=q_values.device, dtype=torch.int32)
+    if _should_fallback_to_dense_short(
+        fallback_to_dense_if_short, prefix_lens, topk_tokens
+    ):
+        return None
+    if prepared_block_counts is None:
+        block_counts = torch.div(
+            prefix_lens.to(torch.int32) + block_size - 1,
+            block_size,
+            rounding_mode="floor",
+        ).to(torch.int32)
+    else:
+        block_counts = prepared_block_counts.to(device=q_values.device, dtype=torch.int32)
+    if prepared_block_topk_counts is not None and prepared_effective_block_topk is not None:
+        block_topk_counts = prepared_block_topk_counts.to(
+            device=q_values.device, dtype=torch.int32
+        )
+        effective_block_topk = int(prepared_effective_block_topk)
+    elif compression_ratio is None or compression_ratio <= 0:
+        block_topk_counts = torch.full_like(block_counts, block_topk)
+        effective_block_topk = block_topk
+    else:
+        block_topk_counts, effective_block_topk = _hisa_block_topk_counts(
+            block_counts,
+            block_size=block_size,
+            topk_tokens=topk_tokens,
+            compression_ratio=compression_ratio,
+        )
+    candidate_len = effective_block_topk * block_size
+
+    stage = _profile_start(q_values.device)
+    top_blocks = hisa_selector_parallel_select_blocks_indexer_cache_nvfp4(
+        q_fp4,
+        seq_lens_flat,
+        weights,
+        token_to_batch_idx,
+        block_rep_fp4,
+        max_blocks,
+        block_counts,
+        block_topk_counts,
+        effective_block_topk,
+        page_table_dtype=page_table.dtype,
+    )
+    _profile_end(
+        "selector_collective_select_blocks",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        max_blocks=max_blocks,
+        block_topk=effective_block_topk,
+        fused_cuda=True,
+    )
+
+    keep = min(topk_tokens, candidate_len)
+    if candidate_len == topk_tokens:
+        stage = _profile_start(q_values.device)
+        topk_indices = hisa_map_candidate_indices_indexer_cache_nvfp4(
+            top_blocks,
+            prefix_lens.to(torch.int32),
+            topk_tokens,
+            page_table_dtype=page_table.dtype,
+        )
+        _profile_end(
+            "selector_collective_map_all",
+            stage,
+            q_values.device,
+            rows=int(q_values.shape[0]),
+            candidate_len=candidate_len,
+            topk_tokens=topk_tokens,
+            fused_cuda=True,
+        )
+        return topk_indices
+
+    stage = _profile_start(q_values.device)
+    candidate_page_table = hisa_candidate_pages_indexer_cache_nvfp4(
+        top_blocks, page_table, token_to_batch_idx
+    )
+    _profile_end(
+        "selector_collective_candidate_pages",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        block_topk=effective_block_topk,
+        candidate_pages=int(candidate_page_table.shape[1]),
+        fused_cuda=True,
+    )
+
+    import deep_gemm
+
+    schedule_metadata = prepared_candidate_schedule_metadata
+    if prepared_candidate_context_lens is None and schedule_metadata is None:
+        context_lens, schedule_metadata = _hisa_uniform_candidate_schedule(
+            q_values, candidate_len, deep_gemm
+        )
+    elif prepared_candidate_context_lens is None:
+        context_lens = torch.full(
+            (q_values.shape[0], 1),
+            candidate_len,
+            device=q_values.device,
+            dtype=torch.int32,
+        )
+    else:
+        context_lens = prepared_candidate_context_lens.to(
+            device=q_values.device, dtype=torch.int32
+        )
+    if schedule_metadata is None:
+        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, 64, deep_gemm.get_num_sms()
+        )
+    stage = _profile_start(q_values.device)
+    logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+        (q_values.view(torch.int8).unsqueeze(1), q_scales.unsqueeze(1)),
+        index_k_with_scale_buffer.view(index_k_with_scale_buffer.shape[0], 64, 1, 68),
+        weights,
+        context_lens,
+        candidate_page_table,
+        schedule_metadata,
+        candidate_len,
+        clean_logits=False,
+        logits_dtype=torch.float32,
+    )
+    _profile_end(
+        "selector_collective_candidate_logits",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        candidate_len=candidate_len,
+        backend="deepgemm_fp4_paged_mqa",
+    )
+
+    stage = _profile_start(q_values.device)
+    topk_indices = hisa_fused_mask_topk_map_indexer_cache_nvfp4(
+        logits,
+        top_blocks,
+        prefix_lens.to(torch.int32),
+        keep,
+        page_table_dtype=page_table.dtype,
+    )
+    _profile_end(
+        "selector_collective_fused_mask_topk_map",
+        stage,
+        q_values.device,
+        rows=int(q_values.shape[0]),
+        candidate_len=candidate_len,
+        topk_tokens=int(keep),
+        fused_cuda=True,
+    )
+    if keep < topk_tokens:
+        padding = torch.full(
+            (topk_indices.shape[0], topk_tokens - keep),
+            -1,
+            device=topk_indices.device,
+            dtype=torch.int32,
+        )
+        topk_indices = torch.cat((topk_indices, padding), dim=1)
+    return topk_indices
 
 
 def nvfp4_hisa_indexer_paged_deepgemm(

@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-b-test-cpu")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
@@ -110,6 +111,27 @@ class TestSMCDisaggregationArgs(unittest.TestCase):
                 speculative_algorithm="SMC",
                 speculative_draft_model_path="dummy",
             )
+
+    def test_smc_draft_kv_dtype_uses_draft_hf_config(self):
+        hf_config = SimpleNamespace(
+            quantization_config={
+                "kv_cache_scheme": {
+                    "quant_method": "higgs_mha_2bit",
+                    "scope": "smc_draft",
+                },
+            }
+        )
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.get_config",
+            return_value=hf_config,
+        ):
+            server_args = ServerArgs(
+                model_path="dummy",
+                speculative_algorithm="SMC",
+                speculative_draft_model_path="dummy-draft",
+            )
+
+        self.assertEqual(server_args.smc_draft_kv_cache_dtype, "higgs_2bit")
 
 
 class TestFlashSamplingArgs(unittest.TestCase):

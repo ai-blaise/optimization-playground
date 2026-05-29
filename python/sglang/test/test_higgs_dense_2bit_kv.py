@@ -1,5 +1,8 @@
 """Tests for the 2-bit HIGGS dense MLA KV codec + CUDA kernel."""
 
+import os
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -113,6 +116,7 @@ def test_higgs_b200_candidate_registry_has_opt_in_candidates():
         "store_const_codebook_warp_pack_fma_score",
         "store_const_codebook_warp_pack_scale_broadcast",
         "store_const_codebook_warp_pack_rope_first",
+        "store_saw_scalar2",
         "dequant_const_codebook",
         "dequant_vec4_smem_codebook",
         "dequant_vec4_ldg_codebook",
@@ -216,6 +220,12 @@ def test_higgs_b200_candidate_selector_defaults_to_production(monkeypatch):
         == "const_codebook_warp_pack_rope_first"
     )
 
+    monkeypatch.setenv(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "store_saw_scalar2")
+    candidate = get_higgs_dense_2bit_b200_candidate()
+    assert candidate.store_variant == "saw_scalar2"
+    assert candidate.dequant_variant == "saw_scalar2"
+    assert candidate.page_table_dequant_variant == "saw_scalar2"
+
     monkeypatch.setenv(
         HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, "dequant_vec4_ldg_codebook"
     )
@@ -287,6 +297,32 @@ def test_higgs_split_policy_candidates_are_opt_in(monkeypatch):
     assert select_higgs_mla_decode_num_splits(1, 8, 2048) == 80
     assert select_higgs_mla_decode_num_splits(1, 8, 4096) == 128
     assert select_higgs_mla_decode_num_splits(64, 8, 4096) == 48
+
+
+def test_higgs_candidate_can_be_selected_from_hf_config(monkeypatch):
+    from sglang.srt.layers.quantization.quantization_config_dispatch import (
+        apply_quantization_config_dispatch,
+    )
+
+    monkeypatch.delenv(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, raising=False)
+    server_args = SimpleNamespace(
+        enable_higgs_dense_2bit_kv_cache=False,
+        enable_turboquant_dense_kv_cache=False,
+    )
+    hf_config = SimpleNamespace(
+        quantization_config={
+            "kv_cache_scheme": {
+                "quant_method": "higgs_dense_2bit",
+                "b200_candidate": "store_saw_scalar2",
+            }
+        }
+    )
+
+    apply_quantization_config_dispatch(server_args, hf_config)
+
+    assert server_args.enable_higgs_dense_2bit_kv_cache
+    assert get_higgs_dense_2bit_b200_candidate().name == "store_saw_scalar2"
+    os.environ.pop(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, None)
 
 
 def test_higgs_b200_candidate_metadata_is_json_ready():
@@ -435,3 +471,74 @@ def test_higgs_mla_decode_matches_dequantized_reference():
     weights = torch.softmax(scores, dim=-1)
     expected = torch.einsum("rhk,rkd->rhd", weights, ref_latent[rows])
     torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_higgs_mla_decode_saw_scalar2_matches_dequantized_reference():
+    """The SAW scalar2 fused decode matches its own packed-slot semantics."""
+    from sglang.jit_kernel.higgs_dense_2bit import (
+        dequantize_higgs_dense_2bit,
+        store_higgs_dense_2bit,
+    )
+    from sglang.jit_kernel.higgs_dense_2bit_mla_decode import (
+        higgs_dense_2bit_mla_decode_saw_scalar2,
+        higgs_dense_2bit_mla_decode_saw_scalar2_split,
+    )
+
+    device = torch.device("cuda")
+    cfg = HiggsDense2BitConfig(latent_dim=512, rope_dim=64)
+    codec = HiggsDense2BitCodec(cfg, device)
+    torch.manual_seed(0x5A17)
+    num_slots = 64
+    locs = torch.arange(num_slots, device=device, dtype=torch.int64)
+    latent = torch.randn(num_slots, 1, 512, device=device, dtype=torch.bfloat16)
+    rope = torch.randn(num_slots, 1, 64, device=device, dtype=torch.bfloat16)
+    compressed = torch.empty(
+        (num_slots, 1, cfg.slot_bytes), device=device, dtype=torch.uint8
+    )
+    old_candidate = os.environ.get(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV)
+    os.environ[HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV] = "store_saw_scalar2"
+    try:
+        store_higgs_dense_2bit(
+            compressed, locs, latent, rope, codec.codebook, codec.codebook_norm_sq
+        )
+        dequant = torch.empty((num_slots, 1, 576), device=device, dtype=torch.bfloat16)
+        dequantize_higgs_dense_2bit(compressed, locs, dequant, codec.codebook)
+    finally:
+        if old_candidate is None:
+            os.environ.pop(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV, None)
+        else:
+            os.environ[HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV] = old_candidate
+
+    num_rows = 2
+    num_heads = 3
+    topk = 32
+    page_table = torch.arange(
+        num_rows * topk, device=device, dtype=torch.int32
+    ).reshape(num_rows, topk)
+    q_nope = torch.randn(num_rows, num_heads, 512, device=device, dtype=torch.bfloat16)
+    q_rope = torch.randn(num_rows, num_heads, 64, device=device, dtype=torch.bfloat16)
+    out = torch.empty(
+        (num_rows, num_heads, 512), device=device, dtype=torch.bfloat16
+    )
+    out_split = torch.empty_like(out)
+    mid = torch.empty((num_rows, num_heads, 4, 514), device=device, dtype=torch.float32)
+    sm_scale = 1.0 / (512 ** 0.5)
+    higgs_dense_2bit_mla_decode_saw_scalar2(
+        q_nope, q_rope, compressed, page_table, out, codec.codebook, sm_scale
+    )
+    higgs_dense_2bit_mla_decode_saw_scalar2_split(
+        q_nope, q_rope, compressed, page_table, mid, out_split, codec.codebook, sm_scale
+    )
+
+    ref_latent = dequant[..., :512].squeeze(1).float()
+    ref_rope = dequant[..., 512:].squeeze(1).float()
+    rows = page_table.long()
+    scores = (
+        torch.einsum("rhd,rkd->rhk", q_nope.float(), ref_latent[rows])
+        + torch.einsum("rhe,rke->rhk", q_rope.float(), ref_rope[rows])
+    ) * sm_scale
+    weights = torch.softmax(scores, dim=-1)
+    expected = torch.einsum("rhk,rkd->rhd", weights, ref_latent[rows])
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out_split.float(), expected, rtol=2e-2, atol=2e-2)

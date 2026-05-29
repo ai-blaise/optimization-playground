@@ -13,7 +13,8 @@ Three fields are recognized:
    ``server_args.enable_turboquant_dense_kv_cache = True`` and copies the
    ``preset`` field into ``server_args.turboquant_dense_kv_preset``. When
    ``quant_method == "higgs_dense_2bit"``, sets
-   ``server_args.enable_higgs_dense_2bit_kv_cache = True``.
+   ``server_args.enable_higgs_dense_2bit_kv_cache = True`` and may select a
+   validated HIGGS B200 candidate through ``kv_cache_scheme.b200_candidate``.
 
 2. ``indexer_quantization``: a new top-level dict; records supported
    cache formats on ``server_args.indexer_quantization_declared`` and can
@@ -37,6 +38,7 @@ that an unfamiliar checkpoint loads cleanly on a stock SGLang build.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable, Dict, Optional
 
 from sglang.srt.layers.attention.dsa.indexer_quantization import (
@@ -44,6 +46,10 @@ from sglang.srt.layers.attention.dsa.indexer_quantization import (
     INDEXER_FP8_QUANT_METHOD,
     INDEXER_NVFP4_QUANT_METHOD,
     SUPPORTED_INDEXER_QUANT_METHODS,
+)
+from sglang.srt.layers.quantization.higgs_dense_2bit_kv import (
+    HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV,
+    get_higgs_dense_2bit_b200_candidate,
 )
 from sglang.srt.layers.quantization.turboquant_dense_kv import (
     TURBOQUANT_DENSE_KV_PRESETS,
@@ -54,6 +60,7 @@ logger = logging.getLogger(__name__)
 TURBOQUANT_DENSE_QUANT_METHOD = "turboquant_dense"
 DEFAULT_TURBOQUANT_DENSE_KV_PRESET = "latent_2p5bit_nc"
 HIGGS_DENSE_2BIT_QUANT_METHOD = "higgs_dense_2bit"
+HIGGS_MHA_2BIT_QUANT_METHOD = "higgs_mha_2bit"
 DEFAULT_DSA_INDEXCACHE_FREQ = 4
 DEFAULT_NSA_INDEXCACHE_FREQ = DEFAULT_DSA_INDEXCACHE_FREQ
 SUPPORTED_CONFIG_INDEXER_MODES = ("vanilla", "indexcache")
@@ -157,6 +164,46 @@ def _maybe_apply_higgs_dense_2bit(server_args: Any, quant_cfg: Dict[str, Any]) -
             "Enabling HIGGS 2-bit dense KV from quantization_config "
             "(kv_cache_scheme.quant_method=higgs_dense_2bit)."
         )
+
+    candidate_name = kv_cache_scheme.get("b200_candidate") or kv_cache_scheme.get(
+        "candidate"
+    )
+    if candidate_name is None:
+        return
+
+    candidate = get_higgs_dense_2bit_b200_candidate(str(candidate_name))
+    current = os.environ.get(HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV)
+    if current and current != candidate.name:
+        logger.info(
+            "Keeping %s=%s over quantization_config.kv_cache_scheme "
+            "candidate=%s.",
+            HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV,
+            current,
+            candidate.name,
+        )
+        return
+
+    os.environ[HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV] = candidate.name
+    logger.info(
+        "Selecting HIGGS 2-bit dense KV candidate %s from "
+        "quantization_config.kv_cache_scheme.",
+        candidate.name,
+    )
+
+
+def get_smc_draft_kv_cache_dtype_from_config(hf_config: Any) -> Optional[str]:
+    """Return the SMC draft KV dtype requested by a draft model config."""
+    quant_cfg = _get_quantization_config(hf_config)
+    if quant_cfg is None:
+        return None
+    kv_cache_scheme = _coerce_dict(
+        quant_cfg.get("smc_draft_kv_cache_scheme")
+    ) or _coerce_dict(quant_cfg.get("kv_cache_scheme"))
+    if kv_cache_scheme is None:
+        return None
+    if kv_cache_scheme.get("quant_method") == HIGGS_MHA_2BIT_QUANT_METHOD:
+        return "higgs_2bit"
+    return None
 
 
 def _maybe_apply_indexer_quantization(

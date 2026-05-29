@@ -324,6 +324,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                     "cache_seqlens"
                 ][:bs]
+                metadata.cache_seqlens_int32.copy_(
+                    seq_lens + self.speculative_step_id + 1
+                )
                 metadata.max_seq_len_k = seq_lens.max().item() + (
                     self.speculative_step_id + 1
                 )
@@ -458,16 +461,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # Draft Decode
                 # Here we only support topk = 1 for now.
                 metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
-                metadata.max_seq_len_k = max_len + self.speculative_step_id + 1
+                metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
+                    "cache_seqlens"
+                ][:bs]
+                metadata.cache_seqlens_int32.copy_(
+                    seq_lens + self.speculative_step_id + 1
+                )
+                metadata.max_seq_len_k = seq_lens.max().item() + (
+                    self.speculative_step_id + 1
+                )
 
                 max_seq_pages = (
                     metadata.max_seq_len_k + self.page_size - 1
                 ) // self.page_size
-
-                metadata.cache_seqlens_int32.copy_(
-                    seq_lens + self.speculative_step_id + 1
-                )
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
@@ -537,6 +543,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
         self.forward_metadata = metadata
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        pass
+
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
@@ -558,7 +569,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         cache_loc = self._get_layer_cache_loc(layer, forward_batch)
 
         # Get K/V cache buffers from token_to_kv_pool
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         fused_fp8_set_kv_buffer(
             k=k,
@@ -598,7 +609,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     ),
                     (1, 0),
                 )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
             else:
@@ -611,7 +622,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
         elif forward_batch.forward_mode.is_target_verify():
@@ -635,7 +646,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
                 (1, 0),
             )
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+            metadata.page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
@@ -645,7 +656,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+            metadata.page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
@@ -713,7 +724,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
@@ -721,7 +732,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
             q = q.to(torch.float8_e4m3fn)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache = k_cache.view(
@@ -799,7 +810,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
@@ -807,7 +818,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             q = q.to(torch.float8_e4m3fn)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         k_cache = k_cache.view(
             -1, self.page_size, layer.tp_k_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)

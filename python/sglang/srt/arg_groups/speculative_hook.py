@@ -14,6 +14,7 @@ def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
     trust_remote_code: bool = False,
+    kwargs: Optional[dict] = {},
 ) -> Optional[str]:
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
@@ -25,7 +26,7 @@ def _resolve_speculative_algorithm_alias(
         from sglang.srt.utils.hf_transformers_utils import get_config
 
         cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code
+            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
         )
         is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
             getattr(cfg, "architectures", None) or []
@@ -63,10 +64,17 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
     if server_args.speculative_algorithm is not None:
         server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
 
+    kwargs = {}
+
+    override_config_file = server_args.decrypted_draft_config_file
+    if override_config_file and override_config_file.strip():
+        kwargs["_configuration_file"] = override_config_file.strip()
+
     server_args.speculative_algorithm = _resolve_speculative_algorithm_alias(
         server_args.speculative_algorithm,
         server_args.speculative_draft_model_path,
         trust_remote_code=server_args.trust_remote_code,
+        kwargs=kwargs,
     )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
@@ -235,6 +243,41 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
         )
 
 
+def _maybe_apply_smc_draft_kv_cache_config(server_args: "ServerArgs") -> None:
+    if server_args.smc_draft_kv_cache_dtype not in (None, "auto"):
+        return
+
+    from sglang.srt.layers.quantization.quantization_config_dispatch import (
+        get_smc_draft_kv_cache_dtype_from_config,
+    )
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    model_override_args = json.loads(server_args.json_model_override_args)
+    try:
+        draft_hf_config = get_config(
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.speculative_draft_model_revision,
+            model_override_args=model_override_args,
+        )
+    except OSError:
+        logger.debug(
+            "Unable to read SMC draft model config for KV cache auto-detect."
+        )
+        return
+
+    kv_cache_dtype = get_smc_draft_kv_cache_dtype_from_config(draft_hf_config)
+    if kv_cache_dtype is None:
+        return
+
+    server_args.smc_draft_kv_cache_dtype = kv_cache_dtype
+    logger.info(
+        "Selecting --smc-draft-kv-cache-dtype=%s from draft model "
+        "quantization_config.",
+        kv_cache_dtype,
+    )
+
+
 def _handle_smc(server_args: "ServerArgs") -> None:
     if server_args.disaggregation_mode == "prefill":
         raise ValueError(
@@ -271,13 +314,15 @@ def _handle_smc(server_args: "ServerArgs") -> None:
         )
     smc_supported_target_backends = {"triton", "fa3"}
     smc_supported_draft_backends = {"triton", "fa3", "trtllm_mha"}
-    from sglang.srt.configs.model_config import is_deepseek_dsa
 
     target_supported_backends = set(smc_supported_target_backends)
     if server_args.model_path.lower() in ["none", "dummy"]:
         pass
-    elif is_deepseek_dsa(server_args.get_model_config().hf_config):
-        target_supported_backends.update({"dsa", "nsa"})
+    else:
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        if is_deepseek_dsa(server_args.get_model_config().hf_config):
+            target_supported_backends.update({"dsa", "nsa"})
     unsupported_attention_backends = {}
     for name, backend in {
         "attention_backend": server_args.attention_backend,
@@ -310,6 +355,12 @@ def _handle_smc(server_args: "ServerArgs") -> None:
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
+    if server_args.speculative_draft_model_path is None:
+        raise ValueError(
+            "SMC speculative decoding requires --speculative-draft-model-path."
+        )
+    _maybe_apply_smc_draft_kv_cache_config(server_args)
+
     if server_args.smc_draft_kv_cache_dtype == "bf16":
         server_args.smc_draft_kv_cache_dtype = "bfloat16"
     if server_args.smc_draft_kv_cache_dtype is not None and (
@@ -325,11 +376,17 @@ def _handle_smc(server_args: "ServerArgs") -> None:
     server_args.speculative_eagle_topk = 1
     server_args.speculative_num_steps = server_args.smc_gamma
     server_args.speculative_num_draft_tokens = server_args.smc_gamma + 1
-    server_args.disable_overlap_schedule = True
-    if server_args.speculative_draft_model_path is None:
-        raise ValueError(
-            "SMC speculative decoding requires --speculative-draft-model-path."
+    # SMC supports the overlap scheduler under spec v2 end-to-end (bonus-token
+    # stream recording + seq-len handoff are wired up), so don't disable it
+    # unconditionally. Mirror _handle_eagle_family: keep overlap ON under spec
+    # v2, only falling back to spec v1 (overlap off) when it is explicitly off.
+    if not envs.SGLANG_ENABLE_SPEC_V2.get():
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "SMC: overlap scheduler disabled because SGLANG_ENABLE_SPEC_V2=0."
         )
+    else:
+        logger.info("SMC: overlap scheduler enabled (spec v2).")
 
 
 def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:

@@ -171,10 +171,18 @@ class SamplingBatchInfo:
             },
         )
 
-        temperature_is_uniform = bool(torch.all(temperatures == temperatures[0]).item())
-        temperature_value = (
-            float(temperatures.reshape(-1)[0].item()) if temperature_is_uniform else None
-        )
+        # DP-attention edge case: with dp_size > 1, ranks that scheduled no
+        # requests this step land here with temperatures.numel() == 0, and
+        # temperatures[0] would IndexError. An empty batch is trivially
+        # uniform; pick a benign placeholder so downstream sampling can no-op.
+        if temperatures.numel() == 0:
+            temperature_is_uniform = True
+            temperature_value = 1.0
+        else:
+            temperature_is_uniform = bool(torch.all(temperatures == temperatures[0]).item())
+            temperature_value = (
+                float(temperatures.reshape(-1)[0].item()) if temperature_is_uniform else None
+            )
 
         ret = cls(
             temperatures=temperatures,

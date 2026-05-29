@@ -259,6 +259,26 @@ HIGGS_DENSE_2BIT_B200_CANDIDATES: Tuple[HiggsDense2BitB200Candidate, ...] = (
         promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
     ),
     HiggsDense2BitB200Candidate(
+        name="store_saw_scalar2",
+        summary="SAW-inspired fixed-scale 2-bit dense MLA KV candidate for "
+        "SpinQuant-rotated activations: no online Hadamard, BF16-bit "
+        "threshold encode, packed 64-bit latent stores, and 16-bit rope "
+        "moves in the existing 258-byte HIGGS slot.",
+        category="store algorithm",
+        store_variant="saw_scalar2",
+        dequant_variant="saw_scalar2",
+        page_table_dequant_variant="saw_scalar2",
+        hf_config_fields=(
+            ("kv_cache_scheme.quant_method", "higgs_dense_2bit"),
+            ("kv_cache_scheme.b200_candidate", "store_saw_scalar2"),
+            ("higgs_hadamard_mode", "none"),
+            ("higgs_codebook", "saw_scalar2"),
+            ("higgs_scale_mode", "fixed_1"),
+        ),
+        proof_modules=("docs/proofs/higgs_dense_2bit_saw_scalar2_czs_module.json",),
+        promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,
+    ),
+    HiggsDense2BitB200Candidate(
         name="dequant_const_codebook",
         summary="IKP-derived direct-loc dequant variant that reads the fixed "
         "EDEN2-16 codebook from device constants instead of dynamic global "

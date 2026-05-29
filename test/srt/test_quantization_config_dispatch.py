@@ -37,6 +37,14 @@ _PACKAGE_PATHS = {
     "sglang.srt.layers.attention.nsa": ROOT / "python/sglang/srt/layers/attention/nsa",
     "sglang.srt.layers.quantization": ROOT / "python/sglang/srt/layers/quantization",
 }
+_STUB_MODULE_NAMES = tuple(_PACKAGE_PATHS) + (
+    "sglang.srt.layers.attention.dsa.indexer_quantization",
+    "sglang.srt.layers.attention.nsa.indexer_quantization",
+    "sglang.srt.layers.quantization.turboquant_dense_kv",
+    "sglang.srt.layers.quantization.quantization_config_dispatch",
+)
+_PREVIOUS_MODULES = {name: sys.modules.get(name) for name in _STUB_MODULE_NAMES}
+
 for module_name, package_path in _PACKAGE_PATHS.items():
     module = sys.modules.setdefault(module_name, types.ModuleType(module_name))
     module.__path__ = [str(package_path)]
@@ -64,6 +72,12 @@ dispatcher = _load_module(
     ROOT / "python/sglang/srt/layers/quantization/quantization_config_dispatch.py",
 )
 
+for _module_name, _previous_module in _PREVIOUS_MODULES.items():
+    if _previous_module is None:
+        sys.modules.pop(_module_name, None)
+    else:
+        sys.modules[_module_name] = _previous_module
+
 
 @dataclass
 class FakeServerArgs:
@@ -87,6 +101,32 @@ class FakeServerArgs:
 @dataclass
 class FakeHfConfig:
     quantization_config: Optional[Dict[str, Any]] = field(default=None)
+
+
+def test_smc_draft_higgs_mha_kv_cache_scheme_selects_higgs_2bit():
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "kv_cache_scheme": {
+                "quant_method": "higgs_mha_2bit",
+                "scope": "smc_draft",
+                "head_dim": 128,
+                "slot_bytes": 34,
+            },
+        }
+    )
+    assert (
+        dispatcher.get_smc_draft_kv_cache_dtype_from_config(hf_config)
+        == "higgs_2bit"
+    )
+
+
+def test_unknown_smc_draft_kv_cache_scheme_is_ignored():
+    hf_config = FakeHfConfig(
+        quantization_config={
+            "kv_cache_scheme": {"quant_method": "fp8"},
+        }
+    )
+    assert dispatcher.get_smc_draft_kv_cache_dtype_from_config(hf_config) is None
 
 
 def test_no_quantization_config_is_noop():

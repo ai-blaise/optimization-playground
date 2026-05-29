@@ -51,6 +51,16 @@ def _jit_higgs_dense_2bit_mla_decode_module() -> "Module":
                 "higgs_dense_2bit_mla_detail::"
                 "HiggsDense2BitMLADecodeSplitKernel::run",
             ),
+            (
+                "higgs_dense_2bit_mla_decode_saw_scalar2",
+                "higgs_dense_2bit_mla_detail::"
+                "HiggsDense2BitMLADecodeSawScalar2Kernel::run",
+            ),
+            (
+                "higgs_dense_2bit_mla_decode_saw_scalar2_split",
+                "higgs_dense_2bit_mla_detail::"
+                "HiggsDense2BitMLADecodeSawScalar2SplitKernel::run",
+            ),
         ],
     )
 
@@ -99,6 +109,80 @@ def higgs_dense_2bit_mla_decode(
         q_rope.contiguous(),
         compressed.contiguous(),
         page_table.contiguous(),
+        out,
+        codebook.contiguous(),
+        float(sm_scale),
+    )
+
+
+@debug_kernel_api
+def higgs_dense_2bit_mla_decode_saw_scalar2(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    compressed: torch.Tensor,
+    page_table: torch.Tensor,
+    out: torch.Tensor,
+    codebook: torch.Tensor,
+    sm_scale: float,
+) -> None:
+    """Single-pass MLA decode for the SAW scalar2 HIGGS slot variant."""
+    assert q_nope.is_cuda
+    assert q_rope.is_cuda
+    assert compressed.is_cuda
+    assert page_table.is_cuda
+    assert out.is_cuda
+    assert q_nope.dtype == torch.bfloat16
+    assert q_rope.dtype == torch.bfloat16
+    assert compressed.dtype == torch.uint8
+    assert page_table.dtype == torch.int32
+    assert out.dtype == torch.bfloat16
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_mla_decode_module()
+    module.higgs_dense_2bit_mla_decode_saw_scalar2(
+        q_nope.contiguous(),
+        q_rope.contiguous(),
+        compressed.contiguous(),
+        page_table.contiguous(),
+        out,
+        codebook.contiguous(),
+        float(sm_scale),
+    )
+
+
+@debug_kernel_api
+def higgs_dense_2bit_mla_decode_saw_scalar2_split(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    compressed: torch.Tensor,
+    page_table: torch.Tensor,
+    mid: torch.Tensor,
+    out: torch.Tensor,
+    codebook: torch.Tensor,
+    sm_scale: float,
+) -> None:
+    """Split-K MLA decode for the SAW scalar2 HIGGS slot variant."""
+    assert q_nope.is_cuda
+    assert q_rope.is_cuda
+    assert compressed.is_cuda
+    assert page_table.is_cuda
+    assert mid.is_cuda
+    assert out.is_cuda
+    assert q_nope.dtype == torch.bfloat16
+    assert q_rope.dtype == torch.bfloat16
+    assert compressed.dtype == torch.uint8
+    assert page_table.dtype == torch.int32
+    assert mid.dtype == torch.float32
+    assert out.dtype == torch.bfloat16
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_mla_decode_module()
+    module.higgs_dense_2bit_mla_decode_saw_scalar2_split(
+        q_nope.contiguous(),
+        q_rope.contiguous(),
+        compressed.contiguous(),
+        page_table.contiguous(),
+        mid,
         out,
         codebook.contiguous(),
         float(sm_scale),

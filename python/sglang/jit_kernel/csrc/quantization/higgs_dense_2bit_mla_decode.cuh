@@ -202,9 +202,14 @@ higgs_dense_2bit_mla_decode_kernel(
   if (row >= num_rows || head >= num_heads) return;
 
   __shared__ float smem128[kBlockThreads];
-  __shared__ float softmax_state[4];  // [m, l, alpha, beta]
   __shared__ float warp_partials[4];
   __shared__ float cb_smem[kCodebookSize * kPairDim];  // 32 fp32 = 128 B
+
+  // Online-softmax state lives in registers (every thread holds the same
+  // value via redundant reduction; iter2 drops one __syncthreads() per
+  // slot vs the SMEM-backed variant).
+  float softmax_state_m = kNegInf;
+  float softmax_state_l = 0.0f;
 
   if (tid < kCodebookSize * kPairDim) {
     cb_smem[tid] = __ldg(&codebook[tid]);
@@ -233,12 +238,6 @@ higgs_dense_2bit_mla_decode_kernel(
   v2 *= kInvSqrtLatentDim;
   v3 *= kInvSqrtLatentDim;
 
-  if (tid == 0) {
-    softmax_state[0] = kNegInf;
-    softmax_state[1] = 0.0f;
-  }
-  __syncthreads();
-
   float q_rope_val = 0.0f;
   if (tid < kRopeDim) {
     const bf16_t* q_rope_row =
@@ -265,8 +264,12 @@ higgs_dense_2bit_mla_decode_kernel(
     const float c2 = cb_smem[i2 * kPairDim + coord];
     const float c3 = cb_smem[i3 * kPairDim + coord];
 
-    const half norm_h =
-        *reinterpret_cast<const half*>(slot + kPackedBytes);
+    // Force LDG.NC on the per-slot scale (fp16) — the plain
+    // reinterpret_cast load goes through the regular memory pipe and
+    // doesn't pick up the constant-cache path even though every thread
+    // in the block reads the same address (iter2 vector 2).
+    const half norm_h = __ldg(
+        reinterpret_cast<const half*>(slot + kPackedBytes));
     const float scale = __half2float(norm_h);
 
     float val = valid
@@ -275,7 +278,7 @@ higgs_dense_2bit_mla_decode_kernel(
     if (tid < kRopeDim && valid) {
       const bf16_t* rope =
           reinterpret_cast<const bf16_t*>(slot + kPackedBytes + kNormBytes);
-      val += q_rope_val * bf16_to_float(rope[tid]);
+      val += q_rope_val * bf16_to_float(__ldg(rope + tid));
     }
 
     const float warp_sum = warp_reduce_sum(val);
@@ -284,32 +287,29 @@ higgs_dense_2bit_mla_decode_kernel(
     if (lane == 0) warp_partials[warp_id] = warp_sum;
     __syncthreads();
 
-    if (tid == 0) {
-      const float total =
-          warp_partials[0] + warp_partials[1] +
-          warp_partials[2] + warp_partials[3];
-      const float score = valid ? total * sm_scale : kNegInf;
-      const float old_m = softmax_state[0];
-      const float old_l = softmax_state[1];
-      const float new_m = fmaxf(old_m, score);
-      const float alpha = __expf(old_m - new_m);
-      const float beta = __expf(score - new_m);
-      softmax_state[0] = new_m;
-      softmax_state[1] = old_l * alpha + beta;
-      softmax_state[2] = alpha;
-      softmax_state[3] = beta;
-    }
-    __syncthreads();
+    // Every thread redundantly computes the block-wide reduction and
+    // softmax-state update from warp_partials — saves the publish-and-
+    // resync hop (iter2 vector 3, 2 → 1 __syncthreads() per slot).
+    const float total =
+        warp_partials[0] + warp_partials[1] +
+        warp_partials[2] + warp_partials[3];
+    const float score = valid ? total * sm_scale : kNegInf;
+    const float old_m = softmax_state_m;
+    const float old_l = softmax_state_l;
+    const float new_m = fmaxf(old_m, score);
+    const float alpha = __expf(old_m - new_m);
+    const float beta = __expf(score - new_m);
+    softmax_state_m = new_m;
+    softmax_state_l = old_l * alpha + beta;
 
-    const float alpha = softmax_state[2];
-    const float beta_scaled = softmax_state[3] * scale;
+    const float beta_scaled = beta * scale;
     acc0 = acc0 * alpha + beta_scaled * c0;
     acc1 = acc1 * alpha + beta_scaled * c1;
     acc2 = acc2 * alpha + beta_scaled * c2;
     acc3 = acc3 * alpha + beta_scaled * c3;
   }
 
-  const float denom = softmax_state[1];
+  const float denom = softmax_state_l;
   const bool ok = denom > 0.0f;
   v0 = ok ? acc0 / denom : 0.0f;
   v1 = ok ? acc1 / denom : 0.0f;
@@ -381,8 +381,13 @@ higgs_dense_2bit_mla_decode_saw_scalar2_kernel(
   const int tid = threadIdx.x;
   if (row >= num_rows || head >= num_heads) return;
 
-  __shared__ float softmax_state[4];  // [m, l, alpha, beta]
   __shared__ float warp_partials[4];
+
+  // Online-softmax state lives in registers (iter2 vector 3 — saves one
+  // __syncthreads() per slot vs the SMEM-backed variant; see the
+  // dense-codebook kernel above for the rationale).
+  float softmax_state_m = kNegInf;
+  float softmax_state_l = 0.0f;
 
   const bf16_t* q_nope_row =
       q_nope + row * q_nope_stride_0 + head * q_nope_stride_1;
@@ -390,12 +395,6 @@ higgs_dense_2bit_mla_decode_saw_scalar2_kernel(
   const float q1 = bf16_to_float(q_nope_row[1 * 128 + tid]);
   const float q2 = bf16_to_float(q_nope_row[2 * 128 + tid]);
   const float q3 = bf16_to_float(q_nope_row[3 * 128 + tid]);
-
-  if (tid == 0) {
-    softmax_state[0] = kNegInf;
-    softmax_state[1] = 0.0f;
-  }
-  __syncthreads();
 
   float q_rope_val = 0.0f;
   if (tid < kRopeDim) {
@@ -429,7 +428,7 @@ higgs_dense_2bit_mla_decode_saw_scalar2_kernel(
     if (tid < kRopeDim && valid) {
       const bf16_t* rope =
           reinterpret_cast<const bf16_t*>(slot + kPackedBytes + kNormBytes);
-      val += q_rope_val * bf16_to_float(rope[tid]);
+      val += q_rope_val * bf16_to_float(__ldg(rope + tid));
     }
 
     const float warp_sum = warp_reduce_sum(val);
@@ -438,32 +437,25 @@ higgs_dense_2bit_mla_decode_saw_scalar2_kernel(
     if (lane == 0) warp_partials[warp_id] = warp_sum;
     __syncthreads();
 
-    if (tid == 0) {
-      const float total =
-          warp_partials[0] + warp_partials[1] +
-          warp_partials[2] + warp_partials[3];
-      const float score = valid ? total * sm_scale : kNegInf;
-      const float old_m = softmax_state[0];
-      const float old_l = softmax_state[1];
-      const float new_m = fmaxf(old_m, score);
-      const float alpha = __expf(old_m - new_m);
-      const float beta = __expf(score - new_m);
-      softmax_state[0] = new_m;
-      softmax_state[1] = old_l * alpha + beta;
-      softmax_state[2] = alpha;
-      softmax_state[3] = beta;
-    }
-    __syncthreads();
+    const float total =
+        warp_partials[0] + warp_partials[1] +
+        warp_partials[2] + warp_partials[3];
+    const float score = valid ? total * sm_scale : kNegInf;
+    const float old_m = softmax_state_m;
+    const float old_l = softmax_state_l;
+    const float new_m = fmaxf(old_m, score);
+    const float alpha = __expf(old_m - new_m);
+    const float beta = __expf(score - new_m);
+    softmax_state_m = new_m;
+    softmax_state_l = old_l * alpha + beta;
 
-    const float alpha = softmax_state[2];
-    const float beta = softmax_state[3];
     acc0 = acc0 * alpha + beta * c0;
     acc1 = acc1 * alpha + beta * c1;
     acc2 = acc2 * alpha + beta * c2;
     acc3 = acc3 * alpha + beta * c3;
   }
 
-  const float denom = softmax_state[1];
+  const float denom = softmax_state_l;
   const bool ok = denom > 0.0f;
   bf16_t* out_row = out + row * out_stride_0 + head * out_stride_1;
   out_row[0 * 128 + tid] = __float2bfloat16(ok ? acc0 / denom : 0.0f);
@@ -552,9 +544,13 @@ higgs_dense_2bit_mla_decode_stage1_split_kernel(
   const int tid = threadIdx.x;
   if (row >= num_rows || head >= num_heads || split >= num_splits) return;
 
-  __shared__ float softmax_state[4];
   __shared__ float warp_partials[4];
   __shared__ float cb_smem[kCodebookSize * kPairDim];
+
+  // Online-softmax state lives in registers (iter2 vector 3 — see the
+  // single-pass dense-codebook kernel for the sync-reduction rationale).
+  float softmax_state_m = kNegInf;
+  float softmax_state_l = 0.0f;
 
   if (tid < kCodebookSize * kPairDim) {
     cb_smem[tid] = __ldg(&codebook[tid]);
@@ -566,12 +562,6 @@ higgs_dense_2bit_mla_decode_stage1_split_kernel(
   const float v1 = q_rot_row[1 * 128 + tid];
   const float v2 = q_rot_row[2 * 128 + tid];
   const float v3 = q_rot_row[3 * 128 + tid];
-
-  if (tid == 0) {
-    softmax_state[0] = kNegInf;
-    softmax_state[1] = 0.0f;
-  }
-  __syncthreads();
 
   float q_rope_val = 0.0f;
   if (tid < kRopeDim) {
@@ -603,8 +593,9 @@ higgs_dense_2bit_mla_decode_stage1_split_kernel(
     const float c2 = cb_smem[i2 * kPairDim + coord];
     const float c3 = cb_smem[i3 * kPairDim + coord];
 
-    const half norm_h =
-        *reinterpret_cast<const half*>(slot + kPackedBytes);
+    // Force LDG.NC on per-slot fp16 scale + bf16 rope (iter2 vector 2).
+    const half norm_h = __ldg(
+        reinterpret_cast<const half*>(slot + kPackedBytes));
     const float scale = __half2float(norm_h);
 
     float val = valid
@@ -613,7 +604,7 @@ higgs_dense_2bit_mla_decode_stage1_split_kernel(
     if (tid < kRopeDim && valid) {
       const bf16_t* rope =
           reinterpret_cast<const bf16_t*>(slot + kPackedBytes + kNormBytes);
-      val += q_rope_val * bf16_to_float(rope[tid]);
+      val += q_rope_val * bf16_to_float(__ldg(rope + tid));
     }
 
     const float warp_sum = warp_reduce_sum(val);
@@ -622,25 +613,19 @@ higgs_dense_2bit_mla_decode_stage1_split_kernel(
     if (lane == 0) warp_partials[warp_id] = warp_sum;
     __syncthreads();
 
-    if (tid == 0) {
-      const float total =
-          warp_partials[0] + warp_partials[1] +
-          warp_partials[2] + warp_partials[3];
-      const float score = valid ? total * sm_scale : kNegInf;
-      const float old_m = softmax_state[0];
-      const float old_l = softmax_state[1];
-      const float new_m = fmaxf(old_m, score);
-      const float alpha = __expf(old_m - new_m);
-      const float beta = __expf(score - new_m);
-      softmax_state[0] = new_m;
-      softmax_state[1] = old_l * alpha + beta;
-      softmax_state[2] = alpha;
-      softmax_state[3] = beta;
-    }
-    __syncthreads();
+    const float total =
+        warp_partials[0] + warp_partials[1] +
+        warp_partials[2] + warp_partials[3];
+    const float score = valid ? total * sm_scale : kNegInf;
+    const float old_m = softmax_state_m;
+    const float old_l = softmax_state_l;
+    const float new_m = fmaxf(old_m, score);
+    const float alpha = __expf(old_m - new_m);
+    const float beta = __expf(score - new_m);
+    softmax_state_m = new_m;
+    softmax_state_l = old_l * alpha + beta;
 
-    const float alpha = softmax_state[2];
-    const float beta_scaled = softmax_state[3] * scale;
+    const float beta_scaled = beta * scale;
     acc0 = acc0 * alpha + beta_scaled * c0;
     acc1 = acc1 * alpha + beta_scaled * c1;
     acc2 = acc2 * alpha + beta_scaled * c2;
@@ -653,8 +638,8 @@ higgs_dense_2bit_mla_decode_stage1_split_kernel(
       mid + row * mid_stride_0 + head * mid_stride_1 +
       split * mid_stride_2;
   if (tid == 0) {
-    mid_row[0] = softmax_state[0];
-    mid_row[1] = softmax_state[1];
+    mid_row[0] = softmax_state_m;
+    mid_row[1] = softmax_state_l;
   }
   mid_row[2 + 0 * 128 + tid] = acc0;
   mid_row[2 + 1 * 128 + tid] = acc1;
@@ -768,8 +753,12 @@ higgs_dense_2bit_mla_decode_saw_scalar2_stage1_split_kernel(
   const int tid = threadIdx.x;
   if (row >= num_rows || head >= num_heads || split >= num_splits) return;
 
-  __shared__ float softmax_state[4];
   __shared__ float warp_partials[4];
+
+  // Online-softmax state lives in registers (iter2 vector 3 — see the
+  // single-pass dense-codebook kernel for the sync-reduction rationale).
+  float softmax_state_m = kNegInf;
+  float softmax_state_l = 0.0f;
 
   const bf16_t* q_nope_row =
       q_nope + row * q_nope_stride_0 + head * q_nope_stride_1;
@@ -777,12 +766,6 @@ higgs_dense_2bit_mla_decode_saw_scalar2_stage1_split_kernel(
   const float q1 = bf16_to_float(q_nope_row[1 * 128 + tid]);
   const float q2 = bf16_to_float(q_nope_row[2 * 128 + tid]);
   const float q3 = bf16_to_float(q_nope_row[3 * 128 + tid]);
-
-  if (tid == 0) {
-    softmax_state[0] = kNegInf;
-    softmax_state[1] = 0.0f;
-  }
-  __syncthreads();
 
   float q_rope_val = 0.0f;
   if (tid < kRopeDim) {
@@ -820,7 +803,7 @@ higgs_dense_2bit_mla_decode_saw_scalar2_stage1_split_kernel(
     if (tid < kRopeDim && valid) {
       const bf16_t* rope =
           reinterpret_cast<const bf16_t*>(slot + kPackedBytes + kNormBytes);
-      val += q_rope_val * bf16_to_float(rope[tid]);
+      val += q_rope_val * bf16_to_float(__ldg(rope + tid));
     }
 
     const float warp_sum = warp_reduce_sum(val);
@@ -829,25 +812,18 @@ higgs_dense_2bit_mla_decode_saw_scalar2_stage1_split_kernel(
     if (lane == 0) warp_partials[warp_id] = warp_sum;
     __syncthreads();
 
-    if (tid == 0) {
-      const float total =
-          warp_partials[0] + warp_partials[1] +
-          warp_partials[2] + warp_partials[3];
-      const float score = valid ? total * sm_scale : kNegInf;
-      const float old_m = softmax_state[0];
-      const float old_l = softmax_state[1];
-      const float new_m = fmaxf(old_m, score);
-      const float alpha = __expf(old_m - new_m);
-      const float beta = __expf(score - new_m);
-      softmax_state[0] = new_m;
-      softmax_state[1] = old_l * alpha + beta;
-      softmax_state[2] = alpha;
-      softmax_state[3] = beta;
-    }
-    __syncthreads();
+    const float total =
+        warp_partials[0] + warp_partials[1] +
+        warp_partials[2] + warp_partials[3];
+    const float score = valid ? total * sm_scale : kNegInf;
+    const float old_m = softmax_state_m;
+    const float old_l = softmax_state_l;
+    const float new_m = fmaxf(old_m, score);
+    const float alpha = __expf(old_m - new_m);
+    const float beta = __expf(score - new_m);
+    softmax_state_m = new_m;
+    softmax_state_l = old_l * alpha + beta;
 
-    const float alpha = softmax_state[2];
-    const float beta = softmax_state[3];
     acc0 = acc0 * alpha + beta * c0;
     acc1 = acc1 * alpha + beta * c1;
     acc2 = acc2 * alpha + beta * c2;
@@ -858,8 +834,8 @@ higgs_dense_2bit_mla_decode_saw_scalar2_stage1_split_kernel(
       mid + row * mid_stride_0 + head * mid_stride_1 +
       split * mid_stride_2;
   if (tid == 0) {
-    mid_row[0] = softmax_state[0];
-    mid_row[1] = softmax_state[1];
+    mid_row[0] = softmax_state_m;
+    mid_row[1] = softmax_state_l;
   }
   mid_row[2 + 0 * 128 + tid] = acc0;
   mid_row[2 + 1 * 128 + tid] = acc1;

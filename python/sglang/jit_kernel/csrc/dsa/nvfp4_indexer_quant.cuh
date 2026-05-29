@@ -3373,42 +3373,78 @@ __global__ void hisa_candidate_score_indexer_cache_nvfp4(
     return;
   }
 
-  constexpr uint32_t kHeadsPerGroup = 8;
-  const auto head_group = blockIdx.z;
+  // n_heads > 8: rewritten iter1 fused-head design.
+  //
+  // The legacy kernel split heads across blockIdx.z (8 head groups), which
+  //   (a) reloaded the same K row from HBM once per head group (8x amplification),
+  //   (b) scheduled 8x more blocks than necessary, and
+  //   (c) combined head groups via atomicAdd on logits.
+  //
+  // The new design uses a single block per (cand, row) pair. The K row is
+  // dequantized into shared memory once and reused by all warps; each warp
+  // handles ceil(n_heads / kMaxWarps) heads; lane partitioning of head_dim is
+  // unchanged. There is no atomicAdd anywhere: the per-head partial dot lives
+  // in registers, gets warp-summed, parked in shared memory, then a final
+  // warp-level weighted reduction writes logits directly.
+  //
+  // Correctness is bit-identical (within FP32 round-off ordering) to the
+  // legacy kernel because both compute sum_h fmaxf(q[h]@k, 0) * weight[h].
+  constexpr uint32_t kMaxWarps = 8;
   const auto warp_id = threadIdx.x >> 5;
   const auto lane = threadIdx.x & 31;
-  const auto head = head_group * kHeadsPerGroup + warp_id;
-  if (warp_id < kHeadsPerGroup && head < param.n_heads) {
-    float dot = 0.0f;
+
+  // Stage 1: decode the K row into shared memory once. kIndexerHeadDim=128,
+  // blockDim.x=256 — the first 128 threads each decode one dim.
+  __shared__ float smem_k[kIndexerHeadDim];
+  if (threadIdx.x < kIndexerHeadDim) {
+    smem_k[threadIdx.x] = load_nvfp4_value(value_ptr, scale_ptr, threadIdx.x);
+  }
+  __syncthreads();
+
+  // Stage 2: each lane pulls its 4 K dims (stride-32) into registers.
+  float kvals[4];
+  #pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    kvals[j] = smem_k[lane + j * 32];
+  }
+
+  // Stage 3: per-warp head dispatch with no atomics.
+  const auto heads_per_warp = (param.n_heads + kMaxWarps - 1) / kMaxWarps;
+  for (uint32_t h_off = 0; h_off < heads_per_warp; ++h_off) {
+    const uint32_t head = warp_id * heads_per_warp + h_off;
+    if (head >= param.n_heads) break;
+
     const auto q_value_ptr =
         static_cast<const uint8_t*>(param.q_values) +
         (static_cast<int64_t>(row) * param.n_heads + head) * kNVFP4ValueBytes;
     const auto q_scale_ptr =
         static_cast<const uint32_t*>(param.q_scales) +
         static_cast<int64_t>(row) * param.n_heads + head;
-    for (uint32_t dim = lane; dim < kIndexerHeadDim; dim += 32) {
-      const auto kval = load_nvfp4_value(value_ptr, scale_ptr, dim);
-      const auto qval = load_nvfp4_value(q_value_ptr, q_scale_ptr, dim);
-      dot += qval * kval;
+    float dot = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const uint32_t dim = lane + j * 32;
+      const float qval = load_nvfp4_value(q_value_ptr, q_scale_ptr, dim);
+      dot += qval * kvals[j];
     }
     dot = warp_sum(dot);
-    if (lane == 0) head_dot[warp_id] = dot;
+    if (lane == 0) head_dot[head] = dot;
   }
   __syncthreads();
 
-  if (threadIdx.x == 0) {
+  // Stage 4: single-warp weighted reduction; write logits + candidate_indices
+  // directly (no atomicAdd).
+  if (warp_id == 0) {
     float partial = 0.0f;
-    for (uint32_t i = 0; i < kHeadsPerGroup; ++i) {
-      const auto global_head = head_group * kHeadsPerGroup + i;
-      if (global_head >= param.n_heads) break;
-      const auto weight =
-          static_cast<const float*>(param.weights)[static_cast<int64_t>(row) *
-                                                       param.n_heads +
-                                                   global_head];
-      partial += fmaxf(head_dot[i], 0.0f) * weight;
+    for (uint32_t h = lane; h < param.n_heads; h += 32) {
+      const float w =
+          static_cast<const float*>(param.weights)[
+              static_cast<int64_t>(row) * param.n_heads + h];
+      partial += fmaxf(head_dot[h], 0.0f) * w;
     }
-    atomicAdd(static_cast<float*>(param.logits) + out_idx, partial);
-    if (head_group == 0) {
+    partial = warp_sum(partial);
+    if (lane == 0) {
+      static_cast<float*>(param.logits)[out_idx] = partial;
       static_cast<int32_t*>(param.candidate_indices)[out_idx] = token;
     }
   }
@@ -3416,16 +3452,31 @@ __global__ void hisa_candidate_score_indexer_cache_nvfp4(
 
 __global__ void hisa_block_score_indexer_cache_nvfp4(
     const __grid_constant__ NVFP4HISABlockScoreParam param) {
+  // Rewritten iter1 fused-head design. The legacy kernel used
+  //   for linear in [0, n_heads * 128): load reps[dim], decode q[head,dim],
+  //     atomicAdd(&head_dot[head], q * k);
+  // which serialised on shared-mem atomicAdd (256 threads contending over
+  // 64 slots) and reloaded reps[dim] multiple times across head iterations
+  // (linear/128 == head, linear%128 == dim — dim 0..31 across head 0..63
+  //  reloads the same 32 reps floats 64 times).
+  //
+  // New layout: cooperatively stage reps[0..128) into shared memory; each
+  // lane pulls its 4 reps dims into registers; each warp owns
+  // ceil(n_heads / kMaxWarps) heads and computes the dot in registers via
+  // warp_sum — no atomics. Final weighted reduction happens on warp 0 only.
+  //
+  // Correctness is equivalent (within FP32 ordering round-off) to the
+  // legacy atomicAdd version because both compute the same dot products
+  // followed by sum_h fmaxf(dot[h], 0) * weight[h].
   constexpr uint32_t kHISABlockSize = 128;
-  constexpr uint32_t kMaxHeads = 128;
+  constexpr uint32_t kMaxWarps = 8;
+  constexpr uint32_t kMaxHeads = 64;
+  __shared__ float smem_reps[kIndexerHeadDim];
   __shared__ float head_dot[kMaxHeads];
-  __shared__ float reduce_buf[256];
 
   const auto block_id = blockIdx.x;
   const auto row = blockIdx.y;
   if (row >= param.q_rows || block_id >= param.max_blocks) return;
-  if (threadIdx.x < kMaxHeads) head_dot[threadIdx.x] = 0.0f;
-  __syncthreads();
 
   const auto batch = static_cast<const int32_t*>(param.token_to_batch_idx)[row];
   const auto prefix_len = static_cast<const int32_t*>(param.seq_lens)[batch];
@@ -3437,39 +3488,62 @@ __global__ void hisa_block_score_indexer_cache_nvfp4(
     return;
   }
 
+  const auto warp_id = threadIdx.x >> 5;
+  const auto lane = threadIdx.x & 31;
+
+  // Stage 1: load 128 reps floats into shared memory cooperatively.
   const auto rep_base =
       (static_cast<int64_t>(batch) * param.max_blocks + block_id) * kIndexerHeadDim;
-  for (uint32_t linear = threadIdx.x; linear < param.n_heads * kIndexerHeadDim;
-       linear += blockDim.x) {
-    const auto head = linear / kIndexerHeadDim;
-    const auto dim = linear - head * kIndexerHeadDim;
-    const auto kval = static_cast<const float*>(param.reps)[rep_base + dim];
+  const auto* reps_ptr = static_cast<const float*>(param.reps) + rep_base;
+  if (threadIdx.x < kIndexerHeadDim) {
+    smem_reps[threadIdx.x] = reps_ptr[threadIdx.x];
+  }
+  __syncthreads();
+
+  // Stage 2: each lane reads its 4 dims of reps into registers.
+  float kvals[4];
+  #pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    kvals[j] = smem_reps[lane + j * 32];
+  }
+
+  // Stage 3: per-warp head dispatch.
+  const auto heads_per_warp = (param.n_heads + kMaxWarps - 1) / kMaxWarps;
+  for (uint32_t h_off = 0; h_off < heads_per_warp; ++h_off) {
+    const uint32_t head = warp_id * heads_per_warp + h_off;
+    if (head >= param.n_heads) break;
+
     const auto q_value_ptr =
         static_cast<const uint8_t*>(param.q_values) +
         (static_cast<int64_t>(row) * param.n_heads + head) * kNVFP4ValueBytes;
     const auto q_scale_ptr =
         static_cast<const uint32_t*>(param.q_scales) +
         static_cast<int64_t>(row) * param.n_heads + head;
-    const auto qval = load_nvfp4_value(q_value_ptr, q_scale_ptr, dim);
-    atomicAdd(&head_dot[head], qval * kval);
+    float dot = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const uint32_t dim = lane + j * 32;
+      const float qval = load_nvfp4_value(q_value_ptr, q_scale_ptr, dim);
+      dot += qval * kvals[j];
+    }
+    dot = warp_sum(dot);
+    if (lane == 0) head_dot[head] = dot;
   }
   __syncthreads();
 
-  float partial = 0.0f;
-  for (uint32_t head = threadIdx.x; head < param.n_heads; head += blockDim.x) {
-    const auto weight =
-        static_cast<const float*>(param.weights)[static_cast<int64_t>(row) *
-                                                     param.n_heads +
-                                                 head];
-    partial += fmaxf(head_dot[head], 0.0f) * weight;
+  // Stage 4: single-warp weighted reduction. n_heads ≤ 64, so 32 lanes is
+  // enough — each lane sums ≤ 2 heads' contributions.
+  if (warp_id == 0) {
+    float partial = 0.0f;
+    for (uint32_t h = lane; h < param.n_heads; h += 32) {
+      const float w =
+          static_cast<const float*>(param.weights)[
+              static_cast<int64_t>(row) * param.n_heads + h];
+      partial += fmaxf(head_dot[h], 0.0f) * w;
+    }
+    partial = warp_sum(partial);
+    if (lane == 0) static_cast<float*>(param.block_scores)[out_idx] = partial;
   }
-  reduce_buf[threadIdx.x] = partial;
-  __syncthreads();
-  for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) reduce_buf[threadIdx.x] += reduce_buf[threadIdx.x + stride];
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) static_cast<float*>(param.block_scores)[out_idx] = reduce_buf[0];
 }
 
 __global__ void hisa_block_topk_indexer_cache_nvfp4(
@@ -4144,9 +4218,12 @@ struct NVFP4IndexerQuantKernel {
         .block_topk = static_cast<uint32_t>(BT.unwrap()),
         .page_table_stride = static_cast<uint32_t>(P.unwrap()),
     };
-    const auto head_groups = params.n_heads <= 8 ? 1 : div_ceil(params.n_heads, 8u);
+    // iter1 fused-head rewrite collapses the legacy z-axis head_groups: a
+    // single block per (cand, row) handles all heads, eliminating 8x K HBM
+    // reload and 8x scheduler overhead. The kernel's internal warp dispatch
+    // handles ceil(n_heads / 8) heads per warp.
     LaunchKernel(
-        dim3(params.block_topk * 128, params.q_rows, head_groups),
+        dim3(params.block_topk * 128, params.q_rows),
         256,
         device_.unwrap())(
         candidate_score_kernel, params);

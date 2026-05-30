@@ -9,7 +9,11 @@ NSA_PREFILL_CP_LAYERSPLIT_LAYOUT_CHOICES = ("interleaved", "contiguous")
 LAYERSPLIT_B200_CANDIDATE_ENV = "SGLANG_LAYERSPLIT_B200_CANDIDATE"
 LAYERSPLIT_STAGE_SMALL_BYTES_ENV = "SGLANG_LAYERSPLIT_STAGE_SMALL_BYTES"
 LAYERSPLIT_PRODUCTION_STAGE_SMALL_BYTES = 512 * 1024
-LAYERSPLIT_HIGGS_DENSE_2BIT_SLOT_BYTES = 258
+# Iter4 (#16) bumped the HIGGS dense 2-bit slot stride from 258 to
+# 272 (258 B payload + 14 B 16-align pad) so ``cp.async.16`` from the
+# slot base is legal in the split-K decode kernel. LayerSplit dense-KV
+# transfer chunks size against this slot stride.
+LAYERSPLIT_HIGGS_DENSE_2BIT_SLOT_BYTES = 272
 
 
 @dataclass(frozen=True)
@@ -133,8 +137,9 @@ LAYERSPLIT_B200_CANDIDATES: Tuple[LayerSplitB200Candidate, ...] = (
     ),
     LayerSplitB200Candidate(
         name="higgs_dense_kv_transfer_sizing",
-        summary="Size LayerSplit dense-KV transfer chunks from the HIGGS 258 "
-        "B/token slot instead of BF16 dense row width.",
+        summary="Size LayerSplit dense-KV transfer chunks from the HIGGS 272 "
+        "B/token slot (258 B payload + 14 B 16-align pad; iter4 #16) "
+        "instead of BF16 dense row width.",
         category="HIGGS transfer sizing",
         higgs_dense_kv_transfer_sizing=True,
         promotion_blockers=_COMMON_B200_PROMOTION_BLOCKERS,

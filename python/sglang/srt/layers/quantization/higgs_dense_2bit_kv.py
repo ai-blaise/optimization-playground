@@ -21,15 +21,24 @@ Algorithm summary
 * Decode reverses the steps: codebook lookup -> scale -> inverse
   Hadamard.
 
-Slot layout (kSlotBytes = 258)
-------------------------------
+Slot layout (kSlotBytes = 272 = pad16(258); payload = 258 B)
+------------------------------------------------------------
 
-  [packed 4-bit pair indices: 128 B] [norm scale fp16: 2 B] [rope: 128 B]
+  [packed 4-bit pair indices: 128 B] [norm scale fp16: 2 B]
+  [rope: 128 B] [zero pad: 14 B]
 
-That is 16 bytes / slot smaller than the existing 2.5-bit TurboQuant
-slot (``kSlotBytes2p5 = 274``). The savings come from the fact that
-HIGGS uses a *uniform 2-bit* code (no high/low split) and one single
-scale per token.
+The 258-B payload (packed + norm + rope) keeps the same byte
+offsets as before; the trailing 14 bytes of zero pad bring the slot
+stride to 272, which is 16-byte aligned. Iter4 (#16) added the pad
+to unblock ``cp.async.16`` one-slot lookahead in the split decode
+kernel (the prior stride of 258 was only 2-byte aligned, so
+``cp.async.{4,8,16}`` faulted with ``cudaErrorMisalignedAddress``
+for any odd page index). All CUDA kernels in this codec read at
+offsets within the unpadded 258-B payload; the pad is dead memory.
+
+The 14-B/slot overhead (5.4 %) costs ~1.7 GB extra HBM at the
+production REAP B200 deploy footprint. The slot is still 2 B
+smaller than the 2.5-bit TurboQuant slot (``kSlotBytes2p5 = 274``).
 
 Acceptance gates the reference codec is verified against:
 
@@ -37,7 +46,7 @@ Acceptance gates the reference codec is verified against:
   unit-variance latents at ``latent_dim=512`` (mirrors
   ``test_codec_2p5_round_trip_preserves_rope``).
 * pack/unpack round trip is bit-exact.
-* slot bytes == 258.
+* slot bytes == 272 (payload 258 + 14 B zero pad to 16-align).
 
 The CUDA kernel in ``python/sglang/jit_kernel/csrc/quantization/
 higgs_dense_2bit_kv.cuh`` mirrors this math; differences are kernel
@@ -83,7 +92,21 @@ HIGGS_CODEBOOK_SIZE = 16
 HIGGS_BITS_PER_INDEX = 4  # log2(16); each index covers two scalars
 HIGGS_HADAMARD_ORDER = 512  # block size for the rotation
 HIGGS_NORM_BYTES = 2  # fp16 scale per token
+# Per-slot alignment in bytes. Iter4 (#16) added a tail pad so the
+# slot stride is 16-byte aligned, which is the minimum required for
+# ``cp.async.16`` on B200 sm_100 (a misaligned source address faults
+# with ``cudaErrorMisalignedAddress``). The payload (128 packed + 2
+# norm + 128 rope = 258 B) is unchanged; only the stride grows by
+# 14 B/slot.
+HIGGS_SLOT_ALIGNMENT_BYTES = 16
 HIGGS_DENSE_2BIT_B200_CANDIDATE_ENV = "SGLANG_HIGGS_DENSE_2BIT_B200_CANDIDATE"
+
+
+def _pad_up(value: int, multiple: int) -> int:
+    """Round ``value`` up to the next multiple of ``multiple`` (>= 1)."""
+    if multiple <= 0:
+        raise ValueError(f"_pad_up multiple must be positive; got {multiple}.")
+    return ((value + multiple - 1) // multiple) * multiple
 
 
 @dataclass(frozen=True)
@@ -263,7 +286,8 @@ HIGGS_DENSE_2BIT_B200_CANDIDATES: Tuple[HiggsDense2BitB200Candidate, ...] = (
         summary="SAW-inspired fixed-scale 2-bit dense MLA KV candidate for "
         "SpinQuant-rotated activations: no online Hadamard, BF16-bit "
         "threshold encode, packed 64-bit latent stores, and 16-bit rope "
-        "moves in the existing 258-byte HIGGS slot.",
+        "moves in the existing 272-byte HIGGS slot (iter4 #16: 258 B "
+        "payload + 14 B 16-align pad).",
         category="store algorithm",
         store_variant="saw_scalar2",
         dequant_variant="saw_scalar2",
@@ -686,8 +710,31 @@ class HiggsDense2BitConfig:
         return self.rope_dim * torch.tensor([], dtype=self.rope_dtype).element_size()
 
     @property
-    def slot_bytes(self) -> int:
+    def payload_bytes(self) -> int:
+        """Actual data per slot, prior to alignment pad.
+
+        Byte width of [packed | norm | rope] before any trailing zero
+        pad. This is what every consumer kernel reads, and what the
+        prior (iter3) slot layout exposed as ``slot_bytes``.
+        """
         return self.latent_bytes + self.rope_bytes
+
+    @property
+    def slot_bytes(self) -> int:
+        """16-aligned per-slot stride.
+
+        Iter4 (#16): ``pad16(payload_bytes)`` so the slot base
+        address is 16-byte aligned for ``cp.async.16`` in the split
+        decode hot loop. Pre-iter4 the stride was the bare 258 B
+        payload (2-byte aligned; cp.async faulted with
+        ``cudaErrorMisalignedAddress`` on odd page indices).
+        """
+        return _pad_up(self.payload_bytes, HIGGS_SLOT_ALIGNMENT_BYTES)
+
+    @property
+    def pad_bytes(self) -> int:
+        """Zero pad bytes appended to each slot (slot_bytes - payload_bytes)."""
+        return self.slot_bytes - self.payload_bytes
 
 
 class HiggsDense2BitCodec:
@@ -790,9 +837,18 @@ class HiggsDense2BitCodec:
             .contiguous()
             .view(torch.uint8)
         )
-        return torch.cat((latent_bytes, rope_bytes), dim=-1).reshape(
-            n, 1, self.config.slot_bytes
-        )
+        payload = torch.cat((latent_bytes, rope_bytes), dim=-1)
+        # Iter4 (#16): zero-pad the slot tail to 16-byte alignment.
+        # All decode kernels read at offsets within payload_bytes; the
+        # pad is dead memory. Encoder writes zeros for stability across
+        # store -> dequant round trips.
+        pad_bytes = self.config.pad_bytes
+        if pad_bytes:
+            pad = torch.zeros(
+                (n, pad_bytes), dtype=torch.uint8, device=payload.device,
+            )
+            payload = torch.cat((payload, pad), dim=-1)
+        return payload.reshape(n, 1, self.config.slot_bytes)
 
     def decompress(
         self, compressed: torch.Tensor, dst_dtype: torch.dtype
@@ -817,8 +873,13 @@ class HiggsDense2BitCodec:
         )
         rotated = values * scale[:, None]
         latent = self.inverse_rotate(rotated).to(dst_dtype)
+        # Bound the rope slice by ``payload_bytes`` so the iter4 (#16)
+        # tail pad (slot_bytes - payload_bytes) is excluded — without
+        # the upper bound, ``reshape(n, rope_dim)`` would fail since
+        # the padded slice covers ``rope_dim + pad_bytes / element_size``
+        # elements.
         rope = (
-            flat[:, self.config.latent_bytes :]
+            flat[:, self.config.latent_bytes : self.config.payload_bytes]
             .contiguous()
             .view(self.config.rope_dtype)
             .reshape(n, self.config.rope_dim)

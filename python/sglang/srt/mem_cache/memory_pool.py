@@ -3443,9 +3443,13 @@ class TurboQuantDSATokenToKVPool(DSATokenToKVPool):
 class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
     """DSA KV pool with 2-bit HIGGS compressed dense MLA storage.
 
-    Mirrors :class:`TurboQuantDSATokenToKVPool` 1:1 but stores 258 B/token/layer
-    instead of TurboQuant's 274 B/token/layer (-5.84%) using EDEN2-16 lattice
+    Mirrors :class:`TurboQuantDSATokenToKVPool` 1:1 but stores 272 B/token/layer
+    (258 B payload + 14 B 16-align pad as of iter4 #16) instead of
+    TurboQuant's 274 B/token/layer (-0.73%) using EDEN2-16 lattice
     quantization (Pletka et al. arXiv 2501.19392 + AquaKV reference).
+    The pre-iter4 slot stride was the bare 258 B payload (-5.84% vs
+    TurboQuant); the 14 B pad was added to make the slot base 16-byte
+    aligned for ``cp.async.16`` in the split decode hot loop.
 
     Two-attribute compatibility shim with the TurboQuant dispatch:
       * ``turboquant_execution_mode`` mirrors as ``"fused_decode"`` so the

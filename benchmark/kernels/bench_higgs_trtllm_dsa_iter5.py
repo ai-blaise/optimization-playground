@@ -68,7 +68,9 @@ def _build_inputs(
 
     cfg = HiggsDense2BitConfig(latent_dim=512, rope_dim=64)
     slot_bytes = cfg.slot_bytes
-    assert slot_bytes == 258, f"unexpected slot_bytes {slot_bytes}"
+    # Iter4 (#16) bumped the HIGGS dense slot stride from 258 to 272
+    # (258 B payload + 14 B 16-align pad for ``cp.async.16``).
+    assert slot_bytes == 272, f"unexpected slot_bytes {slot_bytes}"
 
     # Two HIGGS-packed K caches, one per simulated layer.
     compressed = [

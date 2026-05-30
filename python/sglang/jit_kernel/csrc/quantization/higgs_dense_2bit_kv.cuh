@@ -28,11 +28,19 @@
 // 2.5-bit kernel that lives alongside this file
 // (``turboquant_dense_kv.cuh``); the math is identical.
 //
-// Slot layout (kSlotBytes = 258, vs 274 for 2.5-bit TurboQuant):
+// Slot layout (kSlotBytes = 272 = pad16(258), vs 274 for 2.5-bit
+// TurboQuant). Iter4 (#16): the 258 B payload (packed + norm + rope)
+// keeps the same byte offsets it had through iter3, but the
+// per-slot stride grows by 14 B of trailing zero pad so the slot
+// base is 16-byte aligned. Without that pad the stride was 2-byte
+// aligned (258 = 2 mod 4), which makes ``cp.async.{4,8,16}`` fault
+// with ``cudaErrorMisalignedAddress`` on any odd page index — the
+// blocker that killed iter3's cp.async prefetch.
 //
 //   [packed 4-bit pair indices: 128 B]
 //   [per-token block-scale fp16:   2 B]
 //   [rope bf16 (kRopeDim=64):     128 B]
+//   [zero pad to 16-align:         14 B]
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -57,12 +65,28 @@ constexpr int kCodebookSize = 16;                 // 4 bits per index
 constexpr int kNumPairs = kLatentDim / kPairDim;  // 256
 constexpr int kPackedBytes = kNumPairs / 2;       // 128 bytes
 constexpr int kNormBytes = 2;
-constexpr int kSlotBytes = kPackedBytes + kNormBytes + kRopeDim * 2;  // 258
+// Per-slot data payload (matches HiggsDense2BitConfig.payload_bytes).
+// Kernel offsets are computed relative to slot base and address only
+// bytes in [0, kPayloadBytes); the pad tail is dead memory.
+constexpr int kPayloadBytes = kPackedBytes + kNormBytes + kRopeDim * 2;  // 258
+// Iter4 (#16) per-slot stride: ``pad_up(kPayloadBytes, 16) = 272``.
+// Used as the innermost compressed-buffer stride; bumps the slot
+// base alignment from 2 B to 16 B so ``cp.async.16`` is legal in
+// the split-K decode kernel for any page index.
+constexpr int kSlotAlignmentBytes = 16;
+constexpr int kSlotBytes =
+    (kPayloadBytes + kSlotAlignmentBytes - 1) /
+    kSlotAlignmentBytes * kSlotAlignmentBytes;
+constexpr int kSlotPadBytes = kSlotBytes - kPayloadBytes;
 constexpr int kSawScalar2LargeRowThreshold = 16384;
 constexpr float kInvSqrtLatentDim = 0.044194173824159216f;  // 1 / sqrt(512)
 
 static_assert(kPackedBytes == 128, "expected 128 packed bytes per slot");
-static_assert(kSlotBytes == 258, "expected slot bytes = 258");
+static_assert(kPayloadBytes == 258, "expected payload bytes = 258");
+static_assert(kSlotBytes == 272, "expected padded slot bytes = 272");
+static_assert(kSlotPadBytes == 14, "expected 14 B tail pad per slot");
+static_assert(kSlotBytes % kSlotAlignmentBytes == 0,
+              "slot stride must be 16-byte aligned for cp.async.16");
 
 __device__ __constant__ float kEden2_16Codebook[kCodebookSize * kPairDim] = {
     -0.8996632695198059f, -1.6360418796539307f,
@@ -879,11 +903,12 @@ __global__ void higgs_dense_2bit_dequant_page_table_fp8_kernel(
   __shared__ float buf[kLatentDim];
 
   // Rope tile: 64 BF16 elements at slot[kPackedBytes + kNormBytes = 130];
-  // the slot is uint8-aligned (compressed_stride_0 = 258), so the rope
-  // payload is byte-aligned not bf16-aligned. Stage through a local 8 B
-  // uint8 buffer to avoid misaligned-load faults, then reinterpret as
-  // bf16x2 and downcast inline to FP8. 16 lanes × 4 elements = 64 BF16
-  // in, 64 FP8 out (64 B written, vs 128 B BF16).
+  // the slot stride is 272 (compressed_stride_0 = 272 with 14 B tail
+  // pad as of iter4 #16) and the rope offset 130 is byte-aligned not
+  // bf16-aligned. Stage through a local 8 B uint8 buffer to avoid
+  // misaligned-load faults, then reinterpret as bf16x2 and downcast
+  // inline to FP8. 16 lanes × 4 elements = 64 BF16 in, 64 FP8 out
+  // (64 B written, vs 128 B BF16).
   if (tid < 16) {
     const uint8_t* slot_rope = slot + kPackedBytes + kNormBytes;
     fp8_e4m3_t* rope_out = row_out + kLatentDim;

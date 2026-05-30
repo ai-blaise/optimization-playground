@@ -170,7 +170,10 @@ def store_higgs_dense_2bit(
     """Encode ``(N, 1, latent_dim+rope_dim)`` MLA KV into packed slots.
 
     Args:
-      compressed: ``(num_slots, 1, slot_bytes=258)`` ``uint8`` destination.
+      compressed: ``(num_slots, 1, slot_bytes=272)`` ``uint8`` destination.
+        Slot layout = [packed 128 B | scale 2 B | rope 128 B | pad 14 B];
+        the 14 B tail pad makes the slot stride 16-byte aligned for
+        ``cp.async.16`` in the iter4 (#16) split decode kernel.
       locs: ``(N,)`` ``int64`` slot indices into ``compressed``.
       latent: ``(N, 1, 512)`` ``bfloat16`` latent half.
       rope: ``(N, 1, 64)`` ``bfloat16`` rope half.
@@ -232,7 +235,8 @@ def dequantize_higgs_dense_2bit(
     """Decode packed slots back to BF16 latent + rope.
 
     Args:
-      compressed: ``(num_slots, 1, 258)`` ``uint8`` packed slots.
+      compressed: ``(num_slots, 1, 272)`` ``uint8`` packed slots
+        (iter4 #16: 258 B payload + 14 B 16-align pad).
       locs: ``(N,)`` ``int64`` slot indices to decode.
       out: ``(N, 1, 576)`` ``bfloat16`` destination (latent + rope).
       codebook: ``(16, 2)`` ``float32`` EDEN2-16 lattice.
@@ -378,7 +382,8 @@ def dequantize_higgs_dense_2bit_page_table(
     """Page-table variant of :func:`dequantize_higgs_dense_2bit`.
 
     Args:
-      compressed: ``(num_slots, 1, 258)`` ``uint8`` packed slots.
+      compressed: ``(num_slots, 1, 272)`` ``uint8`` packed slots
+        (iter4 #16: 258 B payload + 14 B 16-align pad).
       page_table: ``(B, K)`` ``int32`` slot indices (-1 marks invalid).
       out: ``(B*K, 1, 576)`` ``bfloat16`` destination.
       compact_page_table: ``(B, K)`` ``int32`` written so that valid
@@ -440,7 +445,8 @@ def dequantize_higgs_dense_2bit_page_table_fp8(
     original-range BMM1 inputs.
 
     Args:
-      compressed: ``(num_slots, 1, 258)`` ``uint8`` packed slots.
+      compressed: ``(num_slots, 1, 272)`` ``uint8`` packed slots
+        (iter4 #16: 258 B payload + 14 B 16-align pad).
       page_table: ``(B, K)`` ``int32`` slot indices (-1 marks invalid).
       out: ``(B*K, 1, 576)`` ``torch.float8_e4m3fn`` destination.
       compact_page_table: ``(B, K)`` ``int32`` written so that valid rows

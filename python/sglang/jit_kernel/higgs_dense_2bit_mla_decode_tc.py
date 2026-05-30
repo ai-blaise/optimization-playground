@@ -57,7 +57,8 @@ def higgs_dense_2bit_mla_decode_tc(
     Args:
       q_nope: ``(num_rows, num_heads, 512)`` ``bfloat16`` query latent.
       q_rope: ``(num_rows, num_heads, 64)`` ``bfloat16`` query rope.
-      compressed: ``(num_slots, 1, 258)`` ``uint8`` packed KV slots.
+      compressed: ``(num_slots, 1, 272)`` ``uint8`` packed KV slots
+        (iter4 #16: 258 B payload + 14 B 16-align pad).
       page_table: ``(num_rows, topk)`` ``int32`` slot indices
         (``-1`` masks a row).
       out: ``(num_rows, num_heads, 512)`` ``bfloat16`` destination.

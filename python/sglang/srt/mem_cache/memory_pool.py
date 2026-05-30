@@ -55,6 +55,9 @@ from sglang.jit_kernel.higgs_dense_2bit import (
     dequantize_higgs_dense_2bit_page_table_fp8,
     store_higgs_dense_2bit,
 )
+from sglang.jit_kernel.higgs_inline_sparse_mla_decode import (
+    higgs_inline_sparse_mla_produce_fp8,
+)
 from sglang.jit_kernel.higgs_dense_2bit_mla_decode import (
     higgs_dense_2bit_mla_decode_saw_scalar2_split,
     higgs_dense_2bit_mla_decode_split,
@@ -3734,14 +3737,28 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
                         )
                         self._higgs_selected_buffer_fp8_pp[parity] = sel_buf
                 kv_cache = sel_buf[: page_table.numel()]
-                dequantize_higgs_dense_2bit_page_table_fp8(
-                    layer_buffer,
-                    page_table,
-                    kv_cache,
-                    compact_pt,
-                    self.higgs_codec.codebook,
-                    fp8_inv_kv_scale,
-                )
+                if envs.SGLANG_HIGGS_DSA_INLINE_PRODUCER.get():
+                    # iter9 PRIMARY: inline FWHT + EDEN2-16 dequant via
+                    # cp.async + depth-2 SMEM ping-pong. Same FFI as
+                    # dequantize_higgs_dense_2bit_page_table_fp8; emits
+                    # FP8 (B*K, 1, 576) into the same kv_cache buffer.
+                    higgs_inline_sparse_mla_produce_fp8(
+                        layer_buffer,
+                        page_table,
+                        kv_cache,
+                        compact_pt,
+                        self.higgs_codec.codebook,
+                        fp8_inv_kv_scale,
+                    )
+                else:
+                    dequantize_higgs_dense_2bit_page_table_fp8(
+                        layer_buffer,
+                        page_table,
+                        kv_cache,
+                        compact_pt,
+                        self.higgs_codec.codebook,
+                        fp8_inv_kv_scale,
+                    )
                 return kv_cache, compact_pt
             if parity == 0:
                 sel_buf = self._higgs_selected_buffer

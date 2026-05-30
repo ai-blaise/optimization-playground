@@ -543,6 +543,17 @@ class Envs:
     # ``QkvE4m3OBfloat16`` sparse-MLA cubin set is selected. Saves ~6 ms
     # TPOT on the 12.3 ms BF16-bound materialization round-trip.
     SGLANG_HIGGS_DSA_TRTLLM_FP8 = EnvBool(False)
+    # ai-blaise #19 iter9 PRIMARY vector: swap HIGGS sparse-MLA FP8
+    # materialization for the iter8 inline producer kernel
+    # (higgs_inline_sparse_mla_produce_fp8). Same FFI as
+    # dequantize_higgs_dense_2bit_page_table_fp8 (iter3) but uses
+    # cp.async slot prefetch + depth-2 SMEM ping-pong staging, which
+    # the iter8 microbench measured +20.2%% per-kernel (~9.56 ms TPOT
+    # across 61 layers) at B=128 K=2048. Same SAW-INT4 design pattern:
+    # fused rotation+quantization into a single pass that the trtllm
+    # cubin reads. Requires SGLANG_HIGGS_DSA_TRTLLM_FP8=1 to be
+    # set as well; default off pending production-shape A/B.
+    SGLANG_HIGGS_DSA_INLINE_PRODUCER = EnvBool(False)
     # Per-tensor scale applied before the FP8 cast in the HIGGS dequant
     # kernel. The downstream attention's ``bmm1_scale`` then multiplies
     # by ``1/SGLANG_HIGGS_DSA_TRTLLM_FP8_INV_KV_SCALE`` to recover the

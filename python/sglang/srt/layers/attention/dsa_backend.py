@@ -2640,14 +2640,29 @@ class DeepseekSparseAttnBackend(
         # for the compact dequant scratch + compact_page_table. With a
         # single shared slot, the side-stream dequant for layer N+1 is
         # implicitly serialized behind layer N's trtllm-gen read because
-        # both touch the same physical buffer (and behind the prior
-        # iter4 ``wait_stream(main)`` which folds the same constraint in
-        # through a coarser event). Alternating slots by ``layer_id & 1``
-        # breaks the aliasing — adjacent layers touch disjoint scratch,
-        # so layer N's trtllm-gen on the main stream can run
-        # concurrently with layer N+1's dequant on the side stream.
-        # Gated by ``SGLANG_HIGGS_DSA_TRTLLM_PINGPONG``; default off keeps
-        # the iter4 bit-for-bit behavior (single slot, parity always 0).
+        # both touch the same physical buffer. Alternating slots by
+        # ``layer_id & 1`` breaks the aliasing — adjacent layers touch
+        # disjoint scratch.
+        #
+        # Honest scope note (iter5 close-out). The aliasing-only fix is
+        # *infrastructure*; under the current model dispatch it does NOT
+        # by itself deliver the originally-claimed 3-5 ms TPOT savings.
+        # The reason is structural: the iter4 ``wait_stream(main)`` call
+        # on the side stream blocks until *every kernel currently in
+        # main's queue* finishes, and prior trtllm-gen L was queued on
+        # main before layer L+1's set_mla_kv_buffer + page_table_1
+        # transform. Even with the buffer aliasing gone, CUDA stream
+        # FIFO + event semantics prevent layer L+1's dequant from
+        # starting before prior trtllm-gen L completes on main. To
+        # break that, the model dispatch would need to put trtllm-gen
+        # on its OWN stream (separate from kv-proj L+1 and downstream
+        # ops), which is a model-layer refactor outside this iter's
+        # blast radius. The ping-pong infrastructure is the prerequisite
+        # for that refactor and is foundationally correct on its own.
+        #
+        # Gated by ``SGLANG_HIGGS_DSA_TRTLLM_PINGPONG``; default off
+        # keeps the iter4 bit-for-bit behavior (single slot, parity
+        # always 0).
         higgs_pingpong_enabled = (
             is_higgs_dense_pool
             and envs.SGLANG_HIGGS_DSA_TRTLLM_PINGPONG.get()

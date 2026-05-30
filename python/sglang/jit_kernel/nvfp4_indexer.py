@@ -68,13 +68,23 @@ _hisa_nvfp4_candidate_score_tilen = _env_bool(
 _hisa_nvfp4_candidate_score_tilen_size = _env_int(
     "SGLANG_NSA_NVFP4_HISA_CANDIDATE_SCORE_TILEN_SIZE", 8
 )
-if _hisa_nvfp4_candidate_score_tilen_size not in (8, 16):
+if _hisa_nvfp4_candidate_score_tilen_size not in (8, 16, 32):
     logger.warning(
-        "SGLANG_NSA_NVFP4_HISA_CANDIDATE_SCORE_TILEN_SIZE must be 8 or 16; "
-        "got %d, falling back to 8.",
+        "SGLANG_NSA_NVFP4_HISA_CANDIDATE_SCORE_TILEN_SIZE must be 8, 16, "
+        "or 32; got %d, falling back to 8.",
         _hisa_nvfp4_candidate_score_tilen_size,
     )
     _hisa_nvfp4_candidate_score_tilen_size = 8
+
+# iter3 vector 4: per-shape kTileN auto-tune toggle. When True (default),
+# the dispatcher routes each (q_rows, candidate_len) cell to the kTileN
+# variant that minimized cand_score on the bench harness for that cell.
+# When False, the SGLANG_NSA_NVFP4_HISA_CANDIDATE_SCORE_TILEN_SIZE env
+# value is used unconditionally. The auto-tune table is fixed at module
+# import time (no per-call CUDA event measurements).
+_hisa_nvfp4_candidate_score_autotune = _env_bool(
+    "SGLANG_NSA_NVFP4_HISA_CANDIDATE_SCORE_AUTOTUNE", True
+)
 
 # iter3 vector 1: opt-in persistent-block candidate_score kernel.
 # Amortizes the per-row NVFP4 Q dequant across many tile-blocks of the
@@ -274,6 +284,13 @@ def _jit_nvfp4_indexer_module(
                 # amortization vs the iter1 per-candidate kernel.
                 "hisa_candidate_score_tilen16_indexer_cache_nvfp4",
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score_tilen16",
+            ),
+            (
+                # iter3 vector 4: kTileN=32 variant; 32x Q dequant
+                # amortization vs iter1 per-candidate. 4x fewer CTAs
+                # vs iter2 kTileN=8. Larger per-CTA SMEM (~32 KB).
+                "hisa_candidate_score_tilen32_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score_tilen32",
             ),
             (
                 # iter3 vector 1: persistent-block candidate_score
@@ -696,6 +713,71 @@ def hisa_candidate_score_tilen16_indexer_cache_nvfp4(
     _get_module_fast(
         torch.bfloat16, page_table.dtype, page_size
     ).hisa_candidate_score_tilen16_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale,
+        page_table,
+        seq_lens.to(torch.int32),
+        weights,
+        top_blocks.to(torch.int32),
+        token_to_batch_idx.to(torch.int32),
+        logits,
+        candidate_indices,
+    )
+    return logits, candidate_indices
+
+
+@debug_kernel_api
+def hisa_candidate_score_tilen32_indexer_cache_nvfp4(
+    q_values: torch.Tensor,
+    q_scales: torch.Tensor,
+    index_k_with_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    top_blocks: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    page_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """iter3 vector 4: kTileN=32 candidate_score variant.
+
+    32x Q dequant amortization vs iter1 per-candidate kernel
+    (4x more than iter2 kTileN=8). Trades grid CTA count (drops 4x
+    vs kTileN=8) for larger per-CTA SMEM (~32 KB) and longer
+    stage A/B loops (kStageARounds=4 rounds at kMaxWarps=8). Suitable
+    when the cand_score kernel is launch-bound or wave-tail-bound at
+    very-large batch.
+    """
+    if weights.dtype != torch.float32:
+        weights = weights.float()
+    if q_values.dtype != torch.uint8:
+        raise ValueError(f"NVFP4 HISA q values must be uint8, got {q_values.dtype}.")
+    if q_scales.dtype != torch.int32:
+        q_scales = q_scales.to(torch.int32)
+    q_values = q_values.contiguous()
+    q_scales = q_scales.contiguous()
+    weights = weights.contiguous()
+    if not index_k_with_scale.is_contiguous():
+        index_k_with_scale = index_k_with_scale.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
+    if not top_blocks.is_contiguous():
+        top_blocks = top_blocks.contiguous()
+    if not token_to_batch_idx.is_contiguous():
+        token_to_batch_idx = token_to_batch_idx.contiguous()
+
+    candidate_len = top_blocks.shape[1] * 128
+    logits = torch.empty(
+        (q_values.shape[0], candidate_len), dtype=torch.float32, device=q_values.device
+    )
+    candidate_indices = torch.empty(
+        (q_values.shape[0], candidate_len), dtype=torch.int32, device=q_values.device
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_candidate_score_tilen32_indexer_cache_nvfp4(
         q_values,
         q_scales,
         index_k_with_scale,
@@ -2483,9 +2565,11 @@ def nvfp4_hisa_indexer_paged_torch(
     if not _hisa_nvfp4_candidate_score_tilen:
         _candidate_score_fn = hisa_candidate_score_indexer_cache_nvfp4
     elif _hisa_nvfp4_candidate_score_persistent:
-        # iter3 vector 1 default: persistent-block kernel. kTileN=8 is the
-        # primary path; kTileN=16 is opt-in via SGLANG_NSA_NVFP4_HISA_
-        # CANDIDATE_SCORE_TILEN_SIZE=16.
+        # iter3 vector 1 OPT-IN: persistent-block kernel. Default off
+        # because it's strictly slower than tile-N at the production
+        # shape grid (see iter3 vector 1 commit body for the table).
+        # When forced on by env var, kTileN=8 is the primary; kTileN=16
+        # is opt-in via SGLANG_NSA_NVFP4_HISA_CANDIDATE_SCORE_TILEN_SIZE.
         if _hisa_nvfp4_candidate_score_tilen_size == 16:
             _candidate_score_fn = (
                 hisa_candidate_score_persistent_tilen16_indexer_cache_nvfp4
@@ -2494,6 +2578,39 @@ def nvfp4_hisa_indexer_paged_torch(
             _candidate_score_fn = (
                 hisa_candidate_score_persistent_indexer_cache_nvfp4
             )
+    elif _hisa_nvfp4_candidate_score_autotune:
+        # iter3 vector 4: per-shape kTileN auto-tune. Bench harness
+        # measurements at (n_heads=64, head_dim=128, index_topk=1024,
+        # hisa block_size=128, page_size=64, compression_ratio=4.0)
+        # show:
+        #   * q_rows*candidate_len < ~262144 (32/8192 cell):
+        #     kTileN=16 (~1.5% better than kTileN=8, ~0% kTileN=32).
+        #   * q_rows*candidate_len < ~524288 (32/16384, 64/32768):
+        #     kTileN=16 wins (~3% better than kTileN=8 at 64/32768).
+        #   * q_rows*candidate_len >= ~1048576 (128/32768):
+        #     kTileN=32 wins (~20% better than kTileN=8, ~5% better
+        #     than kTileN=16 — the launch + per-CTA fixed cost
+        #     amortization scales linearly with kTileN at this size).
+        # The total-work threshold is the natural cut: tile_blocks *
+        # q_rows = candidate_len/kTileN * q_rows ∝ wave count, and
+        # waves dominate the kernel's wall time at large batch.
+        n_rows = int(q_values.shape[0])
+        cand_len_proj = int(top_blocks.shape[1]) * 128
+        total_work = n_rows * cand_len_proj
+        if total_work >= 1048576:
+            _candidate_score_fn = (
+                hisa_candidate_score_tilen32_indexer_cache_nvfp4
+            )
+        elif total_work >= 262144:
+            _candidate_score_fn = (
+                hisa_candidate_score_tilen16_indexer_cache_nvfp4
+            )
+        else:
+            _candidate_score_fn = (
+                hisa_candidate_score_tilen_indexer_cache_nvfp4
+            )
+    elif _hisa_nvfp4_candidate_score_tilen_size == 32:
+        _candidate_score_fn = hisa_candidate_score_tilen32_indexer_cache_nvfp4
     elif _hisa_nvfp4_candidate_score_tilen_size == 16:
         _candidate_score_fn = hisa_candidate_score_tilen16_indexer_cache_nvfp4
     else:

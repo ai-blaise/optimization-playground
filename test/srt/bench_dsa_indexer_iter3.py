@@ -3,11 +3,12 @@
 Measures per-call latency (us) of:
   1. hisa_candidate_score_indexer_cache_nvfp4 (iter1 baseline, per-candidate)
   2. hisa_candidate_score_tilen_indexer_cache_nvfp4 (iter2 kTileN=8)
-  3. hisa_candidate_score_tilen16_indexer_cache_nvfp4 (iter2 kTileN=16 opt-in)
-  4. hisa_candidate_score_persistent_indexer_cache_nvfp4 (iter3, when wired)
-  5. hisa_mean_pool_indexer_cache_nvfp4 (iter2 mean_pool)
-  6. hisa_block_score_indexer_cache_nvfp4 (iter1 fused-head)
-  7. Full per-layer pipeline (mean_pool + block_score + block_topk + candidate_score)
+  3. hisa_candidate_score_tilen16_indexer_cache_nvfp4 (iter2 kTileN=16)
+  4. hisa_candidate_score_tilen32_indexer_cache_nvfp4 (iter3 vec4 kTileN=32)
+  5. hisa_candidate_score_persistent_indexer_cache_nvfp4 (iter3 vec1)
+  6. hisa_mean_pool_indexer_cache_nvfp4 (iter2 mean_pool)
+  7. hisa_block_score_indexer_cache_nvfp4 (iter1 fused-head)
+  8. Full per-layer pipeline (mean_pool + block_score + block_topk + candidate_score)
 
 Shape grid matches the iter2 commit body and the prompt:
   - (batch, prefix) in [(32, 8192), (32, 16384), (64, 32768), (128, 32768)]
@@ -141,10 +142,11 @@ def main():
     parser.add_argument(
         "--variants",
         type=str,
-        default="iter2_tilen8,iter2_tilen16,iter3_persistent",
+        default="iter2_tilen8,iter2_tilen16,iter3_tilen32,iter3_persistent",
         help=(
             "Comma-separated list of variants to measure. Options: "
-            "iter1_per_cand, iter2_tilen8, iter2_tilen16, iter3_persistent"
+            "iter1_per_cand, iter2_tilen8, iter2_tilen16, iter3_tilen32, "
+            "iter3_persistent"
         ),
     )
     parser.add_argument(
@@ -200,29 +202,39 @@ def main():
         hisa_mean_pool_indexer_cache_nvfp4,
     )
 
-    has_iter3 = hasattr(
+    has_iter3_persist = hasattr(
         nvfp4_indexer, "hisa_candidate_score_persistent_indexer_cache_nvfp4"
     )
-    if has_iter3:
-        from sglang.jit_kernel.nvfp4_indexer import (
-            hisa_candidate_score_persistent_indexer_cache_nvfp4,
-        )
+    has_iter3_tilen32 = hasattr(
+        nvfp4_indexer, "hisa_candidate_score_tilen32_indexer_cache_nvfp4"
+    )
 
     fn_map = {
         "iter1_per_cand": hisa_candidate_score_indexer_cache_nvfp4,
         "iter2_tilen8": hisa_candidate_score_tilen_indexer_cache_nvfp4,
         "iter2_tilen16": hisa_candidate_score_tilen16_indexer_cache_nvfp4,
     }
-    if has_iter3:
+    if has_iter3_persist:
+        from sglang.jit_kernel.nvfp4_indexer import (
+            hisa_candidate_score_persistent_indexer_cache_nvfp4,
+        )
         fn_map["iter3_persistent"] = (
             hisa_candidate_score_persistent_indexer_cache_nvfp4
         )
-    else:
-        print(
-            "# WARN: iter3 persistent kernel not wired in nvfp4_indexer.py yet; "
-            "skipping iter3_persistent"
+    if has_iter3_tilen32:
+        from sglang.jit_kernel.nvfp4_indexer import (
+            hisa_candidate_score_tilen32_indexer_cache_nvfp4,
         )
-        variants = [v for v in variants if v != "iter3_persistent"]
+        fn_map["iter3_tilen32"] = (
+            hisa_candidate_score_tilen32_indexer_cache_nvfp4
+        )
+    missing = [v for v in variants if v not in fn_map]
+    if missing:
+        print(
+            f"# WARN: variants not wired in nvfp4_indexer.py: {missing}; "
+            "skipping"
+        )
+        variants = [v for v in variants if v not in missing]
 
     # Header
     print(

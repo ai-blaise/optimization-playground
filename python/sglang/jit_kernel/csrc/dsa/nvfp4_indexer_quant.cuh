@@ -3551,8 +3551,8 @@ __global__ void hisa_candidate_score_indexer_cache_nvfp4(
 template <typename IndicesT, uint32_t kPageSize, uint32_t kTileN>
 __global__ void hisa_candidate_score_tilen_indexer_cache_nvfp4(
     const __grid_constant__ NVFP4HISACandidateScoreParam param) {
-  static_assert(kTileN >= 1 && kTileN <= 16,
-                "kTileN must be in [1, 16]; stage A/C loop kStageARounds = "
+  static_assert(kTileN >= 1 && kTileN <= 32,
+                "kTileN must be in [1, 32]; stage A/C loop kStageARounds = "
                 "ceil(kTileN/kMaxWarps) rounds");
   constexpr int64_t kPageBytes = (kNVFP4ValueBytes + kScaleBytes) * kPageSize;
   constexpr uint32_t kHISABlockSize = 128;
@@ -4514,6 +4514,14 @@ struct NVFP4IndexerQuantKernel {
   // when kTileN > kMaxWarps; the current implementation supports this.
   static constexpr auto candidate_score_tilen16_kernel =
       hisa_candidate_score_tilen_indexer_cache_nvfp4<IndicesT, kPageSize, 16>;
+  // iter3 vector 4: kTileN=32 extension of the iter2 template. Quarters
+  // the Q HBM traffic vs kTileN=8 at the cost of 4x the per-CTA stage-A
+  // K decode + 4x the stage-B inner-tile loop. SMEM per CTA: smem_k 16
+  // KB + smem_head_dot 16 KB + small = 32 KB (under the default 48 KB
+  // cap). Best when launch + per-CTA fixed overhead dominates the iter2
+  // tile-N kernel's wall time (typical at very-large batch).
+  static constexpr auto candidate_score_tilen32_kernel =
+      hisa_candidate_score_tilen_indexer_cache_nvfp4<IndicesT, kPageSize, 32>;
   // iter3 vector 1: persistent-block candidate_score. The kTileN=8 variant
   // is the default production iter3 path; kTileN=16 is exposed as an
   // opt-in to A/B against the iter2 kTileN=16 baseline.
@@ -4954,6 +4962,83 @@ struct NVFP4IndexerQuantKernel {
         256,
         device_.unwrap())(
         candidate_score_tilen16_kernel, params);
+  }
+
+  // iter3 vector 4: kTileN=32 candidate_score launcher. Same FFI as the
+  // iter2 tile-N launchers but the underlying kernel template is
+  // instantiated at kTileN=32. Grid shrinks 32x vs iter1
+  // per-candidate (and 4x vs iter2 kTileN=8). Per-CTA SMEM grows to
+  // ~32 KB.
+  static void hisa_candidate_score_tilen32(
+      tvm::ffi::TensorView q_values,
+      tvm::ffi::TensorView q_scales,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView weights,
+      tvm::ffi::TensorView top_blocks,
+      tvm::ffi::TensorView token_to_batch_idx,
+      tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView candidate_indices) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto H = SymbolicSize{"n_heads"};
+    auto P = SymbolicSize{"page_table_stride"};
+    auto BT = SymbolicSize{"block_topk"};
+    auto B = SymbolicSize{"batch_size"};
+    auto CL = SymbolicSize{"candidate_len"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, H, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_values);
+    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({B, P}).with_dtype<IndicesT>().with_device(device_).verify(page_table);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+    TensorMatcher({Q, BT}).with_dtype<int32_t>().with_device(device_).verify(top_blocks);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(token_to_batch_idx);
+    TensorMatcher({Q, CL}).with_dtype<float>().with_device(device_).verify(logits);
+    TensorMatcher({Q, CL})
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(candidate_indices);
+    if (static_cast<uint32_t>(CL.unwrap()) !=
+        static_cast<uint32_t>(BT.unwrap()) * 128) {
+      throw std::runtime_error("candidate_len must equal block_topk * 128");
+    }
+    const auto params = NVFP4HISACandidateScoreParam{
+        .q_values = q_values.data_ptr(),
+        .q_scales = q_scales.data_ptr(),
+        .cache = cache.data_ptr(),
+        .page_table = page_table.data_ptr(),
+        .seq_lens = seq_lens.data_ptr(),
+        .weights = weights.data_ptr(),
+        .top_blocks = top_blocks.data_ptr(),
+        .token_to_batch_idx = token_to_batch_idx.data_ptr(),
+        .logits = logits.data_ptr(),
+        .candidate_indices = candidate_indices.data_ptr(),
+        .q_rows = static_cast<uint32_t>(Q.unwrap()),
+        .n_heads = static_cast<uint32_t>(H.unwrap()),
+        .block_topk = static_cast<uint32_t>(BT.unwrap()),
+        .page_table_stride = static_cast<uint32_t>(P.unwrap()),
+    };
+    constexpr uint32_t kTileN32 = 32;
+    const uint32_t candidate_len32 = params.block_topk * 128;
+    const uint32_t tile_blocks32 =
+        (candidate_len32 + kTileN32 - 1) / kTileN32;
+    LaunchKernel(
+        dim3(tile_blocks32, params.q_rows),
+        256,
+        device_.unwrap())(
+        candidate_score_tilen32_kernel, params);
   }
 
   // iter3 vector 1: persistent-block candidate_score launcher (kTileN=8).

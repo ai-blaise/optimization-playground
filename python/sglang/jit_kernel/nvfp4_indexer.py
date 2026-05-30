@@ -479,16 +479,6 @@ def _jit_nvfp4_indexer_module(
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_block_score",
             ),
             (
-                # iter7 PRIMARY: persistent block_score with Q-value
-                # pre-staging. Grid is (q_rows,) -- each CTA loops over
-                # all max_blocks for the row, predecoding the Q tile once
-                # into 32 KB SMEM (vs the base kernel which redoes the
-                # 32 NVFP4 dequants in every one of the 16384 CTAs at
-                # the production 64/32768 cell, ~512x oversampling).
-                "hisa_block_score_persistent_indexer_cache_nvfp4",
-                f"NVFP4IndexerQuantKernel<{args}>::hisa_block_score_persistent",
-            ),
-            (
                 "hisa_block_topk_indexer_cache_nvfp4",
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_block_topk",
             ),
@@ -1403,62 +1393,6 @@ def hisa_block_score_indexer_cache_nvfp4(
     _get_module_fast(
         torch.bfloat16, page_table_dtype, page_size
     ).hisa_block_score_indexer_cache_nvfp4(
-        q_values,
-        q_scales,
-        reps,
-        weights,
-        seq_lens.to(torch.int32),
-        token_to_batch_idx.to(torch.int32),
-        block_scores,
-    )
-    return block_scores
-
-
-@debug_kernel_api
-def hisa_block_score_persistent_indexer_cache_nvfp4(
-    q_values: torch.Tensor,
-    q_scales: torch.Tensor,
-    reps: torch.Tensor,
-    weights: torch.Tensor,
-    seq_lens: torch.Tensor,
-    token_to_batch_idx: torch.Tensor,
-    page_table_dtype: torch.dtype = torch.int32,
-    page_size: int = 64,
-) -> torch.Tensor:
-    """iter7 PRIMARY: persistent block_score with Q-value pre-staging.
-
-    Drop-in replacement for hisa_block_score_indexer_cache_nvfp4 with
-    the grid flipped from (max_blocks, q_rows) to (q_rows,). Each CTA
-    predecodes the per-row Q tile to fp32 in 32 KB SMEM once and then
-    loops over all max_blocks for the row, eliminating the ~512x
-    redundant NVFP4 dequant that the base kernel does at the
-    production 64/32768 cell.
-
-    Same correctness: identical dot computation, identical warp_sum
-    reduction order, identical weighted reduction epilogue, identical
-    -INFINITY padding for block_id >= block_count. Bit-identical to
-    the base kernel.
-    """
-    if weights.dtype != torch.float32:
-        weights = weights.float()
-    if q_values.dtype != torch.uint8:
-        raise ValueError(f"NVFP4 HISA q values must be uint8, got {q_values.dtype}.")
-    if q_scales.dtype != torch.int32:
-        q_scales = q_scales.to(torch.int32)
-    q_values = q_values.contiguous()
-    q_scales = q_scales.contiguous()
-    reps = reps.contiguous()
-    weights = weights.contiguous()
-    if not seq_lens.is_contiguous():
-        seq_lens = seq_lens.contiguous()
-    if not token_to_batch_idx.is_contiguous():
-        token_to_batch_idx = token_to_batch_idx.contiguous()
-    block_scores = torch.empty(
-        (q_values.shape[0], reps.shape[1]), dtype=torch.float32, device=q_values.device
-    )
-    _get_module_fast(
-        torch.bfloat16, page_table_dtype, page_size
-    ).hisa_block_score_persistent_indexer_cache_nvfp4(
         q_values,
         q_scales,
         reps,

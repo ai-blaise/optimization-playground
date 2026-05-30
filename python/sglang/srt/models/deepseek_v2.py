@@ -2329,8 +2329,26 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
 
+        # Iter4 PRIMARY #15 NVFP4 MoE deploy-wire: surface the next-MoE
+        # consumer's fp4 input_global_scale to LayerCommunicator so the
+        # post_attention_layernorm call inside prepare_mlp can fuse with
+        # the downstream fp4_quantize on the
+        # `not use_layer_norm_before_gather` branch (attn_tp_size > 1)
+        # and the `_simple` / `else` allreduce branch (attn_dp_size==1).
+        # The communicator does the env-var gate + dtype check + helper
+        # availability check itself — passing the scale unconditionally
+        # is cheap (just an attribute lookup on the MoE layer).
+        _next_fp4_gs = None
+        if (
+            isinstance(self.mlp, DeepseekV2MoE)
+            and hasattr(self.mlp.experts, "w13_input_scale_quant_slice")
+        ):
+            _next_fp4_gs = self.mlp.experts.w13_input_scale_quant_slice
         hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            next_consumer_fp4_global_scale=_next_fp4_gs,
         )
 
         # Pre-MLP GatedNorm (mirrors the pre-attention path above on the

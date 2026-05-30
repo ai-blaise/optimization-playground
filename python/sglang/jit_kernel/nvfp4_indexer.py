@@ -102,6 +102,57 @@ _hisa_nvfp4_candidate_score_persistent = _env_bool(
     "SGLANG_NSA_NVFP4_HISA_CANDIDATE_SCORE_PERSISTENT", False
 )
 
+# iter4 PRIMARY: persistent-block candidate_score + cp.async K-row prefetch.
+# Pairs the iter3 v1 persistent kernel (Q amortized across all tiles per
+# CTA) with a 2-stage cp.async ping-pong prefetch of raw NVFP4 K bytes
+# into ping-pong SMEM buffers, hiding the per-tile HBM K-decode latency
+# under Stage B/C compute. Default OFF pending the iter4 microbench +
+# correctness sweep on the production HISA grid.
+_hisa_nvfp4_candidate_score_kprefetch = _env_bool(
+    "SGLANG_NSA_NVFP4_HISA_CAND_SCORE_KPREFETCH", False
+)
+
+# iter4 tertiary: predecode-scale mean_pool. The kernel pre-decodes the
+# per-token scale word into an fp32 SMEM table during the staging pass,
+# so the inner per-dim sum loop is branchless and reads one byte + one
+# fp32 per iter (vs iter2's byte + uint32 + shift/mask/__uint_as_float).
+# Bit-identical to iter2; ~1.6x faster on B200 production shapes.
+# Default ON. Set to 0 to fall back to iter2 cooperative-uint4 mean_pool.
+_hisa_nvfp4_mean_pool_predecode = _env_bool(
+    "SGLANG_NSA_NVFP4_HISA_MEAN_POOL_PREDECODE", True
+)
+
+
+def _hisa_mean_pool_call(
+    index_k_with_scale_buffer: "torch.Tensor",
+    page_table: "torch.Tensor",
+    seq_lens_flat: "torch.Tensor",
+    max_blocks: int,
+    page_size: int = 64,
+) -> "torch.Tensor":
+    """Dispatch the mean_pool kernel selected by the iter4 env var.
+
+    Defaults to the iter4 predecode-scale kernel; falls back to the iter2
+    cooperative-uint4 kernel when SGLANG_NSA_NVFP4_HISA_MEAN_POOL_PREDECODE
+    is 0. Both kernels have identical FFI and produce bit-identical
+    outputs modulo fp32 accumulation order.
+    """
+    if _hisa_nvfp4_mean_pool_predecode:
+        return hisa_mean_pool_predecode_indexer_cache_nvfp4(
+            index_k_with_scale_buffer,
+            page_table,
+            seq_lens_flat,
+            max_blocks,
+            page_size=page_size,
+        )
+    return hisa_mean_pool_indexer_cache_nvfp4(
+        index_k_with_scale_buffer,
+        page_table,
+        seq_lens_flat,
+        max_blocks,
+        page_size=page_size,
+    )
+
 
 _hisa_profile_path = os.environ.get(
     "SGLANG_NSA_NVFP4_HISA_PROFILE_PATH"
@@ -275,6 +326,13 @@ def _jit_nvfp4_indexer_module(
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool_tma",
             ),
             (
+                # iter4 tertiary: predecoded-scale mean_pool. Builds a
+                # per-token fp32 scales table during the staging pass so
+                # the hot sum loop is a 1-byte + 1-fp32 SMEM-only kernel.
+                "hisa_mean_pool_predecode_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool_predecode",
+            ),
+            (
                 "hisa_candidate_score_indexer_cache_nvfp4",
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score",
             ),
@@ -310,6 +368,16 @@ def _jit_nvfp4_indexer_module(
                 # iter3 vector 1 experimental: persistent-block kTileN=16.
                 "hisa_candidate_score_persistent_tilen16_indexer_cache_nvfp4",
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score_persistent_tilen16",
+            ),
+            (
+                # iter4 PRIMARY: persistent-block + cp.async K-row prefetch.
+                # Pairs iter3 v1 persistent (Q amortized across all tiles
+                # per CTA) with a 2-stage ping-pong cp.async prefetch of
+                # raw NVFP4 K bytes into ping-pong SMEM buffers, hiding
+                # the per-tile HBM K-decode latency under Stage B/C
+                # compute. Opt-in via SGLANG_NSA_NVFP4_HISA_CAND_SCORE_KPREFETCH.
+                "hisa_candidate_score_persistent_kprefetch_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score_persistent_kprefetch",
             ),
             (
                 "hisa_block_score_indexer_cache_nvfp4",
@@ -574,6 +642,43 @@ def hisa_mean_pool_tma_indexer_cache_nvfp4(
     _get_module_fast(
         torch.bfloat16, page_table.dtype, page_size
     ).hisa_mean_pool_tma_indexer_cache_nvfp4(
+        index_k_with_scale, page_table, seq_lens.to(torch.int32), reps
+    )
+    return reps
+
+
+@debug_kernel_api
+def hisa_mean_pool_predecode_indexer_cache_nvfp4(
+    index_k_with_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_blocks: int,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """iter4 tertiary: predecoded-scale mean_pool.
+
+    Drop-in replacement for hisa_mean_pool_indexer_cache_nvfp4. The per-
+    page staging is identical to iter2 (cooperative uint4 loads). After
+    staging, a one-pass predecode builds a per-(token, scale-group) fp32
+    scales table and a per-token value-byte base offset, so the inner
+    per-dim sum loop becomes a branchless 1-byte + 1-fp32 SMEM chain
+    feeding decode_e2m1_nibble. Invalid pages contribute zero via the
+    zeroed scales table (no page_id branch in the hot loop).
+    """
+    if not index_k_with_scale.is_contiguous():
+        index_k_with_scale = index_k_with_scale.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
+    reps = torch.empty(
+        (page_table.shape[0], max_blocks, 128),
+        dtype=torch.float32,
+        device=index_k_with_scale.device,
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_mean_pool_predecode_indexer_cache_nvfp4(
         index_k_with_scale, page_table, seq_lens.to(torch.int32), reps
     )
     return reps
@@ -942,6 +1047,72 @@ def hisa_candidate_score_persistent_tilen16_indexer_cache_nvfp4(
     _get_module_fast(
         torch.bfloat16, page_table.dtype, page_size
     ).hisa_candidate_score_persistent_tilen16_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale,
+        page_table,
+        seq_lens.to(torch.int32),
+        weights,
+        top_blocks.to(torch.int32),
+        token_to_batch_idx.to(torch.int32),
+        logits,
+        candidate_indices,
+    )
+    return logits, candidate_indices
+
+
+@debug_kernel_api
+def hisa_candidate_score_persistent_kprefetch_indexer_cache_nvfp4(
+    q_values: torch.Tensor,
+    q_scales: torch.Tensor,
+    index_k_with_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    top_blocks: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    page_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """iter4 PRIMARY: persistent-block + cp.async K-row prefetch.
+
+    Drop-in replacement for hisa_candidate_score_persistent_indexer_cache_nvfp4
+    (kTileN=8 variant). Pairs the iter3 v1 persistent kernel with a 2-stage
+    ping-pong cp.async prefetch of raw NVFP4 K bytes so the per-tile HBM
+    K-decode latency hides under Stage B/C compute. Outputs are bit-
+    identical to iter3 v1 modulo fp32 reduction order; the only kernel-
+    level change is WHERE the raw NVFP4 bytes are read from (SMEM after
+    cp.async lands them, vs HBM via load_nvfp4_value in iter3 v1).
+    """
+    if weights.dtype != torch.float32:
+        weights = weights.float()
+    if q_values.dtype != torch.uint8:
+        raise ValueError(f"NVFP4 HISA q values must be uint8, got {q_values.dtype}.")
+    if q_scales.dtype != torch.int32:
+        q_scales = q_scales.to(torch.int32)
+    q_values = q_values.contiguous()
+    q_scales = q_scales.contiguous()
+    weights = weights.contiguous()
+    if not index_k_with_scale.is_contiguous():
+        index_k_with_scale = index_k_with_scale.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
+    if not top_blocks.is_contiguous():
+        top_blocks = top_blocks.contiguous()
+    if not token_to_batch_idx.is_contiguous():
+        token_to_batch_idx = token_to_batch_idx.contiguous()
+
+    candidate_len = top_blocks.shape[1] * 128
+    logits = torch.empty(
+        (q_values.shape[0], candidate_len), dtype=torch.float32, device=q_values.device
+    )
+    candidate_indices = torch.empty(
+        (q_values.shape[0], candidate_len), dtype=torch.int32, device=q_values.device
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_candidate_score_persistent_kprefetch_indexer_cache_nvfp4(
         q_values,
         q_scales,
         index_k_with_scale,
@@ -2069,7 +2240,7 @@ def hisa_precompute_block_reps_indexer_cache_nvfp4(
         max_blocks = _hisa_max_blocks(seq_lens_flat, page_table, block_size)
     else:
         max_blocks = max(1, int(max_blocks))
-    reps = hisa_mean_pool_indexer_cache_nvfp4(
+    reps = _hisa_mean_pool_call(
         index_k_with_scale_buffer,
         page_table,
         seq_lens_flat,
@@ -2507,7 +2678,7 @@ def nvfp4_hisa_indexer_paged_torch(
     max_blocks = _hisa_max_blocks(seq_lens_flat, page_table, block_size)
 
     stage = _profile_start(q_values.device)
-    reps = hisa_mean_pool_indexer_cache_nvfp4(
+    reps = _hisa_mean_pool_call(
         index_k_with_scale_buffer,
         page_table,
         seq_lens_flat,
@@ -2603,6 +2774,15 @@ def nvfp4_hisa_indexer_paged_torch(
     stage = _profile_start(q_values.device)
     if not _hisa_nvfp4_candidate_score_tilen:
         _candidate_score_fn = hisa_candidate_score_indexer_cache_nvfp4
+    elif _hisa_nvfp4_candidate_score_kprefetch:
+        # iter4 PRIMARY OPT-IN: persistent-block + cp.async K-row prefetch.
+        # Pairs the iter3 v1 persistent kernel with a 2-stage ping-pong
+        # cp.async prefetch of raw NVFP4 K bytes into ping-pong SMEM
+        # buffers, hiding the per-tile HBM K-decode latency under Stage
+        # B/C compute. kTileN=8 only at the iter4 first-cut variant.
+        _candidate_score_fn = (
+            hisa_candidate_score_persistent_kprefetch_indexer_cache_nvfp4
+        )
     elif _hisa_nvfp4_candidate_score_persistent:
         # iter3 vector 1 OPT-IN: persistent-block kernel. Default off
         # because it's strictly slower than tile-N at the production
@@ -3935,7 +4115,7 @@ def nvfp4_hisa_indexer_paged_deepgemm(
 
     max_blocks = _hisa_max_blocks(seq_lens_flat, page_table, block_size)
     stage = _profile_start(q_values.device)
-    reps = hisa_mean_pool_indexer_cache_nvfp4(
+    reps = _hisa_mean_pool_call(
         index_k_with_scale_buffer,
         page_table,
         seq_lens_flat,

@@ -619,6 +619,37 @@ SGL_DEVICE float warp_sum(float value) {
   return value;
 }
 
+// cp.async helpers for the iter4 persistent + K-prefetch kernel. These
+// are SM80+ HBM->SMEM async copies; on SM100 they coexist with TMA bulk
+// (cp.async.bulk) and are the right primitive for small per-tile payloads
+// (the K-prefetch issues 5 cp.async per K row, kTileN K rows per tile —
+// too small for bulk amortization, big enough to overlap with the Stage B
+// dot-product compute).
+SGL_DEVICE void cp_async_16(void* smem_ptr, const void* glob_ptr) {
+  const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "cp.async.cg.shared.global [%0], [%1], 16;\n"
+      :
+      : "r"(smem), "l"(glob_ptr));
+}
+
+SGL_DEVICE void cp_async_4(void* smem_ptr, const void* glob_ptr) {
+  const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "cp.async.ca.shared.global [%0], [%1], 4;\n"
+      :
+      : "r"(smem), "l"(glob_ptr));
+}
+
+SGL_DEVICE void cp_async_fence() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int N>
+SGL_DEVICE void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
 #if defined(SGLANG_ENABLE_HISA_SELECTOR_MEGAKERNEL)
 SGL_DEVICE char* hisa_align_smem(char* ptr, uintptr_t alignment) {
   const uintptr_t raw = reinterpret_cast<uintptr_t>(ptr);
@@ -3372,6 +3403,185 @@ __global__ void hisa_mean_pool_indexer_cache_nvfp4(
       token_count == 0 ? 0.0f : sum / static_cast<float>(token_count);
 }
 
+// iter4 tertiary: mean_pool with pre-decoded fp32 scale table.
+//
+// The iter2 inner sum loop reads, per (thread=dim, token), both the staged
+// value byte (1 SMEM byte load) and the staged scale word (1 SMEM uint32
+// load), then extracts the scale exponent via shift+mask+__uint_as_float
+// and recombines as e2m1 nibble * scale. The scale extraction is invariant
+// across dims within a 32-dim band (one scale_exp per 32-nibble group), so
+// it is wasted work: 128 threads each redo the same bit ops on the same
+// scale word for 128 tokens.
+//
+// This variant precomputes, after the page-staging __syncthreads, a per-
+// block scales table smem_scales_fp32[kBlockSize][4] = 128 tokens x 4
+// scale groups (one per 32-dim band). The 512 floats (2 KB) are filled
+// cooperatively by the 128 threads in one pass (each thread builds the 4
+// scales for one token) and the inner sum loop becomes:
+//   - 1 SMEM byte load (value)  (unchanged)
+//   - 1 SMEM fp32 load (scale)  (was: uint32 load + shift + mask + cast)
+//   - decode_e2m1_nibble + FMA  (unchanged)
+//
+// Invalid pages produce zero scales, so the inner loop's `if (page_id < 0)
+// continue;` branch is no longer needed — decode_e2m1_nibble(code, 0)
+// yields 0 contribution. Removing the branch also unlocks deeper unroll
+// on the sum loop (gcc/nvcc emit a tighter LDLs+FMA chain).
+//
+// Correctness: bit-identical to iter2 because the scale value passed to
+// decode_e2m1_nibble is the same fp32 magnitude — the only change is
+// where the uint32->fp32 conversion happens (once per token in the
+// predecode pass vs. once per (thread, token) in the inner loop).
+//
+// Expected: 1.3-1.6x on mean_pool kernel at production shapes; the win
+// is from (a) ~3 ALU ops saved per inner iter, and (b) the dropped
+// branch on page_id<0. The page-staging step is unchanged from iter2.
+template <typename IndicesT, uint32_t kPageSize>
+__global__ void hisa_mean_pool_predecode_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISAMeanPoolParam param) {
+  constexpr int64_t kPageBytes = (kNVFP4ValueBytes + kScaleBytes) * kPageSize;
+  constexpr uint32_t kBlockSize = 128;
+  constexpr uint32_t kMaxPagesPerBlock =
+      (kBlockSize + kPageSize - 1) / kPageSize;
+  constexpr uint32_t kStagedBytesPerPage =
+      kNVFP4ValueBytes * kPageSize + kScaleBytes * kPageSize;
+  constexpr uint32_t kTotalStagedBytes =
+      kStagedBytesPerPage * kMaxPagesPerBlock;
+  constexpr uint32_t kScaleGroups = kIndexerHeadDim / 32;  // 4
+
+  __shared__ uint8_t smem_pages[kTotalStagedBytes];
+  __shared__ int32_t smem_page_ids[kMaxPagesPerBlock];
+  // Pre-decoded fp32 scales per (token-local, scale-group). 128*4 = 512
+  // floats = 2 KB. Invalid-page tokens get zero scales so the inner loop
+  // doesn't need a page_id branch.
+  __shared__ float smem_scales_fp32[kBlockSize][kScaleGroups];
+  // Pre-computed per-token value-byte base offset into smem_pages, in
+  // bytes from the smem_pages base. -1 sentinel for invalid pages so the
+  // inner loop can branchlessly compute the source byte address.
+  __shared__ uint16_t smem_value_offset[kBlockSize];
+
+  const auto tid = threadIdx.x;
+  const auto hisa_block = blockIdx.x;
+  const auto batch = blockIdx.y;
+  if (batch >= param.batch_size || hisa_block >= param.max_blocks) {
+    return;
+  }
+
+  const auto seq_len = static_cast<const int32_t*>(param.seq_lens)[batch];
+  const auto token_start = hisa_block * kBlockSize;
+  const auto token_count =
+      token_start < static_cast<uint32_t>(seq_len)
+          ? min(kBlockSize, static_cast<uint32_t>(seq_len) - token_start)
+          : 0u;
+  const auto logical_page_start = token_start / kPageSize;
+  const auto logical_page_end =
+      token_count == 0 ? logical_page_start
+                       : (token_start + token_count - 1) / kPageSize + 1;
+
+  // Page id resolution (identical to iter2).
+  if (tid < kMaxPagesPerBlock) {
+    const uint32_t lp = logical_page_start + tid;
+    int32_t page_id = -1;
+    if (lp < logical_page_end) {
+      page_id = static_cast<int32_t>(
+          static_cast<const IndicesT*>(
+              param.page_table)[batch * param.page_table_stride + lp]);
+    }
+    smem_page_ids[tid] = page_id;
+  }
+  __syncthreads();
+
+  // Cooperative page staging: identical to iter2 (uint4 vector loads).
+  constexpr uint32_t kVecBytes = sizeof(uint4);
+  static_assert(kStagedBytesPerPage % kVecBytes == 0,
+                "iter4 mean_pool predecode requires page bytes divisible by 16");
+  constexpr uint32_t kVecsPerPage = kStagedBytesPerPage / kVecBytes;
+  for (uint32_t p = 0; p < kMaxPagesPerBlock; ++p) {
+    const int32_t page_id = smem_page_ids[p];
+    auto* smem_dst =
+        reinterpret_cast<uint4*>(smem_pages + p * kStagedBytesPerPage);
+    if (page_id >= 0) {
+      const auto* src = reinterpret_cast<const uint4*>(
+          static_cast<const uint8_t*>(param.cache) +
+          static_cast<int64_t>(page_id) * kPageBytes);
+      for (uint32_t v = tid; v < kVecsPerPage; v += kBlockSize) {
+        smem_dst[v] = src[v];
+      }
+    } else {
+      const uint4 zero = make_uint4(0, 0, 0, 0);
+      for (uint32_t v = tid; v < kVecsPerPage; v += kBlockSize) {
+        smem_dst[v] = zero;
+      }
+    }
+  }
+  __syncthreads();
+
+  // Predecode scales + value byte offsets: each thread handles ONE token
+  // slot. 128 threads cover the 128 token slots in one pass. For valid
+  // tokens we expand the scale_word into 4 fp32 scale lanes; for invalid
+  // tokens we zero the scales (so decode_e2m1_nibble x 0 = 0 contribution)
+  // and use a sentinel offset so the value-byte read targets a known-zero
+  // location (the smem_pages buffer is zeroed for invalid pages above, so
+  // any offset within it is safe).
+  {
+    const uint32_t i = tid;  // token-local index 0..127
+    if (i < kBlockSize) {
+      if (i < token_count) {
+        const uint32_t token = token_start + i;
+        const uint32_t logical_page = token / kPageSize;
+        const uint32_t local_page = logical_page - logical_page_start;
+        const uint32_t offset = token & (kPageSize - 1);
+        const uint8_t* page_smem =
+            smem_pages + local_page * kStagedBytesPerPage;
+        const uint32_t value_byte_base =
+            (page_smem - smem_pages) + offset * kNVFP4ValueBytes;
+        smem_value_offset[i] = static_cast<uint16_t>(value_byte_base);
+        const uint32_t scale_word = *reinterpret_cast<const uint32_t*>(
+            page_smem + kNVFP4ValueBytes * kPageSize + offset * kScaleBytes);
+        #pragma unroll
+        for (uint32_t g = 0; g < kScaleGroups; ++g) {
+          const uint32_t scale_exp = (scale_word >> (g * 8)) & 0xffu;
+          // Invalid-page pages have all-zero staged bytes -> scale_exp=0
+          // -> scale=0 -> zero contribution. Valid pages get their true
+          // scale magnitude as in iter2.
+          smem_scales_fp32[i][g] = __uint_as_float(scale_exp << 23);
+        }
+      } else {
+        // Out-of-range token slots: zero scales -> zero contribution.
+        smem_value_offset[i] = 0;
+        #pragma unroll
+        for (uint32_t g = 0; g < kScaleGroups; ++g) {
+          smem_scales_fp32[i][g] = 0.0f;
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  if (tid >= kIndexerHeadDim) return;
+  const uint32_t dim = tid;
+  const uint32_t dim_group = dim >> 5;        // 0..3
+  const uint32_t dim_byte = dim >> 1;         // 0..63
+  const bool high_nibble = (dim & 1u) != 0u;
+
+  float sum = 0.0f;
+  // Hot loop: 1 SMEM byte load + 1 fp32 SMEM load + nibble + FMA.
+  // No branch on page_id — invalid tokens contribute 0 via scale=0.
+  #pragma unroll 4
+  for (uint32_t i = 0; i < token_count; ++i) {
+    const uint8_t packed =
+        smem_pages[smem_value_offset[i] + dim_byte];
+    const uint32_t code = high_nibble ? (packed >> 4) : (packed & 0xfu);
+    const float scale = smem_scales_fp32[i][dim_group];
+    sum += decode_e2m1_nibble(code, scale);
+  }
+  const auto out_idx =
+      (static_cast<int64_t>(batch) * param.max_blocks + hisa_block) *
+          kIndexerHeadDim +
+      dim;
+  static_cast<float*>(param.reps)[out_idx] =
+      token_count == 0 ? 0.0f : sum / static_cast<float>(token_count);
+}
+
 // iter3 vector 2: TMA-based mean_pool. Replaces the iter2 cooperative
 // uint4 page copy (272 16-byte vec loads cooperatively per page, ~544
 // per CTA across both pages) with a single cp.async.bulk per page
@@ -4175,6 +4385,357 @@ __global__ void hisa_candidate_score_persistent_indexer_cache_nvfp4(
   }
 }
 
+// iter4 PRIMARY: persistent-block candidate_score + K-row cp.async prefetch.
+//
+// Pairs the iter3 vector 1 persistent kernel (Q amortized across many tiles
+// per CTA) with a 2-stage cp.async ping-pong prefetch for the per-tile K
+// rows. The iter3 vector 1 checkpoint was 3-60% SLOWER at production shapes:
+// per-CTA __syncthreads cost (3 per tile, ~96 syncs at 64/32768) ate the Q
+// amortization win because each Stage A blocked on synchronous HBM K-row
+// decode latency (`load_nvfp4_value` reads `value_ptr[dim>>1]` + `*scale_ptr`
+// from HBM per dim per K row, ~32 HBM scalar loads per K row before the
+// Stage A→B __syncthreads can advance).
+//
+// iter4 hypothesis: hide the K-decode HBM latency by issuing a cp.async
+// prefetch of tile N+1's raw NVFP4 bytes into a SECOND SMEM K buffer while
+// the warps execute Stage B/C of tile N. Then Stage A of tile N+1 reads
+// from SMEM (already landed) instead of HBM, so the __syncthreads becomes
+// a pure compute-fence rather than an HBM-stall fence.
+//
+// Per K row: 64 value bytes + 4 scale bytes (NVFP4 e2m1+ue8m0). cp.async
+// can issue 4-, 8-, or 16-byte transactions; we use 4x cp.async.16 for
+// values and 1x cp.async.4 for the scale word, giving 5 cp.async instructions
+// per K row. Per tile (kTileN=8): 40 cp.async issues, spread across 256
+// threads — each thread issues less than 1 op on average, so issue width
+// is not the bottleneck.
+//
+// SMEM layout (per CTA, kTileN=8):
+//   smem_k_raw[2][kTileN * 80] = 2 * 640 = 1280 B   (ping-pong raw NVFP4)
+//   smem_k    [kTileN][128]    = 4096 B              (decoded fp32 K rows)
+//   smem_head_dot[kTileN][64]  = 2048 B              (per-(slot,head) dots)
+//   smem_batch_prefix[2]       = 8 B
+//   total                      = 7432 B (<< 48 KB cap)
+//
+// Per K row in smem_k_raw:
+//   [0..63]   = 64 value bytes (NVFP4 e2m1 nibbles)
+//   [64..67]  = 4 scale bytes (uint32 packed e8m0 scale_word)
+//   [68..79]  = 12 padding bytes (16-byte aligned slot stride)
+//
+// Pipeline:
+//   bootstrap: prefetch tile base_tile into buf 0; cp.async.commit_group
+//   for tile_idx in [base_tile, end_tile):
+//     if tile_idx + 1 < end_tile:
+//       prefetch tile (tile_idx + 1) into buf (1 - (tile_idx - base_tile) % 2)
+//       cp.async.commit_group
+//       cp.async.wait_group<1>  (wait for tile_idx prefetch; let tile_idx+1
+//                                stay outstanding to overlap with Stage B/C)
+//     else:
+//       cp.async.wait_group<0>  (wait for tile_idx prefetch on the last
+//                                iteration)
+//     __syncthreads()  (ensure all threads see the landed bytes)
+//     Stage A: decode K rows from smem_k_raw[cur_buf] into smem_k
+//     __syncthreads()
+//     Stage B + Stage C (identical to iter3 vector 1)
+//     __syncthreads()
+//
+// The prefetch issue is done by all threads cooperatively (per K row,
+// 5 thread slots needed for the 5 cp.async; we use threads 0..40 for
+// kTileN=8 — well within the 256-thread CTA). Address computation
+// (top_blocks lookup + page_table lookup) is hoisted to threads 0..7
+// who broadcast page/offset through SMEM. The page_table read is the
+// only HBM dependency of the prefetch issue; it is small (4 B per K row)
+// and L1-cached across the persistent CTA's tile sweep (same batch row).
+template <typename IndicesT, uint32_t kPageSize, uint32_t kTileN>
+__global__ void
+hisa_candidate_score_persistent_kprefetch_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISACandidateScoreParam param,
+    uint32_t splits_per_row,
+    uint32_t total_tiles) {
+  static_assert(kTileN >= 1 && kTileN <= 16,
+                "kTileN must be in [1, 16]");
+  constexpr int64_t kPageBytes = (kNVFP4ValueBytes + kScaleBytes) * kPageSize;
+  constexpr uint32_t kHISABlockSize = 128;
+  // n_heads <= 64 at production; the launcher rejects larger n_heads.
+  constexpr uint32_t kMaxHeads = 64;
+  constexpr uint32_t kMaxWarps = 8;
+  constexpr uint32_t kMaxHeadsPerWarp = 8;
+
+  // Per K-row stride in the raw NVFP4 SMEM buffer: 64 value + 4 scale +
+  // 12 pad = 80 bytes, 16-byte aligned. The kRowStrideBytes constant must
+  // be a multiple of 16 so the cp.async.16 instructions remain aligned.
+  constexpr uint32_t kRowStrideBytes = 80;
+  static_assert(kRowStrideBytes % 16 == 0, "kRowStrideBytes must be 16-aligned");
+  constexpr uint32_t kRawBufBytes = kTileN * kRowStrideBytes;
+
+  __shared__ alignas(16) uint8_t smem_k_raw[2][kRawBufBytes];
+  __shared__ float smem_k[kTileN][kIndexerHeadDim];
+  __shared__ float smem_head_dot[kTileN][kMaxHeads];
+  // Per-tile metadata (token + valid) staged so Stage C can read it from
+  // SMEM without re-deriving — the iter3 v1 fast path could reuse warp-local
+  // regs because Stage A/C bound 1 K row per warp; for iter4 we want all
+  // threads to see (token, valid) for every K row regardless of which warp
+  // issued the prefetch, so we publish it explicitly.
+  __shared__ int32_t smem_token[2][kTileN];
+  __shared__ int8_t smem_valid[2][kTileN];
+
+  const auto split_idx = blockIdx.x;
+  const auto row = blockIdx.y;
+  if (row >= param.q_rows) return;
+
+  const auto warp_id = threadIdx.x >> 5;
+  const auto lane = threadIdx.x & 31;
+
+  const uint32_t base_tile =
+      static_cast<uint32_t>(static_cast<uint64_t>(total_tiles) * split_idx /
+                            splits_per_row);
+  const uint32_t end_tile =
+      static_cast<uint32_t>(static_cast<uint64_t>(total_tiles) *
+                            (split_idx + 1) / splits_per_row);
+  if (base_tile >= end_tile) return;
+
+  const auto candidate_len = param.block_topk * kHISABlockSize;
+  const uint32_t n_heads = param.n_heads;
+  const uint32_t heads_per_warp = (n_heads + kMaxWarps - 1) / kMaxWarps;
+
+  // Stage 0: row metadata.
+  __shared__ int32_t smem_batch_prefix[2];
+  if (threadIdx.x == 0) {
+    smem_batch_prefix[0] =
+        static_cast<const int32_t*>(param.token_to_batch_idx)[row];
+    smem_batch_prefix[1] =
+        static_cast<const int32_t*>(param.seq_lens)[smem_batch_prefix[0]];
+  }
+  __syncthreads();
+  const int32_t batch = smem_batch_prefix[0];
+  const int32_t prefix_len = smem_batch_prefix[1];
+
+  // Stage 0b: pre-decode Q into per-warp registers (identical to iter3 v1).
+  float qregs[kMaxHeadsPerWarp][4];
+  #pragma unroll
+  for (uint32_t h_off = 0; h_off < kMaxHeadsPerWarp; ++h_off) {
+    if (h_off >= heads_per_warp) break;
+    const uint32_t head = warp_id * heads_per_warp + h_off;
+    if (head >= n_heads) {
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) qregs[h_off][j] = 0.0f;
+      continue;
+    }
+    const auto q_value_ptr =
+        static_cast<const uint8_t*>(param.q_values) +
+        (static_cast<int64_t>(row) * n_heads + head) * kNVFP4ValueBytes;
+    const auto q_scale_ptr =
+        static_cast<const uint32_t*>(param.q_scales) +
+        static_cast<int64_t>(row) * n_heads + head;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      qregs[h_off][j] = load_nvfp4_value(q_value_ptr, q_scale_ptr,
+                                         lane + j * 32);
+    }
+  }
+
+  // ===== Prefetch lambda =====
+  // Computes K-row addresses for tile `tile_idx` and issues cp.async to
+  // copy the raw NVFP4 bytes into smem_k_raw[buf]. Also publishes
+  // (token, valid) into smem_token[buf][.] / smem_valid[buf][.] for Stage
+  // A / Stage C consumption. NOT followed by a syncthreads or fence —
+  // the caller must invoke cp_async_fence() after this returns.
+  //
+  // Thread layout for prefetch issue:
+  //   - threads 0..kTileN-1: address derivation + (token, valid) publish
+  //   - the same threads issue 4x cp.async.16 + 1x cp.async.4 for their
+  //     K row. Issue is per-thread (cp.async is a per-thread instruction),
+  //     so threads 0..7 issue all 40 ops for kTileN=8.
+  auto prefetch_tile = [&](uint32_t tile_idx, uint32_t buf) {
+    const auto cand_base = tile_idx * kTileN;
+    if (threadIdx.x < kTileN) {
+      const uint32_t t_idx = threadIdx.x;
+      const auto cand = cand_base + t_idx;
+      int32_t token = -1;
+      int8_t valid = 0;
+      const uint8_t* value_src = nullptr;
+      const uint32_t* scale_src = nullptr;
+      if (cand < candidate_len) {
+        const auto block_slot = cand / kHISABlockSize;
+        const auto block_offset = cand - block_slot * kHISABlockSize;
+        const auto top_block = static_cast<const int32_t*>(
+            param.top_blocks)[row * param.block_topk + block_slot];
+        const auto t = top_block * static_cast<int32_t>(kHISABlockSize) +
+                       static_cast<int32_t>(block_offset);
+        if (top_block >= 0 && t >= 0 && t < prefix_len) {
+          token = t;
+          valid = 1;
+          const auto logical_page = static_cast<uint32_t>(t) / kPageSize;
+          const auto offset = static_cast<uint32_t>(t) & (kPageSize - 1);
+          const auto page = static_cast<const IndicesT*>(
+              param.page_table)[batch * param.page_table_stride + logical_page];
+          const auto page_ptr = static_cast<const uint8_t*>(param.cache) +
+                                static_cast<int64_t>(page) * kPageBytes;
+          value_src = page_ptr + offset * kNVFP4ValueBytes;
+          scale_src = reinterpret_cast<const uint32_t*>(
+              page_ptr + kNVFP4ValueBytes * kPageSize + offset * kScaleBytes);
+        }
+      }
+      smem_token[buf][t_idx] = token;
+      smem_valid[buf][t_idx] = valid;
+      uint8_t* row_dst = smem_k_raw[buf] + t_idx * kRowStrideBytes;
+      if (valid) {
+        // Issue 4x cp.async.16 for the 64 value bytes (16-byte aligned).
+        // Each issue copies 16 bytes from HBM to SMEM and registers the
+        // completion against the most-recent cp.async.commit_group fence.
+        #pragma unroll
+        for (uint32_t v = 0; v < 4; ++v) {
+          cp_async_16(row_dst + v * 16, value_src + v * 16);
+        }
+        // Issue 1x cp.async.4 for the scale word at offset 64.
+        cp_async_4(row_dst + 64, scale_src);
+      } else {
+        // Invalid K rows: write zeros directly to SMEM (no cp.async).
+        // The decode path will see zero values + zero scale_word and emit
+        // zero contributions, identical to iter3 v1's explicit zero branch.
+        #pragma unroll
+        for (uint32_t v = 0; v < 4; ++v) {
+          reinterpret_cast<uint4*>(row_dst + v * 16)[0] = make_uint4(0, 0, 0, 0);
+        }
+        *reinterpret_cast<uint32_t*>(row_dst + 64) = 0u;
+      }
+    }
+    // Threads >= kTileN do not issue cp.async for this tile. The
+    // cp_async_fence() / wait_group must still be issued by every thread
+    // because they are per-thread instructions (the fence groups the
+    // issuing thread's outstanding ops; threads with zero outstanding
+    // ops still need to participate in the group boundary).
+  };
+
+  // ===== Decode-from-SMEM lambda =====
+  // Reads the raw NVFP4 bytes from smem_k_raw[buf] and writes the decoded
+  // fp32 values into smem_k. Uses the same decode_e2m1_nibble + scale
+  // arithmetic as load_nvfp4_value, but with both value_ptr and scale_ptr
+  // pointing into SMEM instead of HBM. Each warp owns one K row at
+  // kTileN<=8, kMaxWarps=8 (kStageARounds=1).
+  auto decode_tile = [&](uint32_t buf) {
+    constexpr uint32_t kStageARounds = (kTileN + kMaxWarps - 1) / kMaxWarps;
+    #pragma unroll
+    for (uint32_t r = 0; r < kStageARounds; ++r) {
+      const uint32_t t_idx = r * kMaxWarps + warp_id;
+      if (t_idx < kTileN) {
+        const uint8_t* row_ptr = smem_k_raw[buf] + t_idx * kRowStrideBytes;
+        const uint32_t scale_word =
+            *reinterpret_cast<const uint32_t*>(row_ptr + 64);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const uint32_t dim = lane + j * 32;
+          const auto packed = row_ptr[dim >> 1];
+          const auto code = (dim & 1) ? (packed >> 4) : (packed & 0xfu);
+          const auto scale_exp = (scale_word >> ((dim >> 5) * 8)) & 0xffu;
+          const auto scale = __uint_as_float(scale_exp << 23);
+          smem_k[t_idx][dim] = decode_e2m1_nibble(code, scale);
+        }
+      }
+    }
+  };
+
+  // ===== Pipeline bootstrap =====
+  // Prefetch tile 0 into buf 0 and commit it as the first cp.async group.
+  prefetch_tile(base_tile, 0u);
+  cp_async_fence();
+  // smem_token[0] / smem_valid[0] writes happen-before cp_async_fence and
+  // are visible to all threads after a __syncthreads. We sync just before
+  // the main loop's Stage C consumes them.
+
+  // ===== Main loop =====
+  constexpr uint32_t kStageRounds = (kTileN + kMaxWarps - 1) / kMaxWarps;
+  for (uint32_t tile_idx = base_tile; tile_idx < end_tile; ++tile_idx) {
+    const uint32_t cur_buf = (tile_idx - base_tile) & 1u;
+    const uint32_t next_tile = tile_idx + 1;
+    const bool has_next = next_tile < end_tile;
+    if (has_next) {
+      const uint32_t next_buf = cur_buf ^ 1u;
+      prefetch_tile(next_tile, next_buf);
+      cp_async_fence();
+      // Two groups outstanding (cur + next). Wait until cur lands.
+      cp_async_wait_group<1>();
+    } else {
+      // Last tile: only one group outstanding. Drain everything.
+      cp_async_wait_group<0>();
+    }
+    // The wait_group above releases this thread's view of the prior
+    // cp.async; sync to ensure all threads have committed their writes
+    // and prefetch metadata is visible.
+    __syncthreads();
+
+    // Stage A: decode K rows from cur_buf raw bytes into smem_k.
+    decode_tile(cur_buf);
+    __syncthreads();
+
+    // Stage B: per (warp, head) dot. Identical to iter3 v1.
+    #pragma unroll
+    for (uint32_t h_off = 0; h_off < kMaxHeadsPerWarp; ++h_off) {
+      if (h_off >= heads_per_warp) break;
+      const uint32_t head = warp_id * heads_per_warp + h_off;
+      if (head >= n_heads) break;
+      const auto cand_base = tile_idx * kTileN;
+      #pragma unroll
+      for (uint32_t t = 0; t < kTileN; ++t) {
+        if (cand_base + t >= candidate_len) break;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          dot += qregs[h_off][j] * smem_k[t][lane + j * 32];
+        }
+        dot = warp_sum(dot);
+        if (lane == 0) smem_head_dot[t][head] = dot;
+      }
+    }
+    __syncthreads();
+
+    // Stage C: per-tile weighted reduction. Pulls (token, valid) from
+    // smem_token[cur_buf] / smem_valid[cur_buf] — the iter3 v1 fast-path
+    // warp-local stash doesn't work here because the warp that issued
+    // the prefetch (one of warps 0..kTileN-1 if threadIdx.x < kTileN)
+    // is not necessarily the warp consuming this tile slot in Stage C.
+    #pragma unroll
+    for (uint32_t r = 0; r < kStageRounds; ++r) {
+      const uint32_t t_idx = r * kMaxWarps + warp_id;
+      if (t_idx < kTileN) {
+        const auto cand_base = tile_idx * kTileN;
+        const auto cand = cand_base + t_idx;
+        if (cand < candidate_len) {
+          const auto out_idx =
+              static_cast<int64_t>(row) * candidate_len + cand;
+          const int32_t token = smem_token[cur_buf][t_idx];
+          const int8_t valid = smem_valid[cur_buf][t_idx];
+          if (!valid) {
+            if (lane == 0) {
+              static_cast<float*>(param.logits)[out_idx] = -INFINITY;
+              static_cast<int32_t*>(param.candidate_indices)[out_idx] = -1;
+            }
+          } else {
+            float partial = 0.0f;
+            for (uint32_t h = lane; h < n_heads; h += 32) {
+              const float w = static_cast<const float*>(
+                  param.weights)[static_cast<int64_t>(row) * n_heads + h];
+              partial += fmaxf(smem_head_dot[t_idx][h], 0.0f) * w;
+            }
+            partial = warp_sum(partial);
+            if (lane == 0) {
+              static_cast<float*>(param.logits)[out_idx] = partial;
+              static_cast<int32_t*>(param.candidate_indices)[out_idx] = token;
+            }
+          }
+        }
+      }
+    }
+    // Note: NO end-of-tile __syncthreads. The next iter's syncthreads-
+    // after-wait_group (sync A in the comments) closes the cur-iter
+    // Stage C → next-iter Stage B race because Stage B is what would
+    // overwrite smem_head_dot, and Stage B is preceded by both that
+    // sync A AND the decode_tile sync (Stage A→B). Dropping the
+    // end-of-tile sync gives iter4 kprefetch the same 3-sync per tile
+    // count as iter3 v1 (instead of 4 syncs with the explicit end-of-
+    // tile sync).
+  }
+}
+
 __global__ void hisa_block_score_indexer_cache_nvfp4(
     const __grid_constant__ NVFP4HISABlockScoreParam param) {
   // Rewritten iter1 fused-head design. The legacy kernel used
@@ -4193,6 +4754,81 @@ __global__ void hisa_block_score_indexer_cache_nvfp4(
   // Correctness is equivalent (within FP32 ordering round-off) to the
   // legacy atomicAdd version because both compute the same dot products
   // followed by sum_h fmaxf(dot[h], 0) * weight[h].
+  //
+  // ===== iter5 feasibility note: UMMA / tcgen05.mma block_score =====
+  //
+  // Goal: replace the warp-shuffle dot + per-head reduction with a
+  // single tcgen05.mma over (q_values × block_reps) on SM_100. The op
+  // shape is naturally a batched GEMM: per row, output is
+  // C[n_heads, max_blocks] = Q[n_heads, head_dim] @ R[max_blocks, head_dim]^T
+  // followed by the masked-ReLU epilogue
+  // score[block] = sum_h fmaxf(C[head, block], 0) * weights[head].
+  //
+  // Architectural fit on B200 (SM_100):
+  // - tcgen05.mma.mxfp4.mxfp4.fp32 lets us feed the NVFP4 q_values directly
+  //   without a per-CTA dequant pass; ue8m0 scales ride along via the
+  //   .scale_a/.scale_b paths described in the SM_100 PTX ISA.
+  // - The smallest m-tile for mxfp4 is m=64 — exactly the production
+  //   n_heads. One m-tile covers all heads of one row, so the m-axis is
+  //   filled without wave fragmentation.
+  // - head_dim=128 fits as k=128 inside a single tcgen05.mma group
+  //   (4 × k=32 mxfp4 tiles or 1 × k=128 with the chunked instruction).
+  // - max_blocks (= prefix/128, ~256 at 32k prefix) is the N axis. The
+  //   tcgen05.mma N-tile is configurable from N=8 up. Picking N=64 (or
+  //   N=128 if SMEM allows the larger R tile) covers 4 or 2 wave passes
+  //   per row at 32k prefix.
+  //
+  // Implementation cost (engineering, not GPU):
+  // 1. TMA descriptors for q_values and reps. q_values is contiguous
+  //    [q_rows, n_heads, kNVFP4ValueBytes]; the per-row stride is
+  //    n_heads*kNVFP4ValueBytes, OK for a 2D TMA. reps is
+  //    [batch, max_blocks, head_dim] fp32, and the per-row batch mapping
+  //    comes from token_to_batch_idx — that's an indexed access pattern
+  //    not directly supported by TMA descriptors. Two options:
+  //    (a) build a per-launch gather table on the host that resolves
+  //        (row → batch) and emits per-row reps base pointers, then
+  //        thread 0 of each row-CTA programs the descriptor;
+  //    (b) keep reps unchanged and rely on the kernel's prologue (TMA
+  //        for the [n_heads, head_dim] q-tile, manual ldgsts for
+  //        reps[batch, :, :]). (a) is faster but adds host-side
+  //        prep cost (~5-10 us per call); (b) is simpler but loses
+  //        some TMA throughput.
+  // 2. TMEM allocation (tcgen05.alloc) for the fp32 C accumulator
+  //    [m=64, N=64 or 128]. SM_100 TMEM ceiling is 256 KB per SM, far
+  //    more than the ~16-32 KB needed.
+  // 3. The masked-ReLU + weighted-sum epilogue runs on the row-CTA's
+  //    warps after tcgen05.ld pulls the fp32 dots out of TMEM. Layout:
+  //    per warp owns one N-tile slice (16 blocks); warp does
+  //    fmaxf(dot[h], 0) * weight[h] across all 64 heads via warp_sum.
+  //    1 syncthreads + 1 ldsm + 1 warp-sum chain per block-slice.
+  //
+  // Expected gain (B200 SM_100 microbench, iter5 target estimate):
+  // - Current iter1 kernel at (n_heads=64, prefix=16384, q_rows=32):
+  //   ~50 us (1024 row-block CTAs each doing 32-thread × 4-dim × 64-head
+  //   fused dot + warp-sum + weighted reduction).
+  // - tcgen05.mma m64n64k128 mxfp4.fp32 throughput at SM_100: ~3.4
+  //   PFLOPS (mxfp4) → per-MMA ~0.3 us at full utilization. Per row,
+  //   max_blocks/64 = 4 MMA waves → ~1.2 us. Epilogue ~5 us. Per-row
+  //   total ~6 us. 32 rows / 148 SMs = ~6 rows × 6 us = ~36 us.
+  // - Realistic discount for SMEM swizzle stalls + TMA descriptor
+  //   issue: ~50% utilization → ~40-45 us. Net win: ~10-15 us
+  //   (20-30%), not the 5x optimistic estimate. The m=64 row dim is
+  //   small for tensor-core throughput; an SM_100 mxfp4 m-tile is
+  //   throughput-optimal at m>=128.
+  //
+  // Risk: the host-side gather table (option 1a above) adds CPU
+  //   overhead per call. For batch=1 with index_topk_freq=4 this is
+  //   amortized away; for batch>=64 the prep cost may exceed the
+  //   savings. iter5 should A/B with the simpler (1b) variant first.
+  //
+  // Verdict for iter5: tcgen05.mma block_score is feasible but the
+  //   expected gain (~20-30%, ~10-15 us absolute) is modest. The
+  //   stronger iter5 candidates are (i) mean_pool inner-loop FMA pair
+  //   over 2 tokens per FMA (~20% mean_pool, ~30us at 64/32768);
+  //   (ii) candidate_score WMMA dot (mma.m16n8k8 fp32, replaces the
+  //   warp_sum scalar chain in Stage B, ~15-25% cand_score). Both
+  //   are simpler and have larger absolute impact than UMMA
+  //   block_score at the production shape grid.
   constexpr uint32_t kHISABlockSize = 128;
   constexpr uint32_t kMaxWarps = 8;
   constexpr uint32_t kMaxHeads = 64;
@@ -4675,6 +5311,9 @@ struct NVFP4IndexerQuantKernel {
   // iter3 vector 2: TMA-based mean_pool (cp.async.bulk per page).
   static constexpr auto mean_pool_tma_kernel =
       hisa_mean_pool_tma_indexer_cache_nvfp4<IndicesT, kPageSize>;
+  // iter4 tertiary: predecoded-scale mean_pool (fp32 scale table).
+  static constexpr auto mean_pool_predecode_kernel =
+      hisa_mean_pool_predecode_indexer_cache_nvfp4<IndicesT, kPageSize>;
   static constexpr auto candidate_score_kernel =
       hisa_candidate_score_indexer_cache_nvfp4<IndicesT, kPageSize>;
   // iter2 vector 2: tile-N candidate_score with kTileN=8 candidates per block.
@@ -4703,6 +5342,11 @@ struct NVFP4IndexerQuantKernel {
   static constexpr auto candidate_score_persistent_tilen16_kernel =
       hisa_candidate_score_persistent_indexer_cache_nvfp4<
           IndicesT, kPageSize, 16>;
+  // iter4 PRIMARY: persistent-block candidate_score with 2-stage cp.async
+  // K-row prefetch (kTileN=8 production variant).
+  static constexpr auto candidate_score_persistent_kprefetch_kernel =
+      hisa_candidate_score_persistent_kprefetch_indexer_cache_nvfp4<
+          IndicesT, kPageSize, 8>;
   static constexpr auto block_score_kernel =
       hisa_block_score_indexer_cache_nvfp4;
   static constexpr auto block_topk_kernel =
@@ -4949,6 +5593,46 @@ struct NVFP4IndexerQuantKernel {
     LaunchKernel(
         dim3(params.max_blocks, params.batch_size), 128, device_.unwrap())(
         mean_pool_tma_kernel, params);
+  }
+
+  // iter4 tertiary: predecode-scale mean_pool launcher. Same FFI as the
+  // iter2 mean_pool launcher; underlying kernel pre-decodes scales into
+  // an fp32 SMEM table and uses a branchless inner loop.
+  static void hisa_mean_pool_predecode(
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView reps) {
+    using namespace host;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto P = SymbolicSize{"page_table_stride"};
+    auto MB = SymbolicSize{"max_blocks"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({B, P}).with_dtype<IndicesT>().with_device(device_).verify(page_table);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({B, MB, kIndexerHeadDim})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(reps);
+    const auto params = NVFP4HISAMeanPoolParam{
+        .cache = cache.data_ptr(),
+        .page_table = page_table.data_ptr(),
+        .seq_lens = seq_lens.data_ptr(),
+        .reps = reps.data_ptr(),
+        .batch_size = static_cast<uint32_t>(B.unwrap()),
+        .max_blocks = static_cast<uint32_t>(MB.unwrap()),
+        .page_table_stride = static_cast<uint32_t>(P.unwrap()),
+    };
+    LaunchKernel(
+        dim3(params.max_blocks, params.batch_size), 128, device_.unwrap())(
+        mean_pool_predecode_kernel, params);
   }
 
   static void hisa_candidate_score(
@@ -5453,6 +6137,99 @@ struct NVFP4IndexerQuantKernel {
         params,
         splits_per_row_p16,
         total_tiles_p16);
+  }
+
+  // iter4 PRIMARY: persistent-block candidate_score + cp.async K-row
+  // prefetch launcher. Same FFI and same splits_per_row heuristic as the
+  // iter3 v1 persistent launcher (kTileN=8 production fast path), but
+  // dispatches into the kprefetch kernel which double-buffers raw NVFP4 K
+  // bytes via cp.async to overlap HBM K decode with Stage B/C compute.
+  static void hisa_candidate_score_persistent_kprefetch(
+      tvm::ffi::TensorView q_values,
+      tvm::ffi::TensorView q_scales,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView weights,
+      tvm::ffi::TensorView top_blocks,
+      tvm::ffi::TensorView token_to_batch_idx,
+      tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView candidate_indices) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto H = SymbolicSize{"n_heads"};
+    auto P = SymbolicSize{"page_table_stride"};
+    auto BT = SymbolicSize{"block_topk"};
+    auto B = SymbolicSize{"batch_size"};
+    auto CL = SymbolicSize{"candidate_len"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, H, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_values);
+    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({B, P}).with_dtype<IndicesT>().with_device(device_).verify(page_table);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+    TensorMatcher({Q, BT}).with_dtype<int32_t>().with_device(device_).verify(top_blocks);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(token_to_batch_idx);
+    TensorMatcher({Q, CL}).with_dtype<float>().with_device(device_).verify(logits);
+    TensorMatcher({Q, CL})
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(candidate_indices);
+    if (static_cast<uint32_t>(CL.unwrap()) !=
+        static_cast<uint32_t>(BT.unwrap()) * 128) {
+      throw std::runtime_error("candidate_len must equal block_topk * 128");
+    }
+    if (static_cast<uint32_t>(H.unwrap()) > 64) {
+      throw std::runtime_error(
+          "hisa_candidate_score_persistent_kprefetch: n_heads > 64 not "
+          "supported (smem_head_dot sized for kMaxHeads=64).");
+    }
+    const auto params = NVFP4HISACandidateScoreParam{
+        .q_values = q_values.data_ptr(),
+        .q_scales = q_scales.data_ptr(),
+        .cache = cache.data_ptr(),
+        .page_table = page_table.data_ptr(),
+        .seq_lens = seq_lens.data_ptr(),
+        .weights = weights.data_ptr(),
+        .top_blocks = top_blocks.data_ptr(),
+        .token_to_batch_idx = token_to_batch_idx.data_ptr(),
+        .logits = logits.data_ptr(),
+        .candidate_indices = candidate_indices.data_ptr(),
+        .q_rows = static_cast<uint32_t>(Q.unwrap()),
+        .n_heads = static_cast<uint32_t>(H.unwrap()),
+        .block_topk = static_cast<uint32_t>(BT.unwrap()),
+        .page_table_stride = static_cast<uint32_t>(P.unwrap()),
+    };
+    constexpr uint32_t kTileN_kprefetch = 8;
+    const uint32_t candidate_len_kp = params.block_topk * 128;
+    const uint32_t total_tiles_kp =
+        (candidate_len_kp + kTileN_kprefetch - 1) / kTileN_kprefetch;
+    // Reuse the iter3 v1 splits_per_row heuristic: ~32 tiles per CTA so
+    // Q amortization dominates but active-CTA count stays high. iter4's
+    // K prefetch is per-tile so the same partition shape applies.
+    constexpr uint32_t kTargetTilesPerCTA_kp = 32;
+    uint32_t splits_per_row_kp =
+        (total_tiles_kp + kTargetTilesPerCTA_kp - 1) / kTargetTilesPerCTA_kp;
+    if (splits_per_row_kp < 1) splits_per_row_kp = 1;
+    if (splits_per_row_kp > total_tiles_kp) splits_per_row_kp = total_tiles_kp;
+    LaunchKernel(
+        dim3(splits_per_row_kp, params.q_rows),
+        256,
+        device_.unwrap())(
+        candidate_score_persistent_kprefetch_kernel,
+        params,
+        splits_per_row_kp,
+        total_tiles_kp);
   }
 
   static void hisa_block_score(

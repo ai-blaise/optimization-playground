@@ -213,7 +213,26 @@ class LogitsMetadata:
 
     def compute_dp_attention_metadata(self):
 
-        cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
+        # B200 SM_100 workaround: torch.cumsum on shape (dp_size,) int64
+        # raises cudaErrorInvalidConfiguration in eager mode (the small-shape
+        # scan kernel launch config is invalid on Blackwell). Inside cuda
+        # graph capture the same op succeeds, so we keep the GPU path there.
+        # Outside capture, fall back to a Python prefix sum on the CPU mirror
+        # and re-materialize on device. dp_size <= 8 so the cost is negligible.
+        _src = self.global_num_tokens_for_logprob_gpu
+        if torch.cuda.is_current_stream_capturing():
+            cumtokens = torch.cumsum(_src, dim=0)
+        else:
+            _src_cpu_list = self.global_num_tokens_for_logprob_cpu
+            if _src_cpu_list is None:
+                cumtokens = torch.cumsum(_src, dim=0)
+            else:
+                _acc = 0
+                _prefix = []
+                for _v in _src_cpu_list:
+                    _acc += int(_v)
+                    _prefix.append(_acc)
+                cumtokens = torch.tensor(_prefix, dtype=_src.dtype, device=_src.device)
         dp_rank = get_attention_dp_rank()
         if dp_rank == 0:
             dp_local_start_pos = torch.zeros_like(

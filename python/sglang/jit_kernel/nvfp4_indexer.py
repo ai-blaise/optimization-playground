@@ -345,6 +345,15 @@ def _jit_nvfp4_indexer_module(
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool_predecode",
             ),
             (
+                # iter5 SECONDARY: predecoded-scale mean_pool with
+                # transposed scales SMEM + 2-iter FMA pair. Hot loop
+                # reads 2 scales per LDS.b64 and runs two parallel fp32
+                # accumulators for ILP. Bit-identical to iter4 modulo
+                # accumulation order.
+                "hisa_mean_pool_predecode_fma2_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool_predecode_fma2",
+            ),
+            (
                 "hisa_candidate_score_indexer_cache_nvfp4",
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score",
             ),
@@ -702,6 +711,43 @@ def hisa_mean_pool_predecode_indexer_cache_nvfp4(
     _get_module_fast(
         torch.bfloat16, page_table.dtype, page_size
     ).hisa_mean_pool_predecode_indexer_cache_nvfp4(
+        index_k_with_scale, page_table, seq_lens.to(torch.int32), reps
+    )
+    return reps
+
+
+@debug_kernel_api
+def hisa_mean_pool_predecode_fma2_indexer_cache_nvfp4(
+    index_k_with_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_blocks: int,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """iter5 SECONDARY: predecoded-scale mean_pool with 2-iter FMA pair.
+
+    Strict superset of the iter4 predecode kernel: same page staging, same
+    scale predecode pass, but the scales SMEM is transposed to
+    [scale_group][token-local] so the hot per-dim inner loop walks a
+    contiguous 128-fp32 row and can LDS.b64 two scales per issue.  The
+    inner loop processes two tokens per iter into two separate fp32
+    accumulators, exposing more ILP to the SM_100 schedulers (4 FFMA/
+    cycle).  Bit-identical to iter4 modulo accumulation order.
+    """
+    if not index_k_with_scale.is_contiguous():
+        index_k_with_scale = index_k_with_scale.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
+    reps = torch.empty(
+        (page_table.shape[0], max_blocks, 128),
+        dtype=torch.float32,
+        device=index_k_with_scale.device,
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_mean_pool_predecode_fma2_indexer_cache_nvfp4(
         index_k_with_scale, page_table, seq_lens.to(torch.int32), reps
     )
     return reps

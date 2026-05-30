@@ -446,24 +446,11 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
     dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
-        # B200 SM_100 workaround: see compute_dp_attention_metadata in
-        # logits_processor.py for full rationale. cumsum on (dp_size,) int64
-        # crashes outside capture; CPU prefix sum fallback when the CPU
-        # mirror is available.
+        # B200 SM_100 workaround: float32-cast cumsum (always; works in
+        # both eager and PCG capture). See compute_dp_attention_metadata
+        # in logits_processor.py for rationale.
         _src = forward_batch.global_num_tokens_gpu
-        if torch.cuda.is_current_stream_capturing():
-            cumtokens = torch.cumsum(_src.to(torch.float32), dim=0).to(_src.dtype)
-        else:
-            _src_cpu = forward_batch.global_num_tokens_cpu
-            if _src_cpu is None:
-                cumtokens = torch.cumsum(_src.to(torch.float32), dim=0).to(_src.dtype)
-            else:
-                _acc = 0
-                _prefix = []
-                for _v in _src_cpu:
-                    _acc += int(_v)
-                    _prefix.append(_acc)
-                cumtokens = torch.tensor(_prefix, dtype=_src.dtype, device=_src.device)
+        cumtokens = torch.cumsum(_src.to(torch.float32), dim=0).to(_src.dtype)
         if dp_rank == 0:
             local_start_pos = torch.zeros_like(cumtokens[0])
         else:
@@ -548,17 +535,10 @@ def _dp_gather_via_all_reduce(
     # global_tokens has shape (0, hidden_size); skip fill_ + all_reduce.
     if global_tokens.numel() == 0:
         return
-    # DEBUG instrument: log shape/dtype before potentially-failing fill_(0).
-    try:
-        import os as _os
-        _f = open("/dev/shm/blaise_dp_debug.log", "a")
-        _rank = _os.environ.get("RANK", "?")
-        _f.write(f"[gather_all_reduce rank={_rank}] global_tokens.shape={tuple(global_tokens.shape)} dtype={global_tokens.dtype} numel={global_tokens.numel()} local_tokens.shape={tuple(local_tokens.shape)} dtype={local_tokens.dtype}\n")
-        _f.flush()
-        _f.close()
-    except Exception:
-        pass
-    global_tokens.fill_(0)
+    # B200 SM_100 workaround: fill_(0) on this shape hits
+    # cudaErrorInvalidConfiguration when the captured graph replays it.
+    # mul_(0) dispatches to a different in-place op kernel that works.
+    global_tokens.mul_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
@@ -603,7 +583,8 @@ def _dp_gather_via_all_gather(
 
     if not is_partial:
         if get_attention_tp_rank() != 0 and local_tokens.numel() > 0:
-            local_tokens.fill_(0)
+            # B200 SM_100 workaround: see _dp_gather_via_all_reduce.
+            local_tokens.mul_(0)
     scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
     ]
@@ -739,7 +720,8 @@ def dp_scatter(
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    local_tokens.fill_(0)
+    # B200 SM_100 workaround: see _dp_gather_via_all_reduce.
+    local_tokens.mul_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:

@@ -53,7 +53,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.compilation.piecewise_context_manager import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported
 
 if TYPE_CHECKING:

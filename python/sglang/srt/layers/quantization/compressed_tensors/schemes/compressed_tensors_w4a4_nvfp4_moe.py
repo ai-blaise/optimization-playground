@@ -14,7 +14,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
@@ -49,6 +53,15 @@ _USE_SGL_NVFP4_QUANT_LINEAR = (
 # consume it and skip the redundant `fp4_quantize` call; otherwise the
 # original `_USE_SGL_NVFP4_QUANT_LINEAR` / flashinfer path runs.
 
+# Honor the MoE NVFP4-dispatch env at module load (default 0). When set
+# alongside DeepEP a2a, the dispatcher is instructed to return NVFP4-packed
+# hidden_states + e4m3 block-scale tensors instead of bf16, which halves
+# the dispatch bandwidth and lets the per-expert masked GEMM skip its
+# internal quantize. Mirrors the modelopt scheme's MOE_NVFP4_DISPATCH wire
+# (modelopt_quant.py:274) so the two NVFP4 schemes stay observationally
+# consistent under the same env.
+_MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -66,7 +79,27 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 " above."
             )
         self.group_size = 16
-        self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
+        self._is_deepep = get_moe_a2a_backend().is_deepep()
+        # The trtllm fast path (`trtllm_fp4_block_scale_moe`) does internal
+        # routing on a single rank and ingests un-dispatched tokens; it is
+        # mutually exclusive with DeepEP, which pre-dispatches tokens into
+        # per-local-expert buckets. When DeepEP is enabled we force the
+        # cutlass weight layout (swizzled blockscales + per-expert alphas)
+        # so the DeepEP-LL apply path can drive `flashinfer_cutedsl_moe_masked`
+        # without an extra weight reshuffle. The runner backend the user
+        # passes (e.g. `flashinfer_cutlass`) does not change weight prep
+        # here — only the apply-path branch.
+        self.use_flashinfer_trtllm = (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            and not self._is_deepep
+        )
+        if self._is_deepep and get_moe_runner_backend().is_flashinfer_trtllm():
+            logger.warning_once(
+                "CompressedTensorsW4A4Nvfp4MoE: flashinfer_trtllm runner is "
+                "incompatible with DeepEP a2a (the trtllm kernel does internal "
+                "routing). Forcing cutlass weight layout + flashinfer cutedsl "
+                "masked-GEMM apply path."
+            )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -311,6 +344,24 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 hidden_size=layer.w13_weight.shape[2] * 2,
             )
 
+        # When DeepEP is enabled, wire the dispatcher to either NVFP4-quantize
+        # activations in-flight (saves bandwidth) or hand bf16 hidden_states to
+        # the per-expert masked GEMM. The flashinfer cutedsl moe masked kernel
+        # handles both shapes — see ``apply_weights`` DeepEP-LL branch.
+        if self._is_deepep and hasattr(layer, "dispatcher"):
+            if _MOE_NVFP4_DISPATCH:
+                # Matches modelopt_quant.py:1875 — DeepEP pre-quantizes
+                # activations using ``layer.w13_input_scale_quant``.
+                layer.dispatcher.set_quant_config(
+                    {"input_global_scale": layer.w13_input_scale_quant}
+                )
+            else:
+                # bf16 dispatch; per-expert kernel quantizes internally via
+                # ``scaled_fp4_grouped_quantize`` (see flashinfer_cutedsl_moe.py).
+                layer.dispatcher.set_quant_config(
+                    {"dispatcher_output_dtype": "bf16"}
+                )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -324,6 +375,26 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        # DeepEP a2a branch — the dispatch_output is a DeepEPLLDispatchOutput
+        # (or DeepEPNormalDispatchOutput) NamedTuple, *not* a StandardDispatchOutput
+        # with `.topk_output`. Routing is already complete on the host side; we
+        # only need the per-expert NVFP4 BMM + activation + downproj. Delegate
+        # to the dedicated handler so we don't trip on `dispatch_output.topk_output`
+        # below for the standard path.
+        if dispatch_output.format.is_deepep_ll():
+            return self._apply_weights_deepep_ll(layer, dispatch_output)
+        if dispatch_output.format.is_deepep_normal():
+            # The masked-GEMM path requires DeepEP-LL's `[num_local_experts, m, k]`
+            # layout. Normal-mode DeepEP returns a flat `[N, k]` packed tensor
+            # plus `num_recv_tokens_per_expert` (List[int]) — supporting it
+            # would need a custom grouped-GEMM with cumulative offsets which
+            # we do not have here. Surface a clear error so the operator can
+            # switch to LL mode.
+            raise NotImplementedError(
+                "DeepEP normal mode is not supported by "
+                "CompressedTensorsW4A4Nvfp4MoE; use --deepep-mode low_latency."
+            )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -474,3 +545,83 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             ).to(x.dtype)
 
         return StandardCombineInput(hidden_states=output)
+
+    def _apply_weights_deepep_ll(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output,
+    ):
+        """Per-local-expert NVFP4 MoE for the DeepEP low-latency a2a backend.
+
+        DeepEP-LL hands the rank a buffer pre-bucketed into local experts:
+            hidden_states: [num_local_experts, max_m, k]  (bf16, or uint8 FP4 when
+                NVFP4 dispatch is enabled — then `hidden_states_scale` is e4m3)
+            masked_m: [num_local_experts] int32 — actual token count per expert
+        Routing (`topk_ids` / `topk_weights`) is already computed; the combine
+        step on the way out re-aggregates per-token via DeepEP.
+
+        We pipe this straight into ``flashinfer_cutedsl_moe_masked``: it runs
+        two grouped masked NVFP4 GEMMs (W13 + SiLU·Mul + W2) with the
+        layer's swizzled blockscales and per-expert alphas, exactly the
+        weights the cutlass branch of ``process_weights_after_loading`` lays
+        out. Returns a ``DeepEPLLCombineInput`` so the dispatcher combine
+        path is a drop-in.
+        """
+        from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
+            flashinfer_cutedsl_moe_masked,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import DeepEPLLCombineInput
+
+        assert not self.use_flashinfer_trtllm, (
+            "DeepEP path requires cutlass weight layout (swizzled blockscales). "
+            "use_flashinfer_trtllm should have been forced False in __init__."
+        )
+
+        hidden_states = dispatch_output.hidden_states
+        hidden_states_scale = dispatch_output.hidden_states_scale
+        masked_m = dispatch_output.masked_m
+
+        # When DeepEP pre-quantized to NVFP4, ``hidden_states_scale`` is non-None
+        # and ``input_global_scale`` should be None (kernel skips its internal
+        # quantize). When DeepEP dispatched bf16, ``hidden_states_scale`` is None
+        # and we hand the kernel the per-expert global scale so it can call
+        # ``scaled_fp4_grouped_quantize`` internally.
+        use_nvfp4_dispatch = hidden_states_scale is not None
+        input_global_scale = (
+            None if use_nvfp4_dispatch else layer.w13_input_scale_quant
+        )
+
+        # The kernel reads ``hidden_states[1].view(float8_e4m3fn)`` directly —
+        # if DeepEP returned an int32-packed UE8M0 layout (FP8-DeepGEMM
+        # specific), .view would mis-stride the tensor. Same guard as
+        # modelopt's deepep cutedsl path.
+        if (
+            use_nvfp4_dispatch
+            and hidden_states_scale.element_size() != 1
+            and hidden_states_scale.stride(-1) != 1
+        ):
+            raise AssertionError(
+                f"NVFP4 dispatch scale has stride(-1)={hidden_states_scale.stride(-1)}, "
+                f"dtype={hidden_states_scale.dtype}; "
+                ".view(float8_e4m3fn) requires stride(-1)==1. "
+                "Try SGLANG_MOE_NVFP4_DISPATCH=0 or check DeepEP version."
+            )
+
+        output = flashinfer_cutedsl_moe_masked(
+            hidden_states=(hidden_states, hidden_states_scale),
+            input_global_scale=input_global_scale,
+            w1=layer.w13_weight,
+            w1_blockscale=layer.w13_weight_scale,
+            w1_alpha=layer.g1_alphas,
+            w2=layer.w2_weight,
+            a2_global_scale=layer.w2_input_scale_quant,
+            w2_blockscale=layer.w2_weight_scale,
+            w2_alpha=layer.g2_alphas,
+            masked_m=masked_m,
+        )
+
+        return DeepEPLLCombineInput(
+            hidden_states=output,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )

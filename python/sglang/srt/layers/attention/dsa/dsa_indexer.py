@@ -26,6 +26,7 @@ from sglang.jit_kernel.nvfp4_indexer import (
 )
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
+    get_token_to_kv_pool,
     is_in_piecewise_cuda_graph,
 )
 from sglang.srt.environ import envs
@@ -664,7 +665,7 @@ class Indexer(MultiPlatformOp):
     @staticmethod
     def _uses_nvfp4_indexer(forward_batch: ForwardBatch) -> bool:
         return (
-            getattr(forward_batch.token_to_kv_pool, "indexer_quantization", None)
+            getattr(get_token_to_kv_pool(), "indexer_quantization", None)
             == INDEXER_NVFP4_QUANT_METHOD
         )
 
@@ -679,7 +680,7 @@ class Indexer(MultiPlatformOp):
         if not can_use_dsa_nvfp4_indexer(
             query.dtype,
             forward_batch.out_cache_loc.dtype,
-            forward_batch.token_to_kv_pool.page_size,
+            get_token_to_kv_pool().page_size,
         ):
             raise RuntimeError(
                 "DSA Indexer NVFP4 was requested but the Blackwell NVFP4 "
@@ -688,7 +689,7 @@ class Indexer(MultiPlatformOp):
         q_values, q_scales = quantize_indexer_q_nvfp4(
             query,
             indices_dtype=forward_batch.out_cache_loc.dtype,
-            page_size=forward_batch.token_to_kv_pool.page_size,
+            page_size=get_token_to_kv_pool().page_size,
         )
         return (q_values, q_scales), None
 
@@ -1088,7 +1089,7 @@ class Indexer(MultiPlatformOp):
         block_kv = page_size
         num_heads_kv = 1
         head_dim_with_sf = (
-            forward_batch.token_to_kv_pool.indexer_cache_layout.token_bytes
+            get_token_to_kv_pool().indexer_cache_layout.token_bytes
         )
         kv_cache_fp8 = kv_cache_fp8.view(
             kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
@@ -1755,7 +1756,7 @@ class Indexer(MultiPlatformOp):
 
         if hisa_extend_ok and q_offset >= hisa_boundary_q:
             index_k_with_scale_buffer = (
-                forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                get_token_to_kv_pool().get_index_k_with_scale_buffer(
                     layer_id=layer_id
                 )
             )
@@ -1786,7 +1787,7 @@ class Indexer(MultiPlatformOp):
 
         if hisa_nvfp4_extend_ok:
             index_k_with_scale_buffer = (
-                forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                get_token_to_kv_pool().get_index_k_with_scale_buffer(
                     layer_id=layer_id
                 )
             )
@@ -2367,7 +2368,7 @@ class Indexer(MultiPlatformOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
 
-        pool = forward_batch.token_to_kv_pool
+        pool = get_token_to_kv_pool()
         if not pool.layersplit_owns_layer(layer_id):
             pool.prefetch_layersplit_index_k_with_scale_buffer(layer_id)
             return
@@ -2398,7 +2399,7 @@ class Indexer(MultiPlatformOp):
             get_global_server_args(),
             key.dtype,
             forward_batch.out_cache_loc.dtype,
-            forward_batch.token_to_kv_pool.page_size,
+            get_token_to_kv_pool().page_size,
             auto_compat_check=can_use_dsa_fused_store,
             auto_platform_ok=_is_cuda and (not _is_fp8_fnuz),
         ):

@@ -53,6 +53,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.compilation.piecewise_context_manager import get_token_to_kv_pool
 from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported
 
 if TYPE_CHECKING:
@@ -1567,7 +1568,7 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode.is_target_verify()
             and dsa_impl == "flashmla_kv"
             and getattr(
-                forward_batch.token_to_kv_pool,
+                get_token_to_kv_pool(),
                 "higgs_dense_2bit_preset",
                 None,
             )
@@ -1576,7 +1577,7 @@ class DeepseekSparseAttnBackend(
             and page_table_1.is_cuda
             and page_table_1.dtype == torch.int32
         ):
-            return forward_batch.token_to_kv_pool.forward_higgs_dense_2bit_mla_decode(
+            return get_token_to_kv_pool().forward_higgs_dense_2bit_mla_decode(
                 layer.layer_id,
                 q_nope,
                 q_rope,
@@ -1588,13 +1589,13 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode.is_target_verify()
             and dsa_impl == "flashmla_kv"
             and getattr(
-                forward_batch.token_to_kv_pool,
+                get_token_to_kv_pool(),
                 "turboquant_execution_mode",
                 None,
             )
             == "fused_decode"
             and getattr(
-                forward_batch.token_to_kv_pool,
+                get_token_to_kv_pool(),
                 "turboquant_dense_kv_preset",
                 None,
             )
@@ -1603,7 +1604,7 @@ class DeepseekSparseAttnBackend(
             and page_table_1.is_cuda
             and page_table_1.dtype == torch.int32
         ):
-            return forward_batch.token_to_kv_pool.forward_turboquant_dense_mla_decode(
+            return get_token_to_kv_pool().forward_turboquant_dense_mla_decode(
                 layer.layer_id,
                 q_nope,
                 q_rope,
@@ -1616,7 +1617,7 @@ class DeepseekSparseAttnBackend(
             or dsa_impl == "tokenspeed_mla"
         ) and (
             getattr(
-                forward_batch.token_to_kv_pool,
+                get_token_to_kv_pool(),
                 "higgs_dense_2bit_preset",
                 None,
             )
@@ -1624,7 +1625,7 @@ class DeepseekSparseAttnBackend(
             and topk_transform_method == TopkTransformMethod.PAGED
         ):
             kv_cache, page_table_1 = (
-                forward_batch.token_to_kv_pool.get_higgs_selected_kv_buffer(
+                get_token_to_kv_pool().get_higgs_selected_kv_buffer(
                     layer.layer_id,
                     page_table_1,
                     fp8_layout=dsa_impl == "flashmla_kv",
@@ -1635,7 +1636,7 @@ class DeepseekSparseAttnBackend(
             or dsa_impl == "tokenspeed_mla"
         ) and (
             getattr(
-                forward_batch.token_to_kv_pool,
+                get_token_to_kv_pool(),
                 "turboquant_execution_mode",
                 None,
             )
@@ -1643,14 +1644,14 @@ class DeepseekSparseAttnBackend(
             and topk_transform_method == TopkTransformMethod.PAGED
         ):
             kv_cache, page_table_1 = (
-                forward_batch.token_to_kv_pool.get_turboquant_selected_kv_buffer(
+                get_token_to_kv_pool().get_turboquant_selected_kv_buffer(
                     layer.layer_id,
                     page_table_1,
                     fp8_layout=dsa_impl == "flashmla_kv",
                 )
             )
         else:
-            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cache = get_token_to_kv_pool().get_key_buffer(layer.layer_id)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -1831,7 +1832,7 @@ class DeepseekSparseAttnBackend(
         if (
             self.dsa_decode_impl == "flashmla_kv"
             and getattr(
-                forward_batch.token_to_kv_pool,
+                get_token_to_kv_pool(),
                 "higgs_dense_2bit_preset",
                 None,
             )
@@ -1840,7 +1841,7 @@ class DeepseekSparseAttnBackend(
             and page_table_1.is_cuda
             and page_table_1.dtype == torch.int32
         ):
-            return forward_batch.token_to_kv_pool.forward_higgs_dense_2bit_mla_decode(
+            return get_token_to_kv_pool().forward_higgs_dense_2bit_mla_decode(
                 layer.layer_id,
                 q_nope,
                 q_rope,
@@ -1851,13 +1852,13 @@ class DeepseekSparseAttnBackend(
         if (
             self.dsa_decode_impl == "flashmla_kv"
             and getattr(
-                forward_batch.token_to_kv_pool,
+                get_token_to_kv_pool(),
                 "turboquant_execution_mode",
                 None,
             )
             == "fused_decode"
             and getattr(
-                forward_batch.token_to_kv_pool,
+                get_token_to_kv_pool(),
                 "turboquant_dense_kv_preset",
                 None,
             )
@@ -1866,7 +1867,7 @@ class DeepseekSparseAttnBackend(
             and page_table_1.is_cuda
             and page_table_1.dtype == torch.int32
         ):
-            return forward_batch.token_to_kv_pool.forward_turboquant_dense_mla_decode(
+            return get_token_to_kv_pool().forward_turboquant_dense_mla_decode(
                 layer.layer_id,
                 q_nope,
                 q_rope,
@@ -1878,14 +1879,14 @@ class DeepseekSparseAttnBackend(
             self.dsa_decode_impl
             in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang", "tokenspeed_mla")
             and getattr(
-                forward_batch.token_to_kv_pool,
+                get_token_to_kv_pool(),
                 "higgs_dense_2bit_preset",
                 None,
             )
             == "eden2_16"
         ):
             kv_cache, page_table_1 = (
-                forward_batch.token_to_kv_pool.get_higgs_selected_kv_buffer(
+                get_token_to_kv_pool().get_higgs_selected_kv_buffer(
                     layer.layer_id,
                     page_table_1,
                     fp8_layout=self.dsa_decode_impl == "flashmla_kv",
@@ -1895,21 +1896,21 @@ class DeepseekSparseAttnBackend(
             self.dsa_decode_impl
             in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang", "tokenspeed_mla")
             and getattr(
-                forward_batch.token_to_kv_pool,
+                get_token_to_kv_pool(),
                 "turboquant_execution_mode",
                 None,
             )
             == "fused_decode"
         ):
             kv_cache, page_table_1 = (
-                forward_batch.token_to_kv_pool.get_turboquant_selected_kv_buffer(
+                get_token_to_kv_pool().get_turboquant_selected_kv_buffer(
                     layer.layer_id,
                     page_table_1,
                     fp8_layout=self.dsa_decode_impl == "flashmla_kv",
                 )
             )
         else:
-            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cache = get_token_to_kv_pool().get_key_buffer(layer.layer_id)
 
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:

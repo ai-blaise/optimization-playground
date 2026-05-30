@@ -4754,6 +4754,81 @@ __global__ void hisa_block_score_indexer_cache_nvfp4(
   // Correctness is equivalent (within FP32 ordering round-off) to the
   // legacy atomicAdd version because both compute the same dot products
   // followed by sum_h fmaxf(dot[h], 0) * weight[h].
+  //
+  // ===== iter5 feasibility note: UMMA / tcgen05.mma block_score =====
+  //
+  // Goal: replace the warp-shuffle dot + per-head reduction with a
+  // single tcgen05.mma over (q_values × block_reps) on SM_100. The op
+  // shape is naturally a batched GEMM: per row, output is
+  // C[n_heads, max_blocks] = Q[n_heads, head_dim] @ R[max_blocks, head_dim]^T
+  // followed by the masked-ReLU epilogue
+  // score[block] = sum_h fmaxf(C[head, block], 0) * weights[head].
+  //
+  // Architectural fit on B200 (SM_100):
+  // - tcgen05.mma.mxfp4.mxfp4.fp32 lets us feed the NVFP4 q_values directly
+  //   without a per-CTA dequant pass; ue8m0 scales ride along via the
+  //   .scale_a/.scale_b paths described in the SM_100 PTX ISA.
+  // - The smallest m-tile for mxfp4 is m=64 — exactly the production
+  //   n_heads. One m-tile covers all heads of one row, so the m-axis is
+  //   filled without wave fragmentation.
+  // - head_dim=128 fits as k=128 inside a single tcgen05.mma group
+  //   (4 × k=32 mxfp4 tiles or 1 × k=128 with the chunked instruction).
+  // - max_blocks (= prefix/128, ~256 at 32k prefix) is the N axis. The
+  //   tcgen05.mma N-tile is configurable from N=8 up. Picking N=64 (or
+  //   N=128 if SMEM allows the larger R tile) covers 4 or 2 wave passes
+  //   per row at 32k prefix.
+  //
+  // Implementation cost (engineering, not GPU):
+  // 1. TMA descriptors for q_values and reps. q_values is contiguous
+  //    [q_rows, n_heads, kNVFP4ValueBytes]; the per-row stride is
+  //    n_heads*kNVFP4ValueBytes, OK for a 2D TMA. reps is
+  //    [batch, max_blocks, head_dim] fp32, and the per-row batch mapping
+  //    comes from token_to_batch_idx — that's an indexed access pattern
+  //    not directly supported by TMA descriptors. Two options:
+  //    (a) build a per-launch gather table on the host that resolves
+  //        (row → batch) and emits per-row reps base pointers, then
+  //        thread 0 of each row-CTA programs the descriptor;
+  //    (b) keep reps unchanged and rely on the kernel's prologue (TMA
+  //        for the [n_heads, head_dim] q-tile, manual ldgsts for
+  //        reps[batch, :, :]). (a) is faster but adds host-side
+  //        prep cost (~5-10 us per call); (b) is simpler but loses
+  //        some TMA throughput.
+  // 2. TMEM allocation (tcgen05.alloc) for the fp32 C accumulator
+  //    [m=64, N=64 or 128]. SM_100 TMEM ceiling is 256 KB per SM, far
+  //    more than the ~16-32 KB needed.
+  // 3. The masked-ReLU + weighted-sum epilogue runs on the row-CTA's
+  //    warps after tcgen05.ld pulls the fp32 dots out of TMEM. Layout:
+  //    per warp owns one N-tile slice (16 blocks); warp does
+  //    fmaxf(dot[h], 0) * weight[h] across all 64 heads via warp_sum.
+  //    1 syncthreads + 1 ldsm + 1 warp-sum chain per block-slice.
+  //
+  // Expected gain (B200 SM_100 microbench, iter5 target estimate):
+  // - Current iter1 kernel at (n_heads=64, prefix=16384, q_rows=32):
+  //   ~50 us (1024 row-block CTAs each doing 32-thread × 4-dim × 64-head
+  //   fused dot + warp-sum + weighted reduction).
+  // - tcgen05.mma m64n64k128 mxfp4.fp32 throughput at SM_100: ~3.4
+  //   PFLOPS (mxfp4) → per-MMA ~0.3 us at full utilization. Per row,
+  //   max_blocks/64 = 4 MMA waves → ~1.2 us. Epilogue ~5 us. Per-row
+  //   total ~6 us. 32 rows / 148 SMs = ~6 rows × 6 us = ~36 us.
+  // - Realistic discount for SMEM swizzle stalls + TMA descriptor
+  //   issue: ~50% utilization → ~40-45 us. Net win: ~10-15 us
+  //   (20-30%), not the 5x optimistic estimate. The m=64 row dim is
+  //   small for tensor-core throughput; an SM_100 mxfp4 m-tile is
+  //   throughput-optimal at m>=128.
+  //
+  // Risk: the host-side gather table (option 1a above) adds CPU
+  //   overhead per call. For batch=1 with index_topk_freq=4 this is
+  //   amortized away; for batch>=64 the prep cost may exceed the
+  //   savings. iter5 should A/B with the simpler (1b) variant first.
+  //
+  // Verdict for iter5: tcgen05.mma block_score is feasible but the
+  //   expected gain (~20-30%, ~10-15 us absolute) is modest. The
+  //   stronger iter5 candidates are (i) mean_pool inner-loop FMA pair
+  //   over 2 tokens per FMA (~20% mean_pool, ~30us at 64/32768);
+  //   (ii) candidate_score WMMA dot (mma.m16n8k8 fp32, replaces the
+  //   warp_sum scalar chain in Stage B, ~15-25% cand_score). Both
+  //   are simpler and have larger absolute impact than UMMA
+  //   block_score at the production shape grid.
   constexpr uint32_t kHISABlockSize = 128;
   constexpr uint32_t kMaxWarps = 8;
   constexpr uint32_t kMaxHeads = 64;

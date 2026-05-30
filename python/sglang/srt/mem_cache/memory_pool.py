@@ -3561,12 +3561,33 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
         # for back-compat (no behavior change when the iter5 env flag
         # is off). When the env flag is on, both slots [0] and [1] are
         # populated lazily on first access.
-        self._higgs_selected_buffer_pp: list[Optional[torch.Tensor]] = [None, None]
+        # ai-blaise #19 iter7 (tertiary vector): depth-4 ping-pong. The
+        # iter5 depth-2 design broke same-buffer aliasing between layer
+        # N and N+1 only; back-to-back trtllm-gen kernels on the iter6
+        # dedicated trtllm-gen stream still serialize because a single
+        # stream is a strict FIFO. With depth-4 + a second dedicated
+        # trtllm-gen stream (iter7 backend wiring), layer N (slot 0)
+        # and layer N+1 (slot 1) overlap on streams A/B; layer N+2
+        # (slot 2) reuses stream A only after N's trtllm-gen drains.
+        # Slots indexed by ``layer_id & 3``; legacy parity=0 callers
+        # still hit the singleton attrs above so iter5/iter6 paths are
+        # bit-for-bit unchanged when SGLANG_HIGGS_DSA_TRTLLM_PINGPONG_DEPTH4
+        # is off.
+        self._higgs_selected_buffer_pp: list[Optional[torch.Tensor]] = [
+            None,
+            None,
+            None,
+            None,
+        ]
         self._higgs_selected_buffer_fp8_pp: list[Optional[torch.Tensor]] = [
+            None,
+            None,
             None,
             None,
         ]
         self._higgs_compact_page_table_pp: list[Optional[torch.Tensor]] = [
+            None,
+            None,
             None,
             None,
         ]
@@ -3642,6 +3663,12 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
         a parity; the layer-driven parity comes from the call site in
         :class:`DeepseekSparseAttnBackend._forward_trtllm` and is
         guarded by ``envs.SGLANG_HIGGS_DSA_TRTLLM_PINGPONG``.
+
+        ai-blaise #19 iter7 (tertiary vector) extension: when
+        ``SGLANG_HIGGS_DSA_TRTLLM_PINGPONG_DEPTH4`` is also on, the
+        callsite passes ``slot_parity = layer_id & 3`` and parities
+        2/3 route to ``_pp[2]`` / ``_pp[3]`` slots. Parity 0 still
+        maps to the singleton attrs (back-compat).
         """
         if not self._uses_higgs_layer(layer_id):
             layer_buffer = self._get_layersplit_kv_buffer(layer_id)
@@ -3654,12 +3681,16 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
             and page_table.dtype == torch.int32
             and page_table.is_contiguous()
         ):
-            # ai-blaise #19 iter5: select the ping-pong slot. ``parity=0``
-            # callers (legacy) keep using the original ``_higgs_*``
-            # singleton attrs so the iter3/iter4 paths are bit-for-bit
-            # unchanged when ``SGLANG_HIGGS_DSA_TRTLLM_PINGPONG`` is off.
-            # ``parity=1`` always routes to the ``_pp[1]`` slot.
-            parity = int(slot_parity) & 1
+            # ai-blaise #19 iter5/iter7: select the ping-pong slot.
+            # ``parity=0`` callers (legacy + iter5-style depth-2 even
+            # parity) keep using the original ``_higgs_*`` singleton
+            # attrs so the iter3/iter4 paths are bit-for-bit unchanged
+            # when ``SGLANG_HIGGS_DSA_TRTLLM_PINGPONG`` is off.
+            # ``parity=1`` routes to ``_pp[1]`` (iter5 odd-layer slot).
+            # ``parity=2`` / ``parity=3`` route to ``_pp[2]`` / ``_pp[3]``
+            # (iter7 depth-4 slots), only used when
+            # ``SGLANG_HIGGS_DSA_TRTLLM_PINGPONG_DEPTH4`` is on.
+            parity = int(slot_parity) & 3
             if parity == 0:
                 compact_pt = self._higgs_compact_page_table
                 if (
@@ -3669,13 +3700,13 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
                     compact_pt = torch.empty_like(page_table)
                     self._higgs_compact_page_table = compact_pt
             else:
-                compact_pt = self._higgs_compact_page_table_pp[1]
+                compact_pt = self._higgs_compact_page_table_pp[parity]
                 if (
                     compact_pt is None
                     or compact_pt.shape != page_table.shape
                 ):
                     compact_pt = torch.empty_like(page_table)
-                    self._higgs_compact_page_table_pp[1] = compact_pt
+                    self._higgs_compact_page_table_pp[parity] = compact_pt
             if fp8_layout:
                 # FP8 fast path: half the HBM traffic (576 vs 1152 B/row).
                 if parity == 0:
@@ -3691,7 +3722,7 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
                         )
                         self._higgs_selected_buffer_fp8 = sel_buf
                 else:
-                    sel_buf = self._higgs_selected_buffer_fp8_pp[1]
+                    sel_buf = self._higgs_selected_buffer_fp8_pp[parity]
                     if (
                         sel_buf is None
                         or sel_buf.shape[0] < page_table.numel()
@@ -3701,7 +3732,7 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
                             dtype=torch.float8_e4m3fn,
                             device=self.device,
                         )
-                        self._higgs_selected_buffer_fp8_pp[1] = sel_buf
+                        self._higgs_selected_buffer_fp8_pp[parity] = sel_buf
                 kv_cache = sel_buf[: page_table.numel()]
                 dequantize_higgs_dense_2bit_page_table_fp8(
                     layer_buffer,
@@ -3725,7 +3756,7 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
                     )
                     self._higgs_selected_buffer = sel_buf
             else:
-                sel_buf = self._higgs_selected_buffer_pp[1]
+                sel_buf = self._higgs_selected_buffer_pp[parity]
                 if (
                     sel_buf is None
                     or sel_buf.shape[0] < page_table.numel()
@@ -3735,7 +3766,7 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
                         dtype=self.dtype,
                         device=self.device,
                     )
-                    self._higgs_selected_buffer_pp[1] = sel_buf
+                    self._higgs_selected_buffer_pp[parity] = sel_buf
             kv_cache = sel_buf[: page_table.numel()]
             dequantize_higgs_dense_2bit_page_table(
                 layer_buffer,

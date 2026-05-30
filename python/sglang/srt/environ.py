@@ -590,6 +590,45 @@ class Envs:
     # hazard). Default off — flip together with the iter5 stack on
     # B200 to measure.
     SGLANG_HIGGS_DSA_TRTLLM_DEDICATED_STREAM = EnvBool(False)
+    # ai-blaise #19 iter7 (tertiary vector): depth-4 ping-pong rotation
+    # for the HIGGS sparse-dequant compact buffers. iter5 introduced
+    # depth-2 (``layer_id & 1`` parity) which broke the same-buffer
+    # aliasing between layer N and N+1. iter6 added a dedicated
+    # trtllm-gen stream so layer N+1 dequant's wait_stream(main) no
+    # longer transitively pulls in the prior trtllm-gen tail. The
+    # remaining bottleneck at iter7 is that the *single* dedicated
+    # trtllm-gen stream serializes back-to-back trtllm-gen kernels
+    # (layer N+1's trtllm-gen can't launch until layer N's trtllm-gen
+    # drains on the same stream). Depth-4 adds 4 ping-pong scratch
+    # slots indexed by ``layer_id & 3``, and the companion
+    # ``SGLANG_HIGGS_DSA_TRTLLM_DEDICATED_STREAM_DUAL`` flag below adds
+    # a second dedicated trtllm-gen stream so the parity-A and parity-B
+    # streams run concurrently — layer N (stream A) overlaps with
+    # layer N+1 (stream B) overlaps with layer N+2 (stream A again
+    # after N's trtllm-gen drains). Memory cost: 4x compact dequant
+    # buffer (~1.2 GiB total at production shape vs ~600 MiB depth-2),
+    # comfortably within B200's 192 GiB HBM budget. Requires PINGPONG
+    # to be on; falls back to depth-2 silently when off. Default off
+    # — flip together with the iter6 stack to measure.
+    SGLANG_HIGGS_DSA_TRTLLM_PINGPONG_DEPTH4 = EnvBool(False)
+    # ai-blaise #19 iter7 (tertiary vector): a second dedicated CUDA
+    # stream for the trtllm-gen sparse-MLA kernel itself. Paired with
+    # depth-4 ping-pong above. Even layer ids run trtllm-gen on the
+    # iter6 ``_higgs_trtllm_stream``; odd layer ids run on a new
+    # ``_higgs_trtllm_stream_b``. The two streams have disjoint
+    # ping-pong slots (parity 0/2 on stream A, parity 1/3 on stream B),
+    # so back-to-back trtllm-gens overlap. Together with the iter4
+    # dequant stream + iter5 ping-pong + iter6 dedicated_stream + this
+    # iter7 depth4 + dual_stream, the per-layer pipeline becomes:
+    #   layer N    : main→{kv_proj, set_kv, page_table_1}
+    #              ; side_stream→dequant_{N}
+    #              ; trtllm_stream_A→trtllm_{N}   (slot N&3)
+    #   layer N+1  : main→{kv_proj_{N+1}, set_kv_{N+1}, page_table_1_{N+1}}
+    #              ; side_stream→dequant_{N+1}
+    #              ; trtllm_stream_B→trtllm_{N+1} (slot (N+1)&3)
+    # Requires PINGPONG_DEPTH4=1 + DEDICATED_STREAM=1 (which itself
+    # requires DEQUANT_STREAM=1 + PINGPONG=1). Default off.
+    SGLANG_HIGGS_DSA_TRTLLM_DEDICATED_STREAM_DUAL = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

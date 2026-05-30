@@ -498,6 +498,32 @@ class DeepseekSparseAttnBackend(
         self._higgs_trtllm_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if _is_cuda else None
         )
+        # ai-blaise #19 iter7 (tertiary vector): second dedicated CUDA
+        # stream for the trtllm-gen sparse-MLA kernel. With iter6's
+        # single dedicated trtllm-gen stream, back-to-back trtllm-gen
+        # kernels still serialize because a stream is a strict FIFO
+        # (layer N+1's trtllm-gen waits for layer N's trtllm-gen to
+        # drain on the same stream). Even-layer ids route trtllm-gen to
+        # ``_higgs_trtllm_stream`` (iter6); odd-layer ids route to
+        # ``_higgs_trtllm_stream_b`` so two adjacent trtllm-gen launches
+        # can execute in parallel. Combined with the iter7 depth-4
+        # ping-pong slots (parities 0/2 on stream A, parities 1/3 on
+        # stream B) the pipeline has no aliasing hazard and no
+        # cross-stream FIFO stall. Allocated unconditionally so the
+        # stream is captured into any cuda graph; gated by
+        # :attr:`envs.SGLANG_HIGGS_DSA_TRTLLM_DEDICATED_STREAM_DUAL`.
+        self._higgs_trtllm_stream_b: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream() if _is_cuda else None
+        )
+        # ai-blaise #19 iter7 (tertiary vector): completion event for
+        # the *prior* trtllm-gen call. Lets the main stream wait for the
+        # prior layer's trtllm-gen completion just-in-time (e.g.
+        # right before the next layer's q_all FP8 cast) without
+        # blocking on every layer's own trtllm-gen. Lifecycle: write
+        # once per layer at end of ``_forward_trtllm``, consumed by
+        # the next call at top of trtllm-gen launch. Only used when
+        # dual-stream is on.
+        self._higgs_prior_trtllm_event: Optional[torch.cuda.Event] = None
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
@@ -2687,9 +2713,23 @@ class DeepseekSparseAttnBackend(
             is_higgs_dense_pool
             and envs.SGLANG_HIGGS_DSA_TRTLLM_PINGPONG.get()
         )
-        higgs_slot_parity = (
-            (int(layer.layer_id) & 1) if higgs_pingpong_enabled else 0
+        # ai-blaise #19 iter7 (tertiary vector): depth-4 ping-pong slot
+        # selection. When ``SGLANG_HIGGS_DSA_TRTLLM_PINGPONG_DEPTH4`` is
+        # on, the slot parity becomes ``layer_id & 3`` (4 slots) so
+        # neighbouring layers in BOTH directions touch disjoint scratch.
+        # Falls back to depth-2 (``& 1``) when the depth4 flag is off,
+        # which itself falls back to a single slot when PINGPONG is off
+        # — preserving iter5/iter6 bit-for-bit behaviour.
+        higgs_pingpong_depth4_enabled = (
+            higgs_pingpong_enabled
+            and envs.SGLANG_HIGGS_DSA_TRTLLM_PINGPONG_DEPTH4.get()
         )
+        if higgs_pingpong_depth4_enabled:
+            higgs_slot_parity = int(layer.layer_id) & 3
+        elif higgs_pingpong_enabled:
+            higgs_slot_parity = int(layer.layer_id) & 1
+        else:
+            higgs_slot_parity = 0
         # ai-blaise #19 iter6 (primary vector): dedicated trtllm-gen
         # stream. When set, the trtllm-gen sparse-MLA call below is
         # launched onto ``self._higgs_trtllm_stream`` instead of the
@@ -2710,6 +2750,35 @@ class DeepseekSparseAttnBackend(
             and higgs_pingpong_enabled
             and envs.SGLANG_HIGGS_DSA_TRTLLM_DEDICATED_STREAM.get()
         )
+        # ai-blaise #19 iter7 (tertiary vector): dual-stream selection.
+        # When ``SGLANG_HIGGS_DSA_TRTLLM_DEDICATED_STREAM_DUAL`` is on
+        # AND depth-4 ping-pong is on (so even/odd layer slots are
+        # disjoint), even layer ids go to the iter6
+        # ``_higgs_trtllm_stream`` (call it stream A) and odd layer ids
+        # go to ``_higgs_trtllm_stream_b`` (stream B). With back-to-back
+        # trtllm-gen kernels now on disjoint streams, two adjacent
+        # trtllm-gens can run concurrently rather than serializing on a
+        # single dedicated stream's FIFO. Requires depth-4 because depth-2
+        # would have slot 0 reused on layer N+2 while layer N (stream A)
+        # may still be running (slot-write hazard on stream A's slot 0).
+        # When dual_stream is off, both even and odd layers use stream A
+        # (preserving iter6 behaviour bit-for-bit).
+        use_higgs_trtllm_stream_dual = (
+            use_higgs_trtllm_stream
+            and self._higgs_trtllm_stream_b is not None
+            and higgs_pingpong_depth4_enabled
+            and envs.SGLANG_HIGGS_DSA_TRTLLM_DEDICATED_STREAM_DUAL.get()
+        )
+        if use_higgs_trtllm_stream_dual:
+            # parity-A: even layer (layer_id & 1 == 0) on stream A;
+            # parity-B: odd layer (layer_id & 1 == 1) on stream B.
+            higgs_active_trtllm_stream = (
+                self._higgs_trtllm_stream
+                if (int(layer.layer_id) & 1) == 0
+                else self._higgs_trtllm_stream_b
+            )
+        else:
+            higgs_active_trtllm_stream = self._higgs_trtllm_stream
 
         if is_higgs_dense_pool:
             # NOTE(ai-blaise #19): the HIGGS sparse-materialize adapter
@@ -2828,17 +2897,26 @@ class DeepseekSparseAttnBackend(
         # current trtllm-gen is still running.
         if use_higgs_trtllm_stream:
             main_stream = torch.cuda.current_stream()
+            # ai-blaise #19 iter7 (tertiary vector): pick the active
+            # trtllm-gen stream. Single-stream path (dual_stream off)
+            # keeps iter6 behaviour bit-for-bit
+            # (``higgs_active_trtllm_stream is self._higgs_trtllm_stream``).
+            # Dual-stream path routes by ``layer_id & 1``: even on
+            # stream A, odd on stream B, so back-to-back trtllm-gens run
+            # concurrently on disjoint streams (no FIFO stall on a
+            # single trtllm-gen stream).
+            active_trtllm_stream = higgs_active_trtllm_stream
             # The trtllm stream must observe everything main has queued
             # so far (set_mla_kv_buffer + page_table_1 + the q_all FP8
             # cast). wait_stream(main) records main's tip event onto
             # trtllm_stream — cheap because main hasn't queued
             # trtllm-gen.
-            self._higgs_trtllm_stream.wait_stream(main_stream)
+            active_trtllm_stream.wait_stream(main_stream)
             # Causal dep on the dequant write (already recorded on the
             # side stream above).
             assert higgs_dequant_event is not None
-            self._higgs_trtllm_stream.wait_event(higgs_dequant_event)
-            with torch.cuda.stream(self._higgs_trtllm_stream):
+            active_trtllm_stream.wait_event(higgs_dequant_event)
+            with torch.cuda.stream(active_trtllm_stream):
                 out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
                     query=q,
                     kv_cache=kv,
@@ -2855,7 +2933,7 @@ class DeepseekSparseAttnBackend(
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                 )
                 higgs_trtllm_done_event = (
-                    self._higgs_trtllm_stream.record_event()
+                    active_trtllm_stream.record_event()
                 )
             # Main stream waits for trtllm-gen before any downstream
             # consumer of ``out`` (the o_proj GEMM, MoE, etc.) queues.

@@ -40,6 +40,12 @@ pytestmark = pytest.mark.skipif(
 # Production shapes for DeepSeek-V3.2-REAP NVFP4 MoE
 PROD_HIDDEN = 7168
 DECODE_BATCHES = [1, 8, 16, 32, 64, 128, 256]
+# Iter3 wide-variant batches: kernel auto-selects the SMEM-staged 1024-thread
+# kernel at m>=kWideMinM (=192 by default; tune via SGLANG_NVFP4_FUSED_WIDE_MIN_M).
+# Cover the entry point (m=256), a mid-batch value (m=384), and a prefill-shape
+# value (m=512) to exercise the wide variant occupancy across the M sweep.
+WIDE_BATCHES = [256, 384, 512]
+ALL_BATCHES = DECODE_BATCHES + [b for b in WIDE_BATCHES if b not in DECODE_BATCHES]
 
 
 def _suggest_global_scale(x: torch.Tensor) -> torch.Tensor:
@@ -65,7 +71,7 @@ def _unfused_reference(
     return r_c, fp4, sf
 
 
-@pytest.mark.parametrize("m", DECODE_BATCHES)
+@pytest.mark.parametrize("m", ALL_BATCHES)
 def test_fused_matches_unfused(m: int) -> None:
     from sglang.jit_kernel.nvfp4 import fused_rmsnorm_scaled_fp4_quant_linear
 
@@ -151,7 +157,7 @@ def _time_call(fn, *args, warmup=50, iters=500, use_cuda_graph=True) -> float:
     return start.elapsed_time(end) * 1e3 / iters
 
 
-@pytest.mark.parametrize("m", DECODE_BATCHES)
+@pytest.mark.parametrize("m", ALL_BATCHES)
 def test_perf_vs_unfused(m: int) -> None:
     from sglang.jit_kernel.norm import fused_add_rmsnorm
     from sglang.jit_kernel.nvfp4 import (
@@ -207,7 +213,7 @@ def test_perf_vs_unfused(m: int) -> None:
 
 
 if __name__ == "__main__":
-    for m in DECODE_BATCHES:
+    for m in ALL_BATCHES:
         test_fused_matches_unfused(m)
-    for m in DECODE_BATCHES:
+    for m in ALL_BATCHES:
         test_perf_vs_unfused(m)

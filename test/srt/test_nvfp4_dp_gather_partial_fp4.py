@@ -401,11 +401,11 @@ def _run_bench_graph_captured(
             f"\n[bench-graph] hidden={PROD_HIDDEN}  dp={world}  "
             f"device=cuda:{device.index}  (CUDA-graph captured pynccl)\n"
             f"           |  (a) BF16-only  |  (b) BF16 + post-gather q  |"
-            f"  (c) iter5 serial  |  (d) iter5 grouped |  delta (b)-(d)  |"
-            f"  speedup\n"
+            f"  (c) all 3 serial |  (d) iter5 PROD  |  (e) iter6 PROD  |"
+            f"  iter5->iter6  |  baseline->iter6  |  speedup\n"
             f"-----------+-----------------+----------------------------+"
-            f"-------------------+--------------------+-----------------+"
-            f"----------"
+            f"-------------------+------------------+------------------+"
+            f"---------------+-------------------+----------"
         )
 
     gs = torch.tensor([8.0], dtype=torch.float32, device=device)
@@ -450,7 +450,7 @@ def _run_bench_graph_captured(
                 torch.cuda.synchronize()
 
                 # Time replay.
-                iters = 500
+                iters = 2000
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
@@ -472,9 +472,23 @@ def _run_bench_graph_captured(
             pynccl_comm.all_gather(fp4_global, fp4_l)
             pynccl_comm.all_gather(sf_int32_global, sf_int32_l)
 
-        def _iter5_grouped():
-            # ncclGroupStart/End fuses the 3 allgathers into a single
-            # NCCL launch — same wire cost, single per-call overhead.
+        def _iter5_prod():
+            # Iter5 PRODUCTION wire: BF16 allgather fires as a separate
+            # NCCL launch (via reg_all_gather_into_tensor in production;
+            # raw pynccl_comm.all_gather here for the bench), then
+            # FP4+SF fused under one ncclGroupStart/End.
+            pynccl_comm.all_gather(y_global, y_l)
+            pynccl_comm.group_start()
+            pynccl_comm.all_gather(fp4_global, fp4_l)
+            pynccl_comm.all_gather(sf_int32_global, sf_int32_l)
+            pynccl_comm.group_end()
+
+        def _iter6_all_grouped():
+            # Iter6 PRODUCTION wire: ALL THREE (BF16 + FP4 + SF) fused
+            # under one ncclGroupStart/End. Single NCCL launch instead
+            # of iter5's two. This is the iter6 PRIMARY vector — see
+            # dp_attention.py:dp_gather_partial_bf16_fp4_fused for the
+            # production callsite implementation.
             pynccl_comm.group_start()
             pynccl_comm.all_gather(y_global, y_l)
             pynccl_comm.all_gather(fp4_global, fp4_l)
@@ -489,19 +503,26 @@ def _run_bench_graph_captured(
         dist.barrier()
         t_c = _capture_and_time(_iter5_serial)
         dist.barrier()
-        t_d = _capture_and_time(_iter5_grouped)
+        t_d = _capture_and_time(_iter5_prod)
+        dist.barrier()
+        t_e = _capture_and_time(_iter6_all_grouped)
         dist.barrier()
 
-        delta = t_b - t_d
-        speedup = t_b / t_d if t_d > 0 else 0.0
+        # iter6 win = iter5_prod - iter6_all_grouped: the launch
+        # overhead saved by lifting the BF16 leg into the same
+        # ncclGroupStart/End block as FP4+SF.
+        delta_5_to_6 = t_d - t_e
+        # Cumulative iter5+iter6 vs the true deploy baseline (b):
+        delta_b_to_6 = t_b - t_e
+        speedup_b_to_6 = t_b / t_e if t_e > 0 else 0.0
 
         if rank == 0:
             print(
                 f"  m={m_local:4d}  |  {t_a:11.2f}us  |  "
                 f"{t_b:22.2f}us  |  "
-                f"{t_c:18.2f}us  |  {t_d:14.2f}us  |"
-                f"  {delta:+11.2f}us  |  "
-                f"{speedup:5.2f}x"
+                f"{t_c:11.2f}us  |  {t_d:11.2f}us  |  {t_e:11.2f}us  |"
+                f"  {delta_5_to_6:+9.2f}us  |  {delta_b_to_6:+9.2f}us  |  "
+                f"{speedup_b_to_6:5.2f}x"
             )
 
 

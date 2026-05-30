@@ -769,6 +769,111 @@ def dp_gather_partial_fp4(
         tp.all_gather_into_tensor(scales_global, scales_local)
 
 
+def dp_gather_partial_bf16_fp4_fused(
+    hidden_global: torch.Tensor,
+    hidden_local: torch.Tensor,
+    values_global: torch.Tensor,
+    values_local: torch.Tensor,
+    scales_global: torch.Tensor,
+    scales_local: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Iter6 PRIMARY: parallel DP allgather of (BF16 hidden + FP4 packed
+    bytes + UE8M0 scale bytes) fused under a single ``ncclGroupStart`` /
+    ``ncclGroupEnd`` pair.
+
+    iter5 ``dp_gather_partial_fp4`` already groups FP4 + SF, but the
+    BF16 ``hidden_states`` allgather (issued separately by
+    ``dp_gather_partial`` -> ``_dp_gather_via_all_gather`` ->
+    ``GroupCoordinator.all_gather_into_tensor`` ->
+    ``reg_all_gather_into_tensor`` -> ``pynccl_comm.all_gather``)
+    sits OUTSIDE that group block. The captured graph therefore fires
+    TWO NCCL launches per layer (BF16, then FP4+SF grouped). This
+    function collapses to ONE.
+
+    Saves ~1us/layer at production peak per the iter5 ab38f9568
+    commit's iter6 projection — bench delta in
+    ``test_nvfp4_dp_gather_partial_fp4.py`` (iter5 grouped vs iter6
+    all-3-grouped at m_local=64 / m_global=128, hidden=7168, dp=2 B200,
+    NCCL_NVLS_ENABLE=0, graph-captured pynccl).
+
+    Tensor shapes (matches ``dp_gather_partial`` + ``dp_gather_partial_fp4``):
+      - ``hidden_global``: ``[M_global, hidden]`` BF16/FP16
+      - ``hidden_local``:  ``[M_local, hidden]`` BF16/FP16
+      - ``values_global``: ``[M_global, hidden // 2]`` uint8
+      - ``values_local``:  ``[M_local, hidden // 2]`` uint8
+      - ``scales_global``: ``[M_global, (hidden // 16) // 4]`` int32
+                           (caller views as fp8_e4m3fn ``[M_global,
+                           hidden // 16]`` after)
+      - ``scales_local``:  ``[M_local, (hidden // 16) // 4]`` int32
+
+    Supported deploy config (DSv3.2-REAP DP=TP=8, attn_tp_size=1,
+    max_len padding under CUDA-graph decode). Other configs raise to
+    keep the wire honest (see the iter5 function for the full rationale
+    on the attn_tp_size > 1 and SUM_LEN restrictions).
+    """
+    # Leading-dim alignment across the 3 tensors.
+    assert hidden_local.shape[0] == values_local.shape[0] == scales_local.shape[0]
+    assert hidden_global.shape[0] == values_global.shape[0] == scales_global.shape[0]
+    assert (
+        hidden_global.shape[0]
+        == hidden_local.shape[0] * get_tp_group().world_size
+    )
+    assert hidden_local.is_contiguous() and hidden_global.is_contiguous()
+    assert values_local.is_contiguous() and values_global.is_contiguous()
+    assert scales_local.is_contiguous() and scales_global.is_contiguous()
+
+    if get_attention_tp_size() != 1:
+        raise NotImplementedError(
+            "dp_gather_partial_bf16_fp4_fused requires attn_tp_size == 1 "
+            "(deploy config). Same restriction as dp_gather_partial_fp4."
+        )
+    if not forward_batch.dp_padding_mode.is_max_len():
+        raise NotImplementedError(
+            "dp_gather_partial_bf16_fp4_fused requires max_len "
+            "dp_padding_mode (decode); sum_len (prefill) deferred."
+        )
+
+    # B200 SM_100 workaround for empty-tensor fill_: see
+    # _dp_gather_via_all_reduce. With max_len mode the global tensor
+    # shape is fixed at capture time; numel==0 is a forward_idle
+    # ladder rank where we skip the entire allgather (no FP4 stash
+    # would have been emitted either since the local rmsnorm kernel
+    # also no-ops).
+    if hidden_global.numel() == 0:
+        return
+
+    tp = get_tp_group()
+    pynccl_comm = getattr(tp, "pynccl_comm", None)
+    torchcomms_ncclx_comm = getattr(tp, "torchcomms_ncclx_comm", None)
+    can_group = (
+        pynccl_comm is not None
+        and not pynccl_comm.disabled
+        and (torchcomms_ncclx_comm is None or torchcomms_ncclx_comm.disabled)
+    )
+    if can_group:
+        # Single ncclGroupStart/End fuses all three allgathers into a
+        # single captured-graph launch. The captured graph node has
+        # ONE pre/post pynccl_comm interaction overhead instead of two
+        # (iter5 grouped FP4+SF + separate BF16 launch).
+        with pynccl_comm.change_state(enable=True):
+            pynccl_comm.group_start()
+            pynccl_comm.all_gather(hidden_global, hidden_local)
+            pynccl_comm.all_gather(values_global, values_local)
+            pynccl_comm.all_gather(scales_global, scales_local)
+            pynccl_comm.group_end()
+    else:
+        # Fallback: do the BF16 leg via the registered custom op path
+        # (preserves Dynamo + torchcomms_ncclx compatibility) and the
+        # FP4+SF leg via the iter5 helper. This is a two-launch fall-
+        # back equivalent to the pre-iter6 wire. The iter4 SECONDARY
+        # env flag should be off for deploys where pynccl is not
+        # active (the wire is honest-negative there).
+        tp.all_gather_into_tensor(hidden_global, hidden_local)
+        tp.all_gather_into_tensor(values_global, values_local)
+        tp.all_gather_into_tensor(scales_global, scales_local)
+
+
 def dp_scatter(
     local_tokens: torch.Tensor,  # output
     global_tokens: torch.Tensor,  # input

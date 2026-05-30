@@ -396,7 +396,7 @@ if _is_cuda:
         softmax_scale: float,
         q_scale: torch.Tensor,
     ) -> torch.Tensor:
-        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
+        out = torch.mm(x, weight.t()).to(torch.float32)
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
@@ -761,7 +761,7 @@ class Indexer(MultiPlatformOp):
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
         if _is_cuda:
-            return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
+            return torch.mm(x, self.weights_proj.weight.t()).to(torch.float32)
 
         weights, _ = self.weights_proj(x)
         if _is_hip:

@@ -526,6 +526,8 @@ class HiSparseCoordinator:
         # Build the list of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up),
         # and skip non-aligned steps that did not produce a new compressed token.
+        if req_pool_indices_cpu is None or seq_lens_cpu is None:
+            return  # IndexCache freq>1 path: no CPU mirror available; skip backup
         backup_indices = []
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])

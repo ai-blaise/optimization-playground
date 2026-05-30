@@ -354,6 +354,18 @@ def _jit_nvfp4_indexer_module(
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool_predecode_fma2",
             ),
             (
+                # iter6 PRIMARY: predecoded-scale mean_pool with
+                # transposed scales SMEM + transposed value-byte SMEM +
+                # LDS.b16 vectorized 2-token reads. Hot loop reads 2
+                # value bytes per LDS.b16 (vs 2 LDS.b8 in iter5 SECONDARY)
+                # for a 33% LDS-issue reduction on the inner loop. Adds
+                # 8 KB SMEM for the smem_values_t[64][128] staging table
+                # (kernel total ~19 KB, well under sm_100a 48 KB cap).
+                # Bit-identical to iter5 SECONDARY.
+                "hisa_mean_pool_predecode_transp_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool_predecode_transp",
+            ),
+            (
                 "hisa_candidate_score_indexer_cache_nvfp4",
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score",
             ),
@@ -748,6 +760,44 @@ def hisa_mean_pool_predecode_fma2_indexer_cache_nvfp4(
     _get_module_fast(
         torch.bfloat16, page_table.dtype, page_size
     ).hisa_mean_pool_predecode_fma2_indexer_cache_nvfp4(
+        index_k_with_scale, page_table, seq_lens.to(torch.int32), reps
+    )
+    return reps
+
+
+@debug_kernel_api
+def hisa_mean_pool_predecode_transp_indexer_cache_nvfp4(
+    index_k_with_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_blocks: int,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """iter6 PRIMARY: predecoded-scale mean_pool with value-byte transpose.
+
+    Strict superset of the iter5 SECONDARY fma2 kernel: same page staging,
+    same scale predecode pass, same transposed scales table + 2-iter FMA
+    pair. In addition, the value bytes are staged into a transposed
+    smem_values_t[dim_byte][token-local] = uint8[64][128] table (8 KB
+    SMEM). The hot per-dim inner loop then fetches two consecutive
+    tokens of one dim_byte in a single LDS.b16 (vs two independent
+    LDS.b8 in iter5 SECONDARY), dropping the inner-loop LDS-issue count
+    from 3 per pair to 2 per pair. Bit-identical to iter5 SECONDARY.
+    """
+    if not index_k_with_scale.is_contiguous():
+        index_k_with_scale = index_k_with_scale.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
+    reps = torch.empty(
+        (page_table.shape[0], max_blocks, 128),
+        dtype=torch.float32,
+        device=index_k_with_scale.device,
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_mean_pool_predecode_transp_indexer_cache_nvfp4(
         index_k_with_scale, page_table, seq_lens.to(torch.int32), reps
     )
     return reps

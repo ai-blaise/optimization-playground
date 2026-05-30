@@ -3784,6 +3784,284 @@ __global__ void hisa_mean_pool_predecode_fma2_indexer_cache_nvfp4(
       token_count == 0 ? 0.0f : sum / static_cast<float>(token_count);
 }
 
+// iter6 PRIMARY: mean_pool with SMEM value-byte transpose + LDS.b16
+// vectorized 2-token reads.
+//
+// iter5 SECONDARY (fma2) left the value-byte reads as 2 independent
+// LDS.b8 per pair because off0/off1 point to different page slots in
+// smem_pages and the compiler can't fuse them. The 5% mean_pool win
+// at production cells was bottlenecked on LDS issue throughput, not
+// FFMA throughput.
+//
+// This variant precomputes a transposed value table:
+//   __shared__ uint8_t smem_values_t[kNVFP4ValueBytes][kBlockSize];
+//                                  = [64][128] = 8192 B = 8 KB.
+// Each thread with fixed dim_byte=tid>>1 walks a contiguous 128-byte
+// row in the hot loop, so a 2-token pair becomes a single LDS.b16
+// (vs 2 LDS.b8 in iter5 SECONDARY). The inner-loop LDS issue count
+// drops from 3 per pair (1 LDS.b64 scales + 2 LDS.b8 values) to 2 per
+// pair (1 LDS.b64 scales + 1 LDS.b16 values) -- 33% LDS-issue reduction
+// in the hot loop.
+//
+// Cooperative staging: each thread (tid = token-local i) reads its own
+// token's 64 value bytes from smem_pages as 4 LDS.128 (uint4) and
+// scatters them into smem_values_t[d][i] for d in [0, 64). The dest
+// writes are byte-wide STS.b8 with a per-warp 4-byte-per-bank coalesce
+// pattern (32 threads writing 32 consecutive bytes of one row = 8 banks
+// with 4 byte-enable lanes each = 1 cycle per d per warp). The staging
+// adds 64 STS.b8 per thread (one for each dim_byte) but saves 64 LDS.b8
+// per thread in the hot loop -- net win because the inner-loop LDS chain
+// also feeds dependent FFMAs, so LDS issue reduction is on the critical
+// path.
+//
+// Brief said 32 KB or 64 KB SMEM was the cost but kNVFP4ValueBytes =
+// kIndexerHeadDim / 2 = 64, not 128, so the actual SMEM overhead is
+// 8 KB. Total SMEM remains ~19 KB, comfortably under the sm_100a
+// default 48 KB cap (no cudaFuncSetAttribute escalation).
+//
+// Expected: ~10-15% mean_pool win over iter5 SECONDARY at production
+// cells where the inner loop dominates the kernel wall time (target
+// <225us at 64/32768, down from 240us).
+//
+// Correctness: bit-identical to iter5 SECONDARY. The inner loop
+// processes the same set of decoded bytes/scales in the same partition
+// (sum0 even-i, sum1 odd-i, then sum0 + sum1). The transpose only
+// changes the address mapping; the same fp32 multiplications and
+// additions in the same order produce the same fp32 result.
+template <typename IndicesT, uint32_t kPageSize>
+__global__ void hisa_mean_pool_predecode_transp_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISAMeanPoolParam param) {
+  constexpr int64_t kPageBytes = (kNVFP4ValueBytes + kScaleBytes) * kPageSize;
+  constexpr uint32_t kBlockSize = 128;
+  constexpr uint32_t kMaxPagesPerBlock =
+      (kBlockSize + kPageSize - 1) / kPageSize;
+  constexpr uint32_t kStagedBytesPerPage =
+      kNVFP4ValueBytes * kPageSize + kScaleBytes * kPageSize;
+  constexpr uint32_t kTotalStagedBytes =
+      kStagedBytesPerPage * kMaxPagesPerBlock;
+  constexpr uint32_t kScaleGroups = kIndexerHeadDim / 32;  // 4
+
+  __shared__ uint8_t smem_pages[kTotalStagedBytes];
+  __shared__ int32_t smem_page_ids[kMaxPagesPerBlock];
+  // Same transposed scales table as iter5 SECONDARY.
+  __shared__ float smem_scales_t[kScaleGroups][kBlockSize];
+  // iter6 PRIMARY: transposed value bytes. Layout is
+  // smem_values_t[dim_byte][token-local] so the hot loop walks a
+  // contiguous 128-byte row per (fixed dim_byte) thread, enabling
+  // LDS.b16 fetches of (token i, token i+1) in one issue.
+  //
+  // Padded row stride of 132 bytes (kBlockSize + 4) avoids 16-way bank
+  // conflicts. Without padding, the natural 128-byte row stride aligns
+  // every row to the same set of SMEM banks: a warp of 32 threads at
+  // the same inner-loop i reads addresses `base + (tid>>1)*128 + i`,
+  // which all map to the same bank (32-byte stride * 32 banks = full
+  // wrap, so all 32 rows share the bank assignment for a given i).
+  // The 4-byte (1 word) padding offsets each row by +1 bank, breaking
+  // the conflict to 1-way for any fixed i across the warp.
+  //
+  // SMEM cost: 64 rows * 132 bytes = 8448 bytes (vs 8192 unpadded);
+  // +256 B for ~16x throughput on the inner loop's LDS.b16 issue.
+  constexpr uint32_t kValuesRowStride = kBlockSize + 4;  // 132 bytes
+  __shared__ uint8_t smem_values_t[kNVFP4ValueBytes * kValuesRowStride];
+
+  // Helper for the strided indexing.
+  auto values_at = [&](uint32_t d, uint32_t i) -> uint8_t* {
+    return &smem_values_t[d * kValuesRowStride + i];
+  };
+
+  const auto tid = threadIdx.x;
+  const auto hisa_block = blockIdx.x;
+  const auto batch = blockIdx.y;
+  if (batch >= param.batch_size || hisa_block >= param.max_blocks) {
+    return;
+  }
+
+  const auto seq_len = static_cast<const int32_t*>(param.seq_lens)[batch];
+  const auto token_start = hisa_block * kBlockSize;
+  const auto token_count =
+      token_start < static_cast<uint32_t>(seq_len)
+          ? min(kBlockSize, static_cast<uint32_t>(seq_len) - token_start)
+          : 0u;
+  const auto logical_page_start = token_start / kPageSize;
+  const auto logical_page_end =
+      token_count == 0 ? logical_page_start
+                       : (token_start + token_count - 1) / kPageSize + 1;
+
+  // Page id resolution (identical to iter4/iter5 path).
+  if (tid < kMaxPagesPerBlock) {
+    const uint32_t lp = logical_page_start + tid;
+    int32_t page_id = -1;
+    if (lp < logical_page_end) {
+      page_id = static_cast<int32_t>(
+          static_cast<const IndicesT*>(
+              param.page_table)[batch * param.page_table_stride + lp]);
+    }
+    smem_page_ids[tid] = page_id;
+  }
+  __syncthreads();
+
+  // Cooperative page staging (uint4 vector loads, identical to iter4/iter5).
+  constexpr uint32_t kVecBytes = sizeof(uint4);
+  static_assert(kStagedBytesPerPage % kVecBytes == 0,
+                "iter6 mean_pool transp requires page bytes divisible by 16");
+  constexpr uint32_t kVecsPerPage = kStagedBytesPerPage / kVecBytes;
+  for (uint32_t p = 0; p < kMaxPagesPerBlock; ++p) {
+    const int32_t page_id = smem_page_ids[p];
+    auto* smem_dst =
+        reinterpret_cast<uint4*>(smem_pages + p * kStagedBytesPerPage);
+    if (page_id >= 0) {
+      const auto* src = reinterpret_cast<const uint4*>(
+          static_cast<const uint8_t*>(param.cache) +
+          static_cast<int64_t>(page_id) * kPageBytes);
+      for (uint32_t v = tid; v < kVecsPerPage; v += kBlockSize) {
+        smem_dst[v] = src[v];
+      }
+    } else {
+      const uint4 zero = make_uint4(0, 0, 0, 0);
+      for (uint32_t v = tid; v < kVecsPerPage; v += kBlockSize) {
+        smem_dst[v] = zero;
+      }
+    }
+  }
+  __syncthreads();
+
+  // Predecode scales (transposed) + value-byte transpose. Each thread
+  // tid owns one token-local slot i = tid and:
+  //  (a) writes one scale fp32 to each of the 4 transposed scale rows;
+  //  (b) reads its token's 64 value bytes from smem_pages as 4 uint4
+  //      (16-byte vector loads) and scatters them byte-wise into
+  //      smem_values_t[0..63][i].
+  //
+  // The scatter writes for a warp at fixed d target 32 consecutive bytes
+  // of smem_values_t[d][warp_base..warp_base+32]. That's 8 4-byte words
+  // = 8 banks, with 4 threads sharing each word via byte-enable lanes.
+  // SM_100 STS.b8 byte-write is hardware-coalesced into 1 cycle per warp
+  // per d, so the per-thread staging cost is ~64 issued STS.b8 over
+  // ~64 cycles wall time per warp.
+  {
+    const uint32_t i = tid;  // token-local index 0..127
+    if (i < kBlockSize) {
+      if (i < token_count) {
+        const uint32_t token = token_start + i;
+        const uint32_t logical_page = token / kPageSize;
+        const uint32_t local_page = logical_page - logical_page_start;
+        const uint32_t offset = token & (kPageSize - 1);
+        const uint8_t* page_smem =
+            smem_pages + local_page * kStagedBytesPerPage;
+        // Scales (transposed table, same as iter5 SECONDARY).
+        const uint32_t scale_word = *reinterpret_cast<const uint32_t*>(
+            page_smem + kNVFP4ValueBytes * kPageSize + offset * kScaleBytes);
+        #pragma unroll
+        for (uint32_t g = 0; g < kScaleGroups; ++g) {
+          const uint32_t scale_exp = (scale_word >> (g * 8)) & 0xffu;
+          smem_scales_t[g][i] = __uint_as_float(scale_exp << 23);
+        }
+        // Value bytes: read 64 contiguous bytes (this token's value
+        // payload in smem_pages) as 4 uint4 vector loads. The token's
+        // value payload starts at `page_smem + offset * kNVFP4ValueBytes`
+        // and is 64 bytes long, naturally 16-byte aligned because
+        // kNVFP4ValueBytes = 64 and offset is in [0, kPageSize=64) so the
+        // base is a multiple of 64.
+        const uint4* val_src = reinterpret_cast<const uint4*>(
+            page_smem + offset * kNVFP4ValueBytes);
+        // 4 uint4 = 64 bytes covering dim_byte in [0, 64).
+        #pragma unroll
+        for (uint32_t v = 0; v < 4; ++v) {
+          const uint4 chunk = val_src[v];
+          const uint32_t base_d = v * 16;  // first dim_byte in this chunk
+          // Each uint4 has 16 bytes -> dim_byte base_d..base_d+15.
+          // Scatter as 16 byte stores into smem_values_t[d][i] using
+          // the padded-row indexing helper.
+          const uint32_t w0 = chunk.x;
+          const uint32_t w1 = chunk.y;
+          const uint32_t w2 = chunk.z;
+          const uint32_t w3 = chunk.w;
+          *values_at(base_d +  0, i) = static_cast<uint8_t>(w0      );
+          *values_at(base_d +  1, i) = static_cast<uint8_t>(w0 >>  8);
+          *values_at(base_d +  2, i) = static_cast<uint8_t>(w0 >> 16);
+          *values_at(base_d +  3, i) = static_cast<uint8_t>(w0 >> 24);
+          *values_at(base_d +  4, i) = static_cast<uint8_t>(w1      );
+          *values_at(base_d +  5, i) = static_cast<uint8_t>(w1 >>  8);
+          *values_at(base_d +  6, i) = static_cast<uint8_t>(w1 >> 16);
+          *values_at(base_d +  7, i) = static_cast<uint8_t>(w1 >> 24);
+          *values_at(base_d +  8, i) = static_cast<uint8_t>(w2      );
+          *values_at(base_d +  9, i) = static_cast<uint8_t>(w2 >>  8);
+          *values_at(base_d + 10, i) = static_cast<uint8_t>(w2 >> 16);
+          *values_at(base_d + 11, i) = static_cast<uint8_t>(w2 >> 24);
+          *values_at(base_d + 12, i) = static_cast<uint8_t>(w3      );
+          *values_at(base_d + 13, i) = static_cast<uint8_t>(w3 >>  8);
+          *values_at(base_d + 14, i) = static_cast<uint8_t>(w3 >> 16);
+          *values_at(base_d + 15, i) = static_cast<uint8_t>(w3 >> 24);
+        }
+      } else {
+        // Out-of-range token slots: zero scales -> zero contribution.
+        // Value bytes for these slots are dont-care (scale=0 zeros the
+        // FMA result regardless of byte content), but we zero them so the
+        // tail-pair LDS.b16 reads see well-defined data.
+        #pragma unroll
+        for (uint32_t g = 0; g < kScaleGroups; ++g) {
+          smem_scales_t[g][i] = 0.0f;
+        }
+        #pragma unroll
+        for (uint32_t d = 0; d < kNVFP4ValueBytes; ++d) {
+          *values_at(d, i) = 0u;
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  if (tid >= kIndexerHeadDim) return;
+  const uint32_t dim = tid;
+  const uint32_t dim_group = dim >> 5;        // 0..3
+  const uint32_t dim_byte = dim >> 1;         // 0..63
+  const bool high_nibble = (dim & 1u) != 0u;
+
+  // Two fp32 accumulators (same partition as iter5 SECONDARY:
+  // sum0 = even-i, sum1 = odd-i) so the final reduction sum0 + sum1
+  // matches iter5 SECONDARY bit-for-bit.
+  float sum0 = 0.0f;
+  float sum1 = 0.0f;
+  const uint32_t pair_end = token_count & ~1u;  // round down to even
+  const float* __restrict__ scales_row = &smem_scales_t[dim_group][0];
+  // Padded row stride (kValuesRowStride = 132 B) -- see smem_values_t
+  // declaration above for the bank-conflict rationale.
+  const uint8_t* __restrict__ values_row = values_at(dim_byte, 0);
+  #pragma unroll 4
+  for (uint32_t i = 0; i < pair_end; i += 2) {
+    // 1 LDS.b64 reads 2 fp32 scales contiguously.
+    const float s0 = scales_row[i];
+    const float s1 = scales_row[i + 1];
+    // 1 LDS.b16 reads 2 value bytes contiguously. The dim_byte row is
+    // 132 bytes long (kBlockSize + 4 padding) and starts at an offset
+    // that breaks SMEM bank alignment between rows. Any even i pair
+    // (i, i+1) is 2-B aligned within the row. uint16_t reinterpret_cast
+    // lowers to LDS.b16.
+    const uint16_t bb = *reinterpret_cast<const uint16_t*>(values_row + i);
+    const uint8_t b0 = static_cast<uint8_t>(bb & 0xffu);
+    const uint8_t b1 = static_cast<uint8_t>(bb >> 8);
+    const uint32_t c0 = high_nibble ? (b0 >> 4) : (b0 & 0xfu);
+    const uint32_t c1 = high_nibble ? (b1 >> 4) : (b1 & 0xfu);
+    sum0 += decode_e2m1_nibble(c0, s0);
+    sum1 += decode_e2m1_nibble(c1, s1);
+  }
+  // Scalar tail for odd token_count (matches iter5 SECONDARY).
+  if (pair_end < token_count) {
+    const uint32_t i = pair_end;
+    const float s = scales_row[i];
+    const uint8_t b = values_row[i];
+    const uint32_t c = high_nibble ? (b >> 4) : (b & 0xfu);
+    sum0 += decode_e2m1_nibble(c, s);
+  }
+  const float sum = sum0 + sum1;
+  const auto out_idx =
+      (static_cast<int64_t>(batch) * param.max_blocks + hisa_block) *
+          kIndexerHeadDim +
+      dim;
+  static_cast<float*>(param.reps)[out_idx] =
+      token_count == 0 ? 0.0f : sum / static_cast<float>(token_count);
+}
+
 // iter3 vector 2: TMA-based mean_pool. Replaces the iter2 cooperative
 // uint4 page copy (272 16-byte vec loads cooperatively per page, ~544
 // per CTA across both pages) with a single cp.async.bulk per page
@@ -5816,6 +6094,10 @@ struct NVFP4IndexerQuantKernel {
   // iter5 SECONDARY: mean_pool with transposed scales + 2-iter FMA pair.
   static constexpr auto mean_pool_predecode_fma2_kernel =
       hisa_mean_pool_predecode_fma2_indexer_cache_nvfp4<IndicesT, kPageSize>;
+  // iter6 PRIMARY: mean_pool with transposed scales + transposed value
+  // bytes + LDS.b16 vectorized 2-token reads.
+  static constexpr auto mean_pool_predecode_transp_kernel =
+      hisa_mean_pool_predecode_transp_indexer_cache_nvfp4<IndicesT, kPageSize>;
   static constexpr auto candidate_score_kernel =
       hisa_candidate_score_indexer_cache_nvfp4<IndicesT, kPageSize>;
   // iter2 vector 2: tile-N candidate_score with kTileN=8 candidates per block.
@@ -6190,6 +6472,49 @@ struct NVFP4IndexerQuantKernel {
     LaunchKernel(
         dim3(params.max_blocks, params.batch_size), 128, device_.unwrap())(
         mean_pool_predecode_fma2_kernel, params);
+  }
+
+  // iter6 PRIMARY: mean_pool with transposed scales table + transposed
+  // value byte table + LDS.b16 vectorized 2-token reads. Same FFI as the
+  // iter5 SECONDARY launcher; underlying kernel adds an 8 KB SMEM
+  // smem_values_t[dim_byte][token-local] staging table so the hot per-
+  // dim loop can fetch two consecutive tokens of one dim_byte in a
+  // single LDS.b16 (vs two independent LDS.b8 in iter5 SECONDARY).
+  static void hisa_mean_pool_predecode_transp(
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView reps) {
+    using namespace host;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto P = SymbolicSize{"page_table_stride"};
+    auto MB = SymbolicSize{"max_blocks"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({B, P}).with_dtype<IndicesT>().with_device(device_).verify(page_table);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({B, MB, kIndexerHeadDim})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(reps);
+    const auto params = NVFP4HISAMeanPoolParam{
+        .cache = cache.data_ptr(),
+        .page_table = page_table.data_ptr(),
+        .seq_lens = seq_lens.data_ptr(),
+        .reps = reps.data_ptr(),
+        .batch_size = static_cast<uint32_t>(B.unwrap()),
+        .max_blocks = static_cast<uint32_t>(MB.unwrap()),
+        .page_table_stride = static_cast<uint32_t>(P.unwrap()),
+    };
+    LaunchKernel(
+        dim3(params.max_blocks, params.batch_size), 128, device_.unwrap())(
+        mean_pool_predecode_transp_kernel, params);
   }
 
   static void hisa_candidate_score(

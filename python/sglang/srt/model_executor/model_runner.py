@@ -115,6 +115,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_dp_rank,
     get_attention_tp_group,
     get_attention_tp_size,
     initialize_dp_attention,
@@ -2657,6 +2658,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     device=self.device,
                 )
             )
+            # B200 SM_100 workaround (#14 fix followup 9): precompute the
+            # local DP rank's prefix-sum start (dp_rank * num_tokens under
+            # the [num_tokens]*dp_size cuda-graph fill). Materialize via
+            # cudaMemcpyHostToDevice — bypasses in-capture cumsum/.to() on
+            # the (dp_size,) int64 tensor that triggers
+            # cudaErrorInvalidConfiguration on B200.
+            _dp_rank = get_attention_dp_rank()
+            buffers.dp_local_start_pos_gpu.copy_(
+                torch.tensor(
+                    _dp_rank * num_tokens,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            )
+            buffers.dp_local_start_pos_token_gpu.copy_(
+                torch.tensor(
+                    _dp_rank * num_tokens,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            )
             global_dp_buffer_len = num_tokens * self.server_args.dp_size
         elif require_attn_tp_gather(self.server_args):
             buffers.global_num_tokens_gpu.copy_(
@@ -2672,6 +2694,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     dtype=torch.int32,
                     device=self.device,
                 )
+            )
+            # B200 SM_100 workaround (#14 fix followup 9): attn-tp-gather mode
+            # has only the local slice; start pos is always 0.
+            buffers.dp_local_start_pos_gpu.copy_(
+                torch.tensor(0, dtype=torch.int64, device=self.device)
+            )
+            buffers.dp_local_start_pos_token_gpu.copy_(
+                torch.tensor(0, dtype=torch.int64, device=self.device)
             )
             global_dp_buffer_len = num_tokens
         else:
@@ -2778,6 +2808,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
+            dp_local_start_pos_gpu=(
+                buffers.dp_local_start_pos_gpu
+                if (require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args))
+                else None
+            ),
+            dp_local_start_pos_token_gpu=(
+                buffers.dp_local_start_pos_token_gpu
+                if (require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args))
+                else None
+            ),
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             mrope_positions=buffers.mrope_positions,

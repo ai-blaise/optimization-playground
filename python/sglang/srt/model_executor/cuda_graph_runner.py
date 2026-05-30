@@ -47,6 +47,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
+    get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
@@ -155,6 +156,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
     mamba_track_mask: Optional[torch.Tensor]
     global_num_tokens_gpu: torch.Tensor
     global_num_tokens_for_logprob_gpu: torch.Tensor
+    # B200 SM_100 workaround (#14 fix followup 9): 0-d int64 buffers for
+    # the precomputed local-DP-rank prefix sums. Populated via .copy_()
+    # from torch.tensor() at replay time (in cudaMemcpyHostToDevice form,
+    # NOT via in-capture cumsum). Empty/None when DP attention is disabled.
+    dp_local_start_pos_gpu: Optional[torch.Tensor]
+    dp_local_start_pos_token_gpu: Optional[torch.Tensor]
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
@@ -237,6 +244,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
 
+            # B200 SM_100 workaround (#14 fix followup 9): 0-d int64 scalar
+            # buffers for the precomputed prefix sums. We always allocate them
+            # (cheap — 8 bytes each) so the FB plumbing is uniform regardless
+            # of DP attention being enabled. populate_from_forward_batch will
+            # fill them via .copy_() before capture replay.
+            dp_local_start_pos_gpu = torch.zeros((), dtype=torch.int64)
+            dp_local_start_pos_token_gpu = torch.zeros((), dtype=torch.int64)
+
             ngram_embedding_info = (
                 NgramEmbeddingInfo(
                     token_table=ne_token_table,
@@ -274,6 +289,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
             encoder_lens=encoder_lens,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            dp_local_start_pos_gpu=dp_local_start_pos_gpu,
+            dp_local_start_pos_token_gpu=dp_local_start_pos_token_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
         )
@@ -354,6 +371,19 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
             self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
+            # B200 SM_100 workaround (#14 fix followup 9): populate the
+            # precomputed prefix buffers via .copy_() from the FB-owned
+            # 0-d tensors that were materialized in init_new via
+            # cudaMemcpyHostToDevice. This is a D2D copy_ on a single
+            # int64 scalar — no scan kernel, no .to() cast.
+            if forward_batch.dp_local_start_pos_gpu is not None:
+                self.dp_local_start_pos_gpu.copy_(
+                    forward_batch.dp_local_start_pos_gpu
+                )
+            if forward_batch.dp_local_start_pos_token_gpu is not None:
+                self.dp_local_start_pos_token_gpu.copy_(
+                    forward_batch.dp_local_start_pos_token_gpu
+                )
 
         if enable_num_token_non_padded_flag:
             if require_gathered_buffer and not dsa_enable_prefill_cp:
@@ -1117,6 +1147,26 @@ class CudaGraphRunner:
                     device=input_ids.device,
                 )
             )
+            # B200 SM_100 workaround (#14 fix followup 9): in cuda graph
+            # capture mode every DP rank gets [num_tokens]*dp_size, so the
+            # local DP rank's prefix start is exactly dp_rank * num_tokens.
+            # Materialize via cudaMemcpyHostToDevice (torch.tensor + copy_),
+            # not cumsum on a small int64 tensor.
+            _dp_rank = get_attention_dp_rank()
+            buffers.dp_local_start_pos_gpu.copy_(
+                torch.tensor(
+                    _dp_rank * num_tokens,
+                    dtype=torch.int64,
+                    device=input_ids.device,
+                )
+            )
+            buffers.dp_local_start_pos_token_gpu.copy_(
+                torch.tensor(
+                    _dp_rank * num_tokens,
+                    dtype=torch.int64,
+                    device=input_ids.device,
+                )
+            )
             global_dp_buffer_len = num_tokens * self.dp_size
         elif self.require_attn_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
@@ -1132,6 +1182,15 @@ class CudaGraphRunner:
                     dtype=torch.int32,
                     device=input_ids.device,
                 )
+            )
+            # B200 SM_100 workaround (#14 fix followup 9): attn-tp-gather mode
+            # has dp_size=1 from the perspective of this prefix sum (only
+            # the local rank's slice exists), so start pos is always 0.
+            buffers.dp_local_start_pos_gpu.copy_(
+                torch.tensor(0, dtype=torch.int64, device=input_ids.device)
+            )
+            buffers.dp_local_start_pos_token_gpu.copy_(
+                torch.tensor(0, dtype=torch.int64, device=input_ids.device)
             )
             global_dp_buffer_len = num_tokens
         else:
@@ -1187,6 +1246,16 @@ class CudaGraphRunner:
             positions=positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
+            dp_local_start_pos_gpu=(
+                buffers.dp_local_start_pos_gpu
+                if (self.require_mlp_tp_gather or self.require_attn_tp_gather)
+                else None
+            ),
+            dp_local_start_pos_token_gpu=(
+                buffers.dp_local_start_pos_token_gpu
+                if (self.require_mlp_tp_gather or self.require_attn_tp_gather)
+                else None
+            ),
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             mrope_positions=mrope_positions,

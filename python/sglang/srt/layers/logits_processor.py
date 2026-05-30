@@ -148,6 +148,12 @@ class LogitsMetadata:
     # Number of tokens to sample per DP rank
     global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # B200 SM_100 workaround (#14 fix followup 9): precomputed 0-d int64
+    # tensor holding prefix-sum(global_num_tokens_for_logprob)[dp_rank-1]
+    # (or 0 for rank 0). Materialized at FB construction via cudaMemcpy
+    # to avoid the in-capture cumsum/.to() launches that hit
+    # cudaErrorInvalidConfiguration on shape (8,) int64.
+    dp_local_start_pos_gpu: Optional[torch.Tensor] = None
     # The gather mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for padding
@@ -207,29 +213,40 @@ class LogitsMetadata:
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+            dp_local_start_pos_gpu=forward_batch.dp_local_start_pos_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
         )
 
     def compute_dp_attention_metadata(self):
 
-        # B200 SM_100 workaround: int64 cumsum on shape (dp_size,) hits
-        # cudaErrorInvalidConfiguration in eager AND capture replay. The
-        # float32 scan kernel uses a different launch path that works.
-        # Cast int64 -> float32 (lossless for token counts), cumsum, cast back.
-        # No is_current_stream_capturing() branch because it returns bool,
-        # which breaks Dynamo trace inside PCG capture.
-        _src = self.global_num_tokens_for_logprob_gpu
-        cumtokens = torch.cumsum(_src.to(torch.float32), dim=0).to(_src.dtype)
+        # B200 SM_100 workaround (#14 fix followup 9): consume the
+        # precomputed local-DP-rank prefix value rather than doing an
+        # in-capture cumsum + .to() on shape (dp_size,) int64. The
+        # precomputed tensor was materialized via cudaMemcpyHostToDevice
+        # at FB construction (forward_batch_info.init_new) and propagated
+        # through capture replay buffers (cuda_graph_runner +
+        # piecewise_cuda_graph_runner + model_runner). Read-only access
+        # here means zero new kernel launches inside capture for the cumsum
+        # step. dp_local_num_tokens is a single-element select on the
+        # already-materialized global_num_tokens_for_logprob_gpu — a stride
+        # metadata view, no launch.
         dp_rank = get_attention_dp_rank()
-        if dp_rank == 0:
-            dp_local_start_pos = torch.zeros_like(
-                self.global_num_tokens_for_logprob_gpu[0]
-            )
+        if self.dp_local_start_pos_gpu is not None:
+            self.dp_local_start_pos = self.dp_local_start_pos_gpu
         else:
-            dp_local_start_pos = cumtokens[dp_rank - 1]
-
-        self.dp_local_start_pos = dp_local_start_pos
+            # Fallback for paths that don't precompute the prefix (rare,
+            # e.g. some draft/embedding flows). Keep the legacy float32-cast
+            # cumsum here — this fallback only fires outside the PCG
+            # critical path where the launch-config bug surfaces.
+            _src = self.global_num_tokens_for_logprob_gpu
+            cumtokens = torch.cumsum(_src.to(torch.float32), dim=0).to(_src.dtype)
+            if dp_rank == 0:
+                self.dp_local_start_pos = torch.zeros_like(
+                    self.global_num_tokens_for_logprob_gpu[0]
+                )
+            else:
+                self.dp_local_start_pos = cumtokens[dp_rank - 1]
         self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
         hidden_size = get_dp_hidden_size()

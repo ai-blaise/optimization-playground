@@ -43,6 +43,7 @@ from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
+    get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
@@ -443,6 +444,29 @@ class PiecewiseCudaGraphRunner:
                     if self.model_runner.server_args.enable_dp_attention
                     else None
                 ),
+                # B200 SM_100 workaround (#14 fix followup 9): under PCG capture
+                # every DP rank gets [num_tokens]*dp_size, so the prefix start
+                # for this rank is dp_rank * num_tokens. Materialize via
+                # cudaMemcpyHostToDevice (torch.tensor(scalar).to(device)) — no
+                # scan kernel, no .to() cast on small int64.
+                dp_local_start_pos_gpu=(
+                    torch.tensor(
+                        get_attention_dp_rank() * num_tokens,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    if self.model_runner.server_args.enable_dp_attention
+                    else None
+                ),
+                dp_local_start_pos_token_gpu=(
+                    torch.tensor(
+                        get_attention_dp_rank() * num_tokens,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    if self.model_runner.server_args.enable_dp_attention
+                    else None
+                ),
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=(
                     num_tokens * self.dp_size
@@ -627,6 +651,26 @@ class PiecewiseCudaGraphRunner:
                     torch.full(
                         (self.dp_size,),
                         num_tokens,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    if self.model_runner.server_args.enable_dp_attention
+                    else None
+                ),
+                # B200 SM_100 workaround (#14 fix followup 9): see L426-L448
+                # above for rationale. Same dp_rank * num_tokens precompute.
+                dp_local_start_pos_gpu=(
+                    torch.tensor(
+                        get_attention_dp_rank() * num_tokens,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    if self.model_runner.server_args.enable_dp_attention
+                    else None
+                ),
+                dp_local_start_pos_token_gpu=(
+                    torch.tensor(
+                        get_attention_dp_rank() * num_tokens,
                         dtype=torch.int64,
                         device=self.device,
                     )
@@ -822,6 +866,13 @@ class PiecewiseCudaGraphRunner:
             positions=positions,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+            # B200 SM_100 workaround (#14 fix followup 9): forward the
+            # precomputed prefix tensors that were materialized in init_new
+            # (eager) or via .copy_() onto buffers (capture). Consumed by
+            # compute_dp_attention_metadata + get_dp_local_info without any
+            # in-capture cumsum.
+            dp_local_start_pos_gpu=forward_batch.dp_local_start_pos_gpu,
+            dp_local_start_pos_token_gpu=forward_batch.dp_local_start_pos_token_gpu,
             dp_padding_mode=forward_batch.dp_padding_mode,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             mrope_positions=mrope_positions,

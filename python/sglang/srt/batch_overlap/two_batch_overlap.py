@@ -752,6 +752,13 @@ class TboForwardBatchPreparer:
                 global_dp_buffer_len=global_dp_buffer_len,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
+                # B200 SM_100 workaround (#14 fix followup 9): TBO sub-batches
+                # null the DP attention metadata; the parent FB carries the
+                # precomputed values and the sub-batch path doesn't index
+                # back into them. Listed explicitly so the dataclass-field
+                # validator below sees them as handled.
+                dp_local_start_pos_gpu=None,
+                dp_local_start_pos_token_gpu=None,
                 sampling_info=None,
                 # For logits and logprobs post processing, thus we do not care
                 temperature=None,

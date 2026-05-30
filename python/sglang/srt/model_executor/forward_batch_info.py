@@ -398,6 +398,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # B200 SM_100 workaround (#14 fix followup 9): precomputed prefix sum of
+    # global_num_tokens_for_logprob, indexed at the local DP rank. Materialized
+    # at FB construction (eager: cudaMemcpyHostToDevice via torch.tensor(); PCG
+    # capture/replay: pre-populated via .copy_() into a reused buffer before
+    # capture begins). 0-d int64 tensor. Consumed by compute_dp_attention_metadata
+    # and get_dp_local_info to avoid in-capture cumsum + .to() launches that hit
+    # cudaErrorInvalidConfiguration on small shapes (followup 1-8 failed).
+    dp_local_start_pos_gpu: Optional[torch.Tensor] = None
+    # Sibling for the global_num_tokens (token-count) prefix path used by
+    # get_dp_local_info. Same construction semantics as dp_local_start_pos_gpu.
+    dp_local_start_pos_token_gpu: Optional[torch.Tensor] = None
 
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
@@ -599,6 +610,27 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
+            ).to(device, non_blocking=True)
+
+            # B200 SM_100 workaround (#14 fix followup 9): precompute the
+            # local DP rank's start position (a 0-d int64 tensor) here in
+            # the eager-mode FB construction path. We use Python prefix sum
+            # over the CPU lists (which we already have) and materialize a
+            # single scalar via torch.tensor(int).to(device). This is one
+            # cudaMemcpyHostToDevice — bypasses the .to(float32) + cumsum
+            # scan-kernel launches that trip cudaErrorInvalidConfiguration on
+            # small shapes (followup 1-8 failed). Mirror for both the
+            # logprob token-count prefix (consumed by LogitsMetadata in
+            # compute_dp_attention_metadata) and the global token-count
+            # prefix (consumed by get_dp_local_info in dp_attention.py).
+            _dp_rank = get_attention_dp_rank()
+            ret.dp_local_start_pos_gpu = torch.tensor(
+                sum(global_num_tokens_for_logprob[:_dp_rank]),
+                dtype=torch.int64,
+            ).to(device, non_blocking=True)
+            ret.dp_local_start_pos_token_gpu = torch.tensor(
+                sum(global_num_tokens[:_dp_rank]),
+                dtype=torch.int64,
             ).to(device, non_blocking=True)
 
         if ret.forward_mode.is_idle():

@@ -446,19 +446,35 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
     dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
-        # B200 SM_100 workaround: float32-cast cumsum (always; works in
-        # both eager and PCG capture). See compute_dp_attention_metadata
-        # in logits_processor.py for rationale.
-        _src = forward_batch.global_num_tokens_gpu
-        cumtokens = torch.cumsum(_src.to(torch.float32), dim=0).to(_src.dtype)
-        if dp_rank == 0:
-            local_start_pos = torch.zeros_like(cumtokens[0])
+        if forward_batch.dp_local_start_pos_token_gpu is not None:
+            # B200 SM_100 workaround (#14 fix followup 9): read the precomputed
+            # local-DP-rank prefix value (materialized at FB construction via
+            # cudaMemcpyHostToDevice) instead of running cumsum + .to() inside
+            # capture. dp_local_start_pos_token_gpu is the prefix over
+            # global_num_tokens_gpu (token-count path used by gather/scatter).
+            # Single-element select on the already-allocated
+            # global_num_tokens_gpu is a stride view, no kernel launch.
+            forward_batch.dp_local_start_pos = (
+                forward_batch.dp_local_start_pos_token_gpu
+            )
+            forward_batch.dp_local_num_tokens = (
+                forward_batch.global_num_tokens_gpu[dp_rank]
+            )
         else:
-            local_start_pos = cumtokens[dp_rank - 1]
-        local_num_tokens = forward_batch.global_num_tokens_gpu[dp_rank]
-
-        forward_batch.dp_local_start_pos = local_start_pos
-        forward_batch.dp_local_num_tokens = local_num_tokens
+            # Fallback for paths that don't precompute the prefix (e.g.
+            # EAGLE draft worker cuda graph capture). This branch keeps the
+            # legacy float32-cast cumsum behavior — fine for non-B200 or
+            # non-PCG flows where the launch-config bug doesn't surface.
+            _src = forward_batch.global_num_tokens_gpu
+            cumtokens = torch.cumsum(_src.to(torch.float32), dim=0).to(_src.dtype)
+            if dp_rank == 0:
+                local_start_pos = torch.zeros_like(cumtokens[0])
+            else:
+                local_start_pos = cumtokens[dp_rank - 1]
+            forward_batch.dp_local_start_pos = local_start_pos
+            forward_batch.dp_local_num_tokens = (
+                forward_batch.global_num_tokens_gpu[dp_rank]
+            )
 
     return forward_batch.dp_local_start_pos, forward_batch.dp_local_num_tokens
 

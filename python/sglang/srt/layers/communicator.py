@@ -1021,7 +1021,43 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
-                    hidden_states, residual = layernorm(hidden_states, residual)
+                    # Iter4 SECONDARY #15 NVFP4 MoE deploy-wire:
+                    # use the fused (residual-add + RMSNorm + FP4 + BF16)
+                    # kernel when the next consumer is the NVFP4 MoE expert
+                    # apply_weights and the env flag is set. Pays an extra
+                    # BF16 write vs the iter4 PRIMARY residual-less kernel
+                    # (which omits it) but is required because
+                    # dp_gather_partial below reads the BF16 hidden_states.
+                    # The FP4 stash here is wasted in current deploy
+                    # (local-rows FP4 doesn't survive the gather) and
+                    # is preserved as a no-op stash for the iter5 FP4
+                    # allgather plumbing.
+                    _gs = context.next_consumer_fp4_global_scale
+                    if (
+                        _gs is not None
+                        and envs.SGLANG_USE_SGL_NVFP4_FUSED_RMSNORM.get()
+                        and hasattr(
+                            layernorm,
+                            "forward_with_fused_nvfp4_quant_and_bf16_out",
+                        )
+                        and hidden_states.dtype
+                        in (torch.float16, torch.bfloat16)
+                    ):
+                        y, fp4, sf, residual = (
+                            layernorm.forward_with_fused_nvfp4_quant_and_bf16_out(
+                                hidden_states, residual, _gs
+                            )
+                        )
+                        # Stash FP4 — iter5 FP4-allgather will consume it.
+                        # The consumer dels the attr after reading
+                        # (iter3 commit 3a57f94c2 hook in
+                        # compressed_tensors_w4a4_nvfp4_moe.py L353).
+                        y._sglang_pre_quantized_fp4 = (fp4, sf)
+                        hidden_states = y
+                    else:
+                        hidden_states, residual = layernorm(
+                            hidden_states, residual
+                        )
             elif context.attn_tp_rank == 0:
                 hidden_states += residual
 

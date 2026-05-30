@@ -432,6 +432,231 @@ cvt_fused_rmsnorm_to_fp4_linear_wide(
 }
 
 // ============================================================================
+// Iter4 SECONDARY: residual-add + RMSNorm + FP4 + emit BF16 hidden_states.
+// For the `use_layer_norm_before_gather=True` branch of
+// _gather_hidden_states_and_residual at L1024 of communicator.py
+// (attn_tp_size==1, attn_dp_size>1 — the DSv3.2-REAP deploy config).
+//
+// Differs from iter2's cvt_fused_rmsnorm_to_fp4_linear by writing the
+// post-norm BF16 hidden_states to a separate `y_out` tensor in addition
+// to (fp4_out, sf_out). The BF16 output is consumed by `dp_gather_partial`
+// downstream; the FP4 stash is consumed by the NVFP4 MoE expert
+// apply_weights via the iter3 hook (BUT the stash is only valid when
+// the gathered hidden_states stays per-rank, which is only true when
+// no dp_gather_partial follows the layernorm — see the L1024 path
+// commentary in communicator.py L988-1000).
+//
+// In practice: at L1024 the kernel runs on the LOCAL pre-gather rows
+// (batch/DP), then dp_gather_partial gathers across DP. The FP4 stash
+// computed here covers only the local rows and is wasted post-gather.
+// So this kernel's primary win at the L1024 wire is the launch-overhead
+// amortization (one kernel instead of two) — ~3-5us/call savings purely
+// from skipping the second kernel dispatch. The FP4 output is left
+// unconsumed unless a future iter5 plumbs an FP4 allgather.
+//
+// The kernel pays an extra BF16 write vs iter2's residual variant
+// (which omits the BF16 output entirely). For the L1024 wire we
+// re-introduce it because the BF16 is required by the downstream gather.
+template <class Type, bool kCastXBeforeOutMul = false, bool UE8M0_SF = false>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+__launch_bounds__(512, 4) cvt_fused_rmsnorm_to_fp4_and_bf16_linear(
+#else
+cvt_fused_rmsnorm_to_fp4_and_bf16_linear(
+#endif
+    int32_t numRows, int32_t numCols, Type const* __restrict__ input,
+    Type* __restrict__ residual, Type const* __restrict__ weight,
+    float const* SFScale, Type* __restrict__ y_out, uint32_t* fp4_out,
+    uint32_t* SFout, float eps) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  using packed_t = typename ::dtype_trait<Type>::packed_t;
+  using PackedVec = PackedVec<Type>;
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
+      (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "PackedVec size mismatch");
+  static_assert(CVT_FP4_ELTS_PER_THREAD == 8, "Expected 8 elts per FP4 vec");
+
+  const float SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+  const int numColVecs = numCols / CVT_FP4_ELTS_PER_THREAD;
+
+  packed_t cached_inp_res[kFusedQuantMaxVecsPerThread][4];
+  PackedVec cached_weight[kFusedQuantMaxVecsPerThread];
+  float2 cached_f2[kFusedQuantMaxVecsPerThread][4];
+
+  __shared__ float shared_inv_rms;
+
+  for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x) {
+    const PackedVec* p_in = reinterpret_cast<const PackedVec*>(input) +
+                            static_cast<int64_t>(rowIdx) * numColVecs;
+    PackedVec* p_res = reinterpret_cast<PackedVec*>(residual) +
+                       static_cast<int64_t>(rowIdx) * numColVecs;
+    PackedVec* p_y_out = reinterpret_cast<PackedVec*>(y_out) +
+                         static_cast<int64_t>(rowIdx) * numColVecs;
+    const PackedVec* p_weight = reinterpret_cast<const PackedVec*>(weight);
+
+    // --- Phase 1: load x+res, accumulate squared sum, stash for phase 2 ---
+    float thread_sq_sum = 0.0f;
+    int local_count = 0;
+
+    #pragma unroll 1
+    for (int colIdx = threadIdx.x, iter = 0;
+         colIdx < numColVecs;
+         colIdx += blockDim.x, ++iter) {
+      PackedVec x_vec = p_in[colIdx];
+      PackedVec r_vec = p_res[colIdx];
+      cached_weight[iter] = p_weight[colIdx];
+
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        float2 xf = device::cast<fp32x2_t>(x_vec.elts[i]);
+        float2 rf = device::cast<fp32x2_t>(r_vec.elts[i]);
+        float2 sf = make_float2(xf.x + rf.x, xf.y + rf.y);
+        thread_sq_sum += sf.x * sf.x + sf.y * sf.y;
+        cached_inp_res[iter][i] = device::cast<packed_t>(sf);
+        if constexpr (kCastXBeforeOutMul) {
+          cached_f2[iter][i] = sf;
+        }
+      }
+      local_count = iter + 1;
+    }
+
+    // Write residual <- (x + res) using the cached bf16 round.
+    {
+      int iter = 0;
+      for (int colIdx = threadIdx.x; colIdx < numColVecs;
+           colIdx += blockDim.x, ++iter) {
+        PackedVec out_v;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) out_v.elts[i] = cached_inp_res[iter][i];
+        p_res[colIdx] = out_v;
+      }
+    }
+
+    // --- CTA reduction: sum of squares -> rsqrt ---
+    auto cg_warp = cooperative_groups::tiled_partition<32>(
+        cooperative_groups::this_thread_block());
+    float warp_sum = cooperative_groups::reduce(
+        cg_warp, thread_sq_sum, cooperative_groups::plus<float>());
+
+    __shared__ float warp_partials[32];
+    if (threadIdx.x % 32 == 0) {
+      warp_partials[threadIdx.x / 32] = warp_sum;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+      int nwarps = (blockDim.x + 31) / 32;
+      float v = (threadIdx.x < nwarps) ? warp_partials[threadIdx.x] : 0.0f;
+      float cta_sum = cooperative_groups::reduce(
+          cg_warp, v, cooperative_groups::plus<float>());
+      if (threadIdx.x == 0) {
+        shared_inv_rms =
+            rsqrtf(eps + cta_sum * (1.0f / static_cast<float>(numCols)));
+      }
+    }
+    __syncthreads();
+    const float inv_rms = shared_inv_rms;
+
+    // --- Phase 2: normalize, weight-multiply, write BOTH BF16 + FP4. ---
+    int iter = 0;
+    for (int colIdx = threadIdx.x; colIdx < numColVecs;
+         colIdx += blockDim.x, ++iter) {
+      PackedVec y_vec;
+
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        float2 vf;
+        if constexpr (kCastXBeforeOutMul) {
+          vf = cached_f2[iter][i];
+          float2 wf = device::cast<fp32x2_t>(cached_weight[iter].elts[i]);
+          float2 normed = make_float2(vf.x * inv_rms, vf.y * inv_rms);
+          packed_t rounded = device::cast<packed_t>(normed);
+          float2 rf = device::cast<fp32x2_t>(rounded);
+          y_vec.elts[i] = device::cast<packed_t>(
+              make_float2(rf.x * wf.x, rf.y * wf.y));
+        } else {
+          vf = device::cast<fp32x2_t>(cached_inp_res[iter][i]);
+          float2 wf = device::cast<fp32x2_t>(cached_weight[iter].elts[i]);
+          y_vec.elts[i] = device::cast<packed_t>(make_float2(
+              vf.x * wf.x * inv_rms, vf.y * wf.y * inv_rms));
+        }
+      }
+
+      // Write BF16 hidden_states for the dp_gather_partial consumer.
+      p_y_out[colIdx] = y_vec;
+
+      // Write FP4 + SF for the (local-rows) MoE expert apply_weights
+      // consumer if the iter5 FP4 allgather lands.
+      int64_t outOffset =
+          static_cast<int64_t>(rowIdx) * numColVecs + colIdx;
+      auto sf_out =
+          cvt_quant_to_fp4_get_sf_out_offset_linear_fused<
+              uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(rowIdx, colIdx, numCols,
+                                                   SFout);
+      fp4_out[outOffset] =
+          cvt_warp_fp16_to_fp4<Type, UE8M0_SF>(y_vec, SFScaleVal, sf_out);
+    }
+    (void)local_count;
+  }
+#endif
+}
+
+template <typename T>
+void invokeFusedRMSNormFP4AndBf16QuantLinear(
+    int m, int n, T const* input, T* residual, T const* weight,
+    float const* SFScale, T* y_out, int64_t* fp4_output, int32_t* SFOutput,
+    float eps, bool cast_x_before_out_mul, bool useUE8M0, bool enable_pdl,
+    int multiProcessorCount, DLDevice device) {
+  const int numColVecs = n / ELTS_PER_THREAD;
+  int block_threads = std::min(numColVecs, 512);
+  dim3 block(block_threads);
+  int const numBlocksPerSM = 2048 / block.x;
+  dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
+
+  int vecs_per_thread = (numColVecs + block_threads - 1) / block_threads;
+  RuntimeCheck(vecs_per_thread <= kFusedQuantMaxVecsPerThread,
+               "fused RMSNorm + FP4 + BF16: vecs_per_thread ",
+               vecs_per_thread, " exceeds cap ", kFusedQuantMaxVecsPerThread);
+
+  auto out_u32 = reinterpret_cast<uint32_t*>(fp4_output);
+  auto sf_u32 = reinterpret_cast<uint32_t*>(SFOutput);
+
+  auto launcher = host::LaunchKernel(grid, block, device);
+  launcher.enable_pdl(enable_pdl);
+
+  if (useUE8M0) {
+    if (cast_x_before_out_mul) {
+      auto k = cvt_fused_rmsnorm_to_fp4_and_bf16_linear<T, true, true>;
+      launcher(k, m, n, input, residual, weight, SFScale, y_out, out_u32, sf_u32, eps);
+    } else {
+      auto k = cvt_fused_rmsnorm_to_fp4_and_bf16_linear<T, false, true>;
+      launcher(k, m, n, input, residual, weight, SFScale, y_out, out_u32, sf_u32, eps);
+    }
+  } else {
+    if (cast_x_before_out_mul) {
+      auto k = cvt_fused_rmsnorm_to_fp4_and_bf16_linear<T, true, false>;
+      launcher(k, m, n, input, residual, weight, SFScale, y_out, out_u32, sf_u32, eps);
+    } else {
+      auto k = cvt_fused_rmsnorm_to_fp4_and_bf16_linear<T, false, false>;
+      launcher(k, m, n, input, residual, weight, SFScale, y_out, out_u32, sf_u32, eps);
+    }
+  }
+}
+
+template void invokeFusedRMSNormFP4AndBf16QuantLinear(
+    int m, int n, half const* input, half* residual, half const* weight,
+    float const* SFScale, half* y_out, int64_t* fp4_output,
+    int32_t* SFOutput, float eps, bool cast_x_before_out_mul, bool useUE8M0,
+    bool enable_pdl, int multiProcessorCount, DLDevice device);
+
+template void invokeFusedRMSNormFP4AndBf16QuantLinear(
+    int m, int n, __nv_bfloat16 const* input, __nv_bfloat16* residual,
+    __nv_bfloat16 const* weight, float const* SFScale, __nv_bfloat16* y_out,
+    int64_t* fp4_output, int32_t* SFOutput, float eps,
+    bool cast_x_before_out_mul, bool useUE8M0, bool enable_pdl,
+    int multiProcessorCount, DLDevice device);
+
+// ============================================================================
 // Iter4 PRIMARY: residual-less variant for the
 // `not use_layer_norm_before_gather` deploy path
 // (CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
@@ -967,6 +1192,98 @@ void fused_rmsnorm_only_to_fp4_linear_sm100a_sm120a(
         m, n, in_ptr, w_ptr, sf_in_ptr, y_ptr, fp4_out_ptr, sf_out_ptr,
         static_cast<float>(eps), cast_x_before_out_mul, useUE8M0, enable_pdl,
         multiProcessorCount, device);
+  }
+}
+
+// Iter4 SECONDARY: residual-add + RMSNorm + FP4 + emit BF16 hidden_states.
+// Public entry for the `use_layer_norm_before_gather=True` branch.
+void fused_rmsnorm_to_fp4_and_bf16_linear_sm100a_sm120a(
+    tvm::ffi::TensorView input, tvm::ffi::TensorView residual,
+    tvm::ffi::TensorView weight, tvm::ffi::TensorView input_sf,
+    tvm::ffi::TensorView y_output, tvm::ffi::TensorView fp4_output,
+    tvm::ffi::TensorView sf_output, double eps, bool cast_x_before_out_mul,
+    bool enable_pdl) {
+  RuntimeCheck(input.device().device_type == kDLCUDA,
+               "input must be a CUDA tensor");
+  RuntimeCheck(residual.device() == input.device(),
+               "residual must be on the same device as input");
+  RuntimeCheck(weight.device() == input.device(),
+               "weight must be on the same device as input");
+  RuntimeCheck(input_sf.device() == input.device(),
+               "input_sf must be on the same device as input");
+  RuntimeCheck(y_output.device() == input.device(),
+               "y_output must be on the same device as input");
+  RuntimeCheck(fp4_output.device() == input.device(),
+               "fp4_output must be on the same device as input");
+  RuntimeCheck(sf_output.device() == input.device(),
+               "sf_output must be on the same device as input");
+  RuntimeCheck(input.dim() == 2, "input must be 2D");
+  RuntimeCheck(residual.dim() == 2, "residual must be 2D");
+  RuntimeCheck(weight.dim() == 1, "weight must be 1D");
+  RuntimeCheck(input_sf.numel() == 1,
+               "input_sf must have exactly one element");
+  RuntimeCheck(y_output.dim() == 2, "y_output must be 2D");
+  RuntimeCheck(fp4_output.dim() == 2, "fp4_output must be 2D");
+  RuntimeCheck(sf_output.dim() == 2, "sf_output must be 2D");
+  RuntimeCheck(host::is_type<uint8_t>(fp4_output.dtype()),
+               "fp4_output must be uint8");
+  RuntimeCheck(host::is_type<int32_t>(sf_output.dtype()),
+               "sf_output must be int32 (fp8 packed)");
+  RuntimeCheck(host::is_type<float>(input_sf.dtype()),
+               "input_sf must be float32");
+  RuntimeCheck(host::is_type<fp16_t>(input.dtype()) ||
+                   host::is_type<bf16_t>(input.dtype()),
+               "input dtype must be fp16 or bf16");
+  RuntimeCheck(y_output.dtype() == input.dtype(),
+               "y_output dtype must match input");
+
+  const int device_id = input.device().device_id;
+  RuntimeCheck(getSMVersionFusedQuant(device_id) >= 100,
+               "fused_rmsnorm_to_fp4_and_bf16_linear requires sm100+");
+
+  const int32_t m = static_cast<int32_t>(input.size(0));
+  const int32_t n = static_cast<int32_t>(input.size(1));
+
+  RuntimeCheck(residual.size(0) == m && residual.size(1) == n,
+               "residual shape mismatch");
+  RuntimeCheck(y_output.size(0) == m && y_output.size(1) == n,
+               "y_output shape mismatch");
+  RuntimeCheck(weight.size(0) == n, "weight shape mismatch");
+  RuntimeCheck(fp4_output.size(0) == m && fp4_output.size(1) == n / 2,
+               "fp4_output shape mismatch (expect [m, n/2])");
+  RuntimeCheck(n % 16 == 0, "n must be multiple of 16");
+  RuntimeCheck((n / 16) % 4 == 0,
+               "n/16 must be multiple of 4 for int32-packed SF");
+  RuntimeCheck(sf_output.size(0) == m && sf_output.size(1) == (n / 16) / 4,
+               "sf_output shape mismatch (expect [m, n/64] int32)");
+
+  const int multiProcessorCount =
+      static_cast<int>(runtime::get_sm_count(device_id));
+  const DLDevice device = input.device();
+
+  auto sf_in_ptr = static_cast<float const*>(input_sf.data_ptr());
+  auto sf_out_ptr = static_cast<int32_t*>(sf_output.data_ptr());
+  auto fp4_out_ptr = static_cast<int64_t*>(fp4_output.data_ptr());
+
+  constexpr bool useUE8M0 = false;
+  if (host::is_type<fp16_t>(input.dtype())) {
+    auto in_ptr = reinterpret_cast<half const*>(input.data_ptr());
+    auto res_ptr = reinterpret_cast<half*>(residual.data_ptr());
+    auto w_ptr = reinterpret_cast<half const*>(weight.data_ptr());
+    auto y_ptr = reinterpret_cast<half*>(y_output.data_ptr());
+    invokeFusedRMSNormFP4AndBf16QuantLinear(
+        m, n, in_ptr, res_ptr, w_ptr, sf_in_ptr, y_ptr, fp4_out_ptr,
+        sf_out_ptr, static_cast<float>(eps), cast_x_before_out_mul, useUE8M0,
+        enable_pdl, multiProcessorCount, device);
+  } else {
+    auto in_ptr = reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr());
+    auto res_ptr = reinterpret_cast<__nv_bfloat16*>(residual.data_ptr());
+    auto w_ptr = reinterpret_cast<__nv_bfloat16 const*>(weight.data_ptr());
+    auto y_ptr = reinterpret_cast<__nv_bfloat16*>(y_output.data_ptr());
+    invokeFusedRMSNormFP4AndBf16QuantLinear(
+        m, n, in_ptr, res_ptr, w_ptr, sf_in_ptr, y_ptr, fp4_out_ptr,
+        sf_out_ptr, static_cast<float>(eps), cast_x_before_out_mul, useUE8M0,
+        enable_pdl, multiProcessorCount, device);
   }
 }
 

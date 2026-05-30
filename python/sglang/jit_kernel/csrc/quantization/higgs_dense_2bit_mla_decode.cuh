@@ -359,6 +359,84 @@ __device__ __forceinline__ void higgs_cp_async_wait_group() {
   asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 }
 
+// ─── Iter7 (#16): packed-scratch gather kernel ───────────────────────
+//
+// 2-pass architecture for the HIGGS dense MLA decode hot path:
+//
+//   Pass 1 (this kernel) — gather every selected slot into a packed
+//     scratch buffer indexed [row, split, k_in_chunk, kSlotBytes],
+//     so each (row, split) chunk is contiguous in gmem. Pages with
+//     ``page_table[row, k] < 0`` are zero-filled.
+//
+//   Pass 2 (``higgs_dense_2bit_mla_decode_stage1_split_packed_kernel``)
+//     — decode stage 1 reads from packed scratch instead of from
+//     ``compressed[page * 272]``. Same math as iter5; only the slot
+//     source pointer changes. Since every (row, head, split) CTA reads
+//     the *same* chunk slice for a given (row, split), L2 hit rate
+//     across the 16 heads per rank goes from "depends on random page
+//     overlap" (iter5 baseline) to ~100 % for the chunk bytes
+//     (~34.8 KB per chunk at chunk=128 fits easily in B200 L2).
+//
+// Risk: extra HBM round-trip on the gather output. At B=128, the
+// gather writes 71.3 MB to scratch (chunk * kSlotBytes *
+// num_rows * num_splits = 128 * 272 * 128 * 16 = 71.3 MB). HBM BW at
+// B200 8 TB/s means ~9 us added per call. The benefit must exceed
+// the gather cost; if the kernel is truly compute-bound (iter6
+// close-out diagnosis), the net is likely negative or break-even —
+// measured-empirically here.
+//
+// Grid: (num_rows, num_splits) × kBlockThreads. Each CTA copies one
+// (row, split)'s chunk of slots from ``compressed`` into ``packed``.
+// kCpAsyncSlotLanes (17) lanes per slot via plain LDG.128+STG.128
+// (cp.async needs a smem hop, gmem-to-gmem is one LDG+STG).
+
+__global__ void __launch_bounds__(kBlockThreads, 8)
+higgs_dense_2bit_mla_gather_packed_kernel(
+    const uint8_t* __restrict__ compressed,
+    const int32_t* __restrict__ page_table,
+    uint8_t* __restrict__ packed,
+    int64_t num_rows,
+    int64_t topk,
+    int64_t num_splits,
+    int64_t compressed_stride_0,
+    int64_t page_table_stride_0,
+    int64_t packed_row_stride_bytes,
+    int64_t packed_split_stride_bytes) {
+  const int row = blockIdx.x;
+  const int split = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (row >= num_rows || split >= num_splits) return;
+
+  const int64_t chunk = (topk + num_splits - 1) / num_splits;
+  const int64_t begin = split * chunk;
+  const int64_t end = min(begin + chunk, topk);
+  const int32_t* pages = page_table + row * page_table_stride_0;
+  uint8_t* dst_chunk =
+      packed + row * packed_row_stride_bytes + split * packed_split_stride_bytes;
+
+  for (int64_t k = begin; k < end; ++k) {
+    const int32_t page = __ldg(&pages[k]);
+    const bool valid = page >= 0;
+    const int64_t page_safe = valid ? static_cast<int64_t>(page) : 0;
+    const uint8_t* src = compressed + page_safe * compressed_stride_0;
+    uint8_t* dst = dst_chunk + (k - begin) * kSlotBytes;
+    if (tid < kCpAsyncSlotLanes) {
+      // gmem->gmem direct: LDG.128 + STG.128 cooperatively (17 lanes
+      // ×16 B = 272 B = kSlotBytes). For invalid pages, fall through
+      // and zero-fill the destination so the decode kernel sees a
+      // well-defined slot (the decode masks scores anyway via the
+      // page-validity recheck, but the bytes must be defined).
+      const uint4* src_v = reinterpret_cast<const uint4*>(src + tid * 16);
+      uint4* dst_v = reinterpret_cast<uint4*>(dst + tid * 16);
+      uint4 v = __ldg(src_v);
+      if (!valid) {
+        v = make_uint4(0, 0, 0, 0);
+      }
+      *dst_v = v;
+    }
+  }
+}
+
 // Pre-rotate q_nope into a float32 buffer holding FWHT_512(q_nope) *
 // kInvSqrtLatentDim. Called once per (row, head) before stage1_split.
 // This matches TurboQuant's rotate_query kernel; pre-rotating once and
@@ -682,6 +760,266 @@ higgs_dense_2bit_mla_decode_stage1_split_kernel(
 
   // Write partials. Layout matches TurboQuant's stage1_rotated_fast:
   // mid[..., 0] = m, mid[..., 1] = l, mid[..., 2 + g*128 + tid] = acc_g.
+  float* mid_row =
+      mid + row * mid_stride_0 + head * mid_stride_1 +
+      split * mid_stride_2;
+  if (tid == 0) {
+    mid_row[0] = softmax_state_m;
+    mid_row[1] = softmax_state_l;
+  }
+  mid_row[2 + 0 * 128 + tid] = acc0;
+  mid_row[2 + 1 * 128 + tid] = acc1;
+  mid_row[2 + 2 * 128 + tid] = acc2;
+  mid_row[2 + 3 * 128 + tid] = acc3;
+}
+
+// ─── Iter7 (#16): packed-scratch decode kernel ───────────────────────
+//
+// Same math as ``higgs_dense_2bit_mla_decode_stage1_split_kernel`` but
+// the slot byte source is the packed scratch buffer produced by
+// ``higgs_dense_2bit_mla_gather_packed_kernel``. The slot pointer
+// becomes ``packed + (row * num_splits + split) * chunk * kSlotBytes
+// + (col - begin) * kSlotBytes``, which is contiguous in gmem for
+// each (row, split) chunk.
+//
+// The page-validity check is retained (read ``pages[col]``, gate
+// scores by ``page >= 0``) to keep iter7 bit-identical to iter5 even
+// for page tables with invalid (-1) entries. The cp.async.16 source
+// pointer always points into the packed scratch, which the gather
+// kernel zero-fills for invalid pages, so a fallback page-0 read is
+// not needed.
+
+__global__ void __launch_bounds__(kBlockThreads, 8)
+higgs_dense_2bit_mla_decode_stage1_split_packed_kernel(
+    const float* __restrict__ q_rotated,
+    const bf16_t* __restrict__ q_rope,
+    const uint8_t* __restrict__ packed,
+    const int32_t* __restrict__ page_table,
+    float* __restrict__ mid,
+    const float* __restrict__ codebook,
+    int64_t num_rows,
+    int64_t num_heads,
+    int64_t topk,
+    int64_t num_splits,
+    int64_t q_rot_stride_0,
+    int64_t q_rot_stride_1,
+    int64_t q_rope_stride_0,
+    int64_t q_rope_stride_1,
+    int64_t packed_row_stride_bytes,
+    int64_t packed_split_stride_bytes,
+    int64_t page_table_stride_0,
+    int64_t mid_stride_0,
+    int64_t mid_stride_1,
+    int64_t mid_stride_2,
+    float sm_scale) {
+  const int row = blockIdx.x;
+  const int head = blockIdx.y;
+  const int split = blockIdx.z;
+  const int tid = threadIdx.x;
+  if (row >= num_rows || head >= num_heads || split >= num_splits) return;
+
+  __shared__ float warp_partials[2][4];
+  __shared__ float cb_smem[kCodebookSize * kPairDim];
+  __shared__ __align__(16) uint8_t slot_smem[4][kSlotBytes];
+
+  float softmax_state_m = kNegInf;
+  float softmax_state_l = 0.0f;
+
+  if (tid < kCodebookSize * kPairDim) {
+    cb_smem[tid] = __ldg(&codebook[tid]);
+  }
+
+  const float* q_rot_row =
+      q_rotated + row * q_rot_stride_0 + head * q_rot_stride_1;
+  const float v0 = q_rot_row[0 * 128 + tid];
+  const float v1 = q_rot_row[1 * 128 + tid];
+  const float v2 = q_rot_row[2 * 128 + tid];
+  const float v3 = q_rot_row[3 * 128 + tid];
+
+  float q_rope_val = 0.0f;
+  if (tid < kRopeDim) {
+    const bf16_t* q_rope_row =
+        q_rope + row * q_rope_stride_0 + head * q_rope_stride_1;
+    q_rope_val = bf16_to_float(q_rope_row[tid]);
+  }
+
+  const int64_t chunk = (topk + num_splits - 1) / num_splits;
+  const int64_t begin = split * chunk;
+  const int64_t end = min(begin + chunk, topk);
+  const int32_t* pages = page_table + row * page_table_stride_0;
+  const uint8_t* packed_chunk =
+      packed + row * packed_row_stride_bytes + split * packed_split_stride_bytes;
+
+  float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+  if (begin >= end) {
+    float* mid_row_empty =
+        mid + row * mid_stride_0 + head * mid_stride_1 +
+        split * mid_stride_2;
+    if (tid == 0) {
+      mid_row_empty[0] = kNegInf;
+      mid_row_empty[1] = 0.0f;
+    }
+    mid_row_empty[2 + 0 * 128 + tid] = 0.0f;
+    mid_row_empty[2 + 1 * 128 + tid] = 0.0f;
+    mid_row_empty[2 + 2 * 128 + tid] = 0.0f;
+    mid_row_empty[2 + 3 * 128 + tid] = 0.0f;
+    return;
+  }
+
+  // Iter7: prologue prefetches the first pair from packed scratch (no
+  // safe-fallback indirection needed; packed_chunk is contiguous and
+  // the gather zero-filled any out-of-range bytes).
+  const int32_t first_page_lo = __ldg(&pages[begin]);
+  const bool first_valid_lo = first_page_lo >= 0;
+  bool first_valid_hi = false;
+  {
+    const uint8_t* first_slot_lo_gmem = packed_chunk + 0 * kSlotBytes;
+    higgs_cp_async_prefetch_slot(
+        slot_smem[static_cast<int>(begin & 3)], first_slot_lo_gmem, tid);
+    int32_t first_page_hi_raw = -1;
+    if (begin + 1 < end) {
+      first_page_hi_raw = __ldg(&pages[begin + 1]);
+    }
+    first_valid_hi = (begin + 1 < end) && (first_page_hi_raw >= 0);
+    const uint8_t* first_slot_hi_gmem = packed_chunk + 1 * kSlotBytes;
+    higgs_cp_async_prefetch_slot(
+        slot_smem[static_cast<int>((begin + 1) & 3)],
+        first_slot_hi_gmem, tid);
+    higgs_cp_async_commit();
+  }
+  bool prev_valid_lo = first_valid_lo;
+  bool prev_valid_hi = first_valid_hi;
+
+  for (int64_t col = begin; col < end; col += 2) {
+    const int buf_lo = static_cast<int>(col & 3);
+    const int buf_hi = static_cast<int>((col + 1) & 3);
+    const int next_buf_lo = static_cast<int>((col + 2) & 3);
+    const int next_buf_hi = static_cast<int>((col + 3) & 3);
+
+    int32_t next_page_lo_raw = -1;
+    if (col + 2 < end) {
+      next_page_lo_raw = __ldg(&pages[col + 2]);
+    }
+    const bool next_valid_lo = (col + 2 < end) && (next_page_lo_raw >= 0);
+    // Always prefetch (packed scratch is contiguous; out-of-range
+    // bytes have valid zero contents from the gather kernel).
+    const uint8_t* next_slot_lo_gmem =
+        packed_chunk + (col + 2 - begin) * kSlotBytes;
+    if (col + 2 < end) {
+      higgs_cp_async_prefetch_slot(slot_smem[next_buf_lo], next_slot_lo_gmem, tid);
+    } else {
+      // Slot is past chunk end; prefetch packed_chunk[0] as a safe
+      // bounded read (same trick as iter5 used for the fallback page).
+      higgs_cp_async_prefetch_slot(slot_smem[next_buf_lo], packed_chunk, tid);
+    }
+
+    int32_t next_page_hi_raw = -1;
+    if (col + 3 < end) {
+      next_page_hi_raw = __ldg(&pages[col + 3]);
+    }
+    const bool next_valid_hi = (col + 3 < end) && (next_page_hi_raw >= 0);
+    const uint8_t* next_slot_hi_gmem =
+        packed_chunk + (col + 3 - begin) * kSlotBytes;
+    if (col + 3 < end) {
+      higgs_cp_async_prefetch_slot(slot_smem[next_buf_hi], next_slot_hi_gmem, tid);
+    } else {
+      higgs_cp_async_prefetch_slot(slot_smem[next_buf_hi], packed_chunk, tid);
+    }
+
+    higgs_cp_async_commit();
+    higgs_cp_async_wait_group<1>();
+    __syncthreads();
+
+    const uint8_t* slot_lo = slot_smem[buf_lo];
+    const uint8_t* slot_hi = slot_smem[buf_hi];
+    const bool valid_lo = prev_valid_lo;
+    const bool valid_hi = prev_valid_hi && (col + 1 < end);
+
+    uint32_t i0a, i1a, i2a, i3a;
+    higgs_unpack_indices_smem(slot_lo, tid, i0a, i1a, i2a, i3a);
+    const int coord = tid & 1;
+    const float c0a = cb_smem[i0a * kPairDim + coord];
+    const float c1a = cb_smem[i1a * kPairDim + coord];
+    const float c2a = cb_smem[i2a * kPairDim + coord];
+    const float c3a = cb_smem[i3a * kPairDim + coord];
+    const half norm_a = *reinterpret_cast<const half*>(slot_lo + kPackedBytes);
+    const float scale_a = __half2float(norm_a);
+    float val_a = valid_lo
+        ? scale_a * (v0 * c0a + v1 * c1a + v2 * c2a + v3 * c3a)
+        : 0.0f;
+    if (tid < kRopeDim && valid_lo) {
+      const bf16_t* rope_a =
+          reinterpret_cast<const bf16_t*>(slot_lo + kPackedBytes + kNormBytes);
+      val_a += q_rope_val * bf16_to_float(rope_a[tid]);
+    }
+    const float warp_sum_a = warp_reduce_sum(val_a);
+
+    uint32_t i0b, i1b, i2b, i3b;
+    higgs_unpack_indices_smem(slot_hi, tid, i0b, i1b, i2b, i3b);
+    const float c0b = cb_smem[i0b * kPairDim + coord];
+    const float c1b = cb_smem[i1b * kPairDim + coord];
+    const float c2b = cb_smem[i2b * kPairDim + coord];
+    const float c3b = cb_smem[i3b * kPairDim + coord];
+    const half norm_b = *reinterpret_cast<const half*>(slot_hi + kPackedBytes);
+    const float scale_b = __half2float(norm_b);
+    float val_b = valid_hi
+        ? scale_b * (v0 * c0b + v1 * c1b + v2 * c2b + v3 * c3b)
+        : 0.0f;
+    if (tid < kRopeDim && valid_hi) {
+      const bf16_t* rope_b =
+          reinterpret_cast<const bf16_t*>(slot_hi + kPackedBytes + kNormBytes);
+      val_b += q_rope_val * bf16_to_float(rope_b[tid]);
+    }
+    const float warp_sum_b = warp_reduce_sum(val_b);
+
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    if (lane == 0) {
+      warp_partials[0][warp_id] = warp_sum_a;
+      warp_partials[1][warp_id] = warp_sum_b;
+    }
+    __syncthreads();
+    const float total_a =
+        warp_partials[0][0] + warp_partials[0][1] +
+        warp_partials[0][2] + warp_partials[0][3];
+    const float total_b =
+        warp_partials[1][0] + warp_partials[1][1] +
+        warp_partials[1][2] + warp_partials[1][3];
+
+    const float score_a = valid_lo ? total_a * sm_scale : kNegInf;
+    const float old_m_a = softmax_state_m;
+    const float old_l_a = softmax_state_l;
+    const float new_m_a = fmaxf(old_m_a, score_a);
+    const float alpha_a = __expf(old_m_a - new_m_a);
+    const float beta_a = __expf(score_a - new_m_a);
+    softmax_state_m = new_m_a;
+    softmax_state_l = old_l_a * alpha_a + beta_a;
+    const float beta_a_scaled = beta_a * scale_a;
+    acc0 = acc0 * alpha_a + beta_a_scaled * c0a;
+    acc1 = acc1 * alpha_a + beta_a_scaled * c1a;
+    acc2 = acc2 * alpha_a + beta_a_scaled * c2a;
+    acc3 = acc3 * alpha_a + beta_a_scaled * c3a;
+
+    const float score_b = valid_hi ? total_b * sm_scale : kNegInf;
+    const float old_m_b = softmax_state_m;
+    const float old_l_b = softmax_state_l;
+    const float new_m_b = fmaxf(old_m_b, score_b);
+    const float alpha_b = __expf(old_m_b - new_m_b);
+    const float beta_b = __expf(score_b - new_m_b);
+    softmax_state_m = new_m_b;
+    softmax_state_l = old_l_b * alpha_b + beta_b;
+    const float beta_b_scaled = valid_hi ? (beta_b * scale_b) : 0.0f;
+    acc0 = acc0 * alpha_b + beta_b_scaled * c0b;
+    acc1 = acc1 * alpha_b + beta_b_scaled * c1b;
+    acc2 = acc2 * alpha_b + beta_b_scaled * c2b;
+    acc3 = acc3 * alpha_b + beta_b_scaled * c3b;
+
+    prev_valid_lo = next_valid_lo;
+    prev_valid_hi = next_valid_hi;
+  }
+  higgs_cp_async_wait_group<0>();
+
   float* mid_row =
       mid + row * mid_stride_0 + head * mid_stride_1 +
       split * mid_stride_2;
@@ -1202,6 +1540,188 @@ struct HiggsDense2BitMLADecodeSplitKernel {
         q_rope_stride_0.unwrap(),
         q_rope_stride_1.unwrap(),
         compressed_stride_0.unwrap(),
+        page_table_stride_0.unwrap(),
+        mid_stride_0.unwrap(),
+        mid_stride_1.unwrap(),
+        mid_stride_2.unwrap(),
+        static_cast<float>(sm_scale));
+
+    LaunchKernel(
+        dim3(R.unwrap(), H.unwrap()), kBlockThreads, device.unwrap())(
+        higgs_dense_2bit_mla_decode_stage2_kernel,
+        static_cast<const float*>(mid.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        R.unwrap(),
+        H.unwrap(),
+        P.unwrap(),
+        mid_stride_0.unwrap(),
+        mid_stride_1.unwrap(),
+        mid_stride_2.unwrap(),
+        out_stride_0.unwrap(),
+        out_stride_1.unwrap());
+  }
+};
+
+// ─── Iter7 (#16): packed-scratch gather launcher ─────────────────────
+// Allocates a ``[num_rows, num_splits, chunk, kSlotBytes]`` scratch
+// buffer and runs the gather kernel. The caller passes the packed
+// buffer in for in-place writes. Layout is row-major contiguous so
+// each ``(row, split)`` chunk is a contiguous gmem tile of
+// ``chunk * kSlotBytes`` bytes (34.8 KB at chunk=128).
+
+struct HiggsDense2BitMLAGatherPackedKernel {
+  static void run(
+      tvm::ffi::TensorView compressed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView packed) {
+    using namespace host;
+
+    auto R = SymbolicSize{"num_rows"};
+    auto K = SymbolicSize{"topk"};
+    auto S = SymbolicSize{"num_slots"};
+    auto P = SymbolicSize{"num_splits"};
+    auto C = SymbolicSize{"chunk"};
+    auto compressed_stride_0 = SymbolicSize{"compressed_stride_0"};
+    auto page_table_stride_0 = SymbolicSize{"page_table_stride_0"};
+    auto packed_stride_0 = SymbolicSize{"packed_stride_0"};
+    auto packed_stride_1 = SymbolicSize{"packed_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({S, 1, kSlotBytes})
+        .with_strides({compressed_stride_0, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(compressed);
+    TensorMatcher({R, K})
+        .with_strides({page_table_stride_0, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({R, P, C, kSlotBytes})
+        .with_strides({packed_stride_0, packed_stride_1, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(packed);
+
+    if (R.unwrap() == 0 || P.unwrap() == 0 || K.unwrap() == 0) {
+      return;
+    }
+
+    LaunchKernel(
+        dim3(R.unwrap(), P.unwrap()), kBlockThreads, device.unwrap())(
+        higgs_dense_2bit_mla_gather_packed_kernel,
+        static_cast<const uint8_t*>(compressed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<uint8_t*>(packed.data_ptr()),
+        R.unwrap(),
+        K.unwrap(),
+        P.unwrap(),
+        compressed_stride_0.unwrap(),
+        page_table_stride_0.unwrap(),
+        packed_stride_0.unwrap(),
+        packed_stride_1.unwrap());
+  }
+};
+
+// ─── Iter7 (#16): packed-scratch decode launcher ─────────────────────
+// Same external contract as ``HiggsDense2BitMLADecodeSplitKernel`` but
+// the slot byte source is the packed scratch buffer produced by
+// ``HiggsDense2BitMLAGatherPackedKernel``. The page_table is still
+// passed through so the decode can mask scores by page validity.
+
+struct HiggsDense2BitMLADecodeSplitPackedKernel {
+  static void run(
+      tvm::ffi::TensorView q_rotated,
+      tvm::ffi::TensorView q_rope,
+      tvm::ffi::TensorView packed,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView mid,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView codebook,
+      double sm_scale) {
+    using namespace host;
+
+    auto R = SymbolicSize{"num_rows"};
+    auto H = SymbolicSize{"num_heads"};
+    auto K = SymbolicSize{"topk"};
+    auto P = SymbolicSize{"num_splits"};
+    auto C = SymbolicSize{"chunk"};
+    auto q_rot_stride_0 = SymbolicSize{"q_rot_stride_0"};
+    auto q_rot_stride_1 = SymbolicSize{"q_rot_stride_1"};
+    auto q_rope_stride_0 = SymbolicSize{"q_rope_stride_0"};
+    auto q_rope_stride_1 = SymbolicSize{"q_rope_stride_1"};
+    auto packed_stride_0 = SymbolicSize{"packed_stride_0"};
+    auto packed_stride_1 = SymbolicSize{"packed_stride_1"};
+    auto page_table_stride_0 = SymbolicSize{"page_table_stride_0"};
+    auto mid_stride_0 = SymbolicSize{"mid_stride_0"};
+    auto mid_stride_1 = SymbolicSize{"mid_stride_1"};
+    auto mid_stride_2 = SymbolicSize{"mid_stride_2"};
+    auto out_stride_0 = SymbolicSize{"out_stride_0"};
+    auto out_stride_1 = SymbolicSize{"out_stride_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({R, H, kLatentDim})
+        .with_strides({q_rot_stride_0, q_rot_stride_1, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(q_rotated);
+    TensorMatcher({R, H, kRopeDim})
+        .with_strides({q_rope_stride_0, q_rope_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(q_rope);
+    TensorMatcher({R, P, C, kSlotBytes})
+        .with_strides({packed_stride_0, packed_stride_1, kSlotBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(packed);
+    TensorMatcher({R, K})
+        .with_strides({page_table_stride_0, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(page_table);
+    TensorMatcher({R, H, P, kLatentDim + 2})
+        .with_strides({mid_stride_0, mid_stride_1, mid_stride_2, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(mid);
+    TensorMatcher({R, H, kLatentDim})
+        .with_strides({out_stride_0, out_stride_1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
+    TensorMatcher({kCodebookSize, kPairDim})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(codebook);
+
+    if (R.unwrap() == 0 || H.unwrap() == 0 || K.unwrap() == 0 ||
+        P.unwrap() == 0) {
+      return;
+    }
+
+    LaunchKernel(
+        dim3(R.unwrap(), H.unwrap(), P.unwrap()), kBlockThreads,
+        device.unwrap())(
+        higgs_dense_2bit_mla_decode_stage1_split_packed_kernel,
+        static_cast<const float*>(q_rotated.data_ptr()),
+        static_cast<const bf16_t*>(q_rope.data_ptr()),
+        static_cast<const uint8_t*>(packed.data_ptr()),
+        static_cast<const int32_t*>(page_table.data_ptr()),
+        static_cast<float*>(mid.data_ptr()),
+        static_cast<const float*>(codebook.data_ptr()),
+        R.unwrap(),
+        H.unwrap(),
+        K.unwrap(),
+        P.unwrap(),
+        q_rot_stride_0.unwrap(),
+        q_rot_stride_1.unwrap(),
+        q_rope_stride_0.unwrap(),
+        q_rope_stride_1.unwrap(),
+        packed_stride_0.unwrap(),
+        packed_stride_1.unwrap(),
         page_table_stride_0.unwrap(),
         mid_stride_0.unwrap(),
         mid_stride_1.unwrap(),

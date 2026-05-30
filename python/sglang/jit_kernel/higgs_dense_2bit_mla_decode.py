@@ -50,6 +50,16 @@ def _jit_higgs_dense_2bit_mla_decode_module() -> "Module":
                 "higgs_dense_2bit_mla_detail::"
                 "HiggsDense2BitMLADecodeSawScalar2SplitKernel::run",
             ),
+            (
+                "higgs_dense_2bit_mla_gather_packed",
+                "higgs_dense_2bit_mla_detail::"
+                "HiggsDense2BitMLAGatherPackedKernel::run",
+            ),
+            (
+                "higgs_dense_2bit_mla_decode_split_packed",
+                "higgs_dense_2bit_mla_detail::"
+                "HiggsDense2BitMLADecodeSplitPackedKernel::run",
+            ),
         ],
     )
 
@@ -172,6 +182,85 @@ def higgs_dense_2bit_mla_decode_split(
         q_rotated,
         q_rope.contiguous(),
         compressed.contiguous(),
+        page_table.contiguous(),
+        mid,
+        out,
+        codebook.contiguous(),
+        float(sm_scale),
+    )
+
+
+@debug_kernel_api
+def higgs_dense_2bit_mla_gather_packed(
+    compressed: torch.Tensor,
+    page_table: torch.Tensor,
+    packed: torch.Tensor,
+) -> None:
+    """Iter7 (#16): gather kernel for the 2-pass packed-scratch decode.
+
+    Copies the selected slots from ``compressed[page_table[row, k] *
+    272]`` into a contiguous ``packed[row, split, k_in_chunk, 272]``
+    scratch buffer. ``packed`` is allocated by the caller and reused
+    across calls when its shape is compatible.
+
+    Args:
+      compressed: ``(num_slots, 1, 272)`` ``uint8`` packed KV slots.
+      page_table: ``(num_rows, topk)`` ``int32`` slot indices.
+      packed: ``(num_rows, num_splits, chunk, 272)`` ``uint8``
+        destination scratch. ``chunk = ceil(topk / num_splits)``.
+    """
+    assert compressed.is_cuda
+    assert page_table.is_cuda
+    assert packed.is_cuda
+    assert compressed.dtype == torch.uint8
+    assert page_table.dtype == torch.int32
+    assert packed.dtype == torch.uint8
+
+    module = _jit_higgs_dense_2bit_mla_decode_module()
+    module.higgs_dense_2bit_mla_gather_packed(
+        compressed.contiguous(),
+        page_table.contiguous(),
+        packed,
+    )
+
+
+@debug_kernel_api
+def higgs_dense_2bit_mla_decode_split_packed(
+    q_rotated: torch.Tensor,
+    q_rope: torch.Tensor,
+    packed: torch.Tensor,
+    page_table: torch.Tensor,
+    mid: torch.Tensor,
+    out: torch.Tensor,
+    codebook: torch.Tensor,
+    sm_scale: float,
+) -> None:
+    """Iter7 (#16): packed-scratch decode (pass 2 of the 2-pass arch).
+
+    Same external contract as
+    :func:`higgs_dense_2bit_mla_decode_split` but reads slot bytes
+    from the packed scratch produced by
+    :func:`higgs_dense_2bit_mla_gather_packed`.
+    """
+    assert q_rotated.is_cuda
+    assert q_rope.is_cuda
+    assert packed.is_cuda
+    assert page_table.is_cuda
+    assert mid.is_cuda
+    assert out.is_cuda
+    assert q_rotated.dtype == torch.float32
+    assert q_rope.dtype == torch.bfloat16
+    assert packed.dtype == torch.uint8
+    assert page_table.dtype == torch.int32
+    assert mid.dtype == torch.float32
+    assert out.dtype == torch.bfloat16
+    assert codebook.dtype == torch.float32
+
+    module = _jit_higgs_dense_2bit_mla_decode_module()
+    module.higgs_dense_2bit_mla_decode_split_packed(
+        q_rotated,
+        q_rope.contiguous(),
+        packed,
         page_table.contiguous(),
         mid,
         out,

@@ -1,16 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// HIGGS in-cubin sparse-MLA decode producer — iter8 scaffold.
+// HIGGS in-cubin sparse-MLA decode producer —
+//   iter8 scaffold (dad3bdfca): cp.async + depth-2 SMEM ping-pong @
+//                               128-thread CTA (latent-tile correctness
+//                               gap: 48.5% bit-exact, max_diff 0.875).
+//   iter9 PRIMARY  (this rev) : same cp.async + ping-pong pipeline at
+//                               kBlockThreads = 512 = kLatentDim so the
+//                               FWHT_512 "one lane per element"
+//                               invariant is preserved bit-for-bit vs
+//                               the iter3 production kernel.
 //
-// ai-blaise #19 iter8 PRIMARY vector: foundation kernel that emits the
-// trtllm-gen FP8 sparse-MLA cubin's expected input layout
-// ``(B*K, 1, 576) FP8`` directly from HIGGS slots via cp.async slot
-// prefetch + inline FWHT_512 + EDEN2-16 codebook lookup, with depth-2
-// SMEM ping-pong staging so the producer is a drop-in candidate for
-// the CUTLASS sparse-MLA producer warp that iter9 grafts into the
-// flashinfer cute_dsl monolithic mla_decode_fp8 template.
+// ai-blaise #19 iter9 PRIMARY vector. The iter8 scaffold introduced a
+// new cp.async + depth-2 SMEM ping-pong slot prefetch pipeline that
+// won +20.2% per-kernel (+9.56 ms TPOT across 61 layers) at the
+// production B=128 K=2048 shape, but shipped with a known correctness
+// gap on the latent tile. The gap was caused by launching the
+// producer with 128 threads × 4 elements/lane while reusing
+// ``fwht_512_swizzled`` — that primitive's warp-shuffle butterfly +
+// SMEM-exchange addressing inherently requires 512 active lanes (one
+// lane per FWHT element, each writing ``buf[swizzle(tid)]`` for tid in
+// [0, 512)). Under a 128-thread CTA, the upper 384 SMEM slots stay
+// stale across the 4 sequential FWHT calls and the lane-to-element
+// mapping diverges from the iter3 invariant ``coord = tid & 1``.
 //
-// Surface area vs the existing dequant kernel
+// iter9 fix: revert ``kBlockThreads`` to 512, one element per thread.
+// The cp.async prefetch (lanes 0..16 each issue one 16 B
+// ``cp.async.ca.shared.global``; lanes 17..511 idle on the issue but
+// participate in the CTA-wide commit/wait_group barrier) and depth-2
+// SMEM ping-pong infrastructure survive unchanged — the cp.async win
+// comes from the LDG-vs-cp.async swap (hiding slot-read latency under
+// FWHT compute), which is independent of FWHT lane count.
+//
+// Surface area vs the iter3 production kernel
 // (``higgs_dense_2bit_dequant_page_table_fp8_kernel`` in
 // ``higgs_dense_2bit_kv.cuh``):
 //
@@ -19,38 +40,44 @@
 //     the FWHT_512 swizzle happens in shared. HBM-bound at the slot
 //     read (~302 MiB write across B=128 × K=2048 slots).
 //
-//   iter8 scaffold: 1 CTA per slot, 128 threads, cp.async prefetch +
-//     depth-2 SMEM ping-pong. 4 elements per thread (kDimsPerThread).
-//     Slot N+1 prefetch issued before slot N decode completes; the
-//     decode hides under the cp.async latency. The same FWHT_512 +
-//     EDEN2-16 path is used (existing primitives from
-//     ``higgs_dense_2bit_mla_decode.cuh`` re-used wholesale).
+//   iter9 PRIMARY: 1 CTA / slot, 512 threads, cp.async prefetch into
+//     depth-2 SMEM staging. Each lane decodes 1 latent element exactly
+//     as iter3. Slot N+1 prefetch issued before slot N decode
+//     completes; the decode hides under the cp.async latency. The
+//     FWHT_512 + EDEN2-16 path is reused wholesale.
 //
-// The output is bit-exact to the existing kernel (same FWHT,
-// codebook, scale, FP8 e4m3 saturating cast). The microbench
+// The output is bit-exact to the iter3 kernel (same FWHT, codebook,
+// scale, FP8 e4m3 saturating cast). The only deviation from iter3 is
+// the slot SOURCE: iter3 reads ``slot[byte_idx]`` directly from gmem
+// (uncached LDG); iter9 reads ``slot_smem[buf][byte_idx]`` from the
+// cp.async-staged SMEM. The codebook value, scale, FWHT pass, and FP8
+// cast are byte-identical to iter3. The microbench
 // ``benchmark/kernels/bench_higgs_inline_sparse_mla_decode_iter8.py``
-// compares wall-clock latency at production shape against
-// ``dequantize_higgs_dense_2bit_page_table_fp8``.
+// compares wall-clock latency + bit-identity at production shape
+// against ``dequantize_higgs_dense_2bit_page_table_fp8``.
 //
-// Why this is the scaffold: the SMEM-resident pipeline is exactly the
-// producer the iter9 in-cubin CUTLASS path needs. iter9 replaces the
-// trtllm-gen TMA bulk-tile copy of the K-latent tile with a call into
-// this producer's SMEM-staging path (same FWHT + codebook decode but
-// the FP8 tile lands in the cubin's SMEM rather than gmem). Even if
-// the standalone microbench shows only modest speedup (the iter8
-// kernel still writes the same 302 MiB to gmem; the *elimination* of
-// that write happens at iter9), this scaffold is the foundation.
+// Why the 128-thread launch is NOT necessary for iter9 PRIMARY: the
+// iter8 comment "block size matches the CuTe DSL producer-warp idiom"
+// is forward-looking for the iter9 SECONDARY (in-cubin CUTLASS graft
+// via the vendored flashinfer cute_dsl mla_decode_fp8 template, 2-3
+// days, queued separately). For the standalone roll-out behind
+// ``SGLANG_HIGGS_DSA_INLINE_PRODUCER``, the 512-thread launch is
+// correct and necessary. The SECONDARY graft will need a different
+// latent-decode path because the in-cubin producer warp processes N
+// K-tile slots per launch and emits into the cubin's SMEM (not gmem)
+// — the FWHT inside the cubin runs on the cubin's CTA size, decoupled
+// from this producer's launch shape.
 //
-// Honest scope note for iter8: this scaffold ships the kernel +
-// microbench + correctness check. It is NOT wired into
-// ``_forward_trtllm`` and does NOT replace the production dequant
-// path. iter9 wires it in (gated by
-// ``SGLANG_HIGGS_DSA_INLINE_CUTLASS``) and lifts the SMEM staging
-// into the CUTLASS template's producer warp.
+// Honest scope note for iter9 PRIMARY: this commit ships the bit-exact
+// kernel + microbench (with new bit-identity mode) + a wire-in into
+// ``HiggsDense2BitDSATokenToKVPool.get_higgs_selected_kv_buffer``
+// gated by ``envs.SGLANG_HIGGS_DSA_INLINE_PRODUCER`` (default OFF).
+// The iter9 SECONDARY (in-cubin graft + multi-slot CTA loop) remains
+// queued for separate iters.
 //
-// Output row layout (identical to existing FP8 dequant — 576 B/row):
-//   row_out[0..511]   = 512 B FP8 latent  (one lane writes 4 elements)
-//   row_out[512..575] = 64  B FP8 rope    (lanes 0..15 write 4 elem each)
+// Output row layout (identical to iter3 FP8 dequant — 576 B/row):
+//   row_out[0..511]   = 512 B FP8 latent  (one lane → one byte)
+//   row_out[512..575] = 64  B FP8 rope    (lanes 0..15 → 4 B each)
 //
 // Per-element quantization: per-tensor ``inv_kv_scale`` is applied
 // before the saturating FP8 cast. Downstream attention should pass
@@ -91,23 +118,50 @@ using ::higgs_dense_2bit_detail::kPairDim;
 using ::higgs_dense_2bit_detail::kRopeDim;
 using ::higgs_dense_2bit_detail::kSlotBytes;
 
-// Block size matches the CuTe DSL producer-warp idiom: 128 threads =
-// 1 warpgroup. Each lane decodes 4 latent elements (kLatentDim /
-// kBlockThreads = 4) so the kernel produces all 512 latent values per
-// slot with one full pass.
-constexpr int kBlockThreads = 128;
-constexpr int kDimsPerThread = kLatentDim / kBlockThreads;  // 4
+// iter9 PRIMARY: kBlockThreads = kLatentDim = 512 (one lane per
+// element). Restores the iter3 production invariant — fwht_512_swizzled
+// requires 512 active lanes for its warp-shuffle butterfly +
+// SMEM-exchange addressing — so the latent output is bit-exact vs
+// ``higgs_dense_2bit_dequant_page_table_fp8_kernel``. The 128-thread
+// iter8 launch produced a latent-tile correctness gap (48.5% bit-exact,
+// max_diff 0.875) because each per-lane FWHT pass left 384/512 SMEM
+// slots stale; see ``notes/higgs_dsa_iter9_recon.md`` for the full
+// diagnosis.
+constexpr int kBlockThreads = 512;
+constexpr int kDimsPerThread = kLatentDim / kBlockThreads;  // 1
 static_assert(kDimsPerThread * kBlockThreads == kLatentDim,
               "kBlockThreads must divide kLatentDim evenly");
+static_assert(kBlockThreads == kLatentDim,
+              "iter9 PRIMARY: kBlockThreads must equal kLatentDim — "
+              "fwht_512_swizzled requires one lane per element");
 
 // SMEM ping-pong depth. 2 buffers => slot N+1 prefetch overlaps slot N
 // decode. ``__align__(16)`` is required by ``cp.async.16``; kSlotBytes
 // = 272 is already 16-aligned.
 constexpr int kSmemDepth = 2;
 
+// iter9 PRIMARY multi-slot CTA loop: each CTA processes kSlotsPerCta
+// output rows. With kSmemDepth = 2 staging, the prefetch of slot N+1
+// is issued before the FWHT_512 of slot N completes — the cp.async
+// latency hides under the FWHT compute. This is what unlocks the
+// iter8 +20% speedup under the 512-thread CTA constraint: the iter8
+// scaffold's 128-thread × 8-CTA/SM occupancy hid the wait_group cost
+// via SM-level inter-CTA scheduling, but the 512-thread CTA only
+// runs 2 CTAs/SM so we need intra-CTA pipelining to hide the
+// prefetch latency.
+//
+// kSlotsPerCta = 4 is a conservative choice: it amortizes the
+// FWHT-init and barrier costs over 4 slots while keeping the grid
+// dense enough for the SM scheduler. Production shape B=128 K=2048
+// has num_rows = 262144 → grid = 65536 CTAs at kSlotsPerCta = 4
+// (vs 262144 at kSlotsPerCta = 1), still way over the SM count
+// (B200 = 132 SMs).
+constexpr int kSlotsPerCta = 4;
+static_assert(kSlotsPerCta >= 1, "kSlotsPerCta must be positive");
+
 // cp.async issue width per slot. ``kSlotBytes / 16 = 17`` → lanes
 // 0..16 each issue one ``cp.async.ca.shared.global`` of 16 B; lanes
-// 17..127 are inactive on this issue. Matches the existing
+// 17..511 are inactive on this issue. Matches the existing
 // ``higgs_cp_async_prefetch_slot`` helper in
 // ``higgs_dense_2bit_mla_decode.cuh``.
 constexpr int kCpAsyncSlotLanes = kSlotBytes / 16;  // 17
@@ -118,7 +172,7 @@ static_assert(kCpAsyncSlotLanes <= kBlockThreads,
 
 // SMEM-flavor of the slot prefetch primitive: stage one HIGGS slot
 // (272 B) from gmem into smem via 17 lanes × ``cp.async.ca`` of 16 B.
-// Lanes 17..127 are inactive on this issue but participate in the
+// Lanes 17..511 are inactive on this issue but participate in the
 // subsequent commit/wait_group (which is CTA-wide). The source
 // pointer MUST be 16-byte aligned (guaranteed by the codec's slot
 // allocation thanks to the iter4 stride pad).
@@ -144,77 +198,24 @@ __device__ __forceinline__ void inline_cp_async_wait_group() {
 }
 
 // ---------------------------------------------------------------------------
-// Latent decode core. Reads 4 EDEN2-16 indices from the SMEM-staged
-// slot at ``slot_smem`` (offset 0..127), the fp16 row scale at
-// slot+128, looks up the codebook ``(cb_idx, coord)`` value, applies
-// the scale, runs FWHT_512_swizzled across the CTA's 512 elements
-// (``fwht_buf`` is the swizzled-FWHT scratch, kLatentDim floats), and
-// returns the reconstructed latent element this lane is responsible
-// for. ``coord`` is ``tid & 1`` (each pair of adjacent lanes decodes
-// the (x, y) pair of the codebook entry).
+// (iter9 PRIMARY) The iter8 ``inline_decode_slot_latent`` helper —
+// which packed 4-elements-per-lane into a 128-thread CTA with 4
+// sequential ``fwht_512_swizzled`` calls — is removed. That layout
+// broke the FWHT_512 invariant (the warp-shuffle + SMEM-exchange
+// addressing requires 512 active lanes; under 128 threads the upper
+// 384 SMEM slots were stale across the 4 sequential calls and the
+// per-lane ``coord`` mapping diverged from iter3's ``coord = tid & 1``).
 //
-// The 4-elements-per-thread layout means the 4 latents-per-lane are
-// SPATIALLY non-adjacent in the codebook unpack scheme (lane tid
-// decodes pair_idx = tid * 2 + ..., NOT a contiguous 4-pair block).
-// Spread across 4 separate FWHT_512 calls each over a strided 128
-// elements. This is iter8 scaffold: the easy path is to launch the
-// FWHT_512 four times rather than restructure the codebook unpack.
-//
-// Per-lane decoded latent element index ``e`` maps to lane tid via:
-//   pair_idx = tid * kDimsPerThread + e  ∈ [0, 256)
-//   byte_idx = pair_idx >> 1  ∈ [0, 128)
-//   nibble   = pair_idx & 1   ∈ {0, 1}
-//   cb_idx   = (packed[byte_idx] >> (4*nibble)) & 0x0F
-//   coord    = tid & 1  (NOT pair_idx & 1 — that's the nibble select)
-//
-// IMPORTANT: the iter4 path's ``coord = tid & 1`` decision came from
-// pairing adjacent lanes on the (x, y) coordinate. The iter8 scaffold
-// preserves that pairing because the FWHT_512 swizzled scratch lays
-// the elements out as ``buf[tid]`` per pass.
-__device__ __forceinline__ void inline_decode_slot_latent(
-    const uint8_t* __restrict__ slot_smem,
-    const float* __restrict__ codebook,
-    float (&latent_out)[kDimsPerThread],
-    float* __restrict__ fwht_buf,
-    int tid) {
-  // Each lane decodes ``kDimsPerThread`` latent elements. The decode
-  // is: 4 codebook lookups → scale → 4 FWHT_512 passes. The 4 FWHT
-  // calls share the same fwht_buf via the kPairDim coord interleave.
-  const half scale_h =
-      *reinterpret_cast<const half*>(slot_smem + kPackedBytes);
-  const float scale = __half2float(scale_h);
-
-  #pragma unroll
-  for (int e = 0; e < kDimsPerThread; ++e) {
-    // pair_idx = e * 128 + tid spans [0, 512) in a strided pattern
-    // identical to the existing kernel's ``tid``-only path (when
-    // kBlockThreads == 512). For the 128-thread CTA the strided
-    // pattern is preserved by launching 4 sequential FWHT_512 passes
-    // each over a different 128-lane subset of latent indices.
-    const int pair_idx = e * kBlockThreads + tid;
-    const int byte_idx = pair_idx >> 1;
-    const int nibble = pair_idx & 1;
-    const uint8_t packed = slot_smem[byte_idx];
-    const uint32_t cb_idx =
-        static_cast<uint32_t>(nibble ? (packed >> 4) : (packed & 0x0F));
-    const int coord = (pair_idx & 1) ? (~tid & 1) : (tid & 1);
-    // ↑ NOTE the coord pairing depends on the existing kernel's
-    // 512-thread invariant ``coord = tid & 1`` (each pair of adjacent
-    // lanes decodes (x, y)). Under a 128-thread CTA the equivalent
-    // pairing is ``coord = pair_idx & 1`` after the FWHT pass
-    // accounts for the strided layout. iter8 scaffold note: this
-    // mapping needs reconciliation against the existing kernel's
-    // bit-exact output during iter9 correctness validation.
-    const float g = __ldg(&codebook[cb_idx * kPairDim + coord]);
-    const float rot_recon = scale * g;
-    latent_out[e] =
-        fwht_512_swizzled(rot_recon, fwht_buf) * kInvSqrtLatentDim;
-    if (e + 1 < kDimsPerThread) __syncthreads();
-  }
-}
+// iter9 inlines the iter3 single-element latent decode directly in
+// the kernel body: each of the 512 lanes decodes exactly one element
+// (lane tid → element index tid), runs ONE ``fwht_512_swizzled`` pass
+// per slot, and writes one FP8 byte per slot. The codebook/scale/FWHT
+// path is byte-identical to iter3; the only deviation is the slot
+// SOURCE (cp.async-staged SMEM vs uncached LDG).
+// ---------------------------------------------------------------------------
 
 // Rope tile decode for one slot. 16 lanes (tid < 16) each emit 4 FP8
-// rope values; lanes 16..127 idle. Matches the existing kernel's rope
+// rope values; lanes 16..511 idle. Matches the iter3 kernel's rope
 // emission verbatim.
 __device__ __forceinline__ void inline_decode_slot_rope(
     const uint8_t* __restrict__ slot_smem,
@@ -224,6 +225,10 @@ __device__ __forceinline__ void inline_decode_slot_rope(
   if (tid < 16) {
     const uint8_t* slot_rope = slot_smem + kPackedBytes + kNormBytes;
     const int base = tid * 4;
+    // Stage rope bytes through a local uint8 buffer to avoid
+    // misaligned-load faults (slot_rope offset is byte-aligned, not
+    // bf16-aligned). The SMEM source means a register-staged read is
+    // cheap and side-steps any SMEM-bank-conflict aliasing concern.
     uint8_t bf16_bytes[8];
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -250,24 +255,57 @@ __device__ __forceinline__ void inline_decode_slot_rope(
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// Scaffold producer kernel — emits FP8 e4m3 (B*K, 1, 576) from HIGGS
-// slots with cp.async prefetch + depth-2 SMEM ping-pong.
+// iter9 PRIMARY producer kernel — emits FP8 e4m3 (B*K, 1, 576) from
+// HIGGS slots with cp.async prefetch + depth-2 SMEM ping-pong staging
+// across a kSlotsPerCta-deep streaming loop. Bit-exact vs
+// ``higgs_dense_2bit_dequant_page_table_fp8_kernel`` on both latent
+// and rope tiles.
 //
-// Grid: (num_rows = B*K,) — one CTA per output row.
-// CTA size: kBlockThreads = 128.
+// Grid: (ceil(num_rows / kSlotsPerCta),) — one CTA per kSlotsPerCta
+// output rows.
+// CTA size: kBlockThreads = 512 (one lane per latent element; lanes
+//           0..15 also handle the rope tile; lanes 0..16 also issue
+//           the cp.async slot prefetch).
 //
-// Per CTA: prefetch slot for THIS row into slot_smem[0]. Issue
-// commit_group + wait_group<0>. Decode latent + rope. Write FP8 row.
+// Per CTA, for slot index s in [0, kSlotsPerCta):
+//   - Issue cp.async prefetch of slot s+1 (the lookahead) into the
+//     ping-pong buffer (s+1) & 1, OR — if s == 0 — issue the
+//     prologue prefetch of slot 0 into buffer 0.
+//   - wait_group<1> — wait until at most 1 cp.async group is in
+//     flight (the just-issued s+1 group; the s group has long since
+//     landed). On the first iteration this drops to wait_group<0>
+//     since only one group has been committed.
+//   - __syncthreads — visibility for all 512 lanes.
+//   - Decode rope tile + latent tile from buffer s & 1 (the now-ready
+//     slot s data). Each lane decodes ONE latent element exactly as
+//     iter3; the codebook/scale/FWHT/FP8-cast path is byte-identical
+//     to iter3. Only the slot SOURCE differs (SMEM vs uncached LDG).
+//   - Write FP8 row.
 //
-// Iter8 scope: this scaffold runs the inline pipeline for ONE slot per
-// CTA. The depth-2 ping-pong is exercised across the lane-0 cp.async
-// issue + the rest of the warp's FWHT compute. The full multi-slot
-// ping-pong (where a single CTA processes >1 slot via a slot loop with
-// prefetch lookahead) is iter9 — required to fold N slots per CTA when
-// the in-cubin path runs a single producer warp servicing the K-tile.
+// The depth-2 ping-pong + lookahead overlaps the cp.async memory
+// latency of slot s+1 with the FWHT_512_swizzled decode of slot s.
+// This is what restores the iter8 microbench-projected speedup under
+// the 512-thread CTA constraint that iter9 PRIMARY had to adopt for
+// FWHT_512 correctness — the iter8 scaffold's 128-thread × 8-CTA/SM
+// occupancy hid the wait_group cost via SM-level inter-CTA scheduling
+// (4× more CTAs per slot), but the 512-thread CTA only fits 2 CTAs
+// per SM so we need intra-CTA pipelining instead.
+//
+// Iter9 PRIMARY scope: this kernel runs the inline pipeline with
+// kSlotsPerCta = 4 slots per CTA, depth-2 ping-pong. The iter9
+// SECONDARY (in-cubin CUTLASS graft) will reuse the same
+// SMEM-staging pattern but emit into the cubin's SMEM rather than
+// gmem, eliminating the 302 MiB / layer-step gmem write.
 // ───────────────────────────────────────────────────────────────────────
 
-__global__ void __launch_bounds__(kBlockThreads, 8)
+// __launch_bounds__: maxThreadsPerBlock = 512, minBlocksPerSM = 2.
+// SM_100 (B200) has 1536 threads / SM, so 2 × 512-thread CTAs = 1024
+// threads / SM (the 3-CTA case would need 1536 with no slack for the
+// scheduler). The 8-blocks-per-SM hint from iter8 was sized for the
+// 128-thread CTA; iter9's 512-thread CTA caps at 2 — which is why
+// the multi-slot CTA loop above is necessary to recover the iter8
+// throughput.
+__global__ void __launch_bounds__(kBlockThreads, 2)
 higgs_inline_sparse_mla_produce_fp8_kernel(
     const uint8_t* __restrict__ compressed,
     const int32_t* __restrict__ page_table,
@@ -278,55 +316,132 @@ higgs_inline_sparse_mla_produce_fp8_kernel(
     int64_t compressed_stride_0,
     int64_t out_stride_0,
     float inv_kv_scale) {
-  const int64_t row = blockIdx.x;
   const int tid = threadIdx.x;
-  if (row >= num_rows) return;
+  const int64_t base_row =
+      static_cast<int64_t>(blockIdx.x) * kSlotsPerCta;
+  if (base_row >= num_rows) return;
 
-  const int32_t page = page_table[row];
-  if (tid == 0) {
-    compact_page_table[row] = page >= 0 ? static_cast<int32_t>(row) : -1;
-  }
-  if (page < 0) return;
-
-  // Depth-2 SMEM ping-pong for slot bytes + the FWHT swizzle scratch.
-  // The 4-iteration FWHT inner loop reuses fwht_buf across passes.
+  // Depth-2 SMEM ping-pong slot staging + shared FWHT scratch. The
+  // fwht_buf is reused across the kSlotsPerCta inner-loop iterations
+  // (the FWHT_512 fully consumes + rewrites it per call; no inter-
+  // iteration carry needed).
   __shared__ __align__(16) uint8_t slot_smem[kSmemDepth][kSlotBytes];
   __shared__ __align__(16) float fwht_buf[kLatentDim];
 
-  // iter8 scaffold uses depth=2 SMEM but only one slot per CTA, so
-  // only buffer 0 is touched here. Buffer 1 is wired up for iter9
-  // where the CTA processes multiple slots in a streaming loop.
-  const int buf = 0;
-
-  const int64_t loc = static_cast<int64_t>(page);
-  const uint8_t* slot_gmem = compressed + loc * compressed_stride_0;
-
-  // Prefetch the slot via cp.async (17 lanes × 16 B each).
-  inline_cp_async_prefetch_slot(slot_smem[buf], slot_gmem, tid);
-  inline_cp_async_commit();
-  inline_cp_async_wait_group<0>();
+  // Page slots assigned to this CTA. We load all kSlotsPerCta page
+  // entries up front so the cp.async issues don't stall on the page
+  // table read. Lanes 0..kSlotsPerCta-1 each fetch one entry and
+  // broadcast via SMEM.
+  __shared__ int32_t pages[kSlotsPerCta];
+  if (tid < kSlotsPerCta) {
+    const int64_t row_local = base_row + tid;
+    pages[tid] = (row_local < num_rows) ? page_table[row_local] : -1;
+    // Compact page table emission mirrors iter3: valid row → row
+    // index, invalid row → -1.
+    if (row_local < num_rows) {
+      compact_page_table[row_local] =
+          pages[tid] >= 0 ? static_cast<int32_t>(row_local) : -1;
+    }
+  }
   __syncthreads();
 
-  fp8_e4m3_t* row_out = out + row * out_stride_0;
-
-  // Rope emission. Independent of latent decode; runs on lanes 0..15
-  // while lanes 16..127 are otherwise idle for the rope phase.
-  fp8_e4m3_t* rope_out = row_out + kLatentDim;
-  inline_decode_slot_rope(slot_smem[buf], rope_out, inv_kv_scale, tid);
-
-  // Latent decode. 4 FWHT_512 passes; each pass emits 1 element per
-  // lane (4 elements total per lane).
-  float latent_vals[kDimsPerThread];
-  inline_decode_slot_latent(
-      slot_smem[buf], codebook, latent_vals, fwht_buf, tid);
-
-  // Write latent FP8. Same per-element scaling + saturating cast as
-  // the existing kernel.
-  #pragma unroll
-  for (int e = 0; e < kDimsPerThread; ++e) {
-    const int latent_idx = e * kBlockThreads + tid;
-    row_out[latent_idx] = __nv_fp8_e4m3(latent_vals[e] * inv_kv_scale);
+  // Prologue: issue cp.async for the FIRST slot (s = 0) into buffer
+  // 0. If slot 0 is invalid (page < 0) we skip the prefetch — the
+  // decode loop below also skips invalid slots so the SMEM contents
+  // don't matter.
+  {
+    const int32_t page0 = pages[0];
+    if (page0 >= 0) {
+      const uint8_t* slot_gmem =
+          compressed +
+          static_cast<int64_t>(page0) * compressed_stride_0;
+      inline_cp_async_prefetch_slot(slot_smem[0], slot_gmem, tid);
+    }
+    inline_cp_async_commit();
   }
+
+  #pragma unroll 1
+  for (int s = 0; s < kSlotsPerCta; ++s) {
+    const int64_t row_local = base_row + s;
+    if (row_local >= num_rows) break;
+    const int buf_cur = s & 1;
+    const int buf_next = (s + 1) & 1;
+
+    // Lookahead prefetch: issue cp.async for slot s+1 into the OTHER
+    // ping-pong buffer before we wait on the current slot. This is
+    // what overlaps the memory latency with the FWHT decode of slot s.
+    if (s + 1 < kSlotsPerCta && base_row + s + 1 < num_rows) {
+      const int32_t page_next = pages[s + 1];
+      if (page_next >= 0) {
+        const uint8_t* slot_gmem =
+            compressed +
+            static_cast<int64_t>(page_next) * compressed_stride_0;
+        inline_cp_async_prefetch_slot(slot_smem[buf_next], slot_gmem, tid);
+      }
+      inline_cp_async_commit();
+      // Two groups in flight (s, s+1) — wait until ≤1 remains, which
+      // means the older slot s data has landed.
+      inline_cp_async_wait_group<1>();
+    } else {
+      // No lookahead → drain whatever is in flight (just slot s).
+      inline_cp_async_wait_group<0>();
+    }
+    __syncthreads();
+
+    const int32_t page = pages[s];
+    if (page < 0) continue;
+
+    fp8_e4m3_t* row_out = out + row_local * out_stride_0;
+    fp8_e4m3_t* rope_out = row_out + kLatentDim;
+    inline_decode_slot_rope(slot_smem[buf_cur], rope_out, inv_kv_scale, tid);
+
+    // ──────────────────────────────────────────────────────────────
+    // Latent decode — bit-exact vs the iter3 production kernel
+    // ``higgs_dense_2bit_dequant_page_table_fp8_kernel``. Each lane
+    // tid logically owns element index tid (0..511):
+    //
+    //   pair_idx = tid >> 1        ∈ [0, 256)  — adjacent-tid pairing
+    //   byte_idx = pair_idx >> 1   ∈ [0, 128)  — packed-byte index
+    //   nibble   = pair_idx & 1    ∈ {0, 1}    — high/low nibble
+    //   cb_idx   = nibble ? (packed >> 4) : (packed & 0x0F)
+    //   coord    = tid & 1         ∈ {0, 1}    — codebook (x, y) pair
+    //   g        = codebook[cb_idx * kPairDim + coord]
+    //   scale    = __half2float(scale_h at slot+kPackedBytes)
+    //   rot      = scale * g
+    //   result   = fwht_512_swizzled(rot, fwht_buf) * kInvSqrtLatentDim
+    //   row_out[tid] = __nv_fp8_e4m3(result * inv_kv_scale)
+    //
+    // The only deviation from iter3 is the slot SOURCE: iter3 reads
+    // ``slot[byte_idx]`` from gmem (uncached LDG); iter9 reads
+    // ``slot_smem[buf_cur][byte_idx]`` from the cp.async-staged SMEM.
+    // The codebook value, scale, FWHT pass, and FP8 cast are
+    // byte-identical to iter3.
+    // ──────────────────────────────────────────────────────────────
+    const int pair_idx = tid >> 1;
+    const int byte_idx = pair_idx >> 1;
+    const uint8_t packed = slot_smem[buf_cur][byte_idx];
+    const uint32_t cb_idx = static_cast<uint32_t>(
+        (pair_idx & 1) ? (packed >> 4) : (packed & 0x0F));
+
+    const int coord = tid & 1;
+    const float g = __ldg(&codebook[cb_idx * kPairDim + coord]);
+    const half scale_h = *reinterpret_cast<const half*>(
+        slot_smem[buf_cur] + kPackedBytes);
+    const float scale = __half2float(scale_h);
+
+    const float rot_recon = scale * g;
+    const float result =
+        fwht_512_swizzled(rot_recon, fwht_buf) * kInvSqrtLatentDim;
+
+    // Per-tensor inv_kv_scale folds the downstream attention BMM1
+    // scale absorption (iter3-matching contract: downstream must pass
+    // k_scale = 1/inv_kv_scale via bmm1_scale).
+    row_out[tid] = __nv_fp8_e4m3(result * inv_kv_scale);
+  }
+
+  // Drain any remaining cp.async groups so a subsequent kernel on
+  // the same stream doesn't inherit a non-empty wait queue.
+  inline_cp_async_wait_group<0>();
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -335,7 +450,9 @@ higgs_inline_sparse_mla_produce_fp8_kernel(
 // ``higgs_dense_2bit_kv.cuh``) so the same ``cuda_wrappers`` plumbing
 // in ``higgs_inline_sparse_mla_decode.py`` can register it. Accepts
 // the same ``(B, K)`` page_table shape as the iter3 kernel so the
-// microbench can A/B them at the same call site.
+// microbench can A/B them at the same call site and the wire-in into
+// ``HiggsDense2BitDSATokenToKVPool.get_higgs_selected_kv_buffer`` is a
+// one-line swap when ``SGLANG_HIGGS_DSA_INLINE_PRODUCER`` is set.
 // ───────────────────────────────────────────────────────────────────────
 
 using ::higgs_dense_2bit_detail::kKvDim;
@@ -387,7 +504,13 @@ struct HiggsInlineSparseMLAProduceFp8Kernel {
     const int64_t num_rows = B.unwrap() * K.unwrap();
     if (num_rows == 0) return;
 
-    LaunchKernel(num_rows, kBlockThreads, device.unwrap())(
+    // iter9: grid = ceil(num_rows / kSlotsPerCta) — each CTA streams
+    // kSlotsPerCta output rows via the depth-2 cp.async ping-pong
+    // pipeline above.
+    const int64_t num_ctas =
+        (num_rows + kSlotsPerCta - 1) / kSlotsPerCta;
+
+    LaunchKernel(num_ctas, kBlockThreads, device.unwrap())(
         higgs_inline_sparse_mla_produce_fp8_kernel,
         static_cast<const uint8_t*>(compressed.data_ptr()),
         static_cast<const int32_t*>(page_table.data_ptr()),

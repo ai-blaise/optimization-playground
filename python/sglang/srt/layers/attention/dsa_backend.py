@@ -2581,16 +2581,14 @@ class DeepseekSparseAttnBackend(
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        if higgs_trtllm_fp8:
-            # HIGGS path enters _forward_trtllm with a BF16-merged q (the
-            # FP8 ``kv_cache_dtype`` branch above is gated on the *pool's*
-            # FP8 dtype, which the HIGGS pool reports as BF16 for its
-            # dequant output). We saturating-cast the merged q to FP8
-            # here so the trtllm-gen kernel selector picks the FP8
-            # sparse-MLA cubin (matching the FP8 KV materialization).
-            # Per-tensor q_scale = 1.0; the cubin reads ``bmm1_scale``
-            # for fused scale handling.
-            q_all = q_all.to(torch.float8_e4m3fn)
+        # ai-blaise #19 iter4: defer the q_all FP8 saturating cast until
+        # after the side-stream dequant is launched (down below). The
+        # cast is a small kernel (~few us at B=128) but runs on the main
+        # stream and would otherwise be serialised before the dequant
+        # launch, eating into the overlap window the side stream exists
+        # to create. We record the "needs cast" intent here and apply
+        # it once page_table_1 + dequant are already in flight.
+        defer_higgs_q_fp8_cast = higgs_trtllm_fp8
 
         # Align topk_indices with q dimensions
         if topk_indices is not None:
@@ -2675,6 +2673,16 @@ class DeepseekSparseAttnBackend(
                 # the caching allocator may free; for these reused
                 # tensors it would be a no-op AND (on some PyTorch
                 # versions) raises during CUDA graph capture.
+                #
+                # ai-blaise #19 iter4: apply the deferred q FP8 cast on
+                # the main stream now, while the side stream is busy
+                # with dequant. The cast is small (~us) but compounds at
+                # 61 layers and is the only main-stream work available
+                # to overlap with the dequant in the current per-layer
+                # _forward_trtllm flow.
+                if defer_higgs_q_fp8_cast:
+                    q_all = q_all.to(torch.float8_e4m3fn)
+                    defer_higgs_q_fp8_cast = False
             else:
                 kv_cache_paged, page_table_1 = (
                     self.token_to_kv_pool.get_higgs_selected_kv_buffer_trtllm(
@@ -2707,6 +2715,12 @@ class DeepseekSparseAttnBackend(
             higgs_inv_kv_scale = envs.SGLANG_HIGGS_DSA_TRTLLM_FP8_INV_KV_SCALE.get()
             k_scale = k_scale / float(higgs_inv_kv_scale)
         bmm1_scale = q_scale * k_scale * layer.scaling
+
+        # ai-blaise #19 iter4: fallback FP8 cast for the path that didn't
+        # take the side-stream branch (either env-flag off or non-HIGGS
+        # pool). Preserves the iter3 vector A behavior unchanged.
+        if defer_higgs_q_fp8_cast:
+            q_all = q_all.to(torch.float8_e4m3fn)
 
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape

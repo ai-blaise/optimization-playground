@@ -3372,6 +3372,175 @@ __global__ void hisa_mean_pool_indexer_cache_nvfp4(
       token_count == 0 ? 0.0f : sum / static_cast<float>(token_count);
 }
 
+// iter3 vector 2: TMA-based mean_pool. Replaces the iter2 cooperative
+// uint4 page copy (272 16-byte vec loads cooperatively per page, ~544
+// per CTA across both pages) with a single cp.async.bulk per page
+// (2 TMA bulk instructions per CTA). The bulk instructions are issued
+// by thread 0 with an mbarrier expecting the total transaction bytes;
+// the rest of the CTA arrives at the barrier and waits. On SM100 a
+// cp.async.bulk can sustain >1 TB/s SMEM throughput per CTA, which is
+// faster than the iter2 LDG.128 loop for the 4352-byte page payload
+// when issue width is the bottleneck (rather than HBM bandwidth).
+//
+// Correctness: bit-identical to iter2 modulo FP32 accumulation order.
+// The sum loop is unchanged; only the page-staging mechanism is
+// replaced. Invalid pages (page_id < 0) are zero-filled cooperatively
+// after the TMA bulk completes (so the bulk doesn't issue for them).
+template <typename IndicesT, uint32_t kPageSize>
+__global__ void hisa_mean_pool_tma_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISAMeanPoolParam param) {
+  constexpr int64_t kPageBytes = (kNVFP4ValueBytes + kScaleBytes) * kPageSize;
+  constexpr uint32_t kBlockSize = 128;
+  constexpr uint32_t kMaxPagesPerBlock =
+      (kBlockSize + kPageSize - 1) / kPageSize;
+  constexpr uint32_t kStagedBytesPerPage =
+      kNVFP4ValueBytes * kPageSize + kScaleBytes * kPageSize;
+  constexpr uint32_t kTotalStagedBytes = kStagedBytesPerPage * kMaxPagesPerBlock;
+  static_assert(kStagedBytesPerPage % 16 == 0,
+                "TMA bulk transactions require 16-byte aligned size");
+
+  // 8-byte aligned mbarrier in SMEM. Initialized by thread 0 to expect
+  // 1 arrive (thread 0 doing the TMA bulk arrive_and_expect_tx).
+  __shared__ alignas(16) uint8_t smem_pages[kTotalStagedBytes];
+  __shared__ alignas(8) uint64_t mbar;
+  __shared__ int32_t smem_page_ids[kMaxPagesPerBlock];
+
+  const auto tid = threadIdx.x;
+  const auto hisa_block = blockIdx.x;
+  const auto batch = blockIdx.y;
+  if (batch >= param.batch_size || hisa_block >= param.max_blocks) {
+    return;
+  }
+
+  const auto seq_len = static_cast<const int32_t*>(param.seq_lens)[batch];
+  const auto token_start = hisa_block * kBlockSize;
+  const auto token_count =
+      token_start < static_cast<uint32_t>(seq_len)
+          ? min(kBlockSize, static_cast<uint32_t>(seq_len) - token_start)
+          : 0u;
+  const auto logical_page_start = token_start / kPageSize;
+  const auto logical_page_end =
+      token_count == 0 ? logical_page_start
+                       : (token_start + token_count - 1) / kPageSize + 1;
+
+  // Stage 0: initialize the mbarrier (thread 0).
+  if (tid == 0) {
+    const uint32_t mbar_addr = __cvta_generic_to_shared(&mbar);
+    asm volatile(
+        "mbarrier.init.shared.b64 [%0], 1;\n"
+        :
+        : "r"(mbar_addr));
+  }
+  // Stage 0b: resolve the up-to-kMaxPagesPerBlock page ids.
+  if (tid < kMaxPagesPerBlock) {
+    const uint32_t lp = logical_page_start + tid;
+    int32_t page_id = -1;
+    if (lp < logical_page_end) {
+      page_id = static_cast<int32_t>(static_cast<const IndicesT*>(
+          param.page_table)[batch * param.page_table_stride + lp]);
+    }
+    smem_page_ids[tid] = page_id;
+  }
+  __syncthreads();
+
+  // Stage 1: thread 0 issues cp.async.bulk for each valid page, then
+  // arrive_and_expect_tx for the total bytes that will be transferred.
+  if (tid == 0) {
+    uint32_t total_tx_bytes = 0;
+    const uint32_t mbar_addr = __cvta_generic_to_shared(&mbar);
+    #pragma unroll
+    for (uint32_t p = 0; p < kMaxPagesPerBlock; ++p) {
+      const int32_t page_id = smem_page_ids[p];
+      if (page_id >= 0) {
+        const uint8_t* gmem_src =
+            static_cast<const uint8_t*>(param.cache) +
+            static_cast<int64_t>(page_id) * kPageBytes;
+        void* smem_dst = smem_pages + p * kStagedBytesPerPage;
+        const uint32_t smem_dst_addr =
+            __cvta_generic_to_shared(smem_dst);
+        asm volatile(
+            "cp.async.bulk.shared::cluster.global"
+            ".mbarrier::complete_tx::bytes "
+            "[%0], [%1], %2, [%3];\n"
+            :
+            : "r"(smem_dst_addr),
+              "l"(gmem_src),
+              "n"(kStagedBytesPerPage),
+              "r"(mbar_addr));
+        total_tx_bytes += kStagedBytesPerPage;
+      }
+    }
+    // arrive_and_expect_tx publishes the expected byte count to the
+    // barrier. The bulk instructions above also increment the barrier
+    // tx counter as they complete, so the wait below resolves when the
+    // expected total matches the completed total.
+    asm volatile(
+        "mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;\n"
+        :
+        : "r"(mbar_addr), "r"(total_tx_bytes));
+  }
+
+  // Stage 1b: all threads wait on the mbarrier. The barrier is
+  // 1-arrive (thread 0) plus tx_count, so all other threads just spin
+  // on try_wait until both conditions hold. Phase 0 because mbarrier
+  // was just initialized.
+  {
+    const uint32_t mbar_addr = __cvta_generic_to_shared(&mbar);
+    asm volatile(
+        "{\n"
+        " .reg .pred p;\n"
+        " WAIT:\n"
+        "  mbarrier.try_wait.parity.shared.b64 p, [%0], 0;\n"
+        "  @p bra DONE;\n"
+        "  bra WAIT;\n"
+        " DONE:\n"
+        "}\n"
+        :
+        : "r"(mbar_addr));
+  }
+
+  // Stage 1c: zero-fill any invalid-page slots. The TMA bulk above
+  // skipped them, so smem_pages[p..] still contains stale data.
+  for (uint32_t p = 0; p < kMaxPagesPerBlock; ++p) {
+    if (smem_page_ids[p] < 0) {
+      auto* zero_dst =
+          reinterpret_cast<uint4*>(smem_pages + p * kStagedBytesPerPage);
+      constexpr uint32_t kVecsPerPage = kStagedBytesPerPage / sizeof(uint4);
+      const uint4 zero = make_uint4(0, 0, 0, 0);
+      for (uint32_t v = tid; v < kVecsPerPage; v += blockDim.x) {
+        zero_dst[v] = zero;
+      }
+    }
+  }
+  __syncthreads();
+
+  // Stage 2: per-dim accumulator (one thread per dim, 128 threads total).
+  // Identical to the iter2 sum loop — only the source of the page bytes
+  // changed from cooperative LDG.128 to a single cp.async.bulk per page.
+  if (tid >= kIndexerHeadDim) return;
+  const auto dim = tid;
+  float sum = 0.0f;
+  for (uint32_t i = 0; i < token_count; ++i) {
+    const auto token = token_start + i;
+    const auto logical_page = token / kPageSize;
+    const auto local_page = logical_page - logical_page_start;
+    const int32_t page_id = smem_page_ids[local_page];
+    if (page_id < 0) continue;
+    const auto offset = token & (kPageSize - 1);
+    const auto* page_smem = smem_pages + local_page * kStagedBytesPerPage;
+    const auto* value_ptr = page_smem + offset * kNVFP4ValueBytes;
+    const auto* scale_ptr = reinterpret_cast<const uint32_t*>(
+        page_smem + kNVFP4ValueBytes * kPageSize + offset * kScaleBytes);
+    sum += load_nvfp4_value(value_ptr, scale_ptr, dim);
+  }
+  const auto out_idx =
+      (static_cast<int64_t>(batch) * param.max_blocks + hisa_block) *
+          kIndexerHeadDim +
+      dim;
+  static_cast<float*>(param.reps)[out_idx] =
+      token_count == 0 ? 0.0f : sum / static_cast<float>(token_count);
+}
+
 template <typename IndicesT, uint32_t kPageSize>
 __global__ void hisa_candidate_score_indexer_cache_nvfp4(
     const __grid_constant__ NVFP4HISACandidateScoreParam param) {
@@ -4503,6 +4672,9 @@ struct NVFP4IndexerQuantKernel {
   static constexpr auto dequant_branchless_kernel = dequantize_indexer_nvfp4<true>;
   static constexpr auto mean_pool_kernel =
       hisa_mean_pool_indexer_cache_nvfp4<IndicesT, kPageSize>;
+  // iter3 vector 2: TMA-based mean_pool (cp.async.bulk per page).
+  static constexpr auto mean_pool_tma_kernel =
+      hisa_mean_pool_tma_indexer_cache_nvfp4<IndicesT, kPageSize>;
   static constexpr auto candidate_score_kernel =
       hisa_candidate_score_indexer_cache_nvfp4<IndicesT, kPageSize>;
   // iter2 vector 2: tile-N candidate_score with kTileN=8 candidates per block.
@@ -4737,6 +4909,46 @@ struct NVFP4IndexerQuantKernel {
     };
     LaunchKernel(dim3(params.max_blocks, params.batch_size), 128, device_.unwrap())(
         mean_pool_kernel, params);
+  }
+
+  // iter3 vector 2: TMA-based mean_pool launcher. Same FFI as the
+  // iter2 mean_pool launcher; only the underlying kernel is swapped to
+  // the cp.async.bulk-based variant.
+  static void hisa_mean_pool_tma(
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView reps) {
+    using namespace host;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto P = SymbolicSize{"page_table_stride"};
+    auto MB = SymbolicSize{"max_blocks"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({B, P}).with_dtype<IndicesT>().with_device(device_).verify(page_table);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({B, MB, kIndexerHeadDim})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(reps);
+    const auto params = NVFP4HISAMeanPoolParam{
+        .cache = cache.data_ptr(),
+        .page_table = page_table.data_ptr(),
+        .seq_lens = seq_lens.data_ptr(),
+        .reps = reps.data_ptr(),
+        .batch_size = static_cast<uint32_t>(B.unwrap()),
+        .max_blocks = static_cast<uint32_t>(MB.unwrap()),
+        .page_table_stride = static_cast<uint32_t>(P.unwrap()),
+    };
+    LaunchKernel(
+        dim3(params.max_blocks, params.batch_size), 128, device_.unwrap())(
+        mean_pool_tma_kernel, params);
   }
 
   static void hisa_candidate_score(

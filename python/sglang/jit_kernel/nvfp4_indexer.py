@@ -270,6 +270,11 @@ def _jit_nvfp4_indexer_module(
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool",
             ),
             (
+                # iter3 vector 2: TMA-based mean_pool (cp.async.bulk).
+                "hisa_mean_pool_tma_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool_tma",
+            ),
+            (
                 "hisa_candidate_score_indexer_cache_nvfp4",
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score",
             ),
@@ -535,6 +540,40 @@ def hisa_mean_pool_indexer_cache_nvfp4(
     _get_module_fast(
         torch.bfloat16, page_table.dtype, page_size
     ).hisa_mean_pool_indexer_cache_nvfp4(
+        index_k_with_scale, page_table, seq_lens.to(torch.int32), reps
+    )
+    return reps
+
+
+@debug_kernel_api
+def hisa_mean_pool_tma_indexer_cache_nvfp4(
+    index_k_with_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_blocks: int,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """iter3 vector 2: TMA-based mean_pool (cp.async.bulk per page).
+
+    Drop-in replacement for hisa_mean_pool_indexer_cache_nvfp4. The per-
+    page staging loop is replaced with a single cp.async.bulk per page;
+    the rest of the kernel (page-id resolve, zero-fill of invalid pages,
+    per-dim sum) is unchanged.
+    """
+    if not index_k_with_scale.is_contiguous():
+        index_k_with_scale = index_k_with_scale.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
+    reps = torch.empty(
+        (page_table.shape[0], max_blocks, 128),
+        dtype=torch.float32,
+        device=index_k_with_scale.device,
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_mean_pool_tma_indexer_cache_nvfp4(
         index_k_with_scale, page_table, seq_lens.to(torch.int32), reps
     )
     return reps

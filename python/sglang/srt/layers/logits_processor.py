@@ -221,11 +221,11 @@ class LogitsMetadata:
         # and re-materialize on device. dp_size <= 8 so the cost is negligible.
         _src = self.global_num_tokens_for_logprob_gpu
         if torch.cuda.is_current_stream_capturing():
-            cumtokens = torch.cumsum(_src, dim=0)
+            cumtokens = torch.cumsum(_src.to(torch.float32), dim=0).to(_src.dtype)
         else:
             _src_cpu_list = self.global_num_tokens_for_logprob_cpu
             if _src_cpu_list is None:
-                cumtokens = torch.cumsum(_src, dim=0)
+                cumtokens = torch.cumsum(_src.to(torch.float32), dim=0).to(_src.dtype)
             else:
                 _acc = 0
                 _prefix = []

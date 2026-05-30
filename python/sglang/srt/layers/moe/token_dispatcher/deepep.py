@@ -632,6 +632,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_output: TopKOutput,
     ):
         buffer = self._get_buffer()
+        # Materialize BypassedTopKOutput (trtllm-gen fast-path bypass) before access
+        from sglang.srt.layers.moe.topk import BypassedTopKOutput
+        if isinstance(topk_output, BypassedTopKOutput):
+            topk_output = topk_output.to_standard()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
         expected_m = (

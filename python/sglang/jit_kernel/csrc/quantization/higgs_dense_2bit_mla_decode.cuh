@@ -55,12 +55,55 @@
 // makes the cp.async source pointer 16-byte aligned for every page
 // index.
 //
+// Iter5 (#16) Stage A: loop unroll x2 + batched warp_partials.
+// The iter4 hot loop runs ``2 syncthreads + 1 commit + 1 wait_group``
+// per slot. Iter5 processes *two slots* per loop iteration:
+//
+//   (1) prefetch slots ``col + 2`` and ``col + 3`` into
+//       ``slot_smem[(col+2)&3]`` and ``slot_smem[(col+3)&3]``
+//       (one commit covers both),
+//   (2) one ``wait_group<1>`` drains the previous-pair prefetch,
+//   (3) one ``__syncthreads`` after the wait_group makes both
+//       slots ``col`` and ``col+1`` readable,
+//   (4) consume slot ``col`` (compute q.K dot, warp-reduce into
+//       ``warp_partials[0][warp_id]``),
+//   (5) consume slot ``col+1`` (compute q.K dot, warp-reduce into
+//       ``warp_partials[1][warp_id]``),
+//   (6) ONE ``__syncthreads`` for both partials,
+//   (7) softmax update for slot A then slot B in registers; the
+//       second update reuses ``softmax_state_m / l`` after the
+//       first update has folded slot A in.
+//
+// Cumulative savings per pair-iter relative to iter4:
+//   - commits: 2 → 1 (50% reduction)
+//   - wait_groups: 2 → 1 (50%)
+//   - __syncthreads after cp.async: 2 → 1 (50%)
+//   - __syncthreads after warp_partials: 2 → 1 (50%)
+//   - loop-branch + col-increment: 2 → 1 (50%)
+//
+// Risk: 2x register pressure on slot-local registers
+// (``i0..i3 → 8 uints, c0..c3 → 8 floats, scale → 2 floats,
+//  warp_sum → 2 floats``). The iter4 baseline measures 40 reg/thread,
+// and the ``__launch_bounds__(128, 8)`` budget at sm_100 (65536
+// reg/SM, 1024 thr/SM) is 64 reg/thread; iter5 stage A keeps the
+// resident-CTA target if registers stay ≤ 64.
+//
+// SMEM cost: 4 × kSlotBytes = 1088 B for the slot ping-pong (was
+// 544 B at iter4) + 2 × 4 floats = 32 B for warp_partials[2][4]
+// (was 4 floats = 16 B). At 8 CTAs/SM that is 8 × 1.13 KB ≈ 9.0 KB,
+// still well within the B200 228 KB SMEM budget.
+//
+// Odd-tail handling: when ``end - begin`` is odd, the final slot
+// is consumed in a single-slot fallback after the unrolled loop.
+//
 // Occupancy note: the iter4 ping-pong smem (2 × kSlotBytes = 544 B)
 // is small enough that the existing ``__launch_bounds__(128, 8)``
 // resident-CTA hint still fits within the B200 sm_100 228 KB SMEM
 // budget at 8 CTAs/SM (each CTA also holds 16 B warp_partials + 128
 // B cb_smem + 4 KB q_rot registers; 8 × ~1.5 KB SMEM is comfortably
-// within budget).
+// within budget). Iter5 stage A bumps slot smem to 1088 B (4-deep
+// ping-pong) and warp_partials to 32 B; the budget headroom is
+// untouched at production shape.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -396,15 +439,17 @@ higgs_dense_2bit_mla_decode_stage1_split_kernel(
   const int tid = threadIdx.x;
   if (row >= num_rows || head >= num_heads || split >= num_splits) return;
 
-  __shared__ float warp_partials[4];
+  // Iter5 (#16) Stage A: 2D batched warp_partials so both pair slots
+  // fold into one ``__syncthreads`` per pair-iter (was: 1 per slot).
+  __shared__ float warp_partials[2][4];
   __shared__ float cb_smem[kCodebookSize * kPairDim];
-  // Iter4 (#16) Stage B: ping-pong smem staging for cp.async.16
-  // one-slot lookahead. ``slot_smem[col & 1]`` holds the slot the
-  // current loop iteration consumes; ``slot_smem[(col + 1) & 1]``
-  // is the destination of the prefetch issued at the top of the
-  // iteration. 16-byte alignment is required by cp.async.16; the
-  // declaration aligns the start of the buffer.
-  __shared__ __align__(16) uint8_t slot_smem[2][kSlotBytes];
+  // Iter5 (#16) Stage A: 4-deep ping-pong smem staging for the
+  // unroll-x2 hot loop. Iter4 carried 2 buffers (current + 1-slot
+  // lookahead); iter5 carries (current_pair_lo, current_pair_hi,
+  // next_pair_lo, next_pair_hi) indexed by ``col & 3``. The slot
+  // base must remain 16-byte aligned for cp.async.16; since
+  // ``kSlotBytes = 272`` is divisible by 16, each row is aligned.
+  __shared__ __align__(16) uint8_t slot_smem[4][kSlotBytes];
 
   // Online-softmax state lives in registers (iter2 vector 3 — see the
   // single-pass dense-codebook kernel for the sync-reduction rationale).
@@ -452,100 +497,184 @@ higgs_dense_2bit_mla_decode_stage1_split_kernel(
     return;
   }
 
-  // Iter4 (#16) Stage B: prologue. Issue cp.async.16 for the first
-  // slot so the in-loop ``wait_group<1>`` always has a current-iter
-  // group to drain. ``prev_valid`` tracks the validity of the slot
-  // the loop will consume on the next iteration (i.e. the slot
-  // currently being prefetched).
-  const int32_t first_page = __ldg(&pages[begin]);
-  const bool first_valid = first_page >= 0;
+  // Iter5 (#16) Stage A prologue. Issue cp.async.16 for the first
+  // pair (``begin``, ``begin + 1``) into ``slot_smem[begin & 3]`` and
+  // ``slot_smem[(begin + 1) & 3]``. ``prev_valid_lo`` / ``prev_valid_hi``
+  // track validity of the pair the next pair-iter will consume.
+  //
+  // Always prefetch *both* lo and hi to a real gmem location (using
+  // safe fallback page 0 if the slot index is past ``end``) so the
+  // smem destination never contains uninitialized bytes — the
+  // post-load ``scale`` / codebook reads can produce non-finite
+  // intermediates that would propagate through the ``acc * alpha +
+  // beta_scaled * c`` update even when ``valid_hi=false`` (because
+  // ``beta_b * NaN = NaN``). The result is then masked by
+  // ``valid_hi`` at the score / acc update sites, identical to
+  // iter4's per-slot ``valid`` mask.
+  const int32_t first_page_lo = __ldg(&pages[begin]);
+  const bool first_valid_lo = first_page_lo >= 0;
+  bool first_valid_hi = false;
   {
-    const int64_t first_page_safe =
-        first_valid ? static_cast<int64_t>(first_page) : 0;
-    const uint8_t* first_slot_gmem =
-        compressed + first_page_safe * compressed_stride_0;
-    higgs_cp_async_prefetch_slot(slot_smem[0], first_slot_gmem, tid);
+    const int64_t first_page_lo_safe =
+        first_valid_lo ? static_cast<int64_t>(first_page_lo) : 0;
+    const uint8_t* first_slot_lo_gmem =
+        compressed + first_page_lo_safe * compressed_stride_0;
+    higgs_cp_async_prefetch_slot(
+        slot_smem[static_cast<int>(begin & 3)], first_slot_lo_gmem, tid);
+    int32_t first_page_hi_raw = -1;
+    if (begin + 1 < end) {
+      first_page_hi_raw = __ldg(&pages[begin + 1]);
+    }
+    first_valid_hi = (begin + 1 < end) && (first_page_hi_raw >= 0);
+    const int64_t first_page_hi_safe =
+        first_valid_hi ? static_cast<int64_t>(first_page_hi_raw) : 0;
+    const uint8_t* first_slot_hi_gmem =
+        compressed + first_page_hi_safe * compressed_stride_0;
+    higgs_cp_async_prefetch_slot(
+        slot_smem[static_cast<int>((begin + 1) & 3)],
+        first_slot_hi_gmem, tid);
     higgs_cp_async_commit();
   }
-  bool prev_valid = first_valid;
+  bool prev_valid_lo = first_valid_lo;
+  bool prev_valid_hi = first_valid_hi;
 
-  for (int64_t col = begin; col < end; ++col) {
-    const int buf = static_cast<int>(col & 1);
-    const int next_buf = static_cast<int>((col + 1) & 1);
+  for (int64_t col = begin; col < end; col += 2) {
+    const int buf_lo = static_cast<int>(col & 3);
+    const int buf_hi = static_cast<int>((col + 1) & 3);
+    const int next_buf_lo = static_cast<int>((col + 2) & 3);
+    const int next_buf_hi = static_cast<int>((col + 3) & 3);
 
-    // Prefetch the next slot (col + 1) into the ping-pong slot the
-    // current iteration will not consume. If col + 1 == end, the
-    // ``has_next`` guard skips the cp.async but still emits a commit
-    // group, so the wait-group bookkeeping stays consistent (the
-    // commit group is empty on the last iteration; ``wait_group<1>``
-    // is still a no-op overhead).
-    bool next_valid = false;
-    if (col + 1 < end) {
-      const int32_t next_page = __ldg(&pages[col + 1]);
-      next_valid = next_page >= 0;
-      const int64_t next_page_safe =
-          next_valid ? static_cast<int64_t>(next_page) : 0;
-      const uint8_t* next_slot_gmem =
-          compressed + next_page_safe * compressed_stride_0;
-      higgs_cp_async_prefetch_slot(slot_smem[next_buf], next_slot_gmem, tid);
+    // Always issue both lo and hi prefetches (safe fallback page 0
+    // when out of range) so the buf never contains uninitialized
+    // bytes. ``valid`` masks downstream acc updates.
+    int32_t next_page_lo_raw = -1;
+    if (col + 2 < end) {
+      next_page_lo_raw = __ldg(&pages[col + 2]);
     }
+    const bool next_valid_lo = (col + 2 < end) && (next_page_lo_raw >= 0);
+    const int64_t next_page_lo_safe =
+        next_valid_lo ? static_cast<int64_t>(next_page_lo_raw) : 0;
+    const uint8_t* next_slot_lo_gmem =
+        compressed + next_page_lo_safe * compressed_stride_0;
+    higgs_cp_async_prefetch_slot(
+        slot_smem[next_buf_lo], next_slot_lo_gmem, tid);
+
+    int32_t next_page_hi_raw = -1;
+    if (col + 3 < end) {
+      next_page_hi_raw = __ldg(&pages[col + 3]);
+    }
+    const bool next_valid_hi = (col + 3 < end) && (next_page_hi_raw >= 0);
+    const int64_t next_page_hi_safe =
+        next_valid_hi ? static_cast<int64_t>(next_page_hi_raw) : 0;
+    const uint8_t* next_slot_hi_gmem =
+        compressed + next_page_hi_safe * compressed_stride_0;
+    higgs_cp_async_prefetch_slot(
+        slot_smem[next_buf_hi], next_slot_hi_gmem, tid);
+
     higgs_cp_async_commit();
-    // Drain the current-iter prefetch group: leave at most 1 group in
-    // flight (the next-iter prefetch we just submitted).
+    // Drain the previous-pair prefetch group: leave at most 1 group
+    // in flight (the next-pair prefetch we just submitted).
     higgs_cp_async_wait_group<1>();
     __syncthreads();
 
-    const uint8_t* slot = slot_smem[buf];
-    const bool valid = prev_valid;
+    const uint8_t* slot_lo = slot_smem[buf_lo];
+    const uint8_t* slot_hi = slot_smem[buf_hi];
+    const bool valid_lo = prev_valid_lo;
+    const bool valid_hi = prev_valid_hi && (col + 1 < end);
 
-    uint32_t i0, i1, i2, i3;
-    higgs_unpack_indices_smem(slot, tid, i0, i1, i2, i3);
-
+    // --- Slot A (col) compute ----------------------------------------
+    uint32_t i0a, i1a, i2a, i3a;
+    higgs_unpack_indices_smem(slot_lo, tid, i0a, i1a, i2a, i3a);
     const int coord = tid & 1;
-    const float c0 = cb_smem[i0 * kPairDim + coord];
-    const float c1 = cb_smem[i1 * kPairDim + coord];
-    const float c2 = cb_smem[i2 * kPairDim + coord];
-    const float c3 = cb_smem[i3 * kPairDim + coord];
-
-    // Norm / rope read from smem (the slot has been staged).
-    const half norm_h =
-        *reinterpret_cast<const half*>(slot + kPackedBytes);
-    const float scale = __half2float(norm_h);
-
-    float val = valid
-        ? scale * (v0 * c0 + v1 * c1 + v2 * c2 + v3 * c3)
+    const float c0a = cb_smem[i0a * kPairDim + coord];
+    const float c1a = cb_smem[i1a * kPairDim + coord];
+    const float c2a = cb_smem[i2a * kPairDim + coord];
+    const float c3a = cb_smem[i3a * kPairDim + coord];
+    const half norm_a = *reinterpret_cast<const half*>(slot_lo + kPackedBytes);
+    const float scale_a = __half2float(norm_a);
+    float val_a = valid_lo
+        ? scale_a * (v0 * c0a + v1 * c1a + v2 * c2a + v3 * c3a)
         : 0.0f;
-    if (tid < kRopeDim && valid) {
-      const bf16_t* rope =
-          reinterpret_cast<const bf16_t*>(slot + kPackedBytes + kNormBytes);
-      val += q_rope_val * bf16_to_float(rope[tid]);
+    if (tid < kRopeDim && valid_lo) {
+      const bf16_t* rope_a =
+          reinterpret_cast<const bf16_t*>(slot_lo + kPackedBytes + kNormBytes);
+      val_a += q_rope_val * bf16_to_float(rope_a[tid]);
     }
+    const float warp_sum_a = warp_reduce_sum(val_a);
 
-    const float warp_sum = warp_reduce_sum(val);
+    // --- Slot B (col + 1) compute ------------------------------------
+    uint32_t i0b, i1b, i2b, i3b;
+    higgs_unpack_indices_smem(slot_hi, tid, i0b, i1b, i2b, i3b);
+    const float c0b = cb_smem[i0b * kPairDim + coord];
+    const float c1b = cb_smem[i1b * kPairDim + coord];
+    const float c2b = cb_smem[i2b * kPairDim + coord];
+    const float c3b = cb_smem[i3b * kPairDim + coord];
+    const half norm_b = *reinterpret_cast<const half*>(slot_hi + kPackedBytes);
+    const float scale_b = __half2float(norm_b);
+    float val_b = valid_hi
+        ? scale_b * (v0 * c0b + v1 * c1b + v2 * c2b + v3 * c3b)
+        : 0.0f;
+    if (tid < kRopeDim && valid_hi) {
+      const bf16_t* rope_b =
+          reinterpret_cast<const bf16_t*>(slot_hi + kPackedBytes + kNormBytes);
+      val_b += q_rope_val * bf16_to_float(rope_b[tid]);
+    }
+    const float warp_sum_b = warp_reduce_sum(val_b);
+
+    // --- Single block-reduce sync for both slots ---------------------
     const int lane = tid & 31;
     const int warp_id = tid >> 5;
-    if (lane == 0) warp_partials[warp_id] = warp_sum;
+    if (lane == 0) {
+      warp_partials[0][warp_id] = warp_sum_a;
+      warp_partials[1][warp_id] = warp_sum_b;
+    }
     __syncthreads();
+    const float total_a =
+        warp_partials[0][0] + warp_partials[0][1] +
+        warp_partials[0][2] + warp_partials[0][3];
+    const float total_b =
+        warp_partials[1][0] + warp_partials[1][1] +
+        warp_partials[1][2] + warp_partials[1][3];
 
-    const float total =
-        warp_partials[0] + warp_partials[1] +
-        warp_partials[2] + warp_partials[3];
-    const float score = valid ? total * sm_scale : kNegInf;
-    const float old_m = softmax_state_m;
-    const float old_l = softmax_state_l;
-    const float new_m = fmaxf(old_m, score);
-    const float alpha = __expf(old_m - new_m);
-    const float beta = __expf(score - new_m);
-    softmax_state_m = new_m;
-    softmax_state_l = old_l * alpha + beta;
+    // --- Online softmax + acc update for slot A then slot B ----------
+    const float score_a = valid_lo ? total_a * sm_scale : kNegInf;
+    const float old_m_a = softmax_state_m;
+    const float old_l_a = softmax_state_l;
+    const float new_m_a = fmaxf(old_m_a, score_a);
+    const float alpha_a = __expf(old_m_a - new_m_a);
+    const float beta_a = __expf(score_a - new_m_a);
+    softmax_state_m = new_m_a;
+    softmax_state_l = old_l_a * alpha_a + beta_a;
+    const float beta_a_scaled = beta_a * scale_a;
+    acc0 = acc0 * alpha_a + beta_a_scaled * c0a;
+    acc1 = acc1 * alpha_a + beta_a_scaled * c1a;
+    acc2 = acc2 * alpha_a + beta_a_scaled * c2a;
+    acc3 = acc3 * alpha_a + beta_a_scaled * c3a;
 
-    const float beta_scaled = beta * scale;
-    acc0 = acc0 * alpha + beta_scaled * c0;
-    acc1 = acc1 * alpha + beta_scaled * c1;
-    acc2 = acc2 * alpha + beta_scaled * c2;
-    acc3 = acc3 * alpha + beta_scaled * c3;
+    const float score_b = valid_hi ? total_b * sm_scale : kNegInf;
+    const float old_m_b = softmax_state_m;
+    const float old_l_b = softmax_state_l;
+    const float new_m_b = fmaxf(old_m_b, score_b);
+    const float alpha_b = __expf(old_m_b - new_m_b);
+    const float beta_b = __expf(score_b - new_m_b);
+    softmax_state_m = new_m_b;
+    softmax_state_l = old_l_b * alpha_b + beta_b;
+    // Gate ``beta_b_scaled`` on ``valid_hi``: when the slot is invalid
+    // (because ``col + 1 >= end``), ``slot_hi`` smem still holds page
+    // 0's fallback bytes — its fp16 ``scale_b`` is a random uint16,
+    // which can be a NaN/Inf encoding. ``beta_b == 0`` but ``0 * NaN
+    // = NaN``, so the unguarded ``beta_b * scale_b`` would propagate
+    // NaN into the accumulator. Iter4's per-slot loop never hits this
+    // because it processes one prefetched slot per iter; iter5's
+    // unroll-x2 ``col + 1 >= end`` tail path needs the explicit gate.
+    const float beta_b_scaled = valid_hi ? (beta_b * scale_b) : 0.0f;
+    acc0 = acc0 * alpha_b + beta_b_scaled * c0b;
+    acc1 = acc1 * alpha_b + beta_b_scaled * c1b;
+    acc2 = acc2 * alpha_b + beta_b_scaled * c2b;
+    acc3 = acc3 * alpha_b + beta_b_scaled * c3b;
 
-    prev_valid = next_valid;
+    prev_valid_lo = next_valid_lo;
+    prev_valid_hi = next_valid_hi;
   }
   // Drain any remaining (empty) cp.async groups so a downstream
   // kernel that reuses the same SMEM page sees a quiescent pipeline.
@@ -672,10 +801,12 @@ higgs_dense_2bit_mla_decode_saw_scalar2_stage1_split_kernel(
   const int tid = threadIdx.x;
   if (row >= num_rows || head >= num_heads || split >= num_splits) return;
 
-  __shared__ float warp_partials[4];
-  // Iter4 (#16) Stage B: ping-pong smem staging for cp.async.16
-  // one-slot lookahead (mirrors the dense-codebook split kernel).
-  __shared__ __align__(16) uint8_t slot_smem[2][kSlotBytes];
+  // Iter5 (#16) Stage A: 2D batched warp_partials so both pair slots
+  // fold into one ``__syncthreads`` per pair-iter.
+  __shared__ float warp_partials[2][4];
+  // Iter5 (#16) Stage A: 4-deep ping-pong smem staging for the
+  // unroll-x2 hot loop (mirrors the dense-codebook split kernel).
+  __shared__ __align__(16) uint8_t slot_smem[4][kSlotBytes];
 
   // Online-softmax state lives in registers (iter2 vector 3 — see the
   // single-pass dense-codebook kernel for the sync-reduction rationale).
@@ -721,79 +852,152 @@ higgs_dense_2bit_mla_decode_saw_scalar2_stage1_split_kernel(
     return;
   }
 
-  // Iter4 (#16) Stage B prologue: prefetch slot at ``begin``.
-  const int32_t first_page = __ldg(&pages[begin]);
-  const bool first_valid = first_page >= 0;
+  // Iter5 (#16) Stage A prologue: prefetch first pair (begin,
+  // begin+1) into ``slot_smem[begin & 3]`` and ``slot_smem[(begin+1)
+  // & 3]``. Always issue *both* prefetches (safe fallback page 0
+  // when out of range) so the smem destination never contains
+  // uninitialized bytes — for the saw_scalar2 path c0..c3 are gated
+  // via ``saw_scalar2_unpack_pair_lanes_smem`` behind ``valid``, but
+  // matching the EDEN2-16 path is simpler and avoids any future RAW
+  // surprise.
+  const int32_t first_page_lo = __ldg(&pages[begin]);
+  const bool first_valid_lo = first_page_lo >= 0;
+  bool first_valid_hi = false;
   {
-    const int64_t first_page_safe =
-        first_valid ? static_cast<int64_t>(first_page) : 0;
-    const uint8_t* first_slot_gmem =
-        compressed + first_page_safe * compressed_stride_0;
-    higgs_cp_async_prefetch_slot(slot_smem[0], first_slot_gmem, tid);
+    const int64_t first_page_lo_safe =
+        first_valid_lo ? static_cast<int64_t>(first_page_lo) : 0;
+    const uint8_t* first_slot_lo_gmem =
+        compressed + first_page_lo_safe * compressed_stride_0;
+    higgs_cp_async_prefetch_slot(
+        slot_smem[static_cast<int>(begin & 3)], first_slot_lo_gmem, tid);
+    int32_t first_page_hi_raw = -1;
+    if (begin + 1 < end) {
+      first_page_hi_raw = __ldg(&pages[begin + 1]);
+    }
+    first_valid_hi = (begin + 1 < end) && (first_page_hi_raw >= 0);
+    const int64_t first_page_hi_safe =
+        first_valid_hi ? static_cast<int64_t>(first_page_hi_raw) : 0;
+    const uint8_t* first_slot_hi_gmem =
+        compressed + first_page_hi_safe * compressed_stride_0;
+    higgs_cp_async_prefetch_slot(
+        slot_smem[static_cast<int>((begin + 1) & 3)],
+        first_slot_hi_gmem, tid);
     higgs_cp_async_commit();
   }
-  bool prev_valid = first_valid;
+  bool prev_valid_lo = first_valid_lo;
+  bool prev_valid_hi = first_valid_hi;
 
-  for (int64_t col = begin; col < end; ++col) {
-    const int buf = static_cast<int>(col & 1);
-    const int next_buf = static_cast<int>((col + 1) & 1);
+  for (int64_t col = begin; col < end; col += 2) {
+    const int buf_lo = static_cast<int>(col & 3);
+    const int buf_hi = static_cast<int>((col + 1) & 3);
+    const int next_buf_lo = static_cast<int>((col + 2) & 3);
+    const int next_buf_hi = static_cast<int>((col + 3) & 3);
 
-    bool next_valid = false;
-    if (col + 1 < end) {
-      const int32_t next_page = __ldg(&pages[col + 1]);
-      next_valid = next_page >= 0;
-      const int64_t next_page_safe =
-          next_valid ? static_cast<int64_t>(next_page) : 0;
-      const uint8_t* next_slot_gmem =
-          compressed + next_page_safe * compressed_stride_0;
-      higgs_cp_async_prefetch_slot(slot_smem[next_buf], next_slot_gmem, tid);
+    // Always issue both lo and hi prefetches (safe fallback page 0
+    // when out of range).
+    int32_t next_page_lo_raw = -1;
+    if (col + 2 < end) {
+      next_page_lo_raw = __ldg(&pages[col + 2]);
     }
+    const bool next_valid_lo = (col + 2 < end) && (next_page_lo_raw >= 0);
+    const int64_t next_page_lo_safe =
+        next_valid_lo ? static_cast<int64_t>(next_page_lo_raw) : 0;
+    const uint8_t* next_slot_lo_gmem =
+        compressed + next_page_lo_safe * compressed_stride_0;
+    higgs_cp_async_prefetch_slot(
+        slot_smem[next_buf_lo], next_slot_lo_gmem, tid);
+
+    int32_t next_page_hi_raw = -1;
+    if (col + 3 < end) {
+      next_page_hi_raw = __ldg(&pages[col + 3]);
+    }
+    const bool next_valid_hi = (col + 3 < end) && (next_page_hi_raw >= 0);
+    const int64_t next_page_hi_safe =
+        next_valid_hi ? static_cast<int64_t>(next_page_hi_raw) : 0;
+    const uint8_t* next_slot_hi_gmem =
+        compressed + next_page_hi_safe * compressed_stride_0;
+    higgs_cp_async_prefetch_slot(
+        slot_smem[next_buf_hi], next_slot_hi_gmem, tid);
+
     higgs_cp_async_commit();
     higgs_cp_async_wait_group<1>();
     __syncthreads();
 
-    const uint8_t* slot = slot_smem[buf];
-    const bool valid = prev_valid;
+    const uint8_t* slot_lo = slot_smem[buf_lo];
+    const uint8_t* slot_hi = slot_smem[buf_hi];
+    const bool valid_lo = prev_valid_lo;
+    const bool valid_hi = prev_valid_hi && (col + 1 < end);
 
-    float c0 = 0.0f;
-    float c1 = 0.0f;
-    float c2 = 0.0f;
-    float c3 = 0.0f;
-    if (valid) {
-      saw_scalar2_unpack_pair_lanes_smem(slot, tid, c0, c1, c2, c3);
+    // --- Slot A (col) compute ----------------------------------------
+    float c0a = 0.0f, c1a = 0.0f, c2a = 0.0f, c3a = 0.0f;
+    if (valid_lo) {
+      saw_scalar2_unpack_pair_lanes_smem(slot_lo, tid, c0a, c1a, c2a, c3a);
     }
-
-    float val = valid ? (q0 * c0 + q1 * c1 + q2 * c2 + q3 * c3) : 0.0f;
-    if (tid < kRopeDim && valid) {
-      const bf16_t* rope =
-          reinterpret_cast<const bf16_t*>(slot + kPackedBytes + kNormBytes);
-      val += q_rope_val * bf16_to_float(rope[tid]);
+    float val_a = valid_lo ? (q0 * c0a + q1 * c1a + q2 * c2a + q3 * c3a) : 0.0f;
+    if (tid < kRopeDim && valid_lo) {
+      const bf16_t* rope_a =
+          reinterpret_cast<const bf16_t*>(slot_lo + kPackedBytes + kNormBytes);
+      val_a += q_rope_val * bf16_to_float(rope_a[tid]);
     }
+    const float warp_sum_a = warp_reduce_sum(val_a);
 
-    const float warp_sum = warp_reduce_sum(val);
+    // --- Slot B (col + 1) compute ------------------------------------
+    float c0b = 0.0f, c1b = 0.0f, c2b = 0.0f, c3b = 0.0f;
+    if (valid_hi) {
+      saw_scalar2_unpack_pair_lanes_smem(slot_hi, tid, c0b, c1b, c2b, c3b);
+    }
+    float val_b = valid_hi ? (q0 * c0b + q1 * c1b + q2 * c2b + q3 * c3b) : 0.0f;
+    if (tid < kRopeDim && valid_hi) {
+      const bf16_t* rope_b =
+          reinterpret_cast<const bf16_t*>(slot_hi + kPackedBytes + kNormBytes);
+      val_b += q_rope_val * bf16_to_float(rope_b[tid]);
+    }
+    const float warp_sum_b = warp_reduce_sum(val_b);
+
+    // --- Single block-reduce sync for both slots ---------------------
     const int lane = tid & 31;
     const int warp_id = tid >> 5;
-    if (lane == 0) warp_partials[warp_id] = warp_sum;
+    if (lane == 0) {
+      warp_partials[0][warp_id] = warp_sum_a;
+      warp_partials[1][warp_id] = warp_sum_b;
+    }
     __syncthreads();
+    const float total_a =
+        warp_partials[0][0] + warp_partials[0][1] +
+        warp_partials[0][2] + warp_partials[0][3];
+    const float total_b =
+        warp_partials[1][0] + warp_partials[1][1] +
+        warp_partials[1][2] + warp_partials[1][3];
 
-    const float total =
-        warp_partials[0] + warp_partials[1] +
-        warp_partials[2] + warp_partials[3];
-    const float score = valid ? total * sm_scale : kNegInf;
-    const float old_m = softmax_state_m;
-    const float old_l = softmax_state_l;
-    const float new_m = fmaxf(old_m, score);
-    const float alpha = __expf(old_m - new_m);
-    const float beta = __expf(score - new_m);
-    softmax_state_m = new_m;
-    softmax_state_l = old_l * alpha + beta;
+    // --- Online softmax + acc update for slot A then slot B ----------
+    const float score_a = valid_lo ? total_a * sm_scale : kNegInf;
+    const float old_m_a = softmax_state_m;
+    const float old_l_a = softmax_state_l;
+    const float new_m_a = fmaxf(old_m_a, score_a);
+    const float alpha_a = __expf(old_m_a - new_m_a);
+    const float beta_a = __expf(score_a - new_m_a);
+    softmax_state_m = new_m_a;
+    softmax_state_l = old_l_a * alpha_a + beta_a;
+    acc0 = acc0 * alpha_a + beta_a * c0a;
+    acc1 = acc1 * alpha_a + beta_a * c1a;
+    acc2 = acc2 * alpha_a + beta_a * c2a;
+    acc3 = acc3 * alpha_a + beta_a * c3a;
 
-    acc0 = acc0 * alpha + beta * c0;
-    acc1 = acc1 * alpha + beta * c1;
-    acc2 = acc2 * alpha + beta * c2;
-    acc3 = acc3 * alpha + beta * c3;
+    const float score_b = valid_hi ? total_b * sm_scale : kNegInf;
+    const float old_m_b = softmax_state_m;
+    const float old_l_b = softmax_state_l;
+    const float new_m_b = fmaxf(old_m_b, score_b);
+    const float alpha_b = __expf(old_m_b - new_m_b);
+    const float beta_b = __expf(score_b - new_m_b);
+    softmax_state_m = new_m_b;
+    softmax_state_l = old_l_b * alpha_b + beta_b;
+    acc0 = acc0 * alpha_b + beta_b * c0b;
+    acc1 = acc1 * alpha_b + beta_b * c1b;
+    acc2 = acc2 * alpha_b + beta_b * c2b;
+    acc3 = acc3 * alpha_b + beta_b * c3b;
 
-    prev_valid = next_valid;
+    prev_valid_lo = next_valid_lo;
+    prev_valid_hi = next_valid_hi;
   }
   higgs_cp_async_wait_group<0>();
 

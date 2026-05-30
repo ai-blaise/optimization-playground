@@ -532,6 +532,23 @@ class Envs:
     # in ``dsa/dsa_indexer.py``). Default off — flip to ``1`` on B200 with
     # ``SGLANG_HIGGS_DSA_TRTLLM_FP8=1`` to measure.
     SGLANG_HIGGS_DSA_TRTLLM_DEQUANT_STREAM = EnvBool(False)
+    # ai-blaise #19 iter5 (primary vector): ping-pong compact dequant
+    # buffers in the HIGGS DSA trtllm decode path. With a single
+    # ``_higgs_selected_buffer_fp8`` slot, layer N+1's side-stream
+    # dequant cannot overlap with layer N's trtllm-gen sparse-MLA read
+    # because both touch the same physical scratch buffer. Allocating
+    # two slots (parity = ``layer_id & 1``) breaks that write-after-read
+    # hazard: layer N reads slot 0 while layer N+1 writes slot 1. Paired
+    # with a tighter side-stream wait (event-based on the same-layer
+    # ``set_mla_kv_buffer`` + page_table_1 transform only, *not* on the
+    # prior trtllm-gen tail) this turns the iter4 sub-ms side-stream
+    # scheduling win into a real cross-layer overlap of the dequant
+    # kernel and the prior-layer trtllm-gen kernel. Memory cost: 2× the
+    # compact FP8 + BF16 + compact_page_table buffers (~600 MiB total
+    # vs 300 MiB) — acceptable on B200's 192 GiB HBM. Default off —
+    # flip together with ``SGLANG_HIGGS_DSA_TRTLLM_DEQUANT_STREAM=1`` and
+    # ``SGLANG_HIGGS_DSA_TRTLLM_FP8=1`` on B200 to measure.
+    SGLANG_HIGGS_DSA_TRTLLM_PINGPONG = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

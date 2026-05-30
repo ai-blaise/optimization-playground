@@ -2636,6 +2636,25 @@ class DeepseekSparseAttnBackend(
             and self._higgs_dequant_stream is not None
             and envs.SGLANG_HIGGS_DSA_TRTLLM_DEQUANT_STREAM.get()
         )
+        # ai-blaise #19 iter5 (primary vector): ping-pong slot selection
+        # for the compact dequant scratch + compact_page_table. With a
+        # single shared slot, the side-stream dequant for layer N+1 is
+        # implicitly serialized behind layer N's trtllm-gen read because
+        # both touch the same physical buffer (and behind the prior
+        # iter4 ``wait_stream(main)`` which folds the same constraint in
+        # through a coarser event). Alternating slots by ``layer_id & 1``
+        # breaks the aliasing — adjacent layers touch disjoint scratch,
+        # so layer N's trtllm-gen on the main stream can run
+        # concurrently with layer N+1's dequant on the side stream.
+        # Gated by ``SGLANG_HIGGS_DSA_TRTLLM_PINGPONG``; default off keeps
+        # the iter4 bit-for-bit behavior (single slot, parity always 0).
+        higgs_pingpong_enabled = (
+            is_higgs_dense_pool
+            and envs.SGLANG_HIGGS_DSA_TRTLLM_PINGPONG.get()
+        )
+        higgs_slot_parity = (
+            (int(layer.layer_id) & 1) if higgs_pingpong_enabled else 0
+        )
 
         if is_higgs_dense_pool:
             # NOTE(ai-blaise #19): the HIGGS sparse-materialize adapter
@@ -2662,6 +2681,7 @@ class DeepseekSparseAttnBackend(
                             self.real_page_size,
                             fp8_layout=higgs_trtllm_fp8,
                             fp8_inv_kv_scale=higgs_fp8_inv_kv_scale,
+                            slot_parity=higgs_slot_parity,
                         )
                     )
                     higgs_dequant_event = self._higgs_dequant_stream.record_event()
@@ -2673,6 +2693,10 @@ class DeepseekSparseAttnBackend(
                 # the caching allocator may free; for these reused
                 # tensors it would be a no-op AND (on some PyTorch
                 # versions) raises during CUDA graph capture.
+                # iter5 ping-pong: the per-slot scratch buffers
+                # ``_higgs_selected_buffer*_pp[1]`` / ``_higgs_compact_page_table_pp[1]``
+                # follow the same long-lived-attr policy, so the same
+                # "no record_stream needed" reasoning applies.
                 #
                 # ai-blaise #19 iter4: apply the deferred q FP8 cast on
                 # the main stream now, while the side stream is busy
@@ -2691,6 +2715,7 @@ class DeepseekSparseAttnBackend(
                         self.real_page_size,
                         fp8_layout=higgs_trtllm_fp8,
                         fp8_inv_kv_scale=higgs_fp8_inv_kv_scale,
+                        slot_parity=higgs_slot_parity,
                     )
                 )
                 higgs_dequant_event = None

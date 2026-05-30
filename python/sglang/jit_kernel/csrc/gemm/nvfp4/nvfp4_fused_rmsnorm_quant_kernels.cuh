@@ -57,6 +57,7 @@ Notes:
 #include "nvfp4_quant_kernels.cuh"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 

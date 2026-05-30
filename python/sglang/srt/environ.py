@@ -521,6 +521,17 @@ class Envs:
     # original BMM1 magnitudes. Default 1.0 → saturating cast (HIGGS
     # decompress output is post-norm so typically fits in [-448, 448]).
     SGLANG_HIGGS_DSA_TRTLLM_FP8_INV_KV_SCALE = EnvFloat(1.0)
+    # ai-blaise #19 iter4 vector B: side-stream HIGGS dequant inside
+    # ``_forward_trtllm``. The dequant kernel runs on a dedicated CUDA
+    # stream so the GPU scheduler can overlap it with the on-main-stream
+    # work that already happens before the trtllm-gen sparse-MLA launch
+    # (``set_mla_kv_buffer`` of the current token's K, the q_all FP8 cast,
+    # ``transform_index_page_table_decode``, and the trtllm-gen kernel's
+    # own warmup ramp). Cross-stream sync is event-based and
+    # cuda-graph-capture safe (mirrors the ``Indexer.alt_stream`` pattern
+    # in ``dsa/dsa_indexer.py``). Default off — flip to ``1`` on B200 with
+    # ``SGLANG_HIGGS_DSA_TRTLLM_FP8=1`` to measure.
+    SGLANG_HIGGS_DSA_TRTLLM_DEQUANT_STREAM = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

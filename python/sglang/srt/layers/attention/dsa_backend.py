@@ -62,6 +62,7 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
+_is_cuda = is_cuda()
 
 
 def _deep_gemm_paged_mqa_context_lens(deep_gemm_module, seqlens: torch.Tensor):
@@ -460,6 +461,24 @@ class DeepseekSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
+
+        # ai-blaise #19 iter4 vector B: dedicated CUDA stream for the
+        # HIGGS-packed sparse-MLA dequant inside ``_forward_trtllm``. The
+        # dequant kernel is offloaded here so the GPU scheduler can
+        # interleave it with the same-layer ``set_mla_kv_buffer`` of the
+        # current step's K, the q_all FP8 cast, the page_table_1
+        # transform, and (when CUDA graphs aren't aliasing both streams
+        # onto the same hw queue) the trtllm-gen kernel's launch ramp.
+        # The trtllm-gen attn launch then ``wait_event``s on the dequant
+        # completion event so causal dependency holds across streams.
+        # Mirrors the proven ``Indexer.alt_stream`` pattern in
+        # :file:`dsa/dsa_indexer.py`; allocated unconditionally so the
+        # stream is captured into any cuda graph that may use it, but the
+        # dispatch is env-gated via
+        # :attr:`envs.SGLANG_HIGGS_DSA_TRTLLM_DEQUANT_STREAM`.
+        self._higgs_dequant_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream() if _is_cuda else None
+        )
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
@@ -2593,6 +2612,33 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
+        # ai-blaise #19 iter4 vector B: when the side-stream dequant is
+        # enabled, offload the HIGGS sparse-materialize kernel to
+        # ``self._higgs_dequant_stream`` so the GPU scheduler can overlap
+        # it with the q FP8 cast on the main stream, the trtllm-gen
+        # launcher's host prep + workspace setup, and any tail kernel
+        # from the previous layer that may still be draining. The
+        # event-based sync is captured into the surrounding CUDA graph,
+        # so replays preserve the same cross-stream dependency.
+        #
+        # Why this is non-trivial: ``set_mla_kv_buffer`` (which already
+        # ran above on the main stream) writes the current step's K into
+        # the per-layer HIGGS buffer at ``out_cache_loc``; that row can
+        # appear in ``page_table_1`` (the indexer is free to select the
+        # just-stored slot), so the side stream MUST observe the K-write
+        # before launching dequant. Both ``page_table_1`` (the
+        # transform_index_page_table output) and the K-cache row sit on
+        # the main stream, so a single ``wait_stream(current_stream)`` on
+        # the side stream covers both. On the trtllm-gen side, the
+        # dequant output (``kv_cache_paged``) is consumed by the kernel,
+        # so the main stream ``wait_event`` after the side-stream
+        # ``record_event`` is the matching causal barrier.
+        use_higgs_dequant_stream = (
+            is_higgs_dense_pool
+            and self._higgs_dequant_stream is not None
+            and envs.SGLANG_HIGGS_DSA_TRTLLM_DEQUANT_STREAM.get()
+        )
+
         if is_higgs_dense_pool:
             # NOTE(ai-blaise #19): the HIGGS sparse-materialize adapter
             # writes a compact ``(qo_len * top_k, 1, kv_cache_dim)`` BF16
@@ -2607,19 +2653,44 @@ class DeepseekSparseAttnBackend(
                 if higgs_trtllm_fp8
                 else 1.0
             )
-            kv_cache_paged, page_table_1 = (
-                self.token_to_kv_pool.get_higgs_selected_kv_buffer_trtllm(
-                    layer.layer_id,
-                    page_table_1,
-                    self.real_page_size,
-                    fp8_layout=higgs_trtllm_fp8,
-                    fp8_inv_kv_scale=higgs_fp8_inv_kv_scale,
+            if use_higgs_dequant_stream:
+                current_stream = torch.cuda.current_stream()
+                self._higgs_dequant_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self._higgs_dequant_stream):
+                    kv_cache_paged, page_table_1 = (
+                        self.token_to_kv_pool.get_higgs_selected_kv_buffer_trtllm(
+                            layer.layer_id,
+                            page_table_1,
+                            self.real_page_size,
+                            fp8_layout=higgs_trtllm_fp8,
+                            fp8_inv_kv_scale=higgs_fp8_inv_kv_scale,
+                        )
+                    )
+                    higgs_dequant_event = self._higgs_dequant_stream.record_event()
+                # NOTE(ai-blaise #19 iter4): no ``record_stream`` calls
+                # needed — the compact buffers (``_higgs_selected_buffer_fp8``,
+                # ``_higgs_compact_page_table``) are long-lived attrs on the
+                # pool, allocated once per shape and reused across layers
+                # and steps. ``record_stream`` only matters for tensors
+                # the caching allocator may free; for these reused
+                # tensors it would be a no-op AND (on some PyTorch
+                # versions) raises during CUDA graph capture.
+            else:
+                kv_cache_paged, page_table_1 = (
+                    self.token_to_kv_pool.get_higgs_selected_kv_buffer_trtllm(
+                        layer.layer_id,
+                        page_table_1,
+                        self.real_page_size,
+                        fp8_layout=higgs_trtllm_fp8,
+                        fp8_inv_kv_scale=higgs_fp8_inv_kv_scale,
+                    )
                 )
-            )
+                higgs_dequant_event = None
             # trtllm kernel expects 4-D kv_cache; add the kv_heads=1 axis.
             kv = kv_cache_paged.unsqueeze(1)
         else:
             kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+            higgs_dequant_event = None
 
         q_scale = 1.0
         k_scale = (
@@ -2643,6 +2714,14 @@ class DeepseekSparseAttnBackend(
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+
+        # ai-blaise #19 iter4: drain the side-stream dequant before the
+        # trtllm-gen kernel reads its outputs. Putting the wait here
+        # (instead of right after the dequant launch) gives the GPU the
+        # full window between dequant launch and trtllm-gen launch to
+        # actually overlap.
+        if higgs_dequant_event is not None:
+            torch.cuda.current_stream().wait_event(higgs_dequant_event)
 
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,

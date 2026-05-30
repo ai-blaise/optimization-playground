@@ -102,6 +102,47 @@ _hisa_nvfp4_candidate_score_persistent = _env_bool(
     "SGLANG_NSA_NVFP4_HISA_CANDIDATE_SCORE_PERSISTENT", False
 )
 
+# iter4 tertiary: predecode-scale mean_pool. The kernel pre-decodes the
+# per-token scale word into an fp32 SMEM table during the staging pass,
+# so the inner per-dim sum loop is branchless and reads one byte + one
+# fp32 per iter (vs iter2's byte + uint32 + shift/mask/__uint_as_float).
+# Bit-identical to iter2; ~1.6x faster on B200 production shapes.
+# Default ON. Set to 0 to fall back to iter2 cooperative-uint4 mean_pool.
+_hisa_nvfp4_mean_pool_predecode = _env_bool(
+    "SGLANG_NSA_NVFP4_HISA_MEAN_POOL_PREDECODE", True
+)
+
+
+def _hisa_mean_pool_call(
+    index_k_with_scale_buffer: "torch.Tensor",
+    page_table: "torch.Tensor",
+    seq_lens_flat: "torch.Tensor",
+    max_blocks: int,
+    page_size: int = 64,
+) -> "torch.Tensor":
+    """Dispatch the mean_pool kernel selected by the iter4 env var.
+
+    Defaults to the iter4 predecode-scale kernel; falls back to the iter2
+    cooperative-uint4 kernel when SGLANG_NSA_NVFP4_HISA_MEAN_POOL_PREDECODE
+    is 0. Both kernels have identical FFI and produce bit-identical
+    outputs modulo fp32 accumulation order.
+    """
+    if _hisa_nvfp4_mean_pool_predecode:
+        return hisa_mean_pool_predecode_indexer_cache_nvfp4(
+            index_k_with_scale_buffer,
+            page_table,
+            seq_lens_flat,
+            max_blocks,
+            page_size=page_size,
+        )
+    return hisa_mean_pool_indexer_cache_nvfp4(
+        index_k_with_scale_buffer,
+        page_table,
+        seq_lens_flat,
+        max_blocks,
+        page_size=page_size,
+    )
+
 
 _hisa_profile_path = os.environ.get(
     "SGLANG_NSA_NVFP4_HISA_PROFILE_PATH"
@@ -273,6 +314,13 @@ def _jit_nvfp4_indexer_module(
                 # iter3 vector 2: TMA-based mean_pool (cp.async.bulk).
                 "hisa_mean_pool_tma_indexer_cache_nvfp4",
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool_tma",
+            ),
+            (
+                # iter4 tertiary: predecoded-scale mean_pool. Builds a
+                # per-token fp32 scales table during the staging pass so
+                # the hot sum loop is a 1-byte + 1-fp32 SMEM-only kernel.
+                "hisa_mean_pool_predecode_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_mean_pool_predecode",
             ),
             (
                 "hisa_candidate_score_indexer_cache_nvfp4",
@@ -574,6 +622,43 @@ def hisa_mean_pool_tma_indexer_cache_nvfp4(
     _get_module_fast(
         torch.bfloat16, page_table.dtype, page_size
     ).hisa_mean_pool_tma_indexer_cache_nvfp4(
+        index_k_with_scale, page_table, seq_lens.to(torch.int32), reps
+    )
+    return reps
+
+
+@debug_kernel_api
+def hisa_mean_pool_predecode_indexer_cache_nvfp4(
+    index_k_with_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_blocks: int,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """iter4 tertiary: predecoded-scale mean_pool.
+
+    Drop-in replacement for hisa_mean_pool_indexer_cache_nvfp4. The per-
+    page staging is identical to iter2 (cooperative uint4 loads). After
+    staging, a one-pass predecode builds a per-(token, scale-group) fp32
+    scales table and a per-token value-byte base offset, so the inner
+    per-dim sum loop becomes a branchless 1-byte + 1-fp32 SMEM chain
+    feeding decode_e2m1_nibble. Invalid pages contribute zero via the
+    zeroed scales table (no page_id branch in the hot loop).
+    """
+    if not index_k_with_scale.is_contiguous():
+        index_k_with_scale = index_k_with_scale.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
+    reps = torch.empty(
+        (page_table.shape[0], max_blocks, 128),
+        dtype=torch.float32,
+        device=index_k_with_scale.device,
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_mean_pool_predecode_indexer_cache_nvfp4(
         index_k_with_scale, page_table, seq_lens.to(torch.int32), reps
     )
     return reps
@@ -2069,7 +2154,7 @@ def hisa_precompute_block_reps_indexer_cache_nvfp4(
         max_blocks = _hisa_max_blocks(seq_lens_flat, page_table, block_size)
     else:
         max_blocks = max(1, int(max_blocks))
-    reps = hisa_mean_pool_indexer_cache_nvfp4(
+    reps = _hisa_mean_pool_call(
         index_k_with_scale_buffer,
         page_table,
         seq_lens_flat,
@@ -2507,7 +2592,7 @@ def nvfp4_hisa_indexer_paged_torch(
     max_blocks = _hisa_max_blocks(seq_lens_flat, page_table, block_size)
 
     stage = _profile_start(q_values.device)
-    reps = hisa_mean_pool_indexer_cache_nvfp4(
+    reps = _hisa_mean_pool_call(
         index_k_with_scale_buffer,
         page_table,
         seq_lens_flat,
@@ -3935,7 +4020,7 @@ def nvfp4_hisa_indexer_paged_deepgemm(
 
     max_blocks = _hisa_max_blocks(seq_lens_flat, page_table, block_size)
     stage = _profile_start(q_values.device)
-    reps = hisa_mean_pool_indexer_cache_nvfp4(
+    reps = _hisa_mean_pool_call(
         index_k_with_scale_buffer,
         page_table,
         seq_lens_flat,

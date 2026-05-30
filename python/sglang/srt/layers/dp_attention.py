@@ -446,7 +446,24 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
     dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
-        cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
+        # B200 SM_100 workaround: see compute_dp_attention_metadata in
+        # logits_processor.py for full rationale. cumsum on (dp_size,) int64
+        # crashes outside capture; CPU prefix sum fallback when the CPU
+        # mirror is available.
+        _src = forward_batch.global_num_tokens_gpu
+        if torch.cuda.is_current_stream_capturing():
+            cumtokens = torch.cumsum(_src, dim=0)
+        else:
+            _src_cpu = forward_batch.global_num_tokens_cpu
+            if _src_cpu is None:
+                cumtokens = torch.cumsum(_src, dim=0)
+            else:
+                _acc = 0
+                _prefix = []
+                for _v in _src_cpu:
+                    _acc += int(_v)
+                    _prefix.append(_acc)
+                cumtokens = torch.tensor(_prefix, dtype=_src.dtype, device=_src.device)
         if dp_rank == 0:
             local_start_pos = torch.zeros_like(cumtokens[0])
         else:

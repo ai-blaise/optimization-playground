@@ -336,7 +336,12 @@ if _is_cuda:
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         topk_result: torch.Tensor,
+        q_fp8_scales: Optional[torch.Tensor] = None,
     ) -> None:
+        # NVFP4 indexer returns q_fp8 as a (values, scales) pair; FP8 returns
+        # a plain tensor. The custom op schema can only accept tensors, so
+        # NVFP4 passes the scales separately via q_fp8_scales and the kernel
+        # reassembles the tuple. FP8 path passes None.
         assert (
             _is_cuda
         ), "Internal error: piecewise CUDA graph is only supported on CUDA"
@@ -356,11 +361,15 @@ if _is_cuda:
             act_quant=act_quant,
             out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
         )
+        if q_fp8_scales is not None:
+            q_for_topk = (q_fp8[:extend_num_tokens], q_fp8_scales[:extend_num_tokens])
+        else:
+            q_for_topk = q_fp8[:extend_num_tokens]
         indexer._get_topk_ragged(
             False,
             forward_batch,
             layer_id,
-            q_fp8[:extend_num_tokens],
+            q_for_topk,
             weights,
             metadata,
             topk_result,
@@ -2729,20 +2738,26 @@ class Indexer(MultiPlatformOp):
                     ), "Internal error: piecewise CUDA graph should not be enabled with dual stream"
 
                     # NVFP4 indexer returns q_fp8 as a (values, scales) tuple;
-                    # unwrap to the values tensor for shape/device queries.
-                    q_fp8_tensor = q_fp8[0] if isinstance(q_fp8, tuple) else q_fp8
+                    # FP8 returns a plain tensor. Unwrap so we can pass scales
+                    # as a separate kwarg through the tensor-only PCG op schema.
+                    if isinstance(q_fp8, tuple):
+                        q_fp8_values, q_fp8_scales_arg = q_fp8
+                    else:
+                        q_fp8_values = q_fp8
+                        q_fp8_scales_arg = None
                     topk_result = torch.full(
-                        (q_fp8_tensor.shape[0], self.index_topk),
+                        (q_fp8_values.shape[0], self.index_topk),
                         -1,
-                        device=q_fp8_tensor.device,
+                        device=q_fp8_values.device,
                         dtype=torch.int32,
                     )
                     k_cache_and_topk_result(
                         layer_id=layer_id,
                         key=key,
-                        q_fp8=q_fp8,
+                        q_fp8=q_fp8_values,
                         weights=weights,
                         topk_result=topk_result,
+                        q_fp8_scales=q_fp8_scales_arg,
                     )
                 else:
                     topk_result = self._get_topk_ragged(

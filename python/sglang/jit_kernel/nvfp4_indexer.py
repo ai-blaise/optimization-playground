@@ -112,6 +112,18 @@ _hisa_nvfp4_candidate_score_kprefetch = _env_bool(
     "SGLANG_NSA_NVFP4_HISA_CAND_SCORE_KPREFETCH", False
 )
 
+# iter5 PRIMARY: WMMA candidate_score (mma.m16n8k8 fp32 Stage B). Replaces
+# the scalar fmuladd + warp_sum dot in the iter3 tilen32 Stage B with a
+# B200 SM_100 tensor-core mma over fp16 inputs into an fp32 accumulator.
+# Only supports kTileN=32 and n_heads <= 64 (production cap). When True
+# the autotune dispatcher routes large-batch cells (total_work >= 1M)
+# to the WMMA variant; smaller cells stay on the scalar kTileN=16/8 paths
+# because the WMMA SMEM overhead (16 KB Q-table) hurts more than it helps
+# at small total_work. Opt-in only on B200 SM_100 builds.
+_hisa_nvfp4_candidate_score_wmma = _env_bool(
+    "SGLANG_NSA_NVFP4_HISA_CAND_SCORE_WMMA", False
+)
+
 # iter4 tertiary: predecode-scale mean_pool. The kernel pre-decodes the
 # per-token scale word into an fp32 SMEM table during the staging pass,
 # so the inner per-dim sum loop is branchless and reads one byte + one
@@ -354,6 +366,17 @@ def _jit_nvfp4_indexer_module(
                 # vs iter2 kTileN=8. Larger per-CTA SMEM (~32 KB).
                 "hisa_candidate_score_tilen32_indexer_cache_nvfp4",
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score_tilen32",
+            ),
+            (
+                # iter5 PRIMARY: WMMA candidate_score (mma.m16n8k8 fp32
+                # Stage B). Replaces the scalar fmuladd + warp_sum chain
+                # with a B200 SM_100 tensor-core mma over fp16 inputs into
+                # an fp32 accumulator. Routes to one of three kMaxHeads
+                # instantiations (8 / 16 / 64) based on params.n_heads
+                # so smem_q_h stays sized to the actual production grid.
+                # Opt-in via SGLANG_NSA_NVFP4_HISA_CAND_SCORE_WMMA.
+                "hisa_candidate_score_tilen32_wmma_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score_tilen32_wmma",
             ),
             (
                 # iter3 vector 1: persistent-block candidate_score
@@ -922,6 +945,71 @@ def hisa_candidate_score_tilen32_indexer_cache_nvfp4(
     _get_module_fast(
         torch.bfloat16, page_table.dtype, page_size
     ).hisa_candidate_score_tilen32_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale,
+        page_table,
+        seq_lens.to(torch.int32),
+        weights,
+        top_blocks.to(torch.int32),
+        token_to_batch_idx.to(torch.int32),
+        logits,
+        candidate_indices,
+    )
+    return logits, candidate_indices
+
+
+@debug_kernel_api
+def hisa_candidate_score_tilen32_wmma_indexer_cache_nvfp4(
+    q_values: torch.Tensor,
+    q_scales: torch.Tensor,
+    index_k_with_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    top_blocks: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    page_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """iter5 PRIMARY: WMMA candidate_score variant (kTileN=32).
+
+    Replaces the iter3 tilen32 scalar fmuladd + warp_sum Stage B with a
+    B200 SM_100 tensor-core ``mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32``
+    over fp16 inputs into an fp32 accumulator. Same FFI as the iter3
+    tilen32 wrapper; routes internally to one of three kMaxHeads
+    instantiations (n_heads<=8, <=16, <=64). For n_heads > 64 callers
+    must use the scalar tilen32 wrapper.
+    """
+    if weights.dtype != torch.float32:
+        weights = weights.float()
+    if q_values.dtype != torch.uint8:
+        raise ValueError(f"NVFP4 HISA q values must be uint8, got {q_values.dtype}.")
+    if q_scales.dtype != torch.int32:
+        q_scales = q_scales.to(torch.int32)
+    q_values = q_values.contiguous()
+    q_scales = q_scales.contiguous()
+    weights = weights.contiguous()
+    if not index_k_with_scale.is_contiguous():
+        index_k_with_scale = index_k_with_scale.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
+    if not top_blocks.is_contiguous():
+        top_blocks = top_blocks.contiguous()
+    if not token_to_batch_idx.is_contiguous():
+        token_to_batch_idx = token_to_batch_idx.contiguous()
+
+    candidate_len = top_blocks.shape[1] * 128
+    logits = torch.empty(
+        (q_values.shape[0], candidate_len), dtype=torch.float32, device=q_values.device
+    )
+    candidate_indices = torch.empty(
+        (q_values.shape[0], candidate_len), dtype=torch.int32, device=q_values.device
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_candidate_score_tilen32_wmma_indexer_cache_nvfp4(
         q_values,
         q_scales,
         index_k_with_scale,
@@ -2813,13 +2901,29 @@ def nvfp4_hisa_indexer_paged_torch(
         # The total-work threshold is the natural cut: tile_blocks *
         # q_rows = candidate_len/kTileN * q_rows ∝ wave count, and
         # waves dominate the kernel's wall time at large batch.
+        #
+        # iter5 PRIMARY: when SGLANG_NSA_NVFP4_HISA_CAND_SCORE_WMMA is
+        # set and the cell already routes to kTileN=32 (large-batch
+        # path) with n_heads <= 64, swap in the WMMA mma.m16n8k8 fp32
+        # Stage B variant. The WMMA variant has identical FFI; the
+        # ~16 KB Q SMEM table only pays off at the kTileN=32 cells
+        # where Stage B compute dominates the wall time.
         n_rows = int(q_values.shape[0])
         cand_len_proj = int(top_blocks.shape[1]) * 128
         total_work = n_rows * cand_len_proj
+        n_heads_proj = int(q_values.shape[1])
         if total_work >= 1048576:
-            _candidate_score_fn = (
-                hisa_candidate_score_tilen32_indexer_cache_nvfp4
-            )
+            if (
+                _hisa_nvfp4_candidate_score_wmma
+                and n_heads_proj <= 64
+            ):
+                _candidate_score_fn = (
+                    hisa_candidate_score_tilen32_wmma_indexer_cache_nvfp4
+                )
+            else:
+                _candidate_score_fn = (
+                    hisa_candidate_score_tilen32_indexer_cache_nvfp4
+                )
         elif total_work >= 262144:
             _candidate_score_fn = (
                 hisa_candidate_score_tilen16_indexer_cache_nvfp4
@@ -2829,7 +2933,17 @@ def nvfp4_hisa_indexer_paged_torch(
                 hisa_candidate_score_tilen_indexer_cache_nvfp4
             )
     elif _hisa_nvfp4_candidate_score_tilen_size == 32:
-        _candidate_score_fn = hisa_candidate_score_tilen32_indexer_cache_nvfp4
+        if (
+            _hisa_nvfp4_candidate_score_wmma
+            and int(q_values.shape[1]) <= 64
+        ):
+            _candidate_score_fn = (
+                hisa_candidate_score_tilen32_wmma_indexer_cache_nvfp4
+            )
+        else:
+            _candidate_score_fn = (
+                hisa_candidate_score_tilen32_indexer_cache_nvfp4
+            )
     elif _hisa_nvfp4_candidate_score_tilen_size == 16:
         _candidate_score_fn = hisa_candidate_score_tilen16_indexer_cache_nvfp4
     else:

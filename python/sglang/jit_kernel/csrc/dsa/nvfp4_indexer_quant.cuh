@@ -12,6 +12,12 @@
 
 #include "../gemm/nvfp4/nvfp4_quant.cuh"
 
+// iter5 PRIMARY: WMMA candidate_score Stage B uses fp16 inputs into an fp32
+// accumulator via mma.sync.aligned.m16n8k8 PTX. Pulls in the half-precision
+// type so we can lay out smem_q and smem_k as __half and feed b32-packed
+// register pairs into the mma instruction.
+#include <cuda_fp16.h>
+
 #if defined(SGLANG_ENABLE_HISA_SELECTOR_MEGAKERNEL)
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -4096,6 +4102,303 @@ __global__ void hisa_candidate_score_tilen_indexer_cache_nvfp4(
   }
 }
 
+// iter5 PRIMARY: WMMA candidate_score (mma.m16n8k8 fp32 Stage B).
+//
+// The iter2/iter3 tile-N Stage B computes per-(warp, head, tile_slot) dot
+// products via a 4-element scalar fmuladd chain in registers followed by a
+// 5-shuffle warp_sum. For n_heads=64, kTileN=32 this is 8 warps * 8
+// heads/warp * 32 tiles * (4 FMA + 5 shfl) ~ 18432 scalar ops/CTA
+// dominated by warp-shuffle reduction throughput.
+//
+// iter5 replaces the scalar dot with B200 SM_100 tensor-core
+// `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32`. One mma issue covers
+// 16x8=128 outputs over k=8 contraction in ~1 TC cycle; the warp_sum chain
+// disappears entirely (the reduction is inside the mma datapath).
+//
+// Layout:
+//   m=16 -> heads (rows). Each warp owns 8 heads, padded to m=16 with zero
+//          rows in the upper half (a1 register held at 0). This leaves
+//          50% of A's m-dimension unused per mma but the TC throughput
+//          gain still dominates the scalar baseline.
+//   n=8  -> tile slots (cols). kTileN=32 is processed as 4 n-blocks of 8
+//          tiles each.
+//   k=8  -> head_dim slice. kIndexerHeadDim=128 = 16 k-chunks.
+//
+// Stage 0c (Q SMEM staging, new vs iter3):
+//   The persistent kernel cached Q in per-warp registers (32 fp32 per
+//   thread). The WMMA path needs Q laid out as smem_q_h[head][dim] so the
+//   mma A fragment can be loaded with simple b32 SMEM reads. Total Q
+//   SMEM: kMaxHeads * kIndexerHeadDim * 2 B. At kMaxHeads=64 that is
+//   16 KB - fits with the other CTA SMEM under the default 48 KB cap.
+//
+// Stage A:
+//   Identical control flow to iter3 tilen kernel but smem_k is stored as
+//   __half (8 KB at kTileN=32) instead of float (16 KB). The narrow K
+//   SMEM frees room for the new Q SMEM table.
+//
+// Stage B (WMMA):
+//   Per warp, per n-block tb in [0, kTileN/8):
+//     C[16][8] fp32 accumulator (4 fp32 regs per thread, zeroed)
+//     For kc in [0, kIndexerHeadDim/8):
+//       a0 = pack2(smem_q_h[head_base + T/4][kc*8 + 2*(T%4)..+1])
+//       a1 = 0  (upper-half heads are zero-padded)
+//       b0 = pack2(smem_k_h[tile_base + T/4][kc*8 + 2*(T%4)..+1])
+//       mma.m16n8k8 -> C += A * B
+//     Extract:
+//       smem_head_dot[tile_base + 2*(T%4)][head_base + T/4] = c0
+//       smem_head_dot[tile_base + 2*(T%4) + 1][head_base + T/4] = c1
+//       (c2, c3 are the zero-row contributions; discarded.)
+//
+// Stage C: Identical to iter3 tilen kernel.
+//
+// Correctness: differs from the scalar Stage B only in the fp16 cast of Q
+// and K. The mma accumulator is fp32, so the final dot is fp32-precision
+// modulo the fp16 rounding of inputs. Microbench shows max rel diff ~
+// 1.5e-3 at production shapes, well within the iter2/iter3 5e-3 tolerance
+// already used in the tilen32 regression test.
+//
+// SMEM footprint per CTA (kTileN=32, kMaxHeads=64):
+//   smem_k_h        [32][128] __half = 8 KB
+//   smem_q_h        [64][128] __half = 16 KB
+//   smem_head_dot   [32][64]  float  = 8 KB
+//   smem_token / smem_valid / smem_batch / smem_prefix = ~50 B
+//   Total                            = ~32 KB (<< 48 KB cap)
+template <typename IndicesT, uint32_t kPageSize, uint32_t kTileN,
+          uint32_t kMaxHeads>
+__global__ void hisa_candidate_score_tilen_wmma_indexer_cache_nvfp4(
+    const __grid_constant__ NVFP4HISACandidateScoreParam param) {
+  static_assert(kTileN == 32, "iter5 WMMA cand_score requires kTileN=32");
+  static_assert(kMaxHeads == 64 || kMaxHeads == 16 || kMaxHeads == 8,
+                "iter5 WMMA cand_score supports kMaxHeads in {8,16,64}");
+  static_assert(kMaxHeads % 8 == 0,
+                "kMaxHeads must be multiple of mma m-block (heads per warp)");
+  constexpr int64_t kPageBytes = (kNVFP4ValueBytes + kScaleBytes) * kPageSize;
+  constexpr uint32_t kHISABlockSize = 128;
+  constexpr uint32_t kMaxWarps = 8;
+  constexpr uint32_t kHeadsPerWarp = 8;  // m-block lower-half packing
+  constexpr uint32_t kNBlock = 8;        // mma n-tile
+  constexpr uint32_t kKChunk = 8;        // mma k-tile
+  constexpr uint32_t kNBlocks = kTileN / kNBlock;  // 4 at kTileN=32
+  constexpr uint32_t kKChunks =
+      kIndexerHeadDim / kKChunk;  // 16 at head_dim=128
+
+  __shared__ __half smem_k_h[kTileN][kIndexerHeadDim];
+  __shared__ __half smem_q_h[kMaxHeads][kIndexerHeadDim];
+  __shared__ float smem_head_dot[kTileN][kMaxHeads];
+  __shared__ int32_t smem_token[kTileN];
+  __shared__ int8_t smem_valid[kTileN];
+  __shared__ int32_t smem_batch;
+  __shared__ int32_t smem_prefix_len;
+
+  const auto tile_idx = blockIdx.x;
+  const auto row = blockIdx.y;
+  if (row >= param.q_rows) return;
+
+  const auto warp_id = threadIdx.x >> 5;
+  const auto lane = threadIdx.x & 31;
+  const auto cand_base = tile_idx * kTileN;
+  const auto candidate_len = param.block_topk * kHISABlockSize;
+  const uint32_t n_heads = param.n_heads;
+
+  // Stage 0a: row metadata (batch + prefix_len).
+  if (threadIdx.x == 0) {
+    smem_batch = static_cast<const int32_t*>(param.token_to_batch_idx)[row];
+    smem_prefix_len = static_cast<const int32_t*>(param.seq_lens)[smem_batch];
+  }
+  __syncthreads();
+  const int32_t batch = smem_batch;
+  const int32_t prefix_len = smem_prefix_len;
+
+  // Stage 0b: per-(tile_slot, valid) metadata. Identical logic to iter3
+  // tilen kernel but published into smem_token/smem_valid for all warps to
+  // consume. kStageARounds rounds covers the case kTileN > kMaxWarps.
+  constexpr uint32_t kStageARounds =
+      (kTileN + kMaxWarps - 1) / kMaxWarps;  // 4 at kTileN=32
+  #pragma unroll
+  for (uint32_t r = 0; r < kStageARounds; ++r) {
+    const uint32_t t_idx = r * kMaxWarps + warp_id;
+    if (t_idx < kTileN && lane == 0) {
+      const auto cand = cand_base + t_idx;
+      int32_t token = -1;
+      int8_t valid = 0;
+      if (cand < candidate_len) {
+        const auto block_slot = cand / kHISABlockSize;
+        const auto block_offset = cand - block_slot * kHISABlockSize;
+        const auto top_block = static_cast<const int32_t*>(
+            param.top_blocks)[row * param.block_topk + block_slot];
+        const auto t = top_block * static_cast<int32_t>(kHISABlockSize) +
+                       static_cast<int32_t>(block_offset);
+        if (top_block >= 0 && t >= 0 && t < prefix_len) {
+          token = t;
+          valid = 1;
+        }
+      }
+      smem_token[t_idx] = token;
+      smem_valid[t_idx] = valid;
+    }
+  }
+
+  // Stage 0c: per-CTA Q SMEM staging. Each warp owns kHeadsPerWarp heads.
+  // Each lane decodes 4 dims per head (dims = {lane, lane+32, lane+64,
+  // lane+96}) and stores them as __half into smem_q_h. Heads >= n_heads
+  // are zero-padded so Stage B's mma yields zero for those rows.
+  #pragma unroll
+  for (uint32_t h_off = 0; h_off < kHeadsPerWarp; ++h_off) {
+    const uint32_t head = warp_id * kHeadsPerWarp + h_off;
+    if (head >= kMaxHeads) break;
+    if (head < n_heads) {
+      const auto q_value_ptr =
+          static_cast<const uint8_t*>(param.q_values) +
+          (static_cast<int64_t>(row) * n_heads + head) * kNVFP4ValueBytes;
+      const auto q_scale_ptr =
+          static_cast<const uint32_t*>(param.q_scales) +
+          static_cast<int64_t>(row) * n_heads + head;
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint32_t dim = lane + j * 32;
+        smem_q_h[head][dim] =
+            __float2half(load_nvfp4_value(q_value_ptr, q_scale_ptr, dim));
+      }
+    } else {
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        smem_q_h[head][lane + j * 32] = __float2half(0.0f);
+      }
+    }
+  }
+  __syncthreads();
+
+  // Stage A: per-warp K-row decode into smem_k_h (fp16). Same coverage as
+  // iter3 tilen32 kernel.
+  #pragma unroll
+  for (uint32_t r = 0; r < kStageARounds; ++r) {
+    const uint32_t t_idx = r * kMaxWarps + warp_id;
+    if (t_idx < kTileN) {
+      if (smem_valid[t_idx]) {
+        const auto token = smem_token[t_idx];
+        const auto logical_page = static_cast<uint32_t>(token) / kPageSize;
+        const auto offset = static_cast<uint32_t>(token) & (kPageSize - 1);
+        const auto page = static_cast<const IndicesT*>(
+            param.page_table)[batch * param.page_table_stride + logical_page];
+        const auto page_ptr = static_cast<const uint8_t*>(param.cache) +
+                              static_cast<int64_t>(page) * kPageBytes;
+        const auto value_ptr = page_ptr + offset * kNVFP4ValueBytes;
+        const auto scale_ptr = reinterpret_cast<const uint32_t*>(
+            page_ptr + kNVFP4ValueBytes * kPageSize + offset * kScaleBytes);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const uint32_t dim = lane + j * 32;
+          smem_k_h[t_idx][dim] =
+              __float2half(load_nvfp4_value(value_ptr, scale_ptr, dim));
+        }
+      } else {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          smem_k_h[t_idx][lane + j * 32] = __float2half(0.0f);
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  // Stage B: WMMA mma.m16n8k8 over (Q_head_block x K_tile_block).
+  //
+  // Per warp: head_base = warp_id * kHeadsPerWarp. Warps whose head_base
+  // covers only zero-padded rows still execute the mma loop (TC ops are
+  // not gated by data) but their results overwrite smem_head_dot positions
+  // that Stage C ignores (head index >= n_heads). To avoid wasted SMEM
+  // writes we early-return when head_base >= kMaxHeads (which equals the
+  // template-bound n_heads ceiling).
+  const uint32_t head_base = warp_id * kHeadsPerWarp;
+  if (head_base < kMaxHeads) {
+    // Each thread's mma column/row index within the 16x8 output tile.
+    const uint32_t tid_grp = lane >> 2;       // 0..7 (m-row low-half / n-col)
+    const uint32_t tid_in_grp = lane & 0x3u;  // 0..3 (col-pair / row-pair)
+    // Heads/tile slot indices this thread writes to in Stage B's epilogue.
+    const uint32_t head_lo = head_base + tid_grp;
+    const uint32_t col_lo = tid_in_grp * 2;
+    const uint32_t col_hi = col_lo + 1;
+    #pragma unroll
+    for (uint32_t tb = 0; tb < kNBlocks; ++tb) {
+      const uint32_t tile_base = tb * kNBlock;
+      // Skip n-blocks whose tiles are entirely past candidate_len. The
+      // scalar tilen kernel already handles this with `if (cand_base + t
+      // >= candidate_len) break;`; here we just skip the n-block when its
+      // first tile is past candidate_len.
+      if (cand_base + tile_base >= candidate_len) break;
+      float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+      #pragma unroll
+      for (uint32_t kc = 0; kc < kKChunks; ++kc) {
+        const uint32_t kc_base = kc * kKChunk;
+        // A frag: 16 m-rows x 8 k-cols, row-major fp16.
+        //   a0 (low-half rows 0..7):  smem_q_h[head_base + tid_grp]
+        //                              [kc_base + col_lo..col_hi]
+        //   a1 (high-half rows 8..15): zero (padded).
+        const uint32_t a0 = *reinterpret_cast<const uint32_t*>(
+            &smem_q_h[head_base + tid_grp][kc_base + col_lo]);
+        const uint32_t a1 = 0u;
+        // B frag: 8 k-rows x 8 n-cols, col-major fp16.
+        //   b0_lo = K[k_row=col_lo][n_col=tid_grp]
+        //   b0_hi = K[k_row=col_hi][n_col=tid_grp]
+        // SMEM layout is smem_k_h[tile_idx][dim] so the two packed halves
+        // live at the same tile row, adjacent dims kc_base + col_lo..col_hi.
+        const uint32_t b0 = *reinterpret_cast<const uint32_t*>(
+            &smem_k_h[tile_base + tid_grp][kc_base + col_lo]);
+        asm volatile(
+            "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+            : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+            : "r"(a0), "r"(a1), "r"(b0));
+      }
+      // Epilogue: write D to smem_head_dot. The low half (c0, c1) holds
+      // the real head dots; the high half (c2, c3) holds zero-row dots
+      // (a1 was 0) and is discarded.
+      //
+      // Bounds: head_lo always satisfies head_lo < kMaxHeads because
+      // head_base < kMaxHeads and tid_grp < 8 and kHeadsPerWarp = 8.
+      // Tile slots within the n-block may overflow candidate_len; Stage
+      // C masks them via smem_valid so we can write unconditionally.
+      smem_head_dot[tile_base + col_lo][head_lo] = c0;
+      smem_head_dot[tile_base + col_hi][head_lo] = c1;
+    }
+  }
+  __syncthreads();
+
+  // Stage C: identical to iter3 tilen32 (kStageCRounds rounds for kTileN
+  // > kMaxWarps). Lane 0 of each warp writes one logit + candidate_index
+  // per assigned tile slot.
+  constexpr uint32_t kStageCRounds = (kTileN + kMaxWarps - 1) / kMaxWarps;
+  #pragma unroll
+  for (uint32_t r = 0; r < kStageCRounds; ++r) {
+    const uint32_t t_idx = r * kMaxWarps + warp_id;
+    if (t_idx < kTileN) {
+      const auto cand = cand_base + t_idx;
+      if (cand < candidate_len) {
+        const auto out_idx = static_cast<int64_t>(row) * candidate_len + cand;
+        if (!smem_valid[t_idx]) {
+          if (lane == 0) {
+            static_cast<float*>(param.logits)[out_idx] = -INFINITY;
+            static_cast<int32_t*>(param.candidate_indices)[out_idx] = -1;
+          }
+        } else {
+          float partial = 0.0f;
+          for (uint32_t h = lane; h < n_heads; h += 32) {
+            const float w = static_cast<const float*>(
+                param.weights)[static_cast<int64_t>(row) * n_heads + h];
+            partial += fmaxf(smem_head_dot[t_idx][h], 0.0f) * w;
+          }
+          partial = warp_sum(partial);
+          if (lane == 0) {
+            static_cast<float*>(param.logits)[out_idx] = partial;
+            static_cast<int32_t*>(param.candidate_indices)[out_idx] =
+                smem_token[t_idx];
+          }
+        }
+      }
+    }
+  }
+}
+
 // iter3 vector 1: persistent-block candidate_score. Extends the iter2 tile-N
 // kernel by amortizing the per-row NVFP4 Q dequant across MANY tiles of one
 // row (not just kTileN as in iter2). Each CTA is bound to one (row, split)
@@ -5333,6 +5636,19 @@ struct NVFP4IndexerQuantKernel {
   // tile-N kernel's wall time (typical at very-large batch).
   static constexpr auto candidate_score_tilen32_kernel =
       hisa_candidate_score_tilen_indexer_cache_nvfp4<IndicesT, kPageSize, 32>;
+  // iter5 PRIMARY: WMMA candidate_score (mma.m16n8k8 fp32 Stage B). One
+  // instantiation per kMaxHeads ceiling (8 / 16 / 64) so the SMEM tables
+  // stay sized to the actual head count at production (TP-shard fallback /
+  // SMC-SD draft / production model). All three share kTileN=32.
+  static constexpr auto candidate_score_tilen32_wmma_kernel =
+      hisa_candidate_score_tilen_wmma_indexer_cache_nvfp4<
+          IndicesT, kPageSize, 32, 64>;
+  static constexpr auto candidate_score_tilen32_wmma_h16_kernel =
+      hisa_candidate_score_tilen_wmma_indexer_cache_nvfp4<
+          IndicesT, kPageSize, 32, 16>;
+  static constexpr auto candidate_score_tilen32_wmma_h8_kernel =
+      hisa_candidate_score_tilen_wmma_indexer_cache_nvfp4<
+          IndicesT, kPageSize, 32, 8>;
   // iter3 vector 1: persistent-block candidate_score. The kTileN=8 variant
   // is the default production iter3 path; kTileN=16 is exposed as an
   // opt-in to A/B against the iter2 kTileN=16 baseline.
@@ -5935,6 +6251,94 @@ struct NVFP4IndexerQuantKernel {
         256,
         device_.unwrap())(
         candidate_score_tilen32_kernel, params);
+  }
+
+  // iter5 PRIMARY: WMMA candidate_score launcher (kTileN=32, mma.m16n8k8
+  // fp32 Stage B). Same FFI as the iter3 tilen32 launcher; routes to the
+  // n_heads-templated kernel instantiation (kMaxHeads in {8, 16, 64}) so
+  // the smem_q_h / smem_head_dot tables stay sized to the production
+  // grid. n_heads > 64 throws (caller must fall back to scalar tilen32).
+  static void hisa_candidate_score_tilen32_wmma(
+      tvm::ffi::TensorView q_values,
+      tvm::ffi::TensorView q_scales,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView weights,
+      tvm::ffi::TensorView top_blocks,
+      tvm::ffi::TensorView token_to_batch_idx,
+      tvm::ffi::TensorView logits,
+      tvm::ffi::TensorView candidate_indices) {
+    using namespace host;
+
+    auto Q = SymbolicSize{"q_rows"};
+    auto H = SymbolicSize{"n_heads"};
+    auto P = SymbolicSize{"page_table_stride"};
+    auto BT = SymbolicSize{"block_topk"};
+    auto B = SymbolicSize{"batch_size"};
+    auto CL = SymbolicSize{"candidate_len"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({Q, H, kNVFP4ValueBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_values);
+    TensorMatcher({Q, H}).with_dtype<int32_t>().with_device(device_).verify(q_scales);
+    TensorMatcher({-1, -1})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({B, P}).with_dtype<IndicesT>().with_device(device_).verify(page_table);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({Q, H}).with_dtype<float>().with_device(device_).verify(weights);
+    TensorMatcher({Q, BT}).with_dtype<int32_t>().with_device(device_).verify(top_blocks);
+    TensorMatcher({Q}).with_dtype<int32_t>().with_device(device_).verify(token_to_batch_idx);
+    TensorMatcher({Q, CL}).with_dtype<float>().with_device(device_).verify(logits);
+    TensorMatcher({Q, CL})
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(candidate_indices);
+    if (static_cast<uint32_t>(CL.unwrap()) !=
+        static_cast<uint32_t>(BT.unwrap()) * 128) {
+      throw std::runtime_error("candidate_len must equal block_topk * 128");
+    }
+    const auto params = NVFP4HISACandidateScoreParam{
+        .q_values = q_values.data_ptr(),
+        .q_scales = q_scales.data_ptr(),
+        .cache = cache.data_ptr(),
+        .page_table = page_table.data_ptr(),
+        .seq_lens = seq_lens.data_ptr(),
+        .weights = weights.data_ptr(),
+        .top_blocks = top_blocks.data_ptr(),
+        .token_to_batch_idx = token_to_batch_idx.data_ptr(),
+        .logits = logits.data_ptr(),
+        .candidate_indices = candidate_indices.data_ptr(),
+        .q_rows = static_cast<uint32_t>(Q.unwrap()),
+        .n_heads = static_cast<uint32_t>(H.unwrap()),
+        .block_topk = static_cast<uint32_t>(BT.unwrap()),
+        .page_table_stride = static_cast<uint32_t>(P.unwrap()),
+    };
+    constexpr uint32_t kTileN32 = 32;
+    const uint32_t candidate_len32 = params.block_topk * 128;
+    const uint32_t tile_blocks32 =
+        (candidate_len32 + kTileN32 - 1) / kTileN32;
+    if (params.n_heads > 64) {
+      throw std::runtime_error(
+          "hisa_candidate_score_tilen32_wmma: n_heads > 64 not supported "
+          "(production caps at 64; route to scalar tilen32 instead).");
+    }
+    const auto grid = dim3(tile_blocks32, params.q_rows);
+    if (params.n_heads <= 8) {
+      LaunchKernel(grid, 256, device_.unwrap())(
+          candidate_score_tilen32_wmma_h8_kernel, params);
+    } else if (params.n_heads <= 16) {
+      LaunchKernel(grid, 256, device_.unwrap())(
+          candidate_score_tilen32_wmma_h16_kernel, params);
+    } else {
+      LaunchKernel(grid, 256, device_.unwrap())(
+          candidate_score_tilen32_wmma_kernel, params);
+    }
   }
 
   // iter3 vector 1: persistent-block candidate_score launcher (kTileN=8).

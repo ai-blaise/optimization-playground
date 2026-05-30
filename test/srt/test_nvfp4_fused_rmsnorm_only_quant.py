@@ -52,34 +52,50 @@ def _unfused_reference(
     weight: torch.Tensor,
     gs: torch.Tensor,
     eps: float,
+    *,
+    cast_x_before_out_mul: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference: existing jit rmsnorm + scaled_fp4_quant_linear (the
-    pair our kernel replaces at the wired call site)."""
+    pair our kernel replaces at the wired call site).
+
+    Supports both kCastXBeforeOutMul=false (Llama-style, DSv3.2 default)
+    and =true (HF-parity, Gemma/glm4 style — rounds through bf16 after
+    the rms multiply but before the weight multiply).
+    """
     from sglang.jit_kernel.nvfp4 import scaled_fp4_quant_linear
 
-    # Use flashinfer's rmsnorm (the same one upstream `RMSNorm` dispatches
-    # to on cuda). Match the kernel's `kCastXBeforeOutMul=false`
-    # (Llama-style) variant.
-    try:
-        from flashinfer.norm import rmsnorm
-    except ImportError:
-        # Fallback: reference math in plain torch (slower but still fine
-        # for a correctness check at small m).
-        def rmsnorm(x_, w_, eps_):
-            x_f = x_.float()
-            rms = torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + eps_)
-            return (x_f * rms).to(x_.dtype) * w_
+    if cast_x_before_out_mul:
+        # HF-parity reference: do the cast in plain torch since flashinfer
+        # `rmsnorm` only exposes the Llama-style variant on its bf16 cuda
+        # path. Compute in fp32, round to bf16 after the rms multiply
+        # (mirroring the kernel's mid-phase bf16 round), then weight
+        # multiply.
+        x_f = x.float()
+        rms = torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + eps)
+        normed = (x_f * rms).to(x.dtype)
+        y = (normed.float() * weight.float()).to(x.dtype)
+    else:
+        try:
+            from flashinfer.norm import rmsnorm
+        except ImportError:
+            def rmsnorm(x_, w_, eps_):
+                x_f = x_.float()
+                rms = torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + eps_)
+                return (x_f * rms).to(x_.dtype) * w_
 
-    y = rmsnorm(x, weight, eps)
+        y = rmsnorm(x, weight, eps)
     fp4, sf = scaled_fp4_quant_linear(y, gs)
     return y, fp4, sf
 
 
+@pytest.mark.parametrize("cast_x_before_out_mul", [False, True])
 @pytest.mark.parametrize("m", DECODE_BATCHES)
-def test_fused_no_residual_matches_unfused(m: int) -> None:
+def test_fused_no_residual_matches_unfused(
+    m: int, cast_x_before_out_mul: bool
+) -> None:
     from sglang.jit_kernel.nvfp4 import fused_rmsnorm_only_to_fp4_linear
 
-    torch.manual_seed(0xDEADBEEF + m)
+    torch.manual_seed(0xDEADBEEF + m + (1 if cast_x_before_out_mul else 0))
     device = torch.device("cuda")
     # The wired call site (L1042 of communicator.py) feeds
     # post-allgather+scatter hidden_states. Magnitudes are ~residual+attn
@@ -90,9 +106,11 @@ def test_fused_no_residual_matches_unfused(m: int) -> None:
     gs = _suggest_global_scale(x)
     eps = 1e-6
 
-    ref_y, ref_fp4, ref_sf = _unfused_reference(x, weight, gs, eps)
+    ref_y, ref_fp4, ref_sf = _unfused_reference(
+        x, weight, gs, eps, cast_x_before_out_mul=cast_x_before_out_mul
+    )
     fused_y, fused_fp4, fused_sf = fused_rmsnorm_only_to_fp4_linear(
-        x, weight, gs, eps
+        x, weight, gs, eps, cast_x_before_out_mul=cast_x_before_out_mul
     )
 
     # The fused kernel produces a new BF16 tensor; verify it bit-aligns

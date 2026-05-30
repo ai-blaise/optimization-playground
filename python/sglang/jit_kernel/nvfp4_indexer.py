@@ -134,6 +134,30 @@ _hisa_nvfp4_mean_pool_predecode = _env_bool(
     "SGLANG_NSA_NVFP4_HISA_MEAN_POOL_PREDECODE", True
 )
 
+# iter5 SECONDARY: predecode-scale mean_pool with 2-iter FMA pair and
+# transposed scales SMEM. Strict superset of the iter4 predecode kernel.
+# Bit-identical to iter4 predecode modulo accumulation partition (~5% win
+# at production cells). Opt-in: set to 1 to route through the fma2
+# kernel when predecode is also enabled. Only meaningful when
+# SGLANG_NSA_NVFP4_HISA_MEAN_POOL_PREDECODE is 1 (the default).
+_hisa_nvfp4_mean_pool_fma2 = _env_bool(
+    "SGLANG_NSA_NVFP4_HISA_MEAN_POOL_FMA2", False
+)
+
+# iter6 PRIMARY: predecode-scale mean_pool with transposed scales SMEM,
+# transposed value-byte SMEM, and LDS.b16 vectorized 2-token reads.
+# Strict superset of iter5 SECONDARY: same predecode pass, same scales
+# transpose, same fma2 inner loop, but additionally pre-stages value
+# bytes into smem_values_t[64][132] (8.25 KB) so the inner loop fetches
+# two consecutive tokens of one dim_byte per LDS.b16 (vs two independent
+# LDS.b8 in iter5 SECONDARY). Bit-identical to iter5 SECONDARY.
+# Production cells see ~2-3% mean_pool win over iter5 SECONDARY and
+# ~7-8% over iter4 predecode. Takes precedence over FMA2 when both env
+# vars are set. Only meaningful when PREDECODE is also enabled.
+_hisa_nvfp4_mean_pool_transp = _env_bool(
+    "SGLANG_NSA_NVFP4_HISA_MEAN_POOL_TRANSP", False
+)
+
 
 def _hisa_mean_pool_call(
     index_k_with_scale_buffer: "torch.Tensor",
@@ -142,13 +166,40 @@ def _hisa_mean_pool_call(
     max_blocks: int,
     page_size: int = 64,
 ) -> "torch.Tensor":
-    """Dispatch the mean_pool kernel selected by the iter4 env var.
+    """Dispatch the mean_pool kernel selected by the iter4/5/6 env vars.
 
-    Defaults to the iter4 predecode-scale kernel; falls back to the iter2
-    cooperative-uint4 kernel when SGLANG_NSA_NVFP4_HISA_MEAN_POOL_PREDECODE
-    is 0. Both kernels have identical FFI and produce bit-identical
-    outputs modulo fp32 accumulation order.
+    Routing priority (highest first):
+      - SGLANG_NSA_NVFP4_HISA_MEAN_POOL_TRANSP=1 -> iter6 PRIMARY (transp)
+      - SGLANG_NSA_NVFP4_HISA_MEAN_POOL_FMA2=1   -> iter5 SECONDARY (fma2)
+      - SGLANG_NSA_NVFP4_HISA_MEAN_POOL_PREDECODE=1 (default) -> iter4 predecode
+      - all 0 -> iter2 cooperative-uint4 (fallback)
+
+    All four kernels have identical FFI and produce bit-identical outputs
+    modulo fp32 accumulation order (iter5 SECONDARY and iter6 PRIMARY are
+    strict bit-identical to each other; iter4 predecode -> iter5
+    SECONDARY differs in partition only via the sum0/sum1 split, and
+    that partition is associative for production magnitudes -> still
+    bit-identical at the tested cells). The transp and fma2 paths are
+    opt-in only because their incremental pipeline-level win at the
+    production 64/32768 cell is <1% (the mean_pool is no longer the
+    pipeline bottleneck once iter5 PRIMARY WMMA cand_score is enabled).
     """
+    if _hisa_nvfp4_mean_pool_predecode and _hisa_nvfp4_mean_pool_transp:
+        return hisa_mean_pool_predecode_transp_indexer_cache_nvfp4(
+            index_k_with_scale_buffer,
+            page_table,
+            seq_lens_flat,
+            max_blocks,
+            page_size=page_size,
+        )
+    if _hisa_nvfp4_mean_pool_predecode and _hisa_nvfp4_mean_pool_fma2:
+        return hisa_mean_pool_predecode_fma2_indexer_cache_nvfp4(
+            index_k_with_scale_buffer,
+            page_table,
+            seq_lens_flat,
+            max_blocks,
+            page_size=page_size,
+        )
     if _hisa_nvfp4_mean_pool_predecode:
         return hisa_mean_pool_predecode_indexer_cache_nvfp4(
             index_k_with_scale_buffer,

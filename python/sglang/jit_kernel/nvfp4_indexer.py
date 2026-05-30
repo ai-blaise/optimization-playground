@@ -479,6 +479,18 @@ def _jit_nvfp4_indexer_module(
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_block_score",
             ),
             (
+                # iter8 PRIMARY: tiled persistent block_score. Fixes
+                # iter7's SM under-utilization by tiling the block range
+                # across K CTAs per row (K = max(1, ceil(148/q_rows))
+                # capped at max_blocks). Each (row, k) CTA predecodes Q
+                # once and processes a contiguous slice of
+                # ceil(max_blocks/K) blocks. Total CTAs = q_rows * K >=
+                # 148 in production, restoring SM saturation that iter7
+                # gave up.
+                "hisa_block_score_tiled_persistent_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_block_score_tiled_persistent",
+            ),
+            (
                 "hisa_block_topk_indexer_cache_nvfp4",
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_block_topk",
             ),
@@ -1393,6 +1405,65 @@ def hisa_block_score_indexer_cache_nvfp4(
     _get_module_fast(
         torch.bfloat16, page_table_dtype, page_size
     ).hisa_block_score_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        reps,
+        weights,
+        seq_lens.to(torch.int32),
+        token_to_batch_idx.to(torch.int32),
+        block_scores,
+    )
+    return block_scores
+
+
+@debug_kernel_api
+def hisa_block_score_tiled_persistent_indexer_cache_nvfp4(
+    q_values: torch.Tensor,
+    q_scales: torch.Tensor,
+    reps: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    page_table_dtype: torch.dtype = torch.int32,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """iter8 PRIMARY: tiled persistent block_score.
+
+    Fixes iter7's SM under-utilization (NEGATIVE 0.12-0.89x at production
+    cells) by tiling the block range across ``K`` CTAs per row, where
+    ``K = max(1, ceil(148 / q_rows))`` capped at ``max_blocks``. Each
+    (row, k) CTA predecodes the per-row Q tile to 32 KB SMEM once
+    (same as iter7) and processes a contiguous slice of
+    ``ceil(max_blocks / K)`` blocks. Total CTAs = ``q_rows * K`` so
+    SM saturation is restored at all production cells with q_rows in
+    [1, 256].
+
+    The grid (and therefore K) is decided host-side inside the kernel
+    launcher; the Python wrapper passes only tensors. Correctness is
+    bit-identical (modulo fp32 round) to the base
+    ``hisa_block_score_indexer_cache_nvfp4`` and the iter7 persistent
+    variant.
+    """
+    if weights.dtype != torch.float32:
+        weights = weights.float()
+    if q_values.dtype != torch.uint8:
+        raise ValueError(f"NVFP4 HISA q values must be uint8, got {q_values.dtype}.")
+    if q_scales.dtype != torch.int32:
+        q_scales = q_scales.to(torch.int32)
+    q_values = q_values.contiguous()
+    q_scales = q_scales.contiguous()
+    reps = reps.contiguous()
+    weights = weights.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
+    if not token_to_batch_idx.is_contiguous():
+        token_to_batch_idx = token_to_batch_idx.contiguous()
+    block_scores = torch.empty(
+        (q_values.shape[0], reps.shape[1]), dtype=torch.float32, device=q_values.device
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table_dtype, page_size
+    ).hisa_block_score_tiled_persistent_indexer_cache_nvfp4(
         q_values,
         q_scales,
         reps,
@@ -3059,18 +3130,19 @@ def nvfp4_hisa_indexer_paged_torch(
         cand_len_proj = int(top_blocks.shape[1]) * 128
         total_work = n_rows * cand_len_proj
         n_heads_proj = int(q_values.shape[1])
-        if total_work >= 1048576:
-            if (
-                _hisa_nvfp4_candidate_score_wmma
-                and n_heads_proj <= 64
-            ):
-                _candidate_score_fn = (
-                    hisa_candidate_score_tilen32_wmma_indexer_cache_nvfp4
-                )
-            else:
-                _candidate_score_fn = (
-                    hisa_candidate_score_tilen32_indexer_cache_nvfp4
-                )
+        # When WMMA env var is on and n_heads<=64, ALWAYS use WMMA — measured
+        # 1.9-2.2x faster at every production cell including small batches
+        # (per notes/indexer_deep_root_cause.md). Previously gated behind
+        # total_work>=1048576 which is 128x above the production batch=64
+        # cell (8192) — making the win dead code in deploy.
+        if _hisa_nvfp4_candidate_score_wmma and n_heads_proj <= 64:
+            _candidate_score_fn = (
+                hisa_candidate_score_tilen32_wmma_indexer_cache_nvfp4
+            )
+        elif total_work >= 1048576:
+            _candidate_score_fn = (
+                hisa_candidate_score_tilen32_indexer_cache_nvfp4
+            )
         elif total_work >= 262144:
             _candidate_score_fn = (
                 hisa_candidate_score_tilen16_indexer_cache_nvfp4

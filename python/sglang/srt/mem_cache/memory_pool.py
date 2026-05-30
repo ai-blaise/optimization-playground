@@ -56,8 +56,6 @@ from sglang.jit_kernel.higgs_dense_2bit import (
     store_higgs_dense_2bit,
 )
 from sglang.jit_kernel.higgs_dense_2bit_mla_decode import (
-    higgs_dense_2bit_mla_decode,
-    higgs_dense_2bit_mla_decode_saw_scalar2,
     higgs_dense_2bit_mla_decode_saw_scalar2_split,
     higgs_dense_2bit_mla_decode_split,
     higgs_dense_2bit_mla_rotate_query,
@@ -3930,15 +3928,14 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
         """Fused dense MLA decode on the 2-bit HIGGS packed slots.
 
         Mirrors :meth:`TurboQuantDSATokenToKVPool.forward_turboquant_dense_mla_decode`.
-        When ``higgs_mla_decode_num_splits > 1`` the split-K path runs:
-        FWHT_512 of ``q_nope`` into a ``q_rotated`` scratch, then the
-        topk loop is sharded across ``num_splits`` blocks per
-        ``(row, head)`` with a merge-and-inverse-FWHT stage. This
-        mirrors TurboQuant's ``decode_2p5_split_rotated`` two-stage
-        pipeline and recovers small-batch throughput on B200.
-        Setting ``num_splits == 1`` selects the original single-pass
-        kernel, useful when ``num_rows * num_heads`` already saturates
-        the GPU.
+        Always runs the split-K path: FWHT_512 of ``q_nope`` into a
+        ``q_rotated`` scratch, then the topk loop is sharded across
+        ``num_splits`` blocks per ``(row, head)`` with a merge-and-
+        inverse-FWHT stage. The legacy single-pass kernels were
+        retired in iter3 (#16) because the split-K path is uniformly
+        faster (12× at B=1, 4× at B=16 on B200 sm_100, topk=2048).
+        ``num_splits`` is clamped to at least 2 so the dropped
+        single-pass branch is unreachable.
         """
         layer_buffer = self._get_layersplit_kv_buffer(layer_id)
         out = torch.empty(
@@ -3950,20 +3947,12 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
         num_splits = self._select_higgs_mla_decode_num_splits(
             q_nope.shape[0], q_nope.shape[1], page_table.shape[1]
         )
+        # Iter3 (#16): single-pass kernels dropped — always need >= 2
+        # splits to keep stage2 merge well-defined.
+        num_splits = max(int(num_splits), 2)
         if candidate.name == "store_saw_scalar2":
             if page_table.shape[1] >= 1024:
                 num_splits = max(num_splits, 16)
-            if num_splits <= 1:
-                higgs_dense_2bit_mla_decode_saw_scalar2(
-                    q_nope,
-                    q_rope,
-                    layer_buffer,
-                    page_table,
-                    out,
-                    self.higgs_codec.codebook,
-                    sm_scale,
-                )
-                return out
             mid_shape = (
                 q_nope.shape[0],
                 q_nope.shape[1],
@@ -3985,18 +3974,6 @@ class HiggsDense2BitDSATokenToKVPool(DSATokenToKVPool):
                 layer_buffer,
                 page_table,
                 self._higgs_mla_decode_mid,
-                out,
-                self.higgs_codec.codebook,
-                sm_scale,
-            )
-            return out
-
-        if num_splits <= 1:
-            higgs_dense_2bit_mla_decode(
-                q_nope,
-                q_rope,
-                layer_buffer,
-                page_table,
                 out,
                 self.higgs_codec.codebook,
                 sm_scale,

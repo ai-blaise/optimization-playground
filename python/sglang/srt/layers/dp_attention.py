@@ -542,6 +542,12 @@ def _dp_gather_via_all_reduce(
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
+    # B200 SM_100 workaround: Tensor.fill_(0) on numel==0 tensors hits
+    # cudaErrorInvalidConfiguration (same kernel-launch-config family as the
+    # cumsum bug). When all DP ranks have 0 tokens (forward_idle ladder),
+    # global_tokens has shape (0, hidden_size); skip fill_ + all_reduce.
+    if global_tokens.numel() == 0:
+        return
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
@@ -578,12 +584,15 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    # B200 SM_100 workaround for empty-tensor fill_: see _dp_gather_via_all_reduce.
+    if global_tokens.numel() == 0:
+        return
     if get_attention_tp_size() == 1:
         get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
 
     if not is_partial:
-        if get_attention_tp_rank() != 0:
+        if get_attention_tp_rank() != 0 and local_tokens.numel() > 0:
             local_tokens.fill_(0)
     scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
@@ -622,6 +631,63 @@ def dp_gather_replicate(
     forward_batch: ForwardBatch,
 ):
     _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=False)
+
+
+def dp_gather_partial_fp4(
+    values_global: torch.Tensor,
+    values_local: torch.Tensor,
+    scales_global: torch.Tensor,
+    scales_local: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Parallel DP allgather of (FP4 packed bytes, UE8M0 scale bytes).
+
+    Iter5 #15 NVFP4 MoE companion to ``dp_gather_partial``: unlocks the
+    iter4 SECONDARY wire (communicator.py L1024) by making the local-rows
+    FP4 stash from ``cvt_fused_rmsnorm_to_fp4_and_bf16_linear`` survive
+    the DP-allgather. After this call the gathered (fp4, sf) attached to
+    the post-gather BF16 hidden_states matches the layout the NVFP4 MoE
+    expert ``apply_weights`` consumer expects:
+      - ``values_global``: ``[M_global, hidden // 2]`` uint8
+      - ``scales_global``: ``[M_global, hidden // 16]`` fp8_e4m3 (caller
+        must pass an int32-typed buffer of shape ``[M_global,
+        (hidden // 16) // 4]`` for the underlying NCCL collective; the
+        caller re-views as fp8_e4m3 after).
+
+    Both allgathers fire on the same TP group as ``dp_gather_partial``
+    so the leading-dim alignment matches the BF16 allgather. NCCL is
+    dtype-agnostic at the bytes level — uint8 + int32 work natively.
+
+    Supported deploy config (DSv3.2-REAP DP=TP=8, attn_tp_size=1,
+    max_len padding under CUDA-graph decode). Other configs raise.
+    """
+    # Local-rows shape sanity: leading dim must match the BF16 allgather.
+    assert values_local.shape[0] == scales_local.shape[0]
+    assert values_global.shape[0] == scales_global.shape[0]
+    assert values_global.shape[0] == values_local.shape[0] * get_tp_group().world_size
+    assert values_local.is_contiguous() and values_global.is_contiguous()
+    assert scales_local.is_contiguous() and scales_global.is_contiguous()
+
+    if get_attention_tp_size() != 1:
+        raise NotImplementedError(
+            "dp_gather_partial_fp4 requires attn_tp_size == 1 (deploy "
+            "config). attn_tp_size > 1 would need a reduce_scatter on "
+            "FP4 bytes which is not well-defined."
+        )
+    if not forward_batch.dp_padding_mode.is_max_len():
+        # SUM_LEN mode would need the rank-offset memcpy + allreduce-or-
+        # allgather pattern. allreduce sums bytes which corrupts FP4; a
+        # per-rank-padded allgather would have to know the global pad
+        # length. Defer to iter6 when prefill needs it; current deploy
+        # decode path uses MAX_LEN.
+        raise NotImplementedError(
+            "dp_gather_partial_fp4 requires max_len dp_padding_mode "
+            "(decode); sum_len (prefill) deferred to iter6."
+        )
+
+    tp = get_tp_group()
+    tp.all_gather_into_tensor(values_global, values_local)
+    tp.all_gather_into_tensor(scales_global, scales_local)
 
 
 def dp_scatter(

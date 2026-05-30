@@ -480,6 +480,24 @@ class DeepseekSparseAttnBackend(
         self._higgs_dequant_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if _is_cuda else None
         )
+        # ai-blaise #19 iter6 (primary vector): dedicated CUDA stream
+        # for the trtllm-gen sparse-MLA kernel itself. With iter4's
+        # ``_higgs_dequant_stream`` and iter5's ping-pong scratch in
+        # place, the remaining serialization that prevents cross-layer
+        # overlap is that trtllm-gen N runs on the main stream — so layer
+        # N+1's side-stream dequant ``wait_stream(main)`` transitively
+        # waits on prior trtllm-gen N via main-stream FIFO. Putting
+        # trtllm-gen on its OWN stream leaves only the short
+        # ``set_mla_kv_buffer`` + ``page_table_1`` transform on main, so
+        # layer N+1's dequant ``wait_stream(main)`` only blocks on those
+        # small kernels and can run concurrently with the prior trtllm
+        # gen. This is the ``iter5 close-out`` follow-up that the
+        # ping-pong infrastructure was built for. Allocated
+        # unconditionally so the stream is captured into any cuda graph;
+        # gated by :attr:`envs.SGLANG_HIGGS_DSA_TRTLLM_DEDICATED_STREAM`.
+        self._higgs_trtllm_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream() if _is_cuda else None
+        )
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
@@ -2672,6 +2690,26 @@ class DeepseekSparseAttnBackend(
         higgs_slot_parity = (
             (int(layer.layer_id) & 1) if higgs_pingpong_enabled else 0
         )
+        # ai-blaise #19 iter6 (primary vector): dedicated trtllm-gen
+        # stream. When set, the trtllm-gen sparse-MLA call below is
+        # launched onto ``self._higgs_trtllm_stream`` instead of the
+        # main stream. This is the second half of the iter5 close-out:
+        # ping-pong (iter5) broke the same-buffer aliasing, dedicated
+        # stream (iter6) breaks the main-stream-FIFO transitive wait
+        # that kept layer N+1's side-stream dequant pinned behind
+        # layer N's trtllm-gen tail. Together they enable real
+        # cross-layer overlap of dequant_{N+1} with trtllm_gen_N.
+        # Requires the dequant side-stream to be enabled (otherwise
+        # the dequant_event we wait on doesn't exist) AND ping-pong
+        # to be on (otherwise layer N+1's dequant write would alias
+        # layer N's trtllm-gen read on the same buffer).
+        use_higgs_trtllm_stream = (
+            is_higgs_dense_pool
+            and self._higgs_trtllm_stream is not None
+            and use_higgs_dequant_stream
+            and higgs_pingpong_enabled
+            and envs.SGLANG_HIGGS_DSA_TRTLLM_DEDICATED_STREAM.get()
+        )
 
         if is_higgs_dense_pool:
             # NOTE(ai-blaise #19): the HIGGS sparse-materialize adapter
@@ -2776,24 +2814,71 @@ class DeepseekSparseAttnBackend(
         # (instead of right after the dequant launch) gives the GPU the
         # full window between dequant launch and trtllm-gen launch to
         # actually overlap.
-        if higgs_dequant_event is not None:
-            torch.cuda.current_stream().wait_event(higgs_dequant_event)
+        #
+        # ai-blaise #19 iter6: when the dedicated trtllm-gen stream is
+        # enabled, the trtllm-gen call runs on ``_higgs_trtllm_stream``
+        # instead of main. The dequant event is then waited on by the
+        # trtllm stream (not main), and the main stream waits on the
+        # trtllm completion event right after — preserving causal
+        # ordering for downstream consumers of ``out`` on main. The
+        # dequant side-stream → trtllm side-stream → main chain has the
+        # same correctness as the iter4 single-side-stream flow, but
+        # leaves the main stream free to schedule the NEXT layer's
+        # set_mla_kv_buffer + page_table_1 + kv_proj kernels while the
+        # current trtllm-gen is still running.
+        if use_higgs_trtllm_stream:
+            main_stream = torch.cuda.current_stream()
+            # The trtllm stream must observe everything main has queued
+            # so far (set_mla_kv_buffer + page_table_1 + the q_all FP8
+            # cast). wait_stream(main) records main's tip event onto
+            # trtllm_stream — cheap because main hasn't queued
+            # trtllm-gen.
+            self._higgs_trtllm_stream.wait_stream(main_stream)
+            # Causal dep on the dequant write (already recorded on the
+            # side stream above).
+            assert higgs_dequant_event is not None
+            self._higgs_trtllm_stream.wait_event(higgs_dequant_event)
+            with torch.cuda.stream(self._higgs_trtllm_stream):
+                out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                    query=q,
+                    kv_cache=kv,
+                    workspace_buffer=self.workspace_buffer,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    max_seq_len=metadata.max_seq_len_k,
+                    sparse_mla_top_k=self.dsa_index_topk,
+                    bmm1_scale=bmm1_scale,
+                    backend="trtllm-gen",
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                )
+                higgs_trtllm_done_event = (
+                    self._higgs_trtllm_stream.record_event()
+                )
+            # Main stream waits for trtllm-gen before any downstream
+            # consumer of ``out`` (the o_proj GEMM, MoE, etc.) queues.
+            main_stream.wait_event(higgs_trtllm_done_event)
+        else:
+            if higgs_dequant_event is not None:
+                torch.cuda.current_stream().wait_event(higgs_dequant_event)
 
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            query=q,
-            kv_cache=kv,
-            workspace_buffer=self.workspace_buffer,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=metadata.max_seq_len_k,
-            sparse_mla_top_k=self.dsa_index_topk,
-            bmm1_scale=bmm1_scale,
-            backend="trtllm-gen",
-            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-        )
+            out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=q,
+                kv_cache=kv,
+                workspace_buffer=self.workspace_buffer,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=metadata.max_seq_len_k,
+                sparse_mla_top_k=self.dsa_index_topk,
+                bmm1_scale=bmm1_scale,
+                backend="trtllm-gen",
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            )
 
         return out
 

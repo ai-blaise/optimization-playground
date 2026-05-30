@@ -1828,6 +1828,78 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
+        # Structural HIGGS fix: when the pool is HIGGS dense, route
+        # to the fused HIGGS+MLA decode kernel that does inline
+        # FWHT_512 + EDEN2-16 dequant inside the same kernel as the
+        # topk attention. Eliminates the materialize-then-cubin-read
+        # HBM round-trip the trtllm-gen sparse-MLA path imposes.
+        # Gated on env var so the legacy iter3/iter9-producer +
+        # trtllm-gen path stays the default until production-shape
+        # A/B confirms the fused path wins.
+        if (
+            envs.SGLANG_HIGGS_DSA_FUSED_MLA_DECODE.get()
+            and getattr(
+                self.token_to_kv_pool, "higgs_dense_2bit_preset", None
+            )
+            == "eden2_16"
+            and topk_indices is not None
+            and q_rope is not None
+        ):
+            if save_kv_cache and k is not None:
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
+                assert k_rope is not None
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, cache_loc, k, k_rope
+                )
+            q_nope_v = q.view(
+                -1, layer.tp_q_head_num, layer.v_head_dim
+            )
+            q_rope_v = q_rope.view(
+                -1,
+                layer.tp_q_head_num,
+                layer.head_dim - layer.v_head_dim,
+            )
+            topk_indices_aligned = self._pad_topk_indices(
+                topk_indices, q_nope_v.shape[0]
+            )
+            if self.hisparse_coordinator is not None:
+                page_table_1 = (
+                    self.hisparse_coordinator.swap_in_selected_pages(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        topk_indices_aligned,
+                        layer.layer_id,
+                    )
+                )
+            elif envs.SGLANG_DSA_FUSE_TOPK.get():
+                page_table_1 = self._get_fused_topk_page_table(
+                    topk_indices_aligned
+                )
+            else:
+                page_table_1 = transform_index_page_table_decode(
+                    page_table=metadata.page_table_1,
+                    topk_indices=topk_indices_aligned,
+                    page_size=1,
+                )
+            if (
+                page_table_1.is_cuda
+                and page_table_1.dtype == torch.int32
+            ):
+                return (
+                    self.token_to_kv_pool
+                    .forward_higgs_dense_2bit_mla_decode(
+                        layer.layer_id,
+                        q_nope_v,
+                        q_rope_v,
+                        page_table_1,
+                        layer.scaling,
+                    )
+                )
+
         if self.dsa_decode_impl == "trtllm":
             return self._forward_trtllm(
                 q,

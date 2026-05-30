@@ -554,6 +554,19 @@ class Envs:
     # cubin reads. Requires SGLANG_HIGGS_DSA_TRTLLM_FP8=1 to be
     # set as well; default off pending production-shape A/B.
     SGLANG_HIGGS_DSA_INLINE_PRODUCER = EnvBool(False)
+    # Structural HIGGS fix (2026-05-30): route HIGGS dense KV decode
+    # to the fused HIGGS+MLA decode kernel
+    # (``forward_higgs_dense_2bit_mla_decode``) that does inline
+    # FWHT_512 + EDEN2-16 dequant in the same kernel as the topk
+    # attention, eliminating the materialize-then-attend FP8 HBM
+    # round-trip the trtllm-gen sparse-MLA cubin path imposes.
+    # SAW-INT4 (arxiv 2604.19157) calls this the "fused
+    # rotation-quantization kernel ... zero measurable end-to-end
+    # overhead" pattern. The kernel already exists (was only
+    # reachable from target_verify); this env enables routing from
+    # the regular decode path. Default off pending production-shape
+    # A/B vs the iter3/iter9 dequant + cubin path.
+    SGLANG_HIGGS_DSA_FUSED_MLA_DECODE = EnvBool(False)
     # Per-tensor scale applied before the FP8 cast in the HIGGS dequant
     # kernel. The downstream attention's ``bmm1_scale`` then multiplies
     # by ``1/SGLANG_HIGGS_DSA_TRTLLM_FP8_INV_KV_SCALE`` to recover the

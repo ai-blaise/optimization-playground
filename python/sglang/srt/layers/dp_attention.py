@@ -106,7 +106,7 @@ class _DpGatheredBufferWrapper:
     _global_num_tokens: Optional[List[int]]
     _is_extend_in_batch: bool
     # B200 SM_100 workaround (#14 fix followup 10): pre-allocated zero-filled
-    # BF16 buffer used as the source for `global_tokens.copy_(...)` and
+    # buffers used as the source for `global_tokens.copy_(...)` and
     # `local_tokens.copy_(...)` in `_dp_gather_via_all_reduce`,
     # `_dp_gather_via_all_gather`, and `dp_scatter`. Followup 8 replaced
     # the original `fill_(0)` with `mul_(0)`, but both elementwise op
@@ -118,50 +118,71 @@ class _DpGatheredBufferWrapper:
     # `memcpy_triton` data-copy in the same function succeeds at the
     # same shape, confirming the memcpy launch path is good).
     #
-    # The buffer is lazily grown via `_ensure_zero_buffer(length)` at
-    # `set_dp_buffer_len` time, which is always called EAGERLY before
-    # `set_forward_context` opens the captured region (verified in
-    # cuda_graph_runner.run_once, model_runner._capture_one_decode_batch,
+    # Two trailing dims exist in production: hidden (7168) from the BF16
+    # gather/scatter in communicator.py, and vocab (129280) from the
+    # logits dp_scatter in logits_processor.py. Each is keyed by
+    # ``(trailing_dim, dtype)`` in a dict so a single helper serves both.
+    # Buffers are lazily grown via ``_ensure_zero_buffer(length, width,
+    # dtype)`` at ``set_dp_buffer_len`` time (always called EAGERLY
+    # before ``set_forward_context`` opens the captured region; verified
+    # in cuda_graph_runner.run_once, model_runner._capture_one_decode_batch,
     # and piecewise_cuda_graph_runner). Each grow allocates a fresh
-    # `torch.zeros((new_len, hidden), dtype, device)` and assigns it; the
-    # old buffer is kept alive by reference from any previously-captured
-    # graph slice, so previously-captured graphs remain valid.
-    _zero_buffer: Optional[torch.Tensor] = None
+    # ``torch.zeros((new_len, width), dtype, device)`` and replaces the
+    # dict entry; the old buffer is kept alive by reference from any
+    # previously-captured graph slice, so previously-captured graphs
+    # remain valid.
+    _zero_buffers: dict = {}
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
         cls._hidden_size = hidden_size
         cls._dtype = dtype
         cls._device = device
+        # Reset zero buffers across new metadata (test or restart).
+        cls._zero_buffers = {}
 
     @classmethod
-    def _ensure_zero_buffer(cls, length: int) -> None:
-        # Eager-only path. Grows the class-level zero buffer to at least
-        # ``length`` rows. Allocation uses ``torch.zeros`` which is safe
-        # outside CUDA graph capture; the existing buffer (if any) is
-        # retained by previously-captured graph slices.
-        if length <= 0:
+    def _ensure_zero_buffer(
+        cls, length: int, width: int, dtype: torch.dtype
+    ) -> None:
+        # Eager-only path. Grows the class-level zero buffer keyed by
+        # ``(width, dtype)`` to at least ``length`` rows. Allocation uses
+        # ``torch.zeros`` which is safe outside CUDA graph capture; any
+        # existing buffer is retained by previously-captured graph slices.
+        if length <= 0 or width <= 0:
             return
-        if cls._zero_buffer is not None and cls._zero_buffer.shape[0] >= length:
+        key = (width, dtype)
+        buf = cls._zero_buffers.get(key)
+        if buf is not None and buf.shape[0] >= length:
             return
-        cls._zero_buffer = torch.zeros(
-            (length, cls._hidden_size),
-            dtype=cls._dtype,
+        cls._zero_buffers[key] = torch.zeros(
+            (length, width),
+            dtype=dtype,
             device=cls._device,
         )
 
     @classmethod
-    def get_zero_buffer(cls, length: int) -> torch.Tensor:
+    def get_zero_buffer(
+        cls, length: int, width: int, dtype: torch.dtype
+    ) -> torch.Tensor:
         # Returns a view of the pre-allocated zero buffer of the requested
-        # leading-dim length. The buffer must have been grown to at least
-        # ``length`` rows by a prior eager call to ``_ensure_zero_buffer``
-        # (typically via ``set_dp_buffer_len`` before
-        # ``set_forward_context`` opens the captured region). No safety-net
-        # grow here — that would add a Python-side capacity comparison
-        # inside the dynamo-traced ``_dp_gather_via_all_reduce`` path,
-        # introducing a guard that dynamo would specialize on. The slice
-        # itself is a pure view op and traces cleanly.
-        return cls._zero_buffer[:length]
+        # leading-dim length, trailing-dim ``width``, and ``dtype``. Two
+        # production paths reach here:
+        #
+        # 1. Captured (PCG-traced) BF16 communicator path with
+        #    width=hidden_size: the buffer is always pre-allocated by
+        #    ``set_dp_buffer_len`` (eager, before ``set_forward_context``
+        #    opens the captured region), so the safety-net lazy grow
+        #    below is a no-op in this path and dynamo sees a constant
+        #    dict lookup followed by a slice.
+        #
+        # 2. Eager-only logits_processor path with width=vocab_size:
+        #    ``_scatter_dp_attn_logits`` runs outside the PCG-captured
+        #    region (the logits processor is invoked after the model
+        #    forward returns); the safety-net lazy grow below is allowed
+        #    to allocate via ``torch.zeros``.
+        cls._ensure_zero_buffer(length, width, dtype)
+        return cls._zero_buffers[(width, dtype)][:length]
 
     @classmethod
     def set_dp_buffer_len(
@@ -182,9 +203,19 @@ class _DpGatheredBufferWrapper:
         # both `global_tokens.copy_(...)` and `local_tokens.copy_(...)`.
         # ``global_dp_buffer_len`` may be None when DP attention is off
         # or during PCG warmup; default to local in that case.
+        #
+        # We pre-allocate buffers for the two trailing-dim cases observed
+        # in production: hidden_size (BF16 communicator gather/scatter)
+        # and any vocab-shaped scatter (logits_processor scatter). The
+        # vocab buffer is grown lazily on first use of the logits path
+        # via the same ``_ensure_zero_buffer`` helper called from
+        # ``logits_processor.compute_dp_attention_metadata``-adjacent
+        # eager preparation. Here we only seed the hidden_size buffer;
+        # all other widths grow on-demand from eager paths above the
+        # dynamo trace boundary.
         _g = global_dp_buffer_len if global_dp_buffer_len is not None else 0
         _l = local_dp_buffer_len if local_dp_buffer_len is not None else 0
-        cls._ensure_zero_buffer(max(_g, _l))
+        cls._ensure_zero_buffer(max(_g, _l), cls._hidden_size, cls._dtype)
 
     @classmethod
     def get_global_dp_buffer(
@@ -285,14 +316,28 @@ def set_dp_buffer_len(
     )
 
 
-def get_dp_zero_buffer(length: int) -> torch.Tensor:
+def get_dp_zero_buffer(
+    length: int, width: int, dtype: torch.dtype
+) -> torch.Tensor:
     # B200 SM_100 workaround (#14 fix followup 10): returns a view of the
     # pre-allocated zero source buffer used by `_dp_gather_via_all_reduce`,
     # `_dp_gather_via_all_gather`, and `dp_scatter` to zero `global_tokens` /
     # `local_tokens` via `.copy_()` instead of in-place `fill_/mul_`, which
     # hit `cudaErrorInvalidConfiguration` on small leading dims under PCG
-    # capture. See `_DpGatheredBufferWrapper._zero_buffer` for full rationale.
-    return _DpGatheredBufferWrapper.get_zero_buffer(length)
+    # capture. See `_DpGatheredBufferWrapper._zero_buffers` for the full
+    # rationale on width-keyed buffers.
+    return _DpGatheredBufferWrapper.get_zero_buffer(length, width, dtype)
+
+
+def ensure_dp_zero_buffer(
+    length: int, width: int, dtype: torch.dtype
+) -> None:
+    # Module-level shim for the eager-time pre-allocation of a zero buffer
+    # for a given ``(width, dtype)``. Callers above the dynamo trace
+    # boundary (e.g. logits_processor before scattering vocab-sized
+    # tensors) call this to ensure the buffer is grown to at least
+    # ``length`` rows before the captured ``dp_scatter`` reads it.
+    _DpGatheredBufferWrapper._ensure_zero_buffer(length, width, dtype)
 
 
 def get_global_dp_buffer(
@@ -630,18 +675,14 @@ def _dp_gather_via_all_reduce(
     # which uses a launch path that is known-good on B200 SM_100 (the
     # `memcpy_triton` data-copy a few lines below succeeds at the same
     # shape via its own triton launch dispatch, confirming the memcpy
-    # family is safe).
-    # B200 SM_100 workaround (#14 fix followup 11): the precomputed zero
-    # buffer is shaped (*, _hidden_size); only use it when trailing dim
-    # matches, else fall back to mul_(0) (safe when trailing dim is large,
-    # e.g. vocab_size in logits-scatter paths).
-    if (
-        global_tokens.dim() == 2
-        and global_tokens.shape[1] == _DpGatheredBufferWrapper._hidden_size
-    ):
-        global_tokens.copy_(get_dp_zero_buffer(global_tokens.shape[0]))
-    else:
-        global_tokens.mul_(0)
+    # family is safe). The buffer is width/dtype-keyed because in
+    # production we see both ``hidden_size`` (BF16 communicator path)
+    # and ``vocab_size`` (BF16 logits_processor scatter path).
+    global_tokens.copy_(
+        get_dp_zero_buffer(
+            global_tokens.shape[0], global_tokens.shape[1], global_tokens.dtype
+        )
+    )
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
@@ -686,19 +727,18 @@ def _dp_gather_via_all_gather(
 
     if not is_partial:
         if get_attention_tp_rank() != 0 and local_tokens.numel() > 0:
-            # B200 SM_100 workaround (#14 fix followup 10 + 11): copy_ from
-            # the pre-allocated zero source for the hidden_size case;
-            # mul_(0) for any other trailing dim (which won't surface the
-            # small-shape bug because the elementwise dispatcher only
-            # mis-launches for small trailing dim too).
-            if (
-                local_tokens.dim() == 2
-                and local_tokens.shape[1]
-                == _DpGatheredBufferWrapper._hidden_size
-            ):
-                local_tokens.copy_(get_dp_zero_buffer(local_tokens.shape[0]))
-            else:
-                local_tokens.mul_(0)
+            # B200 SM_100 workaround (#14 fix followup 10): replace
+            # `local_tokens.mul_(0)` (followup 8) with a `copy_` from the
+            # pre-allocated zero source. See `_dp_gather_via_all_reduce`
+            # for the full rationale on why the memcpy-family launch
+            # path bypasses the small-leading-dim launch-config bug.
+            local_tokens.copy_(
+                get_dp_zero_buffer(
+                    local_tokens.shape[0],
+                    local_tokens.shape[1],
+                    local_tokens.dtype,
+                )
+            )
     scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
     ]
@@ -834,30 +874,21 @@ def dp_scatter(
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    # B200 SM_100 workaround (#14 fix followup 10 + 11): the pre-allocated
-    # zero buffer in _DpGatheredBufferWrapper has trailing dim
-    # _hidden_size (e.g. 7168). dp_scatter is called for two distinct
-    # tensor shapes: hidden_states (dim = hidden_size, matches buffer)
-    # AND logits (dim = vocab_size, e.g. 129280, does NOT match). For the
-    # logits-scatter case the precomputed buffer's shape mismatches, so
-    # fall back to mul_(0) — vocab_size is large enough that the small-
-    # leading-dim launch-config bug doesn't surface (the bug fires only
-    # when BOTH leading dim AND trailing dim are small for the in-place
-    # elementwise dispatcher). Followup 10 only handled the hidden_size
-    # case; followup 11 picks the right zero path based on the shape.
+    # B200 SM_100 workaround (#14 fix followup 10): replace
+    # `local_tokens.mul_(0)` (followup 8) with a `copy_` from the
+    # pre-allocated zero source. See `_dp_gather_via_all_reduce` for
+    # the full rationale on why memcpy-family ops survive the small-
+    # leading-dim launch-config bug. ``dp_scatter`` is called from both
+    # the BF16 communicator path (width=hidden_size) and the logits
+    # path (width=vocab_size); ensure the dp_zero_buffer for the
+    # vocab-width case has been grown by the eager logits prep before
+    # entering capture.
     if local_tokens.numel() > 0:
-        if (
-            local_tokens.dim() == 2
-            and local_tokens.shape[1] == _DpGatheredBufferWrapper._hidden_size
-        ):
-            # Hidden-states path: small (1,7168) BF16 hits the bug; use the
-            # cudaMemcpyAsync-dispatched copy_ workaround from followup 10.
-            local_tokens.copy_(get_dp_zero_buffer(local_tokens.shape[0]))
-        else:
-            # Logits path: trailing dim is vocab_size (e.g. 129280), well
-            # above the small-tensor launch-config bug threshold; mul_(0)
-            # dispatches to a normal elementwise kernel here without issue.
-            local_tokens.mul_(0)
+        local_tokens.copy_(
+            get_dp_zero_buffer(
+                local_tokens.shape[0], local_tokens.shape[1], local_tokens.dtype
+            )
+        )
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:

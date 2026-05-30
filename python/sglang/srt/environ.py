@@ -566,6 +566,30 @@ class Envs:
     # flip together with ``SGLANG_HIGGS_DSA_TRTLLM_DEQUANT_STREAM=1`` and
     # ``SGLANG_HIGGS_DSA_TRTLLM_FP8=1`` on B200 to measure.
     SGLANG_HIGGS_DSA_TRTLLM_PINGPONG = EnvBool(False)
+    # ai-blaise #19 iter6 (primary vector): dedicated CUDA stream for
+    # the trtllm-gen sparse-MLA kernel itself. With iter4's side-stream
+    # dequant + iter5's ping-pong scratch in place, the remaining
+    # serialization that prevents cross-layer overlap is that
+    # trtllm-gen N runs on the main stream — so layer N+1's
+    # side-stream dequant ``wait_stream(main)`` transitively waits on
+    # prior trtllm-gen N via main-stream FIFO. Putting trtllm-gen on
+    # its OWN stream leaves only the short ``set_mla_kv_buffer`` +
+    # ``page_table_1`` transform + Q FP8 cast on main, so layer N+1's
+    # dequant ``wait_stream(main)`` only blocks on those small kernels
+    # and can run concurrently with the prior trtllm-gen. Causal
+    # ordering preserved: trtllm stream waits on the dequant event
+    # before launching; main stream waits on the trtllm completion
+    # event before any downstream consumer of the attn output runs.
+    # cuda-graph-capture safe (stream construction happens at backend
+    # init outside any capture context; wait_event / wait_stream /
+    # record_event are recorded into the captured graph). Requires
+    # SGLANG_HIGGS_DSA_TRTLLM_DEQUANT_STREAM=1 and
+    # SGLANG_HIGGS_DSA_TRTLLM_PINGPONG=1 to be set as well — otherwise
+    # the dependent event chain is incomplete (dedicated trtllm stream
+    # with single-slot scratch reintroduces the buffer aliasing
+    # hazard). Default off — flip together with the iter5 stack on
+    # B200 to measure.
+    SGLANG_HIGGS_DSA_TRTLLM_DEDICATED_STREAM = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

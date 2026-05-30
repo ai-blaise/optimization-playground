@@ -452,11 +452,11 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
         # mirror is available.
         _src = forward_batch.global_num_tokens_gpu
         if torch.cuda.is_current_stream_capturing():
-            cumtokens = torch.cumsum(_src, dim=0)
+            cumtokens = torch.cumsum(_src.to(torch.float32), dim=0).to(_src.dtype)
         else:
             _src_cpu = forward_batch.global_num_tokens_cpu
             if _src_cpu is None:
-                cumtokens = torch.cumsum(_src, dim=0)
+                cumtokens = torch.cumsum(_src.to(torch.float32), dim=0).to(_src.dtype)
             else:
                 _acc = 0
                 _prefix = []
@@ -548,6 +548,16 @@ def _dp_gather_via_all_reduce(
     # global_tokens has shape (0, hidden_size); skip fill_ + all_reduce.
     if global_tokens.numel() == 0:
         return
+    # DEBUG instrument: log shape/dtype before potentially-failing fill_(0).
+    try:
+        import os as _os
+        _f = open("/dev/shm/blaise_dp_debug.log", "a")
+        _rank = _os.environ.get("RANK", "?")
+        _f.write(f"[gather_all_reduce rank={_rank}] global_tokens.shape={tuple(global_tokens.shape)} dtype={global_tokens.dtype} numel={global_tokens.numel()} local_tokens.shape={tuple(local_tokens.shape)} dtype={local_tokens.dtype}\n")
+        _f.flush()
+        _f.close()
+    except Exception:
+        pass
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()

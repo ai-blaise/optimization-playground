@@ -297,6 +297,9 @@ Replace `total_work >= X` threshold logic with a **lookup table or always-WMMA f
 
 ## Additional findings (lower priority, but worth tracking)
 
+### Z. WMMA correctness sanity-check
+A microbench with **synthetic uint8 cache bytes** produced Inf values in BOTH TILEN=8 and WMMA output. This is a **test artifact**: random cache bytes form invalid NVFP4 scales that dequantize to large magnitudes. The original iter5 PRIMARY commit notes claim bit-identical correctness via the production data path. **WMMA correctness has been previously validated** and Step 1 (force WMMA on) does not pose a known regression risk — but **intel-correctness sweep should re-confirm with the lowered threshold** before deploying.
+
 ### A. The `candidate_len == topk_tokens` early-return path was BROKEN by topk=2048
 With `index_topk=2048`, the early-return at `nvfp4_indexer.py:3042` requires `effective_block_topk * 128 == 2048` → `effective_block_topk == 16` → `block_counts >= 64` → `prefix >= 8192`. At production cell (prefix=4096-5120), early-return is **NEVER taken**. The fast `hisa_block_topk_map_all` kernel (33us) is **bypassed**, forcing the slower `hisa_block_topk + cand_score + topk` path (~250us).
 

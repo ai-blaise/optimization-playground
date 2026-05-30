@@ -1557,7 +1557,32 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        # HIGGS dense / TurboQuant fused_decode pools store compressed slots
+        # and their get_key_buffer either raises or runs an unwanted dequant.
+        # The kv_cache value is overwritten unconditionally by every reachable
+        # dispatch branch below (HIGGS / TurboQuant / else), so the pre-fetch
+        # is only here for the layer-transfer-counter sync side effect on
+        # hierarchical-cache pools. Route compressed-dense pools to a sync-only
+        # call to avoid the raise / dead dequant; other pools keep current
+        # behavior bit-for-bit.
+        if (
+            getattr(self.token_to_kv_pool, "higgs_dense_2bit_preset", None)
+            == "eden2_16"
+            or getattr(
+                self.token_to_kv_pool, "turboquant_execution_mode", None
+            )
+            == "fused_decode"
+        ):
+            # Inline the layer-transfer wait from the parent get_key_buffer
+            # without invoking it (HIGGS raises, TurboQuant runs a dead dequant).
+            transfer_counter = self.token_to_kv_pool.layer_transfer_counter
+            if transfer_counter is not None:
+                transfer_counter.wait_until(
+                    layer.layer_id - self.token_to_kv_pool.start_layer
+                )
+            kv_cache = None
+        else:
+            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1836,7 +1861,32 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Do absorbed multi-latent attention
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        # HIGGS dense / TurboQuant fused_decode pools store compressed slots
+        # and their get_key_buffer either raises or runs an unwanted dequant.
+        # The kv_cache value is overwritten unconditionally by every reachable
+        # dispatch branch below (HIGGS / TurboQuant / else), so the pre-fetch
+        # is only here for the layer-transfer-counter sync side effect on
+        # hierarchical-cache pools. Route compressed-dense pools to a sync-only
+        # call to avoid the raise / dead dequant; other pools keep current
+        # behavior bit-for-bit.
+        if (
+            getattr(self.token_to_kv_pool, "higgs_dense_2bit_preset", None)
+            == "eden2_16"
+            or getattr(
+                self.token_to_kv_pool, "turboquant_execution_mode", None
+            )
+            == "fused_decode"
+        ):
+            # Inline the layer-transfer wait from the parent get_key_buffer
+            # without invoking it (HIGGS raises, TurboQuant runs a dead dequant).
+            transfer_counter = self.token_to_kv_pool.layer_transfer_counter
+            if transfer_counter is not None:
+                transfer_counter.wait_until(
+                    layer.layer_id - self.token_to_kv_pool.start_layer
+                )
+            kv_cache = None
+        else:
+            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(

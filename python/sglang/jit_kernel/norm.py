@@ -157,6 +157,52 @@ def fused_add_rmsnorm(
     module.fused_add_rmsnorm(input, residual, weight, eps)
 
 
+# Re-export the fused (RMSNorm + NVFP4 quantize) kernel from the nvfp4
+# JIT module. Iter2 primary vector for #15 NVFP4 MoE deploy.
+#
+# Drop-in for the two-call sequence:
+#
+#     fused_add_rmsnorm(input, residual, weight, eps,
+#                       cast_x_before_out_mul=False)
+#     fp4, sf = scaled_fp4_quant_linear(input, input_global_scale)
+#
+# producing identical residual + FP4 + SF output (bit-exact for the
+# non-cast_x path at batch sizes 1..256 on B200, per
+# test/srt/test_nvfp4_fused_rmsnorm_quant.py). Bench at hidden=7168
+# shows 0.24-0.33 us / call saved at m=1..128, and 0.5-0.8 us / call
+# saved with enable_pdl=True (programmatic stream serialization lets
+# the kernel start in the shadow of a preceding store).
+def fused_add_rmsnorm_to_nvfp4_linear(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    eps: float = 1e-6,
+    *,
+    cast_x_before_out_mul: bool = False,
+    enable_pdl: bool = False,
+):
+    """Fused (residual-add + RMSNorm + linear-layout NVFP4 quantize).
+
+    Returns (fp4_packed, sf_e4m3) matching `scaled_fp4_quant_linear`.
+    Mutates `residual` in place (writes input+residual back).
+
+    See `sglang.jit_kernel.nvfp4.fused_rmsnorm_scaled_fp4_quant_linear`
+    for the full per-arg contract.
+    """
+    from sglang.jit_kernel.nvfp4 import fused_rmsnorm_scaled_fp4_quant_linear
+
+    return fused_rmsnorm_scaled_fp4_quant_linear(
+        input,
+        residual,
+        weight,
+        input_global_scale,
+        eps,
+        cast_x_before_out_mul=cast_x_before_out_mul,
+        enable_pdl=enable_pdl,
+    )
+
+
 @debug_kernel_api
 def fused_inplace_qknorm_across_heads(
     q: torch.Tensor,

@@ -19,6 +19,8 @@ Compared to the swizzled CUTLASS variant, this kernel:
   * Sets up for iter2 fusion with upstream RMSNorm / downstream prefetch.
 ==============================================================================*/
 
+#pragma once
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -26,6 +28,11 @@ Compared to the swizzled CUTLASS variant, this kernel:
 #include <sgl_kernel/utils.cuh>
 
 #include "nvfp4_quant.cuh"
+// Pull in cvt_warp_fp16_to_fp4 (defined as SGL_DEVICE function template
+// in nvfp4_quant_kernels.cuh). Including the header is safe — its
+// __global__ kernels are templates and only instantiated by callers in
+// the same translation unit, so we don't pick up extra symbols.
+#include "nvfp4_quant_kernels.cuh"
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 

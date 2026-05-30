@@ -62,7 +62,17 @@ constexpr int kCodebookSize = 16;
 constexpr int kNumPairs = kLatentDim / kPairDim;  // 256
 constexpr int kPackedBytes = kNumPairs / 2;       // 128
 constexpr int kNormBytes = 2;
-constexpr int kSlotBytes = kPackedBytes + kNormBytes + kRopeDim * 2;  // 258
+// Payload that the kernel actually reads (offsets in
+// ``[0, kPayloadBytes)``); matches HiggsDense2BitConfig.payload_bytes.
+constexpr int kPayloadBytes = kPackedBytes + kNormBytes + kRopeDim * 2;  // 258
+// Iter4 (#16) per-slot stride: 16-byte aligned. Matches
+// ``kSlotBytes`` in ``higgs_dense_2bit_kv.cuh``.
+constexpr int kSlotAlignmentBytes = 16;
+constexpr int kSlotBytes =
+    (kPayloadBytes + kSlotAlignmentBytes - 1) /
+    kSlotAlignmentBytes * kSlotAlignmentBytes;
+static_assert(kPayloadBytes == 258, "expected payload bytes = 258");
+static_assert(kSlotBytes == 272, "expected padded slot bytes = 272");
 constexpr float kInvSqrtLatentDim = 0.044194173824159216f;
 constexpr float kNegInf = -3.4028234663852886e38f;
 

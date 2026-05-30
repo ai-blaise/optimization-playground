@@ -144,7 +144,8 @@ def higgs_dense_2bit_mla_decode_split(
       q_rotated: ``(num_rows, num_heads, 512)`` ``float32`` rotated
         query produced by :func:`higgs_dense_2bit_mla_rotate_query`.
       q_rope: ``(num_rows, num_heads, 64)`` ``bfloat16`` query rope.
-      compressed: ``(num_slots, 1, 258)`` ``uint8`` packed KV slots.
+      compressed: ``(num_slots, 1, 272)`` ``uint8`` packed KV slots
+        (iter4 #16: 258 B payload + 14 B 16-align pad).
       page_table: ``(num_rows, topk)`` ``int32`` slot indices.
       mid: ``(num_rows, num_heads, num_splits, 514)`` ``float32``
         scratch for per-split ``(m, l, acc[0..511])`` partials.

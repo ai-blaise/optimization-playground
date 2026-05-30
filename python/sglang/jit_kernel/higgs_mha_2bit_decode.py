@@ -3,7 +3,8 @@
 Mirrors :mod:`sglang.jit_kernel.higgs_dense_2bit_mla_decode` but for
 the SMC-SD draft path: standard MHA / GQA with ``head_dim=128`` and
 K + V quantized into independent 34-byte HIGGS slots (vs MLA's single
-258-byte slot that fuses latent + rope).
+272-byte slot — 258 B payload + 14 B 16-align pad as of iter4 #16 —
+that fuses latent + rope).
 
 Single entry point:
 

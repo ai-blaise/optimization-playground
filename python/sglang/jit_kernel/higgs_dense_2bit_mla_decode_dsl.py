@@ -3,10 +3,11 @@
 End-to-end CuTe DSL replacement for `higgs_dense_2bit_mla_decode_tc.cuh`
 (C++ commit 961c4794a, 2.57× over scalar). Adapts the
 `mla_decode_fp8.py` design from tokenspeed-mla for the HIGGS 2-bit KV
-codec: each slot is 258 bytes = 128 packed 4-bit indices + 2 B FP16
-scale + 128 B (64 × BF16) rope. Q stays BF16; we apply FWHT_512 +
-1/sqrt(512) once at the start so the q·K dot lives in the codec's
-rotated basis, and InvFWHT_512 at the end. Rope is untouched.
+codec: each slot is 272 bytes (258 B payload [128 packed 4-bit indices
++ 2 B FP16 scale + 128 B (64 × BF16) rope] + 14 B 16-align pad — see
+iter4 #16 note in ``higgs_dense_2bit_kv.cuh``). Q stays BF16; we apply
+FWHT_512 + 1/sqrt(512) once at the start so the q·K dot lives in the
+codec's rotated basis, and InvFWHT_512 at the end. Rope is untouched.
 
 Iter 1: monolithic compute (4 warps, no specialization), single-CTA
 cluster, M=64 Q heads per CTA. PV split into 2 N-chunks of 256 (SM100
@@ -36,7 +37,14 @@ CODEBOOK_SIZE = 16
 NUM_PAIRS = LATENT_DIM // PAIR_DIM       # 256
 PACKED_BYTES = NUM_PAIRS // 2            # 128
 NORM_BYTES = 2
-SLOT_BYTES = PACKED_BYTES + NORM_BYTES + ROPE_DIM * 2  # 258
+# Payload (what every kernel reads at offsets in ``[0, PAYLOAD_BYTES)``).
+PAYLOAD_BYTES = PACKED_BYTES + NORM_BYTES + ROPE_DIM * 2  # 258
+# Iter4 (#16) per-slot stride: 16-byte aligned (258 → 272). Matches
+# ``kSlotBytes`` in the C++ kernels and
+# ``HiggsDense2BitConfig.slot_bytes`` in the codec.
+SLOT_ALIGNMENT_BYTES = 16
+SLOT_BYTES = ((PAYLOAD_BYTES + SLOT_ALIGNMENT_BYTES - 1)
+              // SLOT_ALIGNMENT_BYTES) * SLOT_ALIGNMENT_BYTES  # 272
 
 INV_SQRT_LATENT = 0.04419417382415922
 LOG2_E = 1.4426950408889634
@@ -544,8 +552,9 @@ class HiggsDense2bitMLADecodeDSL:
 
 def _split_compressed_views(compressed):
     """Return (packed [n, 128] u8, scale [n] fp16, rope [n, 64] bf16)
-    views into the contiguous HIGGS slot tensor [n, 1, 258] u8 with
-    no copies."""
+    views into the contiguous HIGGS slot tensor [n, 1, SLOT_BYTES] u8
+    with no copies. The rope slice is bounded by ``PAYLOAD_BYTES`` so
+    the iter4 (#16) trailing 16-align pad is excluded."""
     import torch
 
     assert compressed.dtype == torch.uint8
@@ -557,8 +566,10 @@ def _split_compressed_views(compressed):
     # scale: 2 bytes at offset 128 -> fp16
     scale_bytes = base[:, PACKED_BYTES:PACKED_BYTES + NORM_BYTES].contiguous()
     scale = scale_bytes.view(torch.float16).reshape(n)
-    # rope: 128 bytes at offset 130 -> 64 bf16
-    rope_bytes = base[:, PACKED_BYTES + NORM_BYTES:].contiguous()
+    # rope: 128 bytes at offset 130 -> 64 bf16 (excludes iter4 pad tail)
+    rope_bytes = base[
+        :, PACKED_BYTES + NORM_BYTES:PAYLOAD_BYTES
+    ].contiguous()
     rope = rope_bytes.view(torch.bfloat16).reshape(n, ROPE_DIM)
     return packed.contiguous(), scale, rope
 

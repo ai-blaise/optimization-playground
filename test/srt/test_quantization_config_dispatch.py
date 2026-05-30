@@ -188,7 +188,7 @@ def test_higgs_dense_kv_cache_scheme_enables_flag():
             "kv_cache_scheme": {
                 "quant_method": "higgs_dense_2bit",
                 "preset": "eden2_16",
-                "slot_bytes": 258,
+                "slot_bytes": 272,
                 "packed_bits": 2,
                 "kv_dim": 576,
                 "latent_dim": 512,
@@ -250,7 +250,7 @@ def test_higgs_quantization_config_object_with_to_dict():
             return {
                 "kv_cache_scheme": {
                     "quant_method": "higgs_dense_2bit",
-                    "slot_bytes": 258,
+                    "slot_bytes": 272,
                 },
             }
 
@@ -268,7 +268,7 @@ def test_reap_higgs_nvfp4_hisa_config_shape_enables_deployment_stack():
             "kv_cache_scheme": {
                 "quant_method": "higgs_dense_2bit",
                 "preset": "eden2_16",
-                "slot_bytes": 258,
+                "slot_bytes": 272,
                 "packed_bits": 2,
                 "kv_dim": 576,
                 "latent_dim": 512,

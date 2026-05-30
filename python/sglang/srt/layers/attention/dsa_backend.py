@@ -53,7 +53,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.compilation.piecewise_context_manager import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported
 
 if TYPE_CHECKING:
@@ -2530,8 +2530,9 @@ class DeepseekSparseAttnBackend(
         # The trtllm DSA kernel reads the dense paged KV cache via flat
         # token indices in ``block_tables``. For dense BF16/FP8 pools the
         # backing buffer can be reshaped in-place. For HIGGS-packed pools
-        # the slots are 258 B uint8 (256 packed indices + fp16 scale + 64
-        # B rope) and dequant must happen *before* the kernel runs; the
+        # the slots are 272 B uint8 (258 B payload [256 packed indices +
+        # fp16 scale + 64 B rope] + 14 B 16-align pad as of iter4 #16)
+        # and dequant must happen *before* the kernel runs; the
         # trtllm-gen CUBIN is closed-source and cannot fetch + dequant
         # in-kernel. We sparsely materialize the indexer-selected slots
         # (B*K rows where K = sparse_mla_top_k) into a compact BF16 paged

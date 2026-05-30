@@ -26,9 +26,9 @@ from sglang.jit_kernel.nvfp4_indexer import (
 )
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
-    get_token_to_kv_pool,
     is_in_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.indexer_policy import uses_hisa
 from sglang.srt.layers.attention.dsa.indexer_quantization import (

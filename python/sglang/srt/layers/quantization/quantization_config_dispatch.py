@@ -135,7 +135,7 @@ def _maybe_apply_higgs_dense_2bit(server_args: Any, quant_cfg: Dict[str, Any]) -
             "quant_method": "higgs_dense_2bit",
             "latent_dim": 512,
             "rope_dim": 64,
-            "slot_bytes": 258
+            "slot_bytes": 272
           }
         }
 

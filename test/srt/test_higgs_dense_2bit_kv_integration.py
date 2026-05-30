@@ -151,12 +151,17 @@ def test_higgs_auto_split_policy_from_b200_probe():
 
 @pytest.mark.skipif(not cuda_available, reason="requires CUDA")
 def test_higgs_pool_slot_layout():
-    """Pool reports 258 B/slot/layer as designed."""
+    """Pool reports 272 B/slot/layer as designed.
+
+    Iter4 (#16): the 258 B HIGGS payload is unchanged, but the
+    per-slot stride is padded to 272 B (14 B tail pad) so the slot
+    base is 16-byte aligned for ``cp.async.16``.
+    """
     pool = _make_higgs_pool()
-    assert pool.higgs_slot_bytes == 258
+    assert pool.higgs_slot_bytes == 272
     assert pool.higgs_dense_2bit_preset == "eden2_16"
     # Layer-0 row width == HIGGS slot (compressed), not BF16 dense (1152 B).
-    assert pool.kv_buffer[0].shape[-1] == 258
+    assert pool.kv_buffer[0].shape[-1] == 272
     assert pool.kv_buffer[0].dtype == torch.uint8
 
 
@@ -270,16 +275,22 @@ def test_higgs_dequant_cos_sim_gate_through_pool():
 
 @pytest.mark.skipif(not cuda_available, reason="requires CUDA")
 def test_higgs_pool_kv_size_smaller_than_turboquant():
-    """Memory check: HIGGS pool buffers are smaller than TurboQuant's."""
+    """Memory check: HIGGS pool buffers are smaller than TurboQuant's.
+
+    Iter4 (#16) bumped the HIGGS slot from 258 to 272 (14 B 16-align
+    pad), shrinking the gap vs TurboQuant 2.5-bit (274 B/token) from
+    -5.84% to -0.73%, but HIGGS remains strictly smaller.
+    """
     higgs_pool = _make_higgs_pool()
     tq_pool = _make_turboquant_pool()
-    # 258 vs 274 bytes per token: HIGGS layer-0 buffer is strictly smaller.
+    # 272 vs 274 bytes per token: HIGGS layer-0 buffer is still strictly
+    # smaller than TurboQuant's after the iter4 pad.
     h_bytes = higgs_pool.kv_buffer[0].numel() * higgs_pool.kv_buffer[0].element_size()
     t_bytes = tq_pool.kv_buffer[0].numel() * tq_pool.kv_buffer[0].element_size()
     assert h_bytes < t_bytes
     ratio = h_bytes / t_bytes
-    # Allow small variation; expected ~258/274 = 0.9416.
-    assert 0.93 <= ratio <= 0.95, f"ratio={ratio!r}"
+    # Expected ~272/274 = 0.9927; allow tight tolerance band.
+    assert 0.99 <= ratio < 1.0, f"ratio={ratio!r}"
 
 
 @pytest.mark.skipif(not cuda_available, reason="requires CUDA")

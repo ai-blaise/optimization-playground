@@ -228,7 +228,8 @@ def test_layersplit_producer_stage_fusion_candidate_is_owner_local():
         policy,
         layer_id=1,
         active_rows=32,
-        row_bytes=258,
+        # Match the iter4 (#16) HIGGS slot stride.
+        row_bytes=272,
     ).should_fuse
 
     decision = should_fuse_layersplit_producer_stage(
@@ -277,11 +278,13 @@ def test_layersplit_higgs_dense_kv_transfer_sizing_candidate_is_opt_in():
         candidate_name="higgs_dense_kv_transfer_sizing",
     )
     assert sizing is not None
+    # Iter4 (#16): LAYERSPLIT_HIGGS_DENSE_2BIT_SLOT_BYTES = 272
+    # (258 B payload + 14 B 16-align pad).
     assert sizing.slot_bytes == LAYERSPLIT_HIGGS_DENSE_2BIT_SLOT_BYTES
-    assert sizing.active_bytes == 129 * 258
+    assert sizing.active_bytes == 129 * 272
     assert sizing.transfer_rows == 192
-    assert sizing.page_item_bytes == 64 * 258
-    assert sizing.transfer_bytes == 3 * 64 * 258
+    assert sizing.page_item_bytes == 64 * 272
+    assert sizing.transfer_bytes == 3 * 64 * 272
 
 
 def test_layersplit_owner_local_validation_candidate_adds_scratch_layer():

@@ -38,7 +38,12 @@ def test_higgs_slot_bytes():
     # 256 pairs / 2 (per byte) + 2 scale + 64*2 rope
     assert cfg.packed_bytes == 128
     assert cfg.latent_bytes == 130
-    assert cfg.slot_bytes == 258
+    # Iter4 (#16): payload is unchanged at 258 B (packed+norm+rope),
+    # but slot stride is padded to 272 B to make ``cp.async.16`` legal.
+    assert cfg.payload_bytes == 258
+    assert cfg.slot_bytes == 272
+    assert cfg.pad_bytes == 14
+    assert cfg.slot_bytes % 16 == 0
 
 
 def test_higgs_codebook_is_eden2_16():
@@ -72,7 +77,12 @@ def test_higgs_codec_round_trip_preserves_rope():
     latent = torch.randn(8, 1, 512, dtype=torch.bfloat16)
     rope = torch.randn(8, 1, 64, dtype=torch.bfloat16)
     compressed = codec.compress(latent, rope)
-    assert compressed.shape == (8, 1, 258)
+    # Iter4 (#16): slot stride is padded to 272 B; the 14 B tail is
+    # zero-initialized by ``compress`` and ignored by ``decompress``.
+    assert compressed.shape == (8, 1, 272)
+    pad_tail = compressed[..., 0, 258:]
+    assert pad_tail.shape == (8, 14)
+    assert torch.all(pad_tail == 0)
     restored = codec.decompress(compressed, torch.bfloat16)
     # rope must round-trip exactly (bf16 -> bf16 is the identity).
     assert torch.equal(restored[..., 512:], rope)
@@ -94,8 +104,11 @@ def test_higgs_codec_smaller_than_turboquant_2p5():
     tq = TurboQuantDenseKVConfig(
         latent_dim=512, rope_dim=64, preset="latent_2p5bit_nc"
     )
+    # Iter4 (#16): HIGGS slot grew from 258 to 272 (14 B 16-align pad)
+    # but is still 2 B smaller than the TurboQuant 2.5-bit slot (274).
     assert higgs.slot_bytes < tq.slot_bytes
-    assert higgs.slot_bytes == 258
+    assert higgs.slot_bytes == 272
+    assert higgs.payload_bytes == 258
     assert tq.slot_bytes == 274
 
 

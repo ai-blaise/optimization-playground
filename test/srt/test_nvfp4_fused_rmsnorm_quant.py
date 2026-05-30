@@ -59,6 +59,7 @@ def _unfused_reference(
     weight: torch.Tensor,
     gs: torch.Tensor,
     eps: float,
+    cast_x_before_out_mul: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference: existing jit fused_add_rmsnorm + scaled_fp4_quant_linear."""
     from sglang.jit_kernel.norm import fused_add_rmsnorm
@@ -66,13 +67,22 @@ def _unfused_reference(
 
     x_c = x.clone()
     r_c = residual.clone()
-    fused_add_rmsnorm(x_c, r_c, weight, eps)
+    fused_add_rmsnorm(
+        x_c, r_c, weight, eps, cast_x_before_out_mul=cast_x_before_out_mul
+    )
     fp4, sf = scaled_fp4_quant_linear(x_c, gs)
     return r_c, fp4, sf
 
 
+# cast_x_before_out_mul covers the HF-parity path (round to dtype before
+# multiplying by weight). iter2/iter3 only exercised the Llama-style
+# False path; the True path needs separate coverage because the kernel
+# emits a different specialization (round_to_dtype on the post-norm
+# accumulator before the weight multiply, then the fp4 quantize sees a
+# slightly different distribution at boundaries).
+@pytest.mark.parametrize("cast_x", [False, True])
 @pytest.mark.parametrize("m", ALL_BATCHES)
-def test_fused_matches_unfused(m: int) -> None:
+def test_fused_matches_unfused(m: int, cast_x: bool) -> None:
     from sglang.jit_kernel.nvfp4 import fused_rmsnorm_scaled_fp4_quant_linear
 
     torch.manual_seed(0xDEADBEEF)
@@ -85,7 +95,8 @@ def test_fused_matches_unfused(m: int) -> None:
 
     # Reference using the unfused pair (does its own clones).
     ref_residual, ref_fp4, ref_sf = _unfused_reference(
-        x, residual, weight, _suggest_global_scale(x), eps
+        x, residual, weight, _suggest_global_scale(x), eps,
+        cast_x_before_out_mul=cast_x,
     )
 
     # Fused (mutates `residual` in place).
@@ -93,7 +104,7 @@ def test_fused_matches_unfused(m: int) -> None:
     r_test = residual.clone()
     gs = _suggest_global_scale(x_test)
     fused_fp4, fused_sf = fused_rmsnorm_scaled_fp4_quant_linear(
-        x_test, r_test, weight, gs, eps
+        x_test, r_test, weight, gs, eps, cast_x_before_out_mul=cast_x,
     )
 
     # Residual: bit-exact (we round through bf16 the same way upstream does).
@@ -101,22 +112,28 @@ def test_fused_matches_unfused(m: int) -> None:
     res_max = res_diff.max().item()
     res_mean = res_diff.mean().item()
     print(
-        f"\n[m={m}] residual max-abs-err={res_max:.6f} mean-abs-err={res_mean:.6f}"
+        f"\n[m={m} cast_x={cast_x}] residual max-abs-err={res_max:.6f} "
+        f"mean-abs-err={res_mean:.6f}"
     )
     # Allow tiny rounding differences (we may differ from upstream's exact
     # rounding mode by one bf16 ULP at the boundary).
-    assert res_max < 0.05, f"residual diverges at m={m}"
+    assert res_max < 0.05, f"residual diverges at m={m} cast_x={cast_x}"
 
     fp4_match = (fused_fp4 == ref_fp4).float().mean().item()
     sf_match = (
         fused_sf.view(torch.uint8) == ref_sf.view(torch.uint8)
     ).float().mean().item()
     print(
-        f"[m={m}] FP4 vals match rate: {fp4_match:.4f}  SF byte match rate: {sf_match:.4f}"
+        f"[m={m} cast_x={cast_x}] FP4 vals match rate: {fp4_match:.4f}  "
+        f"SF byte match rate: {sf_match:.4f}"
     )
     # Allow up to 2% mismatch from rounding-mode differences at scale boundaries.
-    assert fp4_match > 0.95, f"FP4 vals diverge at m={m}: rate {fp4_match:.4f}"
-    assert sf_match > 0.95, f"SF bytes diverge at m={m}: rate {sf_match:.4f}"
+    assert fp4_match > 0.95, (
+        f"FP4 vals diverge at m={m} cast_x={cast_x}: rate {fp4_match:.4f}"
+    )
+    assert sf_match > 0.95, (
+        f"SF bytes diverge at m={m} cast_x={cast_x}: rate {sf_match:.4f}"
+    )
 
 
 def _time_call(fn, *args, warmup=50, iters=500, use_cuda_graph=True) -> float:
@@ -214,6 +231,7 @@ def test_perf_vs_unfused(m: int) -> None:
 
 if __name__ == "__main__":
     for m in ALL_BATCHES:
-        test_fused_matches_unfused(m)
+        for cast_x in (False, True):
+            test_fused_matches_unfused(m, cast_x)
     for m in ALL_BATCHES:
         test_perf_vs_unfused(m)

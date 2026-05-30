@@ -63,6 +63,18 @@ _hisa_row_split_candidate_key_splits = max(
 _hisa_nvfp4_candidate_score_tilen = _env_bool(
     "SGLANG_NSA_NVFP4_HISA_CANDIDATE_SCORE_TILEN", True
 )
+# iter2 vector 2 experimental: kTileN=16 variant; opt-in if the production
+# shape grid shows it strictly faster than kTileN=8.
+_hisa_nvfp4_candidate_score_tilen_size = _env_int(
+    "SGLANG_NSA_NVFP4_HISA_CANDIDATE_SCORE_TILEN_SIZE", 8
+)
+if _hisa_nvfp4_candidate_score_tilen_size not in (8, 16):
+    logger.warning(
+        "SGLANG_NSA_NVFP4_HISA_CANDIDATE_SCORE_TILEN_SIZE must be 8 or 16; "
+        "got %d, falling back to 8.",
+        _hisa_nvfp4_candidate_score_tilen_size,
+    )
+    _hisa_nvfp4_candidate_score_tilen_size = 8
 
 
 _hisa_profile_path = os.environ.get(
@@ -240,6 +252,12 @@ def _jit_nvfp4_indexer_module(
                 # per CTA, amortizing the per-row NVFP4 Q dequant 8x).
                 "hisa_candidate_score_tilen_indexer_cache_nvfp4",
                 f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score_tilen",
+            ),
+            (
+                # iter2 vector 2 experimental: kTileN=16 variant; 16x Q dequant
+                # amortization vs the iter1 per-candidate kernel.
+                "hisa_candidate_score_tilen16_indexer_cache_nvfp4",
+                f"NVFP4IndexerQuantKernel<{args}>::hisa_candidate_score_tilen16",
             ),
             (
                 "hisa_block_score_indexer_cache_nvfp4",
@@ -586,6 +604,68 @@ def hisa_candidate_score_tilen_indexer_cache_nvfp4(
     _get_module_fast(
         torch.bfloat16, page_table.dtype, page_size
     ).hisa_candidate_score_tilen_indexer_cache_nvfp4(
+        q_values,
+        q_scales,
+        index_k_with_scale,
+        page_table,
+        seq_lens.to(torch.int32),
+        weights,
+        top_blocks.to(torch.int32),
+        token_to_batch_idx.to(torch.int32),
+        logits,
+        candidate_indices,
+    )
+    return logits, candidate_indices
+
+
+@debug_kernel_api
+def hisa_candidate_score_tilen16_indexer_cache_nvfp4(
+    q_values: torch.Tensor,
+    q_scales: torch.Tensor,
+    index_k_with_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    weights: torch.Tensor,
+    top_blocks: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    page_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """iter2 vector 2 experimental: kTileN=16 candidate_score variant.
+
+    Same FFI as hisa_candidate_score_tilen_indexer_cache_nvfp4 but the
+    underlying kernel binds kTileN=16, doubling Q-dequant amortization at
+    the cost of looping stages A/C twice per CTA. Opt-in via env var.
+    """
+    if weights.dtype != torch.float32:
+        weights = weights.float()
+    if q_values.dtype != torch.uint8:
+        raise ValueError(f"NVFP4 HISA q values must be uint8, got {q_values.dtype}.")
+    if q_scales.dtype != torch.int32:
+        q_scales = q_scales.to(torch.int32)
+    q_values = q_values.contiguous()
+    q_scales = q_scales.contiguous()
+    weights = weights.contiguous()
+    if not index_k_with_scale.is_contiguous():
+        index_k_with_scale = index_k_with_scale.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
+    if not top_blocks.is_contiguous():
+        top_blocks = top_blocks.contiguous()
+    if not token_to_batch_idx.is_contiguous():
+        token_to_batch_idx = token_to_batch_idx.contiguous()
+
+    candidate_len = top_blocks.shape[1] * 128
+    logits = torch.empty(
+        (q_values.shape[0], candidate_len), dtype=torch.float32, device=q_values.device
+    )
+    candidate_indices = torch.empty(
+        (q_values.shape[0], candidate_len), dtype=torch.int32, device=q_values.device
+    )
+    _get_module_fast(
+        torch.bfloat16, page_table.dtype, page_size
+    ).hisa_candidate_score_tilen16_indexer_cache_nvfp4(
         q_values,
         q_scales,
         index_k_with_scale,
@@ -2245,11 +2325,12 @@ def nvfp4_hisa_indexer_paged_torch(
     )
 
     stage = _profile_start(q_values.device)
-    _candidate_score_fn = (
-        hisa_candidate_score_tilen_indexer_cache_nvfp4
-        if _hisa_nvfp4_candidate_score_tilen
-        else hisa_candidate_score_indexer_cache_nvfp4
-    )
+    if not _hisa_nvfp4_candidate_score_tilen:
+        _candidate_score_fn = hisa_candidate_score_indexer_cache_nvfp4
+    elif _hisa_nvfp4_candidate_score_tilen_size == 16:
+        _candidate_score_fn = hisa_candidate_score_tilen16_indexer_cache_nvfp4
+    else:
+        _candidate_score_fn = hisa_candidate_score_tilen_indexer_cache_nvfp4
     candidate_logits, candidate_indices = _candidate_score_fn(
         q_values,
         q_scales,

@@ -429,6 +429,17 @@ class Envs:
     # fused_add_rmsnorm + fp4_quantize pair runs unchanged.
     SGLANG_USE_SGL_NVFP4_FUSED_RMSNORM = EnvBool(False)
 
+    # ai-blaise #15 iter7 PRIMARY: opt-in for the patched flashinfer
+    # trtllm_fp4_block_scale_moe BF16-act path that unlocks the in-cubin
+    # Bmm_Bfloat16_E2m1E2m1_*.cubin SM_100 variants and eliminates the
+    # host-side scaled_fp4_quant_linear call. Requires the patches at
+    # python/sglang/srt/external_kernels/flashinfer/patches/ to be
+    # applied AND the vendored launcher to be built (Stage B). When
+    # False or the vendored symbol unavailable, the iter1-3 + iter4
+    # PRIMARY production path is taken unchanged. See
+    # notes/nvfp4_moe_iter7_recon.md.
+    SGLANG_USE_TRTLLM_BF16_ACT_FP4_MOE = EnvBool(False)
+
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)

@@ -1,0 +1,73 @@
+From: Spencer Garnets <s.garnets17@gmail.com>
+Subject: [PATCH 1/2] relax (Bfloat16 act + E2m1 weight) gate in FP4 block scale MoE launcher
+
+The trtllm_fused_moe_kernel_launcher.cu ships in flashinfer with a
+FP4BlockScaleLauncher::check_moe() that rejects the (Bfloat16 activation,
+E2m1 weight) quadrant even though the trtllmGen bmm CUBIN export
+contains 58 Bmm_Bfloat16_E2m1E2m1_Fp32_bA16_bB16_*.cubin SM_100
+variants exactly matching this combo.
+
+For DeepSeek-V3.2-REAP-345B (NVFP4 MoE, sf_vec_size=16, E2m1 weight),
+the SGL deploy currently pays a host-side scaled_fp4_quant_linear call
+(~40 us per layer at m_global=128 per the iter4 PRIMARY close-out)
+before invoking the launcher. Relaxing the gate unlocks the fused
+in-cubin SF-generation bmm path that consumes BF16 activation directly.
+
+Cumulative target: ~200-300 us/step on the 58-layer DSv3.2-REAP MoE
+stack (per iter4 PRIMARY ceiling projection).
+
+The runner-side path requires NO change: Gemm2::Runner accepts
+(dtypeAct, dtypeWeights) independently, and sf_vec_size at
+prepare_moe() L1670 already branches MxE2m1->32, else->16.
+
+See notes/nvfp4_moe_iter7_recon.md for the full catalog (58 variants
+enumerated by tile shape) and the 4-stage Stage A-E implementation plan.
+
+Apply against:
+  /usr/local/lib/python3.12/dist-packages/flashinfer/data/csrc/
+  trtllm_fused_moe_kernel_launcher.cu
+  (container path; symlinked at
+   /home/spencer/.local/lib/python3.11/site-packages/flashinfer/...)
+
+---
+diff --git a/csrc/trtllm_fused_moe_kernel_launcher.cu b/csrc/trtllm_fused_moe_kernel_launcher.cu
+index e50f38a..9aa1e6e 100644
+--- a/csrc/trtllm_fused_moe_kernel_launcher.cu
++++ b/csrc/trtllm_fused_moe_kernel_launcher.cu
+@@ -1598,9 +1598,15 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
+                    mDtypeAct == btg::Dtype::E4m3 || mDtypeAct == btg::Dtype::MxE4m3)
+         << "Only E2m1, Bfloat16, MxE4m3 and E4m3 are supported by Fp4 block scale MoE";
+ 
++    // ai-blaise #15 iter7: relax the (Bfloat16 act + E2m1 weight) rejection
++    // to unlock the 58 Bmm_Bfloat16_E2m1E2m1_*.cubin SM_100 variants
++    // shipped in the trtllmGen bmm export. See
++    // notes/nvfp4_moe_iter7_recon.md.
++
+     if (mDtypeAct == btg::Dtype::E2m1) {
+-      TVM_FFI_ICHECK(mDtypeWeights == btg::Dtype::E2m1)
+-          << "Only E2m1 and MxE2m1 are supported by block scale MoE with E2m1 activation";
++      TVM_FFI_ICHECK(mDtypeWeights == btg::Dtype::E2m1 ||
++                     mDtypeWeights == btg::Dtype::MxE2m1)
++          << "Only E2m1 or MxE2m1 weights are supported with E2m1 activation";
+       TVM_FFI_ICHECK(hidden_states_scale.has_value())
+           << "hidden_states_scale is required for E2m1 activation";
+       TVM_FFI_ICHECK(output1_scales_scalar.has_value())
+@@ -1611,9 +1617,15 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
+           << "output2_scales_scalar is required for E2m1 activation";
+     } else if (mDtypeAct == btg::Dtype::Bfloat16 || mDtypeAct == btg::Dtype::E4m3 ||
+                mDtypeAct == btg::Dtype::MxE4m3) {
+-      TVM_FFI_ICHECK(mDtypeWeights == btg::Dtype::MxE2m1)
+-          << "Only MxE2m1 weights are supported by block scale MoE with Bfloat16, E4m3 or "
+-             "MxE4m3 activation";
++      // ai-blaise #15 iter7: Bfloat16 act accepts BOTH MxE2m1 (sf_vec_size=32)
++      // and E2m1 (sf_vec_size=16) weights. E4m3/MxE4m3 act remain MxE2m1-only.
++      bool const valid_pair = (mDtypeAct == btg::Dtype::Bfloat16)
++                                  ? (mDtypeWeights == btg::Dtype::MxE2m1 ||
++                                     mDtypeWeights == btg::Dtype::E2m1)
++                                  : (mDtypeWeights == btg::Dtype::MxE2m1);
++      TVM_FFI_ICHECK(valid_pair)
++          << "Only MxE2m1 (or E2m1 when act=Bfloat16) weights are supported by "
++             "block scale MoE with Bfloat16, E4m3 or MxE4m3 activation";
+     }
+ 
+     if (mDtypeAct == btg::Dtype::E4m3) {

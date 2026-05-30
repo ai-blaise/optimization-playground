@@ -1,0 +1,34 @@
+From: Spencer Garnets <s.garnets17@gmail.com>
+Subject: [PATCH 2/2] mirror (Bfloat16 act + E2m1 weight) relaxation in is_trtllm_moe_supported
+
+Companion to 0001-relax-bf16-act-e2m1-weight.patch.
+
+The python guard flashinfer/fused_moe/core.py:is_trtllm_moe_supported()
+rejects (Bfloat16 act + E2m1 weight) in symmetry with the C++ launcher
+check_moe(). Relaxing the C++ side without the python guard would still
+fall through to a dispatch-time return False; both must relax.
+
+Apply against:
+  /usr/local/lib/python3.12/dist-packages/flashinfer/fused_moe/core.py
+
+---
+diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
+index df6e92d..bf6ddf9 100644
+--- a/flashinfer/fused_moe/core.py
++++ b/flashinfer/fused_moe/core.py
+@@ -119,7 +119,14 @@ def is_trtllm_moe_supported(
+         return False
+     if dtype_weights == DtypeTrtllmGen.E4m3 and dtype_act != DtypeTrtllmGen.E4m3:
+         return False
+-    if dtype_weights == DtypeTrtllmGen.E2m1 and dtype_act != DtypeTrtllmGen.E2m1:
++    # ai-blaise #15 iter7: E2m1 weights now accept BOTH E2m1 act (host-side
++    # pre-quantize path) and Bfloat16 act (in-cubin fused SF-generation
++    # path; eliminates the scaled_fp4_quant_linear host call for
++    # DSv3.2-REAP). Mirrors the C++ launcher check_moe() relaxation.
++    if dtype_weights == DtypeTrtllmGen.E2m1 and dtype_act not in [
++        DtypeTrtllmGen.E2m1,
++        DtypeTrtllmGen.Bfloat16,
++    ]:
+         return False
+     if dtype_weights == DtypeTrtllmGen.MxE2m1 and dtype_act not in [
+         DtypeTrtllmGen.MxE2m1,

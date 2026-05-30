@@ -105,12 +105,65 @@ class _DpGatheredBufferWrapper:
     _dp_max_padding: bool
     _global_num_tokens: Optional[List[int]]
     _is_extend_in_batch: bool
+    # B200 SM_100 workaround (#14 fix followup 10): pre-allocated zero-filled
+    # BF16 buffer used as the source for `global_tokens.copy_(...)` and
+    # `local_tokens.copy_(...)` in `_dp_gather_via_all_reduce`,
+    # `_dp_gather_via_all_gather`, and `dp_scatter`. Followup 8 replaced
+    # the original `fill_(0)` with `mul_(0)`, but both elementwise op
+    # families hit `cudaErrorInvalidConfiguration` on small leading dims
+    # (e.g. (1, 7168) BF16) when the captured PCG graph replays them on
+    # B200 (SM_100). `copy_` from a same-dtype same-device same-shape
+    # tensor dispatches to `cudaMemcpyAsync`, which uses a different
+    # launch path that does not hit the bug (the immediately-following
+    # `memcpy_triton` data-copy in the same function succeeds at the
+    # same shape, confirming the memcpy launch path is good).
+    #
+    # The buffer is lazily grown via `_ensure_zero_buffer(length)` at
+    # `set_dp_buffer_len` time, which is always called EAGERLY before
+    # `set_forward_context` opens the captured region (verified in
+    # cuda_graph_runner.run_once, model_runner._capture_one_decode_batch,
+    # and piecewise_cuda_graph_runner). Each grow allocates a fresh
+    # `torch.zeros((new_len, hidden), dtype, device)` and assigns it; the
+    # old buffer is kept alive by reference from any previously-captured
+    # graph slice, so previously-captured graphs remain valid.
+    _zero_buffer: Optional[torch.Tensor] = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
         cls._hidden_size = hidden_size
         cls._dtype = dtype
         cls._device = device
+
+    @classmethod
+    def _ensure_zero_buffer(cls, length: int) -> None:
+        # Eager-only path. Grows the class-level zero buffer to at least
+        # ``length`` rows. Allocation uses ``torch.zeros`` which is safe
+        # outside CUDA graph capture; the existing buffer (if any) is
+        # retained by previously-captured graph slices.
+        if length <= 0:
+            return
+        if cls._zero_buffer is not None and cls._zero_buffer.shape[0] >= length:
+            return
+        cls._zero_buffer = torch.zeros(
+            (length, cls._hidden_size),
+            dtype=cls._dtype,
+            device=cls._device,
+        )
+
+    @classmethod
+    def get_zero_buffer(cls, length: int) -> torch.Tensor:
+        # Returns a view of the pre-allocated zero buffer of the requested
+        # leading-dim length. Grows lazily as a safety net if the requested
+        # length exceeds the current capacity; callers in the gather/scatter
+        # path should also have triggered ``_ensure_zero_buffer`` via
+        # ``set_dp_buffer_len`` before reaching here. Calling
+        # ``_ensure_zero_buffer`` inside a CUDA graph capture region would
+        # raise (torch.zeros inside capture); the safety-net grow only
+        # fires if the lazy capacity is stale, which in practice happens
+        # only during the very first eager call before DP buffer sizes
+        # are set.
+        cls._ensure_zero_buffer(length)
+        return cls._zero_buffer[:length]
 
     @classmethod
     def set_dp_buffer_len(
@@ -124,6 +177,16 @@ class _DpGatheredBufferWrapper:
         cls._local_dp_buffer_len = local_dp_buffer_len
         cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = global_num_tokens
+        # B200 SM_100 workaround (#14 fix followup 10): grow the zero
+        # source buffer eagerly here (always called outside CUDA graph
+        # capture / set_forward_context). Size to the larger of the
+        # global and local buffer lengths so a single buffer can serve
+        # both `global_tokens.copy_(...)` and `local_tokens.copy_(...)`.
+        # ``global_dp_buffer_len`` may be None when DP attention is off
+        # or during PCG warmup; default to local in that case.
+        _g = global_dp_buffer_len if global_dp_buffer_len is not None else 0
+        _l = local_dp_buffer_len if local_dp_buffer_len is not None else 0
+        cls._ensure_zero_buffer(max(_g, _l))
 
     @classmethod
     def get_global_dp_buffer(
@@ -222,6 +285,16 @@ def set_dp_buffer_len(
     _DpGatheredBufferWrapper.set_dp_buffer_len(
         global_dp_buffer_len, local_dp_buffer_len, dp_max_padding, global_num_tokens
     )
+
+
+def get_dp_zero_buffer(length: int) -> torch.Tensor:
+    # B200 SM_100 workaround (#14 fix followup 10): returns a view of the
+    # pre-allocated zero source buffer used by `_dp_gather_via_all_reduce`,
+    # `_dp_gather_via_all_gather`, and `dp_scatter` to zero `global_tokens` /
+    # `local_tokens` via `.copy_()` instead of in-place `fill_/mul_`, which
+    # hit `cudaErrorInvalidConfiguration` on small leading dims under PCG
+    # capture. See `_DpGatheredBufferWrapper._zero_buffer` for full rationale.
+    return _DpGatheredBufferWrapper.get_zero_buffer(length)
 
 
 def get_global_dp_buffer(
@@ -548,13 +621,19 @@ def _dp_gather_via_all_reduce(
     # B200 SM_100 workaround: Tensor.fill_(0) on numel==0 tensors hits
     # cudaErrorInvalidConfiguration (same kernel-launch-config family as the
     # cumsum bug). When all DP ranks have 0 tokens (forward_idle ladder),
-    # global_tokens has shape (0, hidden_size); skip fill_ + all_reduce.
+    # global_tokens has shape (0, hidden_size); skip fill + all_reduce.
     if global_tokens.numel() == 0:
         return
-    # B200 SM_100 workaround: fill_(0) on this shape hits
-    # cudaErrorInvalidConfiguration when the captured graph replays it.
-    # mul_(0) dispatches to a different in-place op kernel that works.
-    global_tokens.mul_(0)
+    # B200 SM_100 workaround (#14 fix followup 10): both `fill_(0)` and
+    # `mul_(0)` (followup 8) hit `cudaErrorInvalidConfiguration` on small
+    # leading dims (e.g. (1, 7168) BF16) under PCG capture. Use `copy_`
+    # from the pre-allocated zero source buffer instead — same-dtype
+    # same-device same-shape `copy_` dispatches to `cudaMemcpyAsync`,
+    # which uses a launch path that is known-good on B200 SM_100 (the
+    # `memcpy_triton` data-copy a few lines below succeeds at the same
+    # shape via its own triton launch dispatch, confirming the memcpy
+    # family is safe).
+    global_tokens.copy_(get_dp_zero_buffer(global_tokens.shape[0]))
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
@@ -599,8 +678,12 @@ def _dp_gather_via_all_gather(
 
     if not is_partial:
         if get_attention_tp_rank() != 0 and local_tokens.numel() > 0:
-            # B200 SM_100 workaround: see _dp_gather_via_all_reduce.
-            local_tokens.mul_(0)
+            # B200 SM_100 workaround (#14 fix followup 10): replace
+            # `local_tokens.mul_(0)` (followup 8) with a `copy_` from the
+            # pre-allocated zero source. See `_dp_gather_via_all_reduce`
+            # for the full rationale on why the memcpy-family launch
+            # path bypasses the small-leading-dim launch-config bug.
+            local_tokens.copy_(get_dp_zero_buffer(local_tokens.shape[0]))
     scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
     ]
@@ -736,8 +819,13 @@ def dp_scatter(
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    # B200 SM_100 workaround: see _dp_gather_via_all_reduce.
-    local_tokens.mul_(0)
+    # B200 SM_100 workaround (#14 fix followup 10): replace
+    # `local_tokens.mul_(0)` (followup 8) with a `copy_` from the
+    # pre-allocated zero source. See `_dp_gather_via_all_reduce` for
+    # the full rationale on why memcpy-family ops survive the small-
+    # leading-dim launch-config bug.
+    if local_tokens.numel() > 0:
+        local_tokens.copy_(get_dp_zero_buffer(local_tokens.shape[0]))
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:

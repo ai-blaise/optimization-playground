@@ -678,17 +678,38 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        next_consumer_fp4_global_scale: Optional[torch.Tensor] = None,
     ):
         if cache is not None:
             self._context.cache = cache
 
-        return self._communicate_with_all_reduce_and_layer_norm_fn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
-            layernorm=self.post_attention_layernorm,
-            context=self._context,
+        # Iter4 PRIMARY #15: when the next MoE consumer is the NVFP4
+        # expert apply_weights and the env flag is set, the layernorm
+        # call inside the communicator fuses its BF16 output with the
+        # downstream fp4_quantize via
+        # RMSNorm.forward_with_fused_nvfp4_quant_no_residual. The fp4
+        # tuple is stashed on the returned hidden_states tensor (via
+        # `_sglang_pre_quantized_fp4`) so the apply_weights consumer
+        # skips its own fp4_quantize. See
+        # compressed_tensors_w4a4_nvfp4_moe.py L353 for the consumer
+        # side and layernorm.py forward_with_fused_nvfp4_quant_no_residual
+        # for the helper.
+        self._context.next_consumer_fp4_global_scale = (
+            next_consumer_fp4_global_scale
         )
+        try:
+            return self._communicate_with_all_reduce_and_layer_norm_fn(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+                layernorm=self.post_attention_layernorm,
+                context=self._context,
+            )
+        finally:
+            # Clear the scratch so a stale scale never leaks into the
+            # next layer's prepare_mlp (next layer's
+            # next_consumer_fp4_global_scale defaults to None).
+            self._context.next_consumer_fp4_global_scale = None
 
     def postprocess_layer(
         self,
@@ -779,6 +800,14 @@ class CommunicateContext:
     tp_size: int
     cache = None
     tp_rank: int
+    # Iter4 PRIMARY #15: per-call scratch — set by LayerCommunicator.prepare_mlp
+    # when the immediate next consumer is an NVFP4 MoE expert apply_weights
+    # path. Read by the fused-quant short-circuit inside
+    # `_gather_hidden_states_and_residual` (and `_simple` etc.) so the
+    # layernorm call can fuse with the downstream fp4_quantize. Cleared
+    # back to None right after the call returns. Not part of the
+    # dispatcher key; set/cleared by the caller.
+    next_consumer_fp4_global_scale: Optional[torch.Tensor] = None
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -1010,7 +1039,41 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)
                 if hidden_states.shape[0] != 0:
-                    hidden_states = layernorm(hidden_states)
+                    # Iter4 PRIMARY #15 NVFP4 MoE deploy-wire:
+                    # when the next consumer is the NVFP4 MoE expert
+                    # apply_weights and the env flag is set, fuse the
+                    # post-gather RMSNorm with the downstream
+                    # fp4_quantize. The fp4 stash is attached to the
+                    # new BF16 hidden_states tensor; the MoE
+                    # apply_weights consumer picks it up via the iter3
+                    # `_sglang_pre_quantized_fp4` hook in
+                    # compressed_tensors_w4a4_nvfp4_moe.py and skips
+                    # its own fp4_quantize. The shared_experts /
+                    # gate router still read the BF16 hidden_states.
+                    _gs = context.next_consumer_fp4_global_scale
+                    if (
+                        _gs is not None
+                        and envs.SGLANG_USE_SGL_NVFP4_FUSED_RMSNORM.get()
+                        and hasattr(
+                            layernorm,
+                            "forward_with_fused_nvfp4_quant_no_residual",
+                        )
+                        and hidden_states.dtype
+                        in (torch.float16, torch.bfloat16)
+                    ):
+                        y, fp4, sf = (
+                            layernorm.forward_with_fused_nvfp4_quant_no_residual(
+                                hidden_states, _gs
+                            )
+                        )
+                        # Stash for the NVFP4 MoE apply_weights consumer.
+                        # The consumer del's the attribute after reading
+                        # to defend against double-consume on the same
+                        # tensor.
+                        y._sglang_pre_quantized_fp4 = (fp4, sf)
+                        hidden_states = y
+                    else:
+                        hidden_states = layernorm(hidden_states)
         else:
             handled = False
             if (

@@ -571,6 +571,63 @@ class RMSNorm(MultiPlatformOp):
         )
         return fp4, sf, residual
 
+    def forward_with_fused_nvfp4_quant_no_residual(
+        self,
+        x: torch.Tensor,
+        global_scale: torch.Tensor,
+        *,
+        enable_pdl: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fused (RMSNorm + linear NVFP4 quantize) forward, no residual add.
+
+        Iter4 PRIMARY #15 NVFP4 MoE deploy-wire helper. Equivalent to:
+
+            y = rmsnorm(x, weight, eps)
+            fp4, sf = scaled_fp4_quant_linear(y, global_scale)
+
+        but runs as a single CTA-per-row kernel that fuses the BF16
+        post-norm hidden_states write+read between the two ops.
+
+        Used in the
+        ``CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual``
+        ``not use_layer_norm_before_gather`` branch (see
+        python/sglang/srt/layers/communicator.py), where the residual
+        has already been folded into ``hidden_states`` at
+        ``attn_tp_rank==0`` before the DP allgather, so the layernorm
+        here is a pure RMSNorm (no residual-add).
+
+        Use only on the (Llama-style, non-cast_x_before_out_mul) RMSNorm
+        path with bf16/fp16 dtype on Blackwell sm100+. Callers must check
+        applicability themselves before calling — this method does not
+        fall through to the slow path.
+
+        Args:
+            x:            [m, n] hidden_states (read).
+            global_scale: [1] fp32 — passed to the NVFP4 quantize stage.
+            enable_pdl:   PDL secondary vector — lets this kernel
+                          dispatch in the shadow of the preceding
+                          allgather/scatter copy completion.
+
+        Returns:
+            (y, fp4, sf) — y: [m, n] same dtype as x, post-norm BF16
+            hidden_states for gate/router/shared_experts; fp4: [m, n//2]
+            uint8 packed E2M1; sf: [m, n//16] fp8_e4m3 for the next
+            MoE expert apply_weights consumer (stash on `y`).
+        """
+        from sglang.jit_kernel.nvfp4 import (
+            fused_rmsnorm_only_to_fp4_linear,
+        )
+
+        y, fp4, sf = fused_rmsnorm_only_to_fp4_linear(
+            x,
+            self.weight.data,
+            global_scale,
+            self.variance_epsilon,
+            cast_x_before_out_mul=self.cast_x_before_out_mul,
+            enable_pdl=enable_pdl,
+        )
+        return y, fp4, sf
+
 
 class LayerNorm(MultiPlatformOp):
     def __init__(

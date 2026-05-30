@@ -135,6 +135,10 @@ def _jit_nvfp4_fused_rmsnorm_quant_module() -> Module:
                     "fused_rmsnorm_scaled_fp4_quant_linear",
                     "fused_rmsnorm_scaled_fp4_quant_linear_sm100a_sm120a",
                 ),
+                (
+                    "fused_rmsnorm_only_to_fp4_linear",
+                    "fused_rmsnorm_only_to_fp4_linear_sm100a_sm120a",
+                ),
             ],
             extra_cuda_cflags=_nvfp4_cuda_flags(),
             extra_dependencies=["cutlass"],
@@ -516,6 +520,133 @@ def fused_rmsnorm_scaled_fp4_quant_linear(
     )
     sf_output = sf_output.view(torch.float8_e4m3fn)
     return fp4_output, sf_output
+
+
+@register_custom_op(
+    op_name="fused_rmsnorm_only_to_fp4_linear",
+    mutates_args=["y_output", "fp4_output", "sf_output"],
+)
+def _fused_rmsnorm_only_to_fp4_linear_custom_op(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    y_output: torch.Tensor,
+    fp4_output: torch.Tensor,
+    sf_output: torch.Tensor,
+    eps: float,
+    cast_x_before_out_mul: bool,
+    enable_pdl: bool,
+) -> None:
+    module = _jit_nvfp4_fused_rmsnorm_quant_module()
+    module.fused_rmsnorm_only_to_fp4_linear(
+        input,
+        weight,
+        input_global_scale,
+        y_output,
+        fp4_output,
+        sf_output,
+        eps,
+        cast_x_before_out_mul,
+        enable_pdl,
+    )
+
+
+@debug_kernel_api
+def fused_rmsnorm_only_to_fp4_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    eps: float = 1e-6,
+    *,
+    cast_x_before_out_mul: bool = False,
+    enable_pdl: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused (RMSNorm + linear-layout NVFP4 quantize), residual-less.
+
+    Iter4 PRIMARY vector for #15 NVFP4 MoE deploy. Equivalent to:
+
+        y = rmsnorm(input, weight, eps,
+                    cast_x_before_out_mul=cast_x_before_out_mul)
+        fp4, sf = scaled_fp4_quant_linear(y, input_global_scale)
+
+    but does the work in a single CTA-per-row kernel, fusing the
+    BF16 post-norm hidden_states write+read between the two ops.
+    `input` is NOT mutated; `y` is a fresh BF16 output (consumed by
+    the gate/router/shared_experts), and `(fp4, sf)` is the side
+    stash consumed by the NVFP4 MoE expert apply_weights via the iter3
+    `_sglang_pre_quantized_fp4` hook in
+    compressed_tensors_w4a4_nvfp4_moe.py.
+
+    Target call site:
+        `CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual`
+        in python/sglang/srt/layers/communicator.py, the
+        `not use_layer_norm_before_gather` branch where
+        `hidden_states = layernorm(hidden_states)` is invoked after
+        a DP-attn allgather+scatter. The residual has already been
+        folded in at attn_tp_rank==0 (line 997) so a residual-less
+        kernel is the right contract.
+
+    Output FP4 + linear-SF layout is identical to
+    `scaled_fp4_quant_linear`, so trtllm_fp4_block_scale_moe consumes
+    the result unchanged.
+
+    Args:
+        input:        [m, n] fp16/bf16 — hidden_states (read-only).
+        weight:       [n] same dtype as input — RMSNorm weight.
+        input_global_scale: [1] fp32 — passed to the FP4 quantize stage.
+        eps:          RMSNorm epsilon.
+        cast_x_before_out_mul: HF parity — round to dtype before
+                      multiplying by weight. Default False (Llama-style).
+        enable_pdl:   Programmatic stream serialization — lets this
+                      kernel start in the shadow of the preceding
+                      global store (dp_scatter copy or the symmetric
+                      allgather completion).
+
+    Returns:
+        y_output:    [m, n] same dtype as input — post-norm BF16
+                     hidden_states.
+        fp4_output:  [m, n//2] uint8 packed E2M1.
+        sf_output:   [m, n//16] fp8_e4m3 (int32-packed under the hood).
+    """
+    assert input.ndim == 2, (
+        f"input must be 2D, got input={input.shape}"
+    )
+    m, n = input.shape
+    assert weight.ndim == 1 and weight.shape[0] == n, "weight must be [n]"
+    block_size = 16
+    assert n % block_size == 0, f"last dim must be multiple of 16, got {n}"
+    assert (
+        n // block_size
+    ) % 4 == 0, (
+        f"n/16={n // block_size} must be divisible by 4 for int32-packed SF"
+    )
+    assert input.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"input.dtype must be fp16 or bf16, got {input.dtype}"
+    assert weight.dtype == input.dtype, "weight dtype must match input"
+    assert input_global_scale.numel() == 1, "input_global_scale must be scalar"
+
+    device = input.device
+    y_output = torch.empty((m, n), device=device, dtype=input.dtype)
+    fp4_output = torch.empty((m, n // 2), device=device, dtype=torch.uint8)
+    sf_output = torch.empty(
+        (m, (n // block_size) // 4), device=device, dtype=torch.int32
+    )
+
+    _fused_rmsnorm_only_to_fp4_linear_custom_op(
+        input,
+        weight,
+        input_global_scale,
+        y_output,
+        fp4_output,
+        sf_output,
+        float(eps),
+        bool(cast_x_before_out_mul),
+        bool(enable_pdl),
+    )
+    sf_output = sf_output.view(torch.float8_e4m3fn)
+    return y_output, fp4_output, sf_output
 
 
 def _shuffle_rows_torch(

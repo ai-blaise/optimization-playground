@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
+    dp_gather_partial_fp4,
     dp_reduce_scatter_tensor,
     dp_scatter,
     get_attention_cp_rank,
@@ -1071,6 +1072,83 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+
+            # Iter5 PRIMARY #15 NVFP4 MoE deploy-wire: if the iter4
+            # SECONDARY fused kernel stashed (fp4, sf) on
+            # local_hidden_states above, allgather them in parallel
+            # with the BF16 dp_gather_partial so the post-gather
+            # hidden_states carries a global-shape stash matching the
+            # NVFP4 MoE expert apply_weights consumer's expectations.
+            #
+            # Allgather dim = TP-rank dim (same as the BF16 gather);
+            # gathered tensors share the leading-dim alignment with
+            # `hidden_states`. The fused kernel emits FP4 as uint8
+            # `[m_local, n // 2]` and SF as int32 `[m_local, (n//16)//4]`
+            # (viewed as fp8_e4m3fn `[m_local, n // 16]`). We use the
+            # int32 storage view for NCCL since it is the kernel's
+            # native emit dtype and matches storage stride.
+            _stash = getattr(local_hidden_states, "_sglang_pre_quantized_fp4", None)
+            # Bench-driven m_global gate: the iter5 grouped pynccl wire
+            # saves ~0.7us/layer at the production decode peak
+            # (m_global ≤ 128) but regresses by ~7-10us/layer at
+            # m_global ≥ 256 because the FP4+SF bytes-on-wire scales
+            # past the saved fp4_quantize cost. The deploy decode peak
+            # is m_global=128 (batch=128 @ DP=TP=8), so the gate is
+            # tight but real. Past m_global=128, discard the local
+            # stash and let the downstream consumer run its own
+            # fp4_quantize on the post-gather BF16. Graph-captured
+            # B200 bench: NCCL_NVLS_ENABLE=0 dp=2; m_local=64 / m_global=128
+            # win = +0.7us; m_local=128 / m_global=256 regress = -9.8us.
+            _ITER5_FP4_ALLGATHER_M_GLOBAL_MAX = 128
+            if (
+                _stash is not None
+                and hidden_states.shape[0]
+                <= _ITER5_FP4_ALLGATHER_M_GLOBAL_MAX
+            ):
+                _local_fp4, _local_sf = _stash
+                _n = local_hidden_states.shape[1]
+                _global_fp4 = torch.empty(
+                    (hidden_states.shape[0], _n // 2),
+                    dtype=torch.uint8,
+                    device=local_hidden_states.device,
+                )
+                # The SF storage is int32 with shape [m_local, (n//16)//4].
+                # Allocate the global SF in int32 storage so the NCCL
+                # allgather sees a single contiguous dtype; we view it
+                # back to fp8_e4m3fn (shape [M_global, n//16]) for the
+                # downstream consumer.
+                _sf_storage_local = _local_sf.view(torch.int32)
+                _global_sf_storage = torch.empty(
+                    (hidden_states.shape[0], _sf_storage_local.shape[1]),
+                    dtype=torch.int32,
+                    device=local_hidden_states.device,
+                )
+                dp_gather_partial_fp4(
+                    _global_fp4,
+                    _local_fp4,
+                    _global_sf_storage,
+                    _sf_storage_local,
+                    forward_batch,
+                )
+                _global_sf = _global_sf_storage.view(torch.float8_e4m3fn)
+                # Free the local stash so a second consumer on the
+                # local tensor doesn't accidentally pick it up.
+                try:
+                    del local_hidden_states._sglang_pre_quantized_fp4
+                except AttributeError:
+                    pass
+                # Attach the global stash on the gathered BF16 tensor
+                # for the NVFP4 MoE expert apply_weights consumer
+                # (compressed_tensors_w4a4_nvfp4_moe.py L353 hook).
+                hidden_states._sglang_pre_quantized_fp4 = (_global_fp4, _global_sf)
+            elif _stash is not None:
+                # m_global past the iter5 collective break-even — drop
+                # the local stash so the downstream MoE expert falls
+                # back to its own fp4_quantize on the gathered BF16.
+                try:
+                    del local_hidden_states._sglang_pre_quantized_fp4
+                except AttributeError:
+                    pass
 
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)

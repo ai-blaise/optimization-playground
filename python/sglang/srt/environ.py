@@ -411,6 +411,23 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
+    # Iter3 #15 NVFP4 MoE: deploy-path opt-in for the fused
+    # (residual-add + RMSNorm + linear NVFP4 quantize) kernel. When True,
+    # the post-attention layernorm step in `prepare_mlp` is replaced by
+    # `sglang.jit_kernel.nvfp4.fused_rmsnorm_scaled_fp4_quant_linear`
+    # which writes the FP4-packed activation + linear SF tensors directly
+    # into a per-layer scratch the downstream MoE consumes — eliminating
+    # the BF16 hidden-states roundtrip between RMSNorm and `fp4_quantize`.
+    # Effective only when:
+    #   * MoE scheme is `compressed_tensors_w4a4_nvfp4_moe` and the
+    #     flashinfer trtllm runner is selected (`flashinfer_trtllm`).
+    #   * `should_allreduce_fusion=False` (no closed flashinfer
+    #     allreduce-fusion engaged for the next layer).
+    #   * RMSNorm is the non-`cast_x_before_out_mul` variant
+    #     (Llama-style; DeepSeek-V3.2-REAP qualifies).
+    # On all other paths the env var is a no-op and the existing
+    # fused_add_rmsnorm + fp4_quantize pair runs unchanged.
+    SGLANG_USE_SGL_NVFP4_FUSED_RMSNORM = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)

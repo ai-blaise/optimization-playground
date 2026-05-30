@@ -519,6 +519,58 @@ class RMSNorm(MultiPlatformOp):
             self, x, residual, post_residual_addition, self.weight, use_attn_tp_group
         )
 
+    def forward_with_fused_nvfp4_quant(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        global_scale: torch.Tensor,
+        *,
+        enable_pdl: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fused (residual-add + RMSNorm + linear NVFP4 quantize) forward.
+
+        Iter3 #15 NVFP4 MoE deploy-wire helper. Equivalent to:
+
+            fused_add_rmsnorm(x, residual, weight, eps)
+            fp4, sf = scaled_fp4_quant_linear(x, global_scale)
+
+        but runs as a single CTA-per-row kernel that keeps the post-norm
+        BF16 hidden states in registers / shared memory rather than
+        materializing them in HBM. Mutates `residual` in place; does
+        **not** mutate `x` (no BF16 hidden_states_out is materialized).
+
+        Use only on the (Llama-style, non-cast_x_before_out_mul) RMSNorm
+        path with bf16/fp16 dtype on Blackwell sm100+. Callers must check
+        applicability themselves before calling — this method does not
+        fall through to the slow path.
+
+        Args:
+            x:            [m, n] hidden_states (read).
+            residual:     [m, n] residual accumulator (mutated to `x + residual`).
+            global_scale: [1] fp32 — passed to the NVFP4 quantize stage.
+            enable_pdl:   Iter2 PDL secondary vector — lets this kernel
+                          dispatch in the shadow of a preceding global
+                          store.
+
+        Returns:
+            (fp4, sf, residual) — fp4: [m, n//2] uint8 packed E2M1,
+            sf: [m, n//16] fp8_e4m3, residual: in-place updated input.
+        """
+        from sglang.jit_kernel.nvfp4 import (
+            fused_rmsnorm_scaled_fp4_quant_linear,
+        )
+
+        fp4, sf = fused_rmsnorm_scaled_fp4_quant_linear(
+            x,
+            residual,
+            self.weight.data,
+            global_scale,
+            self.variance_epsilon,
+            cast_x_before_out_mul=self.cast_x_before_out_mul,
+            enable_pdl=enable_pdl,
+        )
+        return fp4, sf, residual
+
 
 class LayerNorm(MultiPlatformOp):
     def __init__(

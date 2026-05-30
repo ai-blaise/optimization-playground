@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -38,6 +39,15 @@ __all__ = ["CompressedTensorsW4A4Nvfp4MoE"]
 _USE_SGL_NVFP4_QUANT_LINEAR = (
     os.environ.get("SGLANG_USE_SGL_NVFP4_QUANT", "0") == "1"
 )
+
+# Iter3 #15 deploy wire: when an upstream RMSNorm hook fuses the
+# residual-add + RMSNorm with the linear NVFP4 quantize, it stashes the
+# resulting (fp4, sf) tuple on the hidden_states tensor as
+# ``_sglang_pre_quantized_fp4``. The activation lives behind
+# ``envs.SGLANG_USE_SGL_NVFP4_FUSED_RMSNORM`` so a deploy can opt in
+# without disturbing the unfused path. When the stash is present we
+# consume it and skip the redundant `fp4_quantize` call; otherwise the
+# original `_USE_SGL_NVFP4_QUANT_LINEAR` / flashinfer path runs.
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -339,7 +349,25 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             # Pre-sliced [:1] view of w13_input_scale_quant is cached on
             # the layer at load time (process_weights_after_loading) so
             # we don't repeat the slice op every step.
-            if _USE_SGL_NVFP4_QUANT_LINEAR:
+            stash = (
+                getattr(x, "_sglang_pre_quantized_fp4", None)
+                if envs.SGLANG_USE_SGL_NVFP4_FUSED_RMSNORM.get()
+                else None
+            )
+            if stash is not None:
+                # Iter3 deploy wire: upstream prepare_mlp hook fused the
+                # post-attention RMSNorm with this kernel's input
+                # quantize. (hs_fp4, hs_scale) are already on device with
+                # matching layouts; skip the redundant fp4_quantize call.
+                hs_fp4, hs_scale = stash
+                # Defensive: clear the stash so a follow-on caller (e.g.
+                # the moe_cp post-allgather re-run) doesn't accidentally
+                # consume the same buffer twice.
+                try:
+                    del x._sglang_pre_quantized_fp4
+                except AttributeError:
+                    pass
+            elif _USE_SGL_NVFP4_QUANT_LINEAR:
                 # Sglang-native non-swizzled NVFP4 quantize. Output layouts
                 # match flashinfer's is_sf_swizzled_layout=False path.
                 from sglang.jit_kernel.nvfp4 import scaled_fp4_quant_linear

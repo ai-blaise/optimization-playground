@@ -20,6 +20,9 @@ import torch
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 
 logger = logging.getLogger(__name__)
+from sglang.jit_kernel.sparse_mla_nvfp4_kv import (
+    sparse_mla_nvfp4_kv,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
@@ -3079,6 +3082,52 @@ class DeepseekSparseAttnBackend(
                 backend="trtllm-gen",
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             )
+
+        # ─────────────────────────────────────────────────────────────────
+        # Native NVFP4 KV path: when the KV pool is NVFP4 (e2m1 + E4M3 scales),
+        # the trtllm-gen sparse-MLA cubin has no matching kernel variant
+        # (probed and confirmed: cubin's `Qkv*` MLA naming requires Q and KV
+        # to share dtype; no QE4m3KvE2m1 MLA sparse variant exists).  Route
+        # to our SM_100-block-scaled UMMA kernel that reads packed FP4 + E4M3
+        # scales as direct UMMA operands.
+        # ─────────────────────────────────────────────────────────────────
+        if (
+            getattr(self.token_to_kv_pool, "kv_cache_quant_method", None) == "nvfp4"
+            and is_prefill is False
+        ):
+            assert q_rope is not None, "NVFP4 path requires split q_nope/q_rope"
+            # Reuse the page_table_1 built above (single-page sparse selection)
+            assert page_table_1.is_cuda and page_table_1.dtype == torch.int32
+
+            # Pull the three NVFP4-pool buffers (values, scales, rope).
+            # The pool exposes them via dedicated accessors; for the iter-zero
+            # wiring we get them all per-layer via get_nvfp4_kv_buffers().
+            kv_nope, kv_scales, kv_rope = (
+                self.token_to_kv_pool.get_nvfp4_kv_buffers(layer.layer_id)
+            )
+
+            # Reassemble Q as (B, 1, num_heads, head_dim_qk) FP8 e4m3.
+            # The trtllm pipeline above already produced q + k_rope merged
+            # via mla_quantize_and_rope_for_fp8 — if so, use that directly;
+            # otherwise concat q_nope + q_rope on the fly.
+            if merge_query:
+                q_for_kernel = q  # already merged in trtllm FP8 path
+            else:
+                q_for_kernel = torch.cat([q, q_rope], dim=-1)
+
+            out = sparse_mla_nvfp4_kv(
+                query=q_for_kernel.view(-1, 1, layer.tp_q_head_num, layer.head_dim),
+                kv_nope=kv_nope,
+                kv_scales=kv_scales,
+                kv_rope=kv_rope,
+                block_tables=page_table_1,
+                seq_lens=seq_lens,
+                topk_indices=topk_indices,
+                sparse_top_k=self.dsa_index_topk,
+                sm_scale=float(layer.scaling),
+            )
+            return out
+        # ─────────────────────────────────────────────────────────────────
 
         return out
 

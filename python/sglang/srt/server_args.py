@@ -1864,7 +1864,8 @@ class ServerArgs:
         assert self.kv_cache_dtype in [
             "bfloat16",
             "fp8_e4m3",
-        ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+            "fp4_e2m1",
+        ], "DeepSeek DSA supports bf16/bfloat16, fp8_e4m3, or fp4_e2m1 (NVFP4 native UMMA kernel) kv_cache_dtype"
 
     def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> str:
         from sglang.srt.arg_groups.hisparse_hook import (

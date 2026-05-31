@@ -1,174 +1,126 @@
-# Sparse-MLA Decode with NVFP4 KV — design notes
+# Sparse-MLA Decode with NVFP4 KV — native-UMMA design (v2)
 
 Source: FlashMLA `csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/` (Apache-2.0).
-Target: drop-in replacement for the trtllm-gen sparse-MLA decode cubin, reading NVFP4 KV directly. No materialize round-trip.
+Target: drop-in replacement for the trtllm-gen sparse-MLA decode cubin, **native NVFP4 KV read** via SM_100 block-scaled tensor cores (no dequant materialize, no SMEM dequant pass).
 
-## KV format change
+## Architecture (corrected from v1)
 
-| | FP8 baseline (FlashMLA today) | NVFP4 variant (new) |
+Previous v1 scaffolding had a SMEM-dequant pass (FP4 → BF16 in SMEM, then BF16 UMMA). That's the suboptimal middle path. **v2 uses the native block-scaled UMMA**: K stays in packed FP4 form right through to the tensor cores; per-block E4M3 scales are passed as a UMMA scale operand.
+
+## Format alignment with target model
+
+`BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4-NextN-Graft` declares:
+- `kv_cache_scheme.quant_method = "higgs_dense_2bit"` (calibrated default)
+- `indexer_quantization.quant_method = "nvfp4_e2m1_ue8m0"` (NVFP4 with MXFP4-style ue8m0 scales)
+- `spinquant_k_bits = 4, spinquant_v_bits = 4` (SpinQuant rotation prepared for 4-bit KV)
+
+Per directive: use **NVFP4 (E4M3) scales** for the KV cache (not MXFP4 ue8m0). The SpinQuant rotation makes any uniform 4-bit format with per-block scales accurate; switching from HIGGS to NVFP4-E4M3 KV is a runtime override that overrides the model's declared `kv_cache_scheme`. Quality may be ~1-2% lower than HIGGS-calibrated until we add the NVFP4 calibration pass (aquakv-style follow-up).
+
+## SMEM layout
+
+| Buffer | FP8 baseline (FlashMLA) | Native NVFP4 UMMA (this design) |
 |---|---|---|
-| Latent value bytes | 512 (fp8_e4m3, 1 byte/elem) | **256** (e2m1, 2 elems/byte) |
-| Block size for scales | 64 | **16** |
-| Number of scale bytes / token | 7 + 1 pad (E8M0, 1 byte each) | **32** (E4M3, 1 byte each) |
-| Rope bytes (BF16, 64 dims) | 128 | 128 (unchanged) |
-| **Total bytes / token** | **~648** | **~416** (~36% less) |
+| `Q` (BF16) | (H_Q/2) × D_Q | (H_Q/2) × D_Q |
+| `K` (BF16 dequanted) | B_TOPK × (D_K/2) × 3 buf = 24 KB | **REMOVED** |
+| `K_raw` (FP8 packed) | B_TOPK × (D_K/2) × 2 buf = 32 KB | **REMOVED** |
+| `K` (FP4 packed, new) | — | B_TOPK × (D_K/2 nibbles) × 3 buf = **12 KB** (4-bit packed) |
+| `K_scales` (E4M3) | — | B_TOPK × 32 × 3 buf = **6 KB** |
+| `V_scales` (E4M3) | — | B_TOPK × 32 × 3 buf = **6 KB** |
+| scales (E8M0, 7+1/token) | 4 × 4 buf = 1 KB | — |
+| TOTAL K-side SMEM | ~57 KB | **~24 KB** (~58% reduction) |
 
-## Code hotspots in `phase1.cuh` (line numbers from current head128/phase1.cuh)
+## UMMA atom
 
-### 1. SMEM K_raw buffer size (config.h:88)
-
-```cpp
-// FP8 today:
-array_aligned<fp8_e4m3, B_TOPK*(D_K/2)> K_raw[NUM_RAW_K_BUFS];
-
-// NVFP4 (half the bytes):
-array_aligned<uint8_t, B_TOPK*(D_K/4)> K_raw_fp4[NUM_RAW_K_BUFS];  // D_K/4 = 128 bytes per token K_nope
-```
-
-### 2. SMEM scale buffer (config.h:95)
+Replaces `SM100_MMA_F16BF16_2x1SM_*` with `SM100_MMA_F8F6F4_BS_2x1SM_SS_NOELECT`:
 
 ```cpp
-// FP8 today (E8M0, 7+1 scales per token):
-CUTE_ALIGNAS(16) fp8_e8m0 scales[NUM_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN/2];
+// FP8 baseline:
+SM100_MMA_F16BF16_2x1SM_TS_NOELECT<bf16, bf16, float, H_Q, B_TOPK*2, K, K>
 
-// NVFP4 (E4M3, 32 scales per token):
-CUTE_ALIGNAS(16) fp8_e4m3 scales_fp4[NUM_INDEX_BUFS][B_TOPK][32];
+// NVFP4 native:
+SM100_MMA_F8F6F4_BS_2x1SM_SS_NOELECT<
+    fp8_e4m3,   // Q operand (FP8 from mla_quantize_and_rope_for_fp8 pipeline)
+    fp4_e2m1,   // K operand (NVFP4, no dequant)
+    float,      // accumulator
+    fp8_e4m3,   // SCALE operand type (E4M3 per-block)
+    H_Q, B_TOPK*2, K, K>
 ```
 
-Per-token scale storage grows: 4 bytes (E8M0/2) → 32 bytes (E4M3). But total still small vs FP8 baseline's 4-byte scales × 4 buffers.
+PTX: `tcgen05.mma.kind::f8f6f4.block_scale_vec::1X` — block-scaled FP8 × FP4 multiply with E4M3 scale tensor lookup fused into accumulation.
 
-### 3. TMA descriptor stride (config.h)
+Reference: DeepGEMM `sm100_fp4_mqa_logits.cuh` uses the same family with E8M0 scales (`kind::mxf4`). The `::nvf4` / `::f8f6f4` PTX variants with E4M3 scales exist on SM_100 per PTX ISA 8.5+.
 
-```cpp
-// FP8: K_nope_bytes + 2*K_rope_bytes = 448 + 128 = 576
-static constexpr int TMA_K_STRIDE_FOR_DECODING = D_NOPE + 2*D_ROPE;
+## Warpgroup roles (changed from FP8 baseline)
 
-// NVFP4: K_nope_bytes(half) + 2*K_rope_bytes + scale_bytes = 224 + 128 + 32 = 384
-static constexpr int TMA_K_STRIDE_FOR_DECODING_FP4 = (D_NOPE/2) + 2*D_ROPE + 32;
-```
+| WG | FP8 baseline | NVFP4 native |
+|---|---|---|
+| 0 | Q fetching + O writeback | unchanged |
+| **1** | KV fetching + FP8→BF16 dequant inner loop (warp 4-7) | **Coord prep + scale TMA loading only (no dequant)** |
+| 2 | UMMA executor + math | UMMA executor with block-scaled MMA |
+| 3 | Idle / sync | unchanged |
 
-### 4. TMA load (phase1.cuh:339, K_nope tile load)
+The dequant warpgroup elimination is the structural win. WG1's `launch_dequant_wg` lambda (FlashMLA phase1.cuh lines ~456-528) **goes away entirely**. Replace with a simpler `launch_coord_prep_wg` that issues the K scales TMA loads + coord lookups, then signals `bar_KV_full`.
 
-```cpp
-// FP8 today loads B_TOPK × (D_K/2) bytes as fp8_e4m3
-// NVFP4 loads B_TOPK × (D_K/4) bytes as uint8 — half the TMA payload
-```
+## Math warpgroup (WG2) changes
 
-The TMA descriptor needs to be constructed with the NVFP4 element type and the halved stride. The `tma_params.tensor_map_kv_nope` (config.h:35) is built host-side in `run()` — separate descriptor with the FP4 layout.
+Today (FP8 baseline, phase1.cuh:~635-720): math warpgroup issues `tcgen05.mma.kind::f16/bf16` UMMA with BF16 operands fetched from `smem.K[k_buf_idx]`.
 
-### 5. Dequant inner loop (phase1.cuh:471-510)
+NVFP4 native: issues `tcgen05.mma.kind::f8f6f4.block_scale_vec::1X` with:
+- A operand: BF16 Q from `smem.Q` (or FP8 Q if we want FP8×FP4 — we have both forms in pipeline)
+- B operand: FP4 K from `smem.K[k_buf_idx]` (packed)
+- Scale operand: E4M3 from `smem.K_scales[k_buf_idx]`
 
-This is the main algorithmic change. Today's loop:
+`make_instr_desc_block_scaled` builds the runtime descriptor that ties the scale-tensor SMEM offset into the UMMA. See `nvfp4_umma_descriptors.cuh`.
 
-```cpp
-uint64_t cur_data_fp8x8 = get_raw_fp8(local_row_idx, 0);  // 8 FP8 bytes = 8 elems
-for (int local_col_idx = 0; local_col_idx < COLS_PER_GROUP; ++local_col_idx) {
-    ku::nve4m3x2 data_fp8[4];   // 4 pairs of FP8
-    *(uint64_t*)data_fp8 = cur_data_fp8x8;
-    bf16 scale = scales[local_col_idx];
-    for (int i = 0; i < 4; ++i)
-        data_bf16[i] = fp8x2_to_bf16x2_with_scale(data_fp8[i], scale);
-    st_128b(...);  // store 8 BF16
-}
-```
+## TMA descriptors (host-side, run())
 
-New NVFP4 loop:
+Three K descriptors per slot (vs two for FP8):
+1. `tensor_map_kv_nope`: packed FP4 latent values, stride 224 B/token (vs 448 FP8)
+2. `tensor_map_kv_scales`: E4M3 per-block scales, stride 32 B/token (new)
+3. `tensor_map_kv_rope`: BF16 rope, stride 128 B/token (unchanged)
 
-```cpp
-// Load 4 bytes (8 NVFP4 elements packed: 4 bytes × 2 elems/byte) per inner iter
-uint32_t cur_data_fp4x8 = get_raw_fp4(local_row_idx, 0);  // 4 bytes packed FP4 = 8 elems
-for (int local_col_idx = 0; local_col_idx < COLS_PER_GROUP; ++local_col_idx) {
-    // Unpack 4 bytes → 8 fp4 nibbles → 8 fp16/bf16 values
-    bf16 data_bf16[8];
-    // Scale: each block of 16 NVFP4 elements has its own E4M3 scale
-    //   At this iter we cover 8 elements; depending on alignment we use 1 or 2 scales
-    fp8_e4m3 scale_e4m3 = scales_fp4[index_buf_idx][row_idx][local_col_idx/2];
-    bf16 scale_bf16 = e4m3_to_bf16(scale_e4m3);
-    // Unpack 4 bytes into 8 e2m1 nibbles, dequant each
-    nvfp4x2_to_bf16x2_with_scale(cur_data_fp4x8, scale_bf16, data_bf16);
-    if (local_col_idx+1 < COLS_PER_GROUP)
-        cur_data_fp4x8 = get_raw_fp4(local_row_idx, local_col_idx+1);
-    st_128b(local_row_idx, local_col_idx, *(__int128_t*)data_bf16);
-}
-```
-
-Need to add helper:
-
-```cpp
-__device__ __forceinline__ void
-nvfp4x2_to_bf16x2_with_scale(uint32_t fp4_bytes, bf16 scale, bf16 out[8]) {
-    // Each of the 4 bytes holds 2 e2m1 values
-    // e2m1 encoding: 1 sign bit, 2 exp bits, 1 mantissa bit
-    constexpr float kE2M1Table[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    #pragma unroll
-    for (int b = 0; b < 4; ++b) {
-        uint8_t byte = (fp4_bytes >> (b*8)) & 0xff;
-        uint8_t lo = byte & 0xf;
-        uint8_t hi = (byte >> 4) & 0xf;
-        float lo_val = (lo & 0x8 ? -1.0f : 1.0f) * kE2M1Table[lo & 0x7];
-        float hi_val = (hi & 0x8 ? -1.0f : 1.0f) * kE2M1Table[hi & 0x7];
-        out[b*2 + 0] = __float2bfloat16(lo_val * __bfloat162float(scale));
-        out[b*2 + 1] = __float2bfloat16(hi_val * __bfloat162float(scale));
-    }
-}
-```
-
-(In practice we'd use `cvt.rn.bf16x2.e2m1x2` PTX instruction on SM_100 for direct hardware dequant — much faster than scalar table lookup.)
-
-### 6. K rope load (no change)
-
-Rope dims stay BF16 — same `tma_params.tensor_map_kv_rope` and load logic.
-
-### 7. UMMA pipeline (no change)
-
-After dequant we still feed BF16 to the existing `TiledMMA_P` and `TiledMMA_O`. The dequant target is BF16 in SMEM (`smem.K[k_buf_idx]`), same shape as today.
-
-## Host-side wiring
-
-The kernel takes `params.kv_cache_ptr` + new `params.kv_scales_ptr` (NVFP4 has separate scale buffer). The Python wrapper constructs the TMA descriptors for both.
-
-## Build path
-
-Add as a new pybind module in `optimization-playground/python/sglang/jit_kernel/sparse_mla_nvfp4_kv/`. Use the existing `flashinfer-style` build pipeline (`tvm-ffi` JIT module) to compile on first call, similar to how the HIGGS kernels are wired.
-
-## SGLang integration (`dsa_backend.py`)
-
-In `_forward_trtllm` (currently at line 2637), add a branch:
-
-```cpp
-if (
-    self.kv_cache_dtype == torch.uint8  // NVFP4 packed
-    and getattr(self.token_to_kv_pool, "indexer_quantization", None) is not None
-):
-    # Route to new NVFP4 sparse-MLA decode kernel
-    return self._forward_flashmla_nvfp4(q, q_rope, ..., topk_indices, ...)
-```
-
-Where `_forward_flashmla_nvfp4` builds the params struct + calls the new kernel.
-
-Lift the DSA `kv_cache_dtype` assertion at server_args.py:1867 to allow `fp4_e2m1`.
-
-## Wiring up the KV pool
-
-The NVFP4 KV pool already exists (`NVFP4KVMethod` in `fp4_kv_cache_quant_method.py`). Hook it in:
-
-1. Allow `enable_nvfp4_dense_kv_cache=True` (new server arg) OR auto-enable when `kv_cache_dtype=fp4_e2m1`.
-2. `quantize_and_store` writes packed FP4 + E4M3 scales to the pool buffers (already implemented).
-3. `_forward_flashmla_nvfp4` reads from the pool directly — no dequant materialize.
-
-## Estimated effort
-
-- Kernel modifications (config.h, phase1.cuh): ~300 lines diff
-- Python wrapper + build glue: ~150 lines
-- SGLang dispatch wiring + assertion lift: ~80 lines
-- Testing harness + correctness check vs FP8 baseline: ~100 lines
-
-Total: ~600-700 lines, multi-day work.
+Total per-token HBM stride: 224 + 32 + 128 = 384 B (vs 576 FP8) → **33% reduction in KV bandwidth**.
 
 ## Expected impact
 
-Per the bandwidth math (NVFP4 KV is 56% of FP8 KV reads, sparse-MLA is HBM-bound):
-- FP8 baseline TPOT: 30.95 ms
-- NVFP4 KV target: **~22-25 ms TPOT** (beat baseline by ~6 ms)
+| Component | FP8 baseline | Native NVFP4 UMMA | Δ |
+|---|---|---|---|
+| HBM KV read per slot | 576 B | 384 B | -33% |
+| HBM total KV per step (B=8, K=1024, 61 layers) | 288 MB | 192 MB | -33% |
+| SMEM K bytes (3 bufs) | ~57 KB | ~24 KB | -58% |
+| Dequant compute (per slot per layer) | full FP8→BF16 dequant pass | **none** | -100% |
+| UMMA throughput (FP8×FP4 vs BF16×BF16) | baseline | ~2x | +100% on compute |
 
-Per the SAW-INT4 paper's "zero overhead" claim once fusion is structural (no materialize round-trip).
+Combined: at our cell (FP8 baseline 30.95 ms TPOT), expected NVFP4 native ~**21-24 ms TPOT** (beats FP8 by 7-10 ms).
+
+## Implementation plan
+
+| Step | Status |
+|---|---|
+| 1. Design + scaffolding | ✓ This commit |
+| 2. `nvfp4_umma_descriptors.cuh` (UMMA atoms + instr_desc helpers) | ✓ |
+| 3. `config.h` rewrite (FP4 SMEM, no dequant buffers, block-scaled UMMA) | ✓ |
+| 4. `phase1.cuh` WG1 surgery — replace dequant with coord-prep + scale TMA | DEFERRED |
+| 5. `phase1.cuh` WG2 surgery — swap UMMA atom + add block-scale operand | DEFERRED |
+| 6. Host-side `run()` — build 3 K TMA descriptors (values + scales + rope) | DEFERRED |
+| 7. Python wrapper + JIT build | DEFERRED |
+| 8. `dsa_backend.py:_forward_trtllm` — dispatch when kv_dtype==uint8 + NVFP4 | DEFERRED |
+| 9. `server_args.py:1867` — extend allowed dtype list | DEFERRED |
+| 10. Correctness harness vs FP8 baseline (BMM1/BMM2 numerics in FP4 noise band) | DEFERRED |
+
+## Implementation note: kv_dtype dispatch in dsa_backend.py
+
+```cpp
+if (
+    self.kv_cache_dtype == torch.uint8   // NVFP4 packed bytes
+    and isinstance(self.token_to_kv_pool, NVFP4KVPool)
+):
+    return self._forward_flashmla_nvfp4_native(
+        q, q_rope, ..., topk_indices,
+        kv_nope_packed,           // (num_pages * page_size, 224 B)
+        kv_scales,                // (num_pages * page_size, 32 B E4M3)
+        kv_rope,                  // (num_pages * page_size, 128 B BF16)
+    )
+```
+
+The new kernel entry point lives in `sglang.jit_kernel.sparse_mla_nvfp4_kv.forward`. It builds the 3 TMA descriptors and launches the kernel with the existing block_tables + seq_lens machinery.

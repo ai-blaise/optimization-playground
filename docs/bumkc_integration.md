@@ -22,20 +22,16 @@ validates:
   engine, simulation, and tensor smoke artifacts,
 - manifest `schema_version == "bumkc.plan.v1"`,
 - manifest `capability_level == "hvm_rooted_runtime_descriptor"`,
-- engine export `schema_version == "bumkc.optimization_playground.v25"`; the
-  loader can still read legacy `v20` artifacts by deriving the engine
-  quantization summary from tensor islands and previous `v21` artifacts by
-  deriving the engine scale-up summary from the runtime descriptor, while `v22`
-  artifacts derive serving hints from quantization metadata and `v23`
-  artifacts derive the launch summary from the runtime substitution plan; `v24`
-  artifacts derive runtime mode from the manifest/model-source contract,
+- engine export `schema_version == "bumkc.optimization_playground.v34"`; the
+  loader can still read older `v20` through `v33` artifacts where the required
+  summary data is present or derivable from the runtime descriptor,
 - model-source export `schema_version == "bumkc.source.v11"`,
 - engine-exported manifest schema/capability fields matching `manifest.json`,
 - engine-exported source schema matching `source/model-source.json`,
-- `runtime_abi_version == "bumkc.runtime.v1"`,
-- runtime smoke schema `bumkc.cuda_smoke.v14`,
+- `runtime_abi_version == "bumkc.runtime.v9"`,
+- runtime smoke schema `bumkc.cuda_smoke.v22`,
 - manifest runtime mode in `{debug, trace, profile, production}`,
-- engine-exported runtime mode matching the manifest for `v25` artifacts,
+- engine-exported runtime mode matching the manifest for current artifacts,
 - `engine == "sglang"`,
 - `engine_profile == "optimization_playground"`,
 - exported serving CLI flags,
@@ -68,12 +64,13 @@ validates:
 - runtime smoke event dispatch descriptors, including task-span bounds, trigger
   counts, owner scheduler summaries, and compact/indexed range-kind summaries,
 - runtime summary fields against the runtime descriptor, including
-  communication-plan collective counts, side-effect counts and code sums,
-  serving-state dependency counts, dependency tensor count, dependency
-  descriptor count/hash including dependency tensor IDs, dependency scope,
-  scope-specific wait expressions, runtime substitution bounds, default
-  shape-bucket validity, serving-state kind enums, serving-state shape-symbol
-  ownership, diagnostic slots, and watchdog timing,
+  placement, dispatch-loop, event-update, communication-plan collective counts,
+  side-effect counts and code sums, serving-state dependency counts, dependency
+  tensor count, dependency descriptor count/hash including dependency tensor
+  IDs, dependency scope, scope-specific wait expressions, runtime substitution
+  bounds, default shape-bucket validity, serving-state kind enums,
+  serving-state shape-symbol ownership, diagnostic slots, telemetry, debug,
+  profiler, mode-execution, dense-block, and watchdog timing fields,
 - engine launch summary fields against the runtime substitution plan, including
   shape-symbol count, min/max/bucket aggregates, default substitution
   aggregates, serving-state binding counts, serving-state kind-code summary,
@@ -83,8 +80,10 @@ validates:
   descriptors, and Event Tensor descriptors, including descriptor-row
   aggregate recomputation for task, dependency, dependency tensor,
   launch-domain, side-effect, serving-state, communication, and rank-topology
-  fields, runtime diagnostic fields, launch-benchmark metadata, schema, runtime
-  ABI, plan, program, descriptor-table, and source contract hashes,
+  fields, runtime placement, dispatch, event-update, diagnostic, telemetry,
+  debug, profiler, mode-execution, dense-block fields, launch-benchmark
+  metadata, schema, runtime ABI, plan, program, descriptor-table, and source
+  contract hashes,
 - and the required REAP validation model contract.
 
 Before invoking any BUMKC runtime entrypoint, the serving path must call

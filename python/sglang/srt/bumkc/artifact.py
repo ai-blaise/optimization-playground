@@ -25,18 +25,20 @@ PREVIOUS_SCHEMA_VERSION = "bumkc.optimization_playground.v21"
 SCALE_UP_SCHEMA_VERSION = "bumkc.optimization_playground.v22"
 SERVING_HINTS_SCHEMA_VERSION = "bumkc.optimization_playground.v23"
 LAUNCH_SCHEMA_VERSION = "bumkc.optimization_playground.v24"
-REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v25"
+RUNTIME_CONTRACT_SCHEMA_VERSION = "bumkc.optimization_playground.v25"
+REQUIRED_SCHEMA_VERSION = "bumkc.optimization_playground.v34"
 SUPPORTED_SCHEMA_VERSIONS = (
     LEGACY_SCHEMA_VERSION,
     PREVIOUS_SCHEMA_VERSION,
     SCALE_UP_SCHEMA_VERSION,
     SERVING_HINTS_SCHEMA_VERSION,
     LAUNCH_SCHEMA_VERSION,
-    REQUIRED_SCHEMA_VERSION,
+    RUNTIME_CONTRACT_SCHEMA_VERSION,
+    *(f"bumkc.optimization_playground.v{version}" for version in range(26, 35)),
 )
 REQUIRED_SOURCE_SCHEMA_VERSION = "bumkc.source.v11"
-REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v1"
-REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v14"
+REQUIRED_RUNTIME_ABI_VERSION = "bumkc.runtime.v9"
+REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION = "bumkc.cuda_smoke.v22"
 SUPPORTED_RUNTIME_MODES = ("debug", "trace", "profile", "production")
 RUNTIME_SMOKE_BENCHMARK_ITERATIONS = 8
 RUNTIME_SMOKE_BENCHMARK_LAUNCH_CAP = 128
@@ -58,6 +60,10 @@ _SOURCE_CONTRACT_KEYS = (
     "benchmark_total_persistent_launches",
     "expected_jit_task_count",
     "expected_aot_task_count",
+    "expected_placement_worker_slots_per_gpu",
+    "expected_placement_scheduler_slots_per_gpu",
+    "expected_placement_total_runtime_slots",
+    "expected_placement_scheduler_slot_offset",
     "expected_queue_capacity",
     "expected_task_instance_capacity",
     "expected_predecessor_event_count_sum",
@@ -101,11 +107,61 @@ _SOURCE_CONTRACT_KEYS = (
     "expected_event_dispatch_max_trigger_count",
     "expected_event_dispatch_range_kind_code_sum",
     "expected_event_dispatch_invalid_range_count",
+    "expected_dispatch_scheduler_iteration_count",
+    "expected_dispatch_ready_event_check_count",
+    "expected_dispatch_queue_enqueue_count",
+    "expected_dispatch_worker_dequeue_count",
+    "expected_dispatch_task_completion_count",
+    "expected_dispatch_event_counter_wait_count",
+    "expected_dispatch_event_counter_update_count",
+    "expected_dispatch_barrier_count",
+    "expected_event_update_counter_count",
+    "expected_event_update_initialized_counter_count",
+    "expected_event_update_ready_event_count",
+    "expected_event_update_wait_edge_count",
+    "expected_event_update_notification_edge_count",
+    "expected_event_update_counter_increment_count",
+    "expected_event_update_ready_transition_count",
+    "expected_event_update_max_predecessor_wait_count",
+    "expected_event_update_max_successor_notification_count",
     "expected_diagnostic_heartbeat_slot_count",
     "expected_diagnostic_queue_snapshot_slot_count",
     "expected_diagnostic_event_counter_snapshot_count",
     "expected_diagnostic_last_completed_task_slot_count",
     "expected_diagnostic_blocked_event_slot_count",
+    "expected_telemetry_queue_watermark_slot_count",
+    "expected_telemetry_worker_idle_slot_count",
+    "expected_telemetry_scheduler_idle_slot_count",
+    "expected_telemetry_task_latency_histogram_count",
+    "expected_telemetry_task_latency_histogram_bucket_count",
+    "expected_telemetry_shared_memory_page_pressure_slot_count",
+    "expected_telemetry_kv_cache_page_pressure_slot_count",
+    "expected_telemetry_communication_wait_slot_count",
+    "expected_telemetry_watchdog_counter_slot_count",
+    "expected_telemetry_fallback_counter_slot_count",
+    "expected_debug_event_counter_shadow_count",
+    "expected_debug_queue_shadow_slot_count",
+    "expected_debug_task_shadow_slot_count",
+    "expected_debug_task_instance_shadow_capacity",
+    "expected_debug_replay_record_slot_count",
+    "expected_debug_invariant_check_count",
+    "expected_debug_shadow_state_bytes",
+    "expected_debug_poisonable_global_bytes",
+    "expected_profiler_task_trace_slot_count",
+    "expected_profiler_event_trace_slot_count",
+    "expected_profiler_queue_trace_slot_count",
+    "expected_profiler_scheduler_trace_slot_count",
+    "expected_profiler_communication_trace_slot_count",
+    "expected_profiler_memory_trace_slot_count",
+    "expected_profiler_launch_trace_slot_count",
+    "expected_profiler_record_slot_count",
+    "expected_profiler_buffer_bytes",
+    "expected_runtime_mode_code",
+    "expected_mode_debug_shadow_write_count",
+    "expected_mode_trace_record_write_count",
+    "expected_mode_profiler_record_write_count",
+    "expected_mode_production_guard_check_count",
+    "expected_mode_active_record_count",
     "expected_watchdog_poll_interval_us",
     "expected_watchdog_timeout_us",
 )
@@ -366,61 +422,75 @@ class BumkcRuntimeSummary:
     diagnostic_blocked_event_slot_count: int
     watchdog_poll_interval_us: int
     watchdog_timeout_us: int
+    placement_worker_slots_per_gpu: int | None = None
+    placement_scheduler_slots_per_gpu: int | None = None
+    placement_total_runtime_slots: int | None = None
+    placement_scheduler_slot_offset: int | None = None
+    dispatch_scheduler_iteration_count: int | None = None
+    dispatch_ready_event_check_count: int | None = None
+    dispatch_queue_enqueue_count: int | None = None
+    dispatch_worker_dequeue_count: int | None = None
+    dispatch_task_completion_count: int | None = None
+    dispatch_event_counter_wait_count: int | None = None
+    dispatch_event_counter_update_count: int | None = None
+    dispatch_barrier_count: int | None = None
+    event_update_counter_count: int | None = None
+    event_update_initialized_counter_count: int | None = None
+    event_update_ready_event_count: int | None = None
+    event_update_wait_edge_count: int | None = None
+    event_update_notification_edge_count: int | None = None
+    event_update_counter_increment_count: int | None = None
+    event_update_ready_transition_count: int | None = None
+    event_update_max_predecessor_wait_count: int | None = None
+    event_update_max_successor_notification_count: int | None = None
+    telemetry_queue_watermark_slot_count: int | None = None
+    telemetry_worker_idle_slot_count: int | None = None
+    telemetry_scheduler_idle_slot_count: int | None = None
+    telemetry_task_latency_histogram_count: int | None = None
+    telemetry_task_latency_histogram_bucket_count: int | None = None
+    telemetry_shared_memory_page_pressure_slot_count: int | None = None
+    telemetry_kv_cache_page_pressure_slot_count: int | None = None
+    telemetry_communication_wait_slot_count: int | None = None
+    telemetry_watchdog_counter_slot_count: int | None = None
+    telemetry_fallback_counter_slot_count: int | None = None
+    debug_event_counter_shadow_count: int | None = None
+    debug_queue_shadow_slot_count: int | None = None
+    debug_task_shadow_slot_count: int | None = None
+    debug_task_instance_shadow_capacity: int | None = None
+    debug_replay_record_slot_count: int | None = None
+    debug_invariant_check_count: int | None = None
+    debug_shadow_state_bytes: int | None = None
+    debug_poisonable_global_bytes: int | None = None
+    profiler_task_trace_slot_count: int | None = None
+    profiler_event_trace_slot_count: int | None = None
+    profiler_queue_trace_slot_count: int | None = None
+    profiler_scheduler_trace_slot_count: int | None = None
+    profiler_communication_trace_slot_count: int | None = None
+    profiler_memory_trace_slot_count: int | None = None
+    profiler_launch_trace_slot_count: int | None = None
+    profiler_record_slot_count: int | None = None
+    profiler_buffer_bytes: int | None = None
+    mode_execution_runtime_mode_code: int | None = None
+    mode_execution_debug_shadow_write_count: int | None = None
+    mode_execution_trace_record_write_count: int | None = None
+    mode_execution_profiler_record_write_count: int | None = None
+    mode_execution_production_guard_check_count: int | None = None
+    mode_execution_active_record_count: int | None = None
+    dense_block_candidate: bool | None = None
+    dense_block_covered: bool | None = None
+    dense_block_required_operator_kind_count: int | None = None
+    dense_block_covered_operator_kind_count: int | None = None
+    dense_block_matmul_task_count: int | None = None
+    dense_block_rms_norm_task_count: int | None = None
+    dense_block_rope_task_count: int | None = None
+    dense_block_attention_task_count: int | None = None
+    dense_block_mlp_task_count: int | None = None
+    dense_block_residual_add_task_count: int | None = None
+    dense_block_dense_operator_task_count: int | None = None
+    dense_block_unsupported_operator_task_count: int | None = None
 
-    def as_log_dict(self) -> dict[str, int]:
-        return {
-            "task_count": self.task_count,
-            "conventional_launch_count": self.conventional_launch_count,
-            "persistent_launch_count": self.persistent_launch_count,
-            "jit_task_count": self.jit_task_count,
-            "aot_task_count": self.aot_task_count,
-            "queue_capacity": self.queue_capacity,
-            "task_instance_capacity": self.task_instance_capacity,
-            "device_global_binding_count": self.device_global_binding_count,
-            "kv_cache_binding_count": self.kv_cache_binding_count,
-            "rank_count": self.rank_count,
-            "task_rank_group_count": self.task_rank_group_count,
-            "task_rank_reference_count": self.task_rank_reference_count,
-            "rank_id_sum": self.rank_id_sum,
-            "task_dependency_count": self.task_dependency_count,
-            "tile_overlap_dependency_count": self.tile_overlap_dependency_count,
-            "whole_producer_dependency_count": self.whole_producer_dependency_count,
-            "dependency_tensor_count": self.dependency_tensor_count,
-            "dependency_scope_code_sum": self.dependency_scope_code_sum,
-            "dependency_descriptor_count": self.dependency_descriptor_count,
-            "dependency_descriptor_hash": self.dependency_descriptor_hash,
-            "collective_task_count": self.collective_task_count,
-            "collective_group_size_sum": self.collective_group_size_sum,
-            "collective_kind_code_sum": self.collective_kind_code_sum,
-            "side_effecting_task_count": self.side_effecting_task_count,
-            "task_side_effect_count": self.task_side_effect_count,
-            "task_side_effect_code_sum": self.task_side_effect_code_sum,
-            "serving_task_count": self.serving_task_count,
-            "serving_dependency_count": self.serving_dependency_count,
-            "serving_kind_code_sum": self.serving_kind_code_sum,
-            "serving_symbol_count": self.serving_symbol_count,
-            "substitution_shape_symbol_count": self.substitution_shape_symbol_count,
-            "substitution_serving_binding_count": (
-                self.substitution_serving_binding_count
-            ),
-            "substitution_symbol_max_sum": self.substitution_symbol_max_sum,
-            "substitution_symbol_bucket_sum": self.substitution_symbol_bucket_sum,
-            "diagnostic_heartbeat_slot_count": (self.diagnostic_heartbeat_slot_count),
-            "diagnostic_queue_snapshot_slot_count": (
-                self.diagnostic_queue_snapshot_slot_count
-            ),
-            "diagnostic_event_counter_snapshot_count": (
-                self.diagnostic_event_counter_snapshot_count
-            ),
-            "diagnostic_last_completed_task_slot_count": (
-                self.diagnostic_last_completed_task_slot_count
-            ),
-            "diagnostic_blocked_event_slot_count": (
-                self.diagnostic_blocked_event_slot_count
-            ),
-            "watchdog_poll_interval_us": self.watchdog_poll_interval_us,
-            "watchdog_timeout_us": self.watchdog_timeout_us,
-        }
+    def as_log_dict(self) -> dict[str, int | bool | None]:
+        return dataclasses.asdict(self)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1545,11 +1615,217 @@ def _load_runtime_summary(
         "watchdog_poll_interval_us": diagnostics_plan.get("watchdog_poll_interval_us"),
         "watchdog_timeout_us": diagnostics_plan.get("watchdog_timeout_us"),
     }
+    if engine.get("schema_version") == REQUIRED_SCHEMA_VERSION:
+        placement_plan = _read_object(runtime, "placement_plan")
+        dispatch_loop_plan = _read_object(runtime, "dispatch_loop_plan")
+        event_update_plan = _read_object(runtime, "event_update_plan")
+        telemetry_plan = _read_object(runtime, "telemetry_plan")
+        debug_plan = _read_object(runtime, "debug_plan")
+        profiler_plan = _read_object(runtime, "profiler_plan")
+        mode_execution_plan = _read_object(runtime, "mode_execution_plan")
+        dense_block_plan = _read_object(runtime, "dense_block_plan")
+        expected.update(
+            {
+                "placement_worker_slots_per_gpu": placement_plan.get(
+                    "worker_slots_per_gpu"
+                ),
+                "placement_scheduler_slots_per_gpu": placement_plan.get(
+                    "scheduler_slots_per_gpu"
+                ),
+                "placement_total_runtime_slots": placement_plan.get(
+                    "total_runtime_slots"
+                ),
+                "placement_scheduler_slot_offset": placement_plan.get(
+                    "scheduler_slot_offset"
+                ),
+                "dispatch_scheduler_iteration_count": dispatch_loop_plan.get(
+                    "scheduler_iteration_count"
+                ),
+                "dispatch_ready_event_check_count": dispatch_loop_plan.get(
+                    "ready_event_check_count"
+                ),
+                "dispatch_queue_enqueue_count": dispatch_loop_plan.get(
+                    "queue_enqueue_count"
+                ),
+                "dispatch_worker_dequeue_count": dispatch_loop_plan.get(
+                    "worker_dequeue_count"
+                ),
+                "dispatch_task_completion_count": dispatch_loop_plan.get(
+                    "task_completion_count"
+                ),
+                "dispatch_event_counter_wait_count": dispatch_loop_plan.get(
+                    "event_counter_wait_count"
+                ),
+                "dispatch_event_counter_update_count": dispatch_loop_plan.get(
+                    "event_counter_update_count"
+                ),
+                "dispatch_barrier_count": dispatch_loop_plan.get(
+                    "dispatch_barrier_count"
+                ),
+                "event_update_counter_count": event_update_plan.get(
+                    "event_counter_count"
+                ),
+                "event_update_initialized_counter_count": event_update_plan.get(
+                    "initialized_counter_count"
+                ),
+                "event_update_ready_event_count": event_update_plan.get(
+                    "ready_event_count"
+                ),
+                "event_update_wait_edge_count": event_update_plan.get("wait_edge_count"),
+                "event_update_notification_edge_count": event_update_plan.get(
+                    "notification_edge_count"
+                ),
+                "event_update_counter_increment_count": event_update_plan.get(
+                    "counter_increment_count"
+                ),
+                "event_update_ready_transition_count": event_update_plan.get(
+                    "ready_transition_count"
+                ),
+                "event_update_max_predecessor_wait_count": event_update_plan.get(
+                    "max_predecessor_wait_count"
+                ),
+                "event_update_max_successor_notification_count": event_update_plan.get(
+                    "max_successor_notification_count"
+                ),
+                "telemetry_queue_watermark_slot_count": telemetry_plan.get(
+                    "queue_watermark_slot_count"
+                ),
+                "telemetry_worker_idle_slot_count": telemetry_plan.get(
+                    "worker_idle_slot_count"
+                ),
+                "telemetry_scheduler_idle_slot_count": telemetry_plan.get(
+                    "scheduler_idle_slot_count"
+                ),
+                "telemetry_task_latency_histogram_count": telemetry_plan.get(
+                    "task_latency_histogram_count"
+                ),
+                "telemetry_task_latency_histogram_bucket_count": telemetry_plan.get(
+                    "task_latency_histogram_bucket_count"
+                ),
+                "telemetry_shared_memory_page_pressure_slot_count": telemetry_plan.get(
+                    "shared_memory_page_pressure_slot_count"
+                ),
+                "telemetry_kv_cache_page_pressure_slot_count": telemetry_plan.get(
+                    "kv_cache_page_pressure_slot_count"
+                ),
+                "telemetry_communication_wait_slot_count": telemetry_plan.get(
+                    "communication_wait_slot_count"
+                ),
+                "telemetry_watchdog_counter_slot_count": telemetry_plan.get(
+                    "watchdog_counter_slot_count"
+                ),
+                "telemetry_fallback_counter_slot_count": telemetry_plan.get(
+                    "fallback_counter_slot_count"
+                ),
+                "debug_event_counter_shadow_count": debug_plan.get(
+                    "event_counter_shadow_count"
+                ),
+                "debug_queue_shadow_slot_count": debug_plan.get("queue_shadow_slot_count"),
+                "debug_task_shadow_slot_count": debug_plan.get("task_shadow_slot_count"),
+                "debug_task_instance_shadow_capacity": debug_plan.get(
+                    "task_instance_shadow_capacity"
+                ),
+                "debug_replay_record_slot_count": debug_plan.get(
+                    "replay_record_slot_count"
+                ),
+                "debug_invariant_check_count": debug_plan.get("invariant_check_count"),
+                "debug_shadow_state_bytes": debug_plan.get("shadow_state_bytes"),
+                "debug_poisonable_global_bytes": debug_plan.get(
+                    "poisonable_global_bytes"
+                ),
+                "profiler_task_trace_slot_count": profiler_plan.get(
+                    "task_trace_slot_count"
+                ),
+                "profiler_event_trace_slot_count": profiler_plan.get(
+                    "event_trace_slot_count"
+                ),
+                "profiler_queue_trace_slot_count": profiler_plan.get(
+                    "queue_trace_slot_count"
+                ),
+                "profiler_scheduler_trace_slot_count": profiler_plan.get(
+                    "scheduler_trace_slot_count"
+                ),
+                "profiler_communication_trace_slot_count": profiler_plan.get(
+                    "communication_trace_slot_count"
+                ),
+                "profiler_memory_trace_slot_count": profiler_plan.get(
+                    "memory_trace_slot_count"
+                ),
+                "profiler_launch_trace_slot_count": profiler_plan.get(
+                    "launch_trace_slot_count"
+                ),
+                "profiler_record_slot_count": profiler_plan.get(
+                    "profiler_record_slot_count"
+                ),
+                "profiler_buffer_bytes": profiler_plan.get("profiler_buffer_bytes"),
+                "mode_execution_runtime_mode_code": mode_execution_plan.get(
+                    "runtime_mode_code"
+                ),
+                "mode_execution_debug_shadow_write_count": mode_execution_plan.get(
+                    "debug_shadow_write_count"
+                ),
+                "mode_execution_trace_record_write_count": mode_execution_plan.get(
+                    "trace_record_write_count"
+                ),
+                "mode_execution_profiler_record_write_count": mode_execution_plan.get(
+                    "profiler_record_write_count"
+                ),
+                "mode_execution_production_guard_check_count": mode_execution_plan.get(
+                    "production_guard_check_count"
+                ),
+                "mode_execution_active_record_count": mode_execution_plan.get(
+                    "active_mode_record_count"
+                ),
+                "dense_block_candidate": dense_block_plan.get(
+                    "dense_decoder_block_candidate"
+                ),
+                "dense_block_covered": dense_block_plan.get(
+                    "dense_decoder_block_covered"
+                ),
+                "dense_block_required_operator_kind_count": dense_block_plan.get(
+                    "required_operator_kind_count"
+                ),
+                "dense_block_covered_operator_kind_count": dense_block_plan.get(
+                    "covered_operator_kind_count"
+                ),
+                "dense_block_matmul_task_count": dense_block_plan.get("matmul_task_count"),
+                "dense_block_rms_norm_task_count": dense_block_plan.get(
+                    "rms_norm_task_count"
+                ),
+                "dense_block_rope_task_count": dense_block_plan.get("rope_task_count"),
+                "dense_block_attention_task_count": dense_block_plan.get(
+                    "attention_task_count"
+                ),
+                "dense_block_mlp_task_count": dense_block_plan.get("mlp_task_count"),
+                "dense_block_residual_add_task_count": dense_block_plan.get(
+                    "residual_add_task_count"
+                ),
+                "dense_block_dense_operator_task_count": dense_block_plan.get(
+                    "dense_operator_task_count"
+                ),
+                "dense_block_unsupported_operator_task_count": dense_block_plan.get(
+                    "unsupported_operator_task_count"
+                ),
+            }
+        )
+    validated = {}
     for key, value in expected.items():
-        if value is None or _read_summary_int(summary, key) != value:
+        if value is None:
             raise BumkcArtifactError(f"BUMKC engine runtime summary mismatch: {key}")
+        if isinstance(value, bool):
+            if _read_bool(summary, key) != value:
+                raise BumkcArtifactError(
+                    f"BUMKC engine runtime summary mismatch: {key}"
+                )
+            validated[key] = value
+        else:
+            if _read_summary_int(summary, key) != value:
+                raise BumkcArtifactError(
+                    f"BUMKC engine runtime summary mismatch: {key}"
+                )
+            validated[key] = int(value)
 
-    return BumkcRuntimeSummary(**{key: int(value) for key, value in expected.items()})
+    return BumkcRuntimeSummary(**validated)
 
 
 def _load_scale_up_summary(
@@ -1962,8 +2238,201 @@ def _validate_runtime_smoke_plan(
         ),
         "expected_watchdog_timeout_us": runtime_summary.watchdog_timeout_us,
     }
+    expected.update(
+        {
+            "expected_placement_worker_slots_per_gpu": (
+                runtime_summary.placement_worker_slots_per_gpu
+            ),
+            "expected_placement_scheduler_slots_per_gpu": (
+                runtime_summary.placement_scheduler_slots_per_gpu
+            ),
+            "expected_placement_total_runtime_slots": (
+                runtime_summary.placement_total_runtime_slots
+            ),
+            "expected_placement_scheduler_slot_offset": (
+                runtime_summary.placement_scheduler_slot_offset
+            ),
+            "expected_dispatch_scheduler_iteration_count": (
+                runtime_summary.dispatch_scheduler_iteration_count
+            ),
+            "expected_dispatch_ready_event_check_count": (
+                runtime_summary.dispatch_ready_event_check_count
+            ),
+            "expected_dispatch_queue_enqueue_count": (
+                runtime_summary.dispatch_queue_enqueue_count
+            ),
+            "expected_dispatch_worker_dequeue_count": (
+                runtime_summary.dispatch_worker_dequeue_count
+            ),
+            "expected_dispatch_task_completion_count": (
+                runtime_summary.dispatch_task_completion_count
+            ),
+            "expected_dispatch_event_counter_wait_count": (
+                runtime_summary.dispatch_event_counter_wait_count
+            ),
+            "expected_dispatch_event_counter_update_count": (
+                runtime_summary.dispatch_event_counter_update_count
+            ),
+            "expected_dispatch_barrier_count": runtime_summary.dispatch_barrier_count,
+            "expected_event_update_counter_count": (
+                runtime_summary.event_update_counter_count
+            ),
+            "expected_event_update_initialized_counter_count": (
+                runtime_summary.event_update_initialized_counter_count
+            ),
+            "expected_event_update_ready_event_count": (
+                runtime_summary.event_update_ready_event_count
+            ),
+            "expected_event_update_wait_edge_count": (
+                runtime_summary.event_update_wait_edge_count
+            ),
+            "expected_event_update_notification_edge_count": (
+                runtime_summary.event_update_notification_edge_count
+            ),
+            "expected_event_update_counter_increment_count": (
+                runtime_summary.event_update_counter_increment_count
+            ),
+            "expected_event_update_ready_transition_count": (
+                runtime_summary.event_update_ready_transition_count
+            ),
+            "expected_event_update_max_predecessor_wait_count": (
+                runtime_summary.event_update_max_predecessor_wait_count
+            ),
+            "expected_event_update_max_successor_notification_count": (
+                runtime_summary.event_update_max_successor_notification_count
+            ),
+            "expected_telemetry_queue_watermark_slot_count": (
+                runtime_summary.telemetry_queue_watermark_slot_count
+            ),
+            "expected_telemetry_worker_idle_slot_count": (
+                runtime_summary.telemetry_worker_idle_slot_count
+            ),
+            "expected_telemetry_scheduler_idle_slot_count": (
+                runtime_summary.telemetry_scheduler_idle_slot_count
+            ),
+            "expected_telemetry_task_latency_histogram_count": (
+                runtime_summary.telemetry_task_latency_histogram_count
+            ),
+            "expected_telemetry_task_latency_histogram_bucket_count": (
+                runtime_summary.telemetry_task_latency_histogram_bucket_count
+            ),
+            "expected_telemetry_shared_memory_page_pressure_slot_count": (
+                runtime_summary.telemetry_shared_memory_page_pressure_slot_count
+            ),
+            "expected_telemetry_kv_cache_page_pressure_slot_count": (
+                runtime_summary.telemetry_kv_cache_page_pressure_slot_count
+            ),
+            "expected_telemetry_communication_wait_slot_count": (
+                runtime_summary.telemetry_communication_wait_slot_count
+            ),
+            "expected_telemetry_watchdog_counter_slot_count": (
+                runtime_summary.telemetry_watchdog_counter_slot_count
+            ),
+            "expected_telemetry_fallback_counter_slot_count": (
+                runtime_summary.telemetry_fallback_counter_slot_count
+            ),
+            "expected_debug_event_counter_shadow_count": (
+                runtime_summary.debug_event_counter_shadow_count
+            ),
+            "expected_debug_queue_shadow_slot_count": (
+                runtime_summary.debug_queue_shadow_slot_count
+            ),
+            "expected_debug_task_shadow_slot_count": (
+                runtime_summary.debug_task_shadow_slot_count
+            ),
+            "expected_debug_task_instance_shadow_capacity": (
+                runtime_summary.debug_task_instance_shadow_capacity
+            ),
+            "expected_debug_replay_record_slot_count": (
+                runtime_summary.debug_replay_record_slot_count
+            ),
+            "expected_debug_invariant_check_count": (
+                runtime_summary.debug_invariant_check_count
+            ),
+            "expected_debug_shadow_state_bytes": runtime_summary.debug_shadow_state_bytes,
+            "expected_debug_poisonable_global_bytes": (
+                runtime_summary.debug_poisonable_global_bytes
+            ),
+            "expected_profiler_task_trace_slot_count": (
+                runtime_summary.profiler_task_trace_slot_count
+            ),
+            "expected_profiler_event_trace_slot_count": (
+                runtime_summary.profiler_event_trace_slot_count
+            ),
+            "expected_profiler_queue_trace_slot_count": (
+                runtime_summary.profiler_queue_trace_slot_count
+            ),
+            "expected_profiler_scheduler_trace_slot_count": (
+                runtime_summary.profiler_scheduler_trace_slot_count
+            ),
+            "expected_profiler_communication_trace_slot_count": (
+                runtime_summary.profiler_communication_trace_slot_count
+            ),
+            "expected_profiler_memory_trace_slot_count": (
+                runtime_summary.profiler_memory_trace_slot_count
+            ),
+            "expected_profiler_launch_trace_slot_count": (
+                runtime_summary.profiler_launch_trace_slot_count
+            ),
+            "expected_profiler_record_slot_count": runtime_summary.profiler_record_slot_count,
+            "expected_profiler_buffer_bytes": runtime_summary.profiler_buffer_bytes,
+            "expected_runtime_mode_code": (
+                runtime_summary.mode_execution_runtime_mode_code
+            ),
+            "expected_mode_debug_shadow_write_count": (
+                runtime_summary.mode_execution_debug_shadow_write_count
+            ),
+            "expected_mode_trace_record_write_count": (
+                runtime_summary.mode_execution_trace_record_write_count
+            ),
+            "expected_mode_profiler_record_write_count": (
+                runtime_summary.mode_execution_profiler_record_write_count
+            ),
+            "expected_mode_production_guard_check_count": (
+                runtime_summary.mode_execution_production_guard_check_count
+            ),
+            "expected_mode_active_record_count": (
+                runtime_summary.mode_execution_active_record_count
+            ),
+            "expected_dense_decoder_block_candidate": runtime_summary.dense_block_candidate,
+            "expected_dense_decoder_block_covered": runtime_summary.dense_block_covered,
+            "expected_dense_block_required_operator_kind_count": (
+                runtime_summary.dense_block_required_operator_kind_count
+            ),
+            "expected_dense_block_covered_operator_kind_count": (
+                runtime_summary.dense_block_covered_operator_kind_count
+            ),
+            "expected_dense_block_matmul_task_count": (
+                runtime_summary.dense_block_matmul_task_count
+            ),
+            "expected_dense_block_rms_norm_task_count": (
+                runtime_summary.dense_block_rms_norm_task_count
+            ),
+            "expected_dense_block_rope_task_count": (
+                runtime_summary.dense_block_rope_task_count
+            ),
+            "expected_dense_block_attention_task_count": (
+                runtime_summary.dense_block_attention_task_count
+            ),
+            "expected_dense_block_mlp_task_count": (
+                runtime_summary.dense_block_mlp_task_count
+            ),
+            "expected_dense_block_residual_add_task_count": (
+                runtime_summary.dense_block_residual_add_task_count
+            ),
+            "expected_dense_block_dense_operator_task_count": (
+                runtime_summary.dense_block_dense_operator_task_count
+            ),
+            "expected_dense_block_unsupported_operator_task_count": (
+                runtime_summary.dense_block_unsupported_operator_task_count
+            ),
+        }
+    )
     for key, value in expected.items():
-        if _read_int(runtime_smoke, key) != value:
+        if isinstance(value, bool):
+            if _read_bool(runtime_smoke, key) != value:
+                raise BumkcArtifactError(f"BUMKC runtime smoke mismatch: {key}")
+        elif value is None or _read_int(runtime_smoke, key) != value:
             raise BumkcArtifactError(f"BUMKC runtime smoke mismatch: {key}")
 
     event_descriptors = _read_list(runtime_smoke, "event_descriptors")
@@ -2201,7 +2670,7 @@ def _validate_runtime_smoke_contracts(
     )
     expected = {
         "expected_schema_hash": _contract_hash_str(
-            REQUIRED_RUNTIME_SMOKE_SCHEMA_VERSION
+            _read_str(runtime_smoke, "schema_version")
         ),
         "expected_runtime_abi_hash": _contract_hash_str(
             _read_str(runtime_smoke, "runtime_abi_version")

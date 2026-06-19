@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -22,6 +23,20 @@ _is_npu = is_npu()
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
 # via the existing SGLANG_IS_IN_CI; off in production.
 _DEBUG_ASSERT = os.getenv("SGLANG_IS_IN_CI", "").lower() == "true"
+
+
+@dataclass
+class FutureIndices:
+    indices: torch.Tensor
+
+
+FutureIndicesLike = Union[torch.Tensor, FutureIndices]
+
+
+def _future_indices_tensor(future_indices: FutureIndicesLike) -> torch.Tensor:
+    if isinstance(future_indices, FutureIndices):
+        return future_indices.indices
+    return future_indices
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
@@ -209,7 +224,7 @@ class FutureMap:
     def set_input_ids_sentinel(
         self,
         batch: ScheduleBatch,
-        future_indices: Optional[torch.Tensor],
+        future_indices: Optional[FutureIndicesLike],
     ) -> None:
         # NOTE(ai-blaise merge): SMC has no future_indices (its worker
         # hands back verified ids directly via batch_result.next_draft_input);
@@ -230,7 +245,7 @@ class FutureMap:
         # Sentinel for the decode portion so mixed batches can cat extend
         # (positive real tokens) + decode (negative sentinels) into one
         # input_ids; resolve_future translates negatives via output_tokens_buf.
-        batch.input_ids = -future_indices
+        batch.input_ids = -_future_indices_tensor(future_indices)
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # seq_lens_cpu may be needed on the host for kernel-launch prep (some backends).
@@ -246,7 +261,8 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
-        batch.seq_lens = self.new_seq_lens_buf[fi]
+        fi_tensor = _future_indices_tensor(fi)
+        batch.seq_lens = self.new_seq_lens_buf[fi_tensor]
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
@@ -264,8 +280,10 @@ class FutureMap:
         batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
-    def publish(self, future_indices: torch.Tensor, new_seq_lens: torch.Tensor) -> None:
-        indices = future_indices
+    def publish(
+        self, future_indices: FutureIndicesLike, new_seq_lens: torch.Tensor
+    ) -> None:
+        indices = _future_indices_tensor(future_indices)
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
@@ -277,10 +295,10 @@ class FutureMap:
 
     def stash(
         self,
-        future_indices: torch.Tensor,
+        future_indices: FutureIndicesLike,
         payload: Union[torch.Tensor, EagleDraftInput],
     ) -> None:
-        indices = future_indices
+        indices = _future_indices_tensor(future_indices)
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return

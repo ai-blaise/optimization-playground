@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import sys
 import types
@@ -437,6 +438,37 @@ def test_layersplit_transfer_params_cover_all_layers_across_cp_sizes(cp_size):
         )
         for local_layer_idx in range(layer_count)
     )
+
+
+def test_nixl_mla_transfer_uses_layersplit_planner():
+    tree = ast.parse(
+        (ROOT / "python/sglang/srt/disaggregation/nixl/conn.py").read_text()
+    )
+    manager = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "NixlKVManager"
+    )
+    transfer = next(
+        node
+        for node in manager.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_send_kvcache_generic"
+    )
+    mla_branch = next(
+        node
+        for node in ast.walk(transfer)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Attribute)
+        and node.test.attr == "is_mla_backend"
+    )
+    calls = [
+        node.func.attr
+        for node in ast.walk(mla_branch)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+
+    assert "get_mla_layers_params_with_pp" in calls
+    assert "get_mla_kv_ptrs_with_pp" not in calls
 
 
 def test_layersplit_rejects_bad_policy():

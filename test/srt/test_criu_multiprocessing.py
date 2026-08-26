@@ -1,10 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 BlaiseAI / ai-blaise. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
 import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
+
+import pytest
 
 
 def _pythonpath_env() -> dict[str, str]:
@@ -14,6 +18,16 @@ def _pythonpath_env() -> dict[str, str]:
     return env
 
 
+requires_neutral_package = pytest.mark.skipif(
+    importlib.util.find_spec("criu_snapshot_hooks") is None,
+    reason="criu_snapshot_hooks is not installed",
+)
+
+
+@pytest.mark.skipif(
+    not Path("/dev/shm").exists(),
+    reason="POSIX semaphore names are only observable via /dev/shm on Linux",
+)
 def test_criu_semaphore_preservation_keeps_spawn_semaphore_linked():
     code = """
 import gc
@@ -75,6 +89,60 @@ os.environ.pop("SGLANG_CRIU_KEEP_POSIX_SEMAPHORES", None)
 before = mp_synchronize.SemLock._cleanup
 module.preserve_posix_semaphores_for_criu()
 assert mp_synchronize.SemLock._cleanup is before
+"""
+    subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)],
+        check=True,
+        env=_pythonpath_env(),
+    )
+
+
+@requires_neutral_package
+def test_criu_semaphore_preservation_delegates_to_neutral_package():
+    code = """
+import importlib.util
+import multiprocessing.synchronize as mp_synchronize
+import os
+from pathlib import Path
+
+module_path = Path("python/sglang/srt/criu_multiprocessing.py").resolve()
+spec = importlib.util.spec_from_file_location("criu_multiprocessing", module_path)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+assert module.NEUTRAL_PACKAGE is not None
+os.environ["SGLANG_CRIU_KEEP_POSIX_SEMAPHORES"] = "1"
+module.preserve_posix_semaphores_for_criu()
+assert mp_synchronize.SemLock._cleanup.__module__ == "criu_snapshot_hooks.semaphores"
+"""
+    subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)],
+        check=True,
+        env=_pythonpath_env(),
+    )
+
+
+def test_criu_semaphore_preservation_inline_when_package_absent():
+    code = """
+import importlib.util
+import multiprocessing.synchronize as mp_synchronize
+import os
+import sys
+from pathlib import Path
+
+sys.modules["criu_snapshot_hooks"] = None
+
+module_path = Path("python/sglang/srt/criu_multiprocessing.py").resolve()
+spec = importlib.util.spec_from_file_location("criu_multiprocessing", module_path)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+assert module.NEUTRAL_PACKAGE is None
+os.environ["SGLANG_CRIU_KEEP_POSIX_SEMAPHORES"] = "1"
+module.preserve_posix_semaphores_for_criu()
+assert mp_synchronize.SemLock._cleanup.__module__ == "criu_multiprocessing"
 """
     subprocess.run(
         [sys.executable, "-c", textwrap.dedent(code)],
